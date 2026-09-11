@@ -1,0 +1,20 @@
+{
+  "seq": 11,
+  "harnessId": "qwen-code",
+  "threadId": "vellum_thread",
+  "nativeSessionId": "native-2",
+  "nativeEventId": "evt-11",
+  "occurredAt": "2026-08-30T12:00:01Z",
+  "event": {
+    "type": "permissionRequested",
+    "data": {
+      "nativeRequestId": "call-3",
+      "description": "write file",
+      "payload": {
+        "toolCall": {
+          "toolCallId": "call-3"
+        }
+      }
+    }
+  }
+}

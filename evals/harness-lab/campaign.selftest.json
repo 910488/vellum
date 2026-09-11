@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "commands": [
+    {
+      "id": "node-runtime",
+      "command": ["node", "--version"]
+    }
+  ]
+}

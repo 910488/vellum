@@ -1,0 +1,7 @@
+{
+  "error": {
+    "message": "Vellum local proxy failed. Provider: Parity Test Provider; model: test-model; endpoint: /responses; upstream_status: HTTP 401; cause: {\"error\":{\"message\":\"synthetic upstream 401\"}}",
+    "type": "vellum_proxy_error",
+    "code": 401
+  }
+}

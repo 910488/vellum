@@ -1,0 +1,8 @@
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "codex-cli", "version": "0.142.5"}}}
+{"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}}
+{"jsonrpc": "2.0", "id": 3, "method": "thread/start", "params": {"cwd": "C:\\workspace", "harnessSelection": {"harnessId": "grok-build", "modelId": "grok-4.6", "reasoningEffort": "high"}}}
+{"jsonrpc": "2.0", "id": 4, "method": "config/value/write", "params": {"threadId": "$THREAD", "key": "model", "value": "grok-4.6"}}
+{"jsonrpc": "2.0", "id": 5, "method": "turn/start", "params": {"threadId": "$THREAD", "input": [{"type": "text", "text": "make one small change"}]}}
+{"jsonrpc": "2.0", "id": 6, "method": "thread/read", "params": {"threadId": "$THREAD"}}
+{"jsonrpc": "2.0", "id": 7, "method": "turn/interrupt", "params": {"threadId": "$THREAD"}}
+{"jsonrpc": "2.0", "id": 8, "method": "thread/compact/start", "params": {"threadId": "$THREAD"}}

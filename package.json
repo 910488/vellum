@@ -1,0 +1,64 @@
+{
+  "name": "vellum",
+  "private": true,
+  "version": "0.2.9",
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Vellum — 本機代理管理器",
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri",
+    "predev:renderer": "node scripts/stop-vellum-vite.mjs",
+    "dev:renderer": "vite --host 127.0.0.1 --port 3100",
+    "dev:stop": "node scripts/stop-vellum-vite.mjs",
+    "build:renderer": "tsc --noEmit && vite build",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "build:sidecar:dev": "node scripts/build-sidecar.mjs --profile=debug",
+    "build:main": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-main.ps1",
+    "build:local-release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-local-release.ps1",
+    "test:build-remote": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-remote-payload.ps1",
+    "dev:host:up": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev-host.ps1 up",
+    "dev:host:down": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev-host.ps1 down",
+    "dev:host:reset": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev-host.ps1 reset",
+    "dev:host:status": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev-host.ps1 status",
+    "remote:stage": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stage-remote-dev.ps1",
+    "remote:e2e": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/remote-e2e.ps1",
+    "remote:e2e:full": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/remote-e2e.ps1 -Lane full",
+    "build:mac": "CI=true bash scripts/build-local-release.sh dmg",
+    "preview": "vite preview",
+    "qa": "node scripts/qa/run.mjs",
+    "typecheck": "tsc --noEmit",
+    "gate:status": "node scripts/enhanced-gate.mjs status",
+    "gate:bridge": "node scripts/enhanced-gate.mjs bridge",
+    "gate:installed": "node scripts/enhanced-gate.mjs installed",
+    "gate:live": "node scripts/enhanced-gate.mjs live",
+    "test": "vitest run",
+    "test:watch": "vitest watch"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "i18next": "^26.3.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-i18next": "^17.0.11"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.9"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

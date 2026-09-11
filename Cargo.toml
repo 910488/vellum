@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+default-members = [
+  "src-tauri",
+  "crates/vellum-proxy-runtime",
+  "crates/vellum-proxy-daemon",
+  "crates/vellum-remote-agent",
+  "crates/vellum-remote-protocol",
+  "crates/vellum-harness-protocol",
+  "crates/vellum-harness-runtime",
+  "crates/vellum-acp-client",
+  "crates/vellum-codex-facade",
+  "crates/vellum-zcode-desktop",
+  "crates/vellum-enhanced-codex",
+]
+members = [
+  "src-tauri",
+  "crates/vellum-codex-app-server",
+  "crates/vellum-codex-gate-child",
+  "crates/vellum-eval",
+  "crates/vellum-proxy-runtime",
+  "crates/vellum-proxy-testkit",
+  "crates/vellum-proxy-daemon",
+  "crates/vellum-remote-agent",
+  "crates/vellum-remote-broker",
+  "crates/vellum-remote-protocol",
+  "crates/vellum-remote-testkit",
+  "crates/vellum-harness-protocol",
+  "crates/vellum-harness-runtime",
+  "crates/vellum-acp-client",
+  "crates/vellum-harness-testkit",
+  "crates/vellum-codex-facade",
+  "crates/vellum-zcode-desktop",
+  "crates/vellum-enhanced-codex",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "=1.50.0", features = ["rt-multi-thread", "macros", "time", "process", "sync", "io-util", "fs", "signal", "net"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
+toml = "0.8"
+ulid = "1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# Daily check/test profile. Official release stays full LTO / codegen-units=1.
+[profile.fast-check]
+inherits = "dev"
+lto = false
+codegen-units = 16
+incremental = true
+# No `panic = "abort"` here on purpose: web.run parses attacker-controlled
+# HTML/PDF and SearchEngine::run fences that pipeline with catch_unwind.
+# Aborting turns any parser bug back into a whole-process kill (0xC0000409).

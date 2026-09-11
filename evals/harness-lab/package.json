@@ -1,0 +1,13 @@
+{
+  "name": "@vellum/harness-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bootstrap": "node src/bootstrap.mjs",
+    "test": "node --test test/*.test.mjs",
+    "replay": "node src/replay.mjs",
+    "corpus": "node src/corpus.mjs",
+    "bridge": "node src/bridge.mjs",
+    "campaign": "node src/campaign.mjs"
+  }
+}

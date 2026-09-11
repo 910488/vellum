@@ -1,0 +1,31 @@
+{
+  "userPrompt": "Determine whether the requested symbol exists using independent workspace and repository evidence.",
+  "mode": "recover",
+  "events": [
+    {
+      "command": "rg TARGET_SYMBOL src",
+      "output": "",
+      "exitCode": 1
+    },
+    {
+      "command": "git grep TARGET_SYMBOL",
+      "output": "",
+      "exitCode": 1
+    },
+    {
+      "command": "Select-String -Path src/* -Pattern TARGET_SYMBOL",
+      "output": "Final output:\n",
+      "exitCode": 0
+    },
+    {
+      "command": "rg TARGET_SYMBOL src",
+      "output": "Chunk ID: replay\nProcess exited with code 1\nFinal output:\n",
+      "exitCode": 1
+    },
+    {
+      "command": "Select-String -Path src/* -Pattern TARGET_SYMBOL",
+      "output": "",
+      "exitCode": 0
+    }
+  ]
+}

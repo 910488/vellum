@@ -1,0 +1,469 @@
+/* ============================================================
+   base：reset、版面骨架、大氣層
+   ------------------------------------------------------------
+   大氣層是這套語彙的主角，不是背景裝飾。堆疊順序：
+
+     .sky    z0   天光漸層（光從右上來）
+     .bokeh  z0   幾顆靜止的散景光斑
+     .leak   z0   一道鏡頭光斜線
+     .grain  z0   紙張纖維（疊在以上全部之上）
+     .shell  z1   介面本體
+
+   顆粒刻意壓在 .shell 底下：卡片是半透明的，所以紙紋會從暈染裡透出來
+   —— 那正是水彩該有的樣子 —— 但文字本身不會被顆粒糊掉。
+   ============================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--ink);
+  background: var(--ground);
+  line-height: 1.75;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden; /* 視窗殼自己捲，body 不捲 */
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--lavender-deep);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+/* ---------- 捲軸 ----------
+   預設捲軸在深色底上是一條亮灰色的軌道加一塊亮灰色的滑塊，
+   它比畫面上任何一個真正的元素都搶眼 —— 一個純粹的機構零件
+   贏過內容，那就是排版失敗。而整套語彙其他地方連分隔線都做成
+   漸層淡出了，不可能只有這裡留一根實心灰柱。
+
+   軌道整個拿掉：紙本身就是軌道。只留一條細墨線當滑塊 ——
+   捲軸要回答的是「還有多少沒讀」，不是「這裡有一個控制項」。
+
+   顏色走 color-mix(--ink-ghost)，跟著明暗主題自己翻，
+   不另外開 token（單一事實來源）。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink-ghost) 42%, transparent) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+/* 透明邊框 + padding-box 把 10px 的軌道收成 4px 的滑塊，
+   命中區仍然是 10px —— 看起來是一條線，按起來還是抓得到。 */
+::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--ink-ghost) 42%, transparent);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--ink-ghost) 68%, transparent);
+}
+
+/* 捲軸出現與消失不該改變內容寬度。
+   不預留的話，換幕時（有的幕要捲、有的不用）整欄文字會左右跳一下。 */
+.canvas,
+.sheet__text {
+  scrollbar-gutter: stable;
+}
+
+/* ---------- 天光 ----------
+   光源在右上角。這個方向會貫穿整套語彙：卡片的受光邊、光斑的分布、
+   鏡頭光的角度都跟著它。光有方向，畫面才有立體感；四面都亮就是塑膠。 */
+.sky {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    /* 右上：主光源 */
+    radial-gradient(118% 80% at 88% -14%, var(--skyglow-wash) 0%, transparent 56%),
+    /* 左下：地面暖反光 */
+    radial-gradient(86% 58% at 10% 112%, var(--apricot-wash) 0%, transparent 60%),
+    /* 冷暖過渡 */
+    linear-gradient(172deg, var(--ground-tint) 0%, transparent 46%);
+}
+
+/* 散景光斑：靜止。
+   原本它們會 26–38 秒慢慢飄 —— 飄到文字底下就會改變對比度，那是一個
+   會動的無障礙缺陷，靜態量一次量不到。氣氛靠分布與明度做，不靠動畫。
+
+   形狀刻意不是正圓：水彩的暈不是圓規畫出來的。 */
+.bokeh {
+  position: absolute;
+  border-radius: 58% 42% 54% 46% / 48% 56% 44% 52%;
+  filter: blur(30px);
+  will-change: auto;
+}
+.bokeh--a {
+  width: 300px;
+  height: 268px;
+  top: -62px;
+  right: 16%;
+  background: var(--skyglow);
+  opacity: 0.3;
+}
+.bokeh--b {
+  width: 216px;
+  height: 240px;
+  top: 30%;
+  right: -46px;
+  background: var(--apricot);
+  opacity: 0.24;
+  border-radius: 46% 54% 42% 58% / 56% 44% 58% 42%;
+}
+.bokeh--c {
+  width: 264px;
+  height: 232px;
+  bottom: -40px;
+  left: 22%;
+  background: var(--lavender);
+  opacity: 0.16;
+  border-radius: 52% 48% 58% 42% / 44% 52% 48% 56%;
+}
+
+/* 鏡頭光：一道。漫畫分鏡裡的斜光，靜止、極淡、只出現一次。
+   兩道以上就變成裝飾，一道才是光。 */
+.leak {
+  position: fixed;
+  top: -30%;
+  right: 12%;
+  width: 180px;
+  height: 160%;
+  z-index: 0;
+  pointer-events: none;
+  transform: rotate(18deg);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--rim-light) 48%,
+    transparent 100%
+  );
+  opacity: 0.28;
+  filter: blur(14px);
+}
+
+/* 紙張纖維。這一層是「看起來像手做的」與「看起來像 CSS」之間的差別。 */
+.grain {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: var(--grain);
+  background-repeat: repeat;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: soft-light;
+}
+
+/* A hidden tray window must not keep compositing decorative full-screen
+   layers or running UI animations in the background. */
+html[data-performance="low"] .sky,
+html[data-performance="low"] .leak,
+html[data-performance="low"] .grain {
+  display: none;
+}
+
+html[data-performance="low"] *,
+html[data-performance="low"] *::before,
+html[data-performance="low"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* ---------- 應用外殼 ----------
+   常駐狀態列橫跨整個寬度，導覽軌與內容區排在它下面。狀態列跨全寬是刻意的：
+   它講的是「整個系統現在怎樣」，不屬於任何一頁。 */
+.shell {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 214px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+}
+
+.statusbar {
+  grid-column: 1 / -1;
+}
+
+.canvas {
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 上緣留白單獨開一個變數：它是捲動容器的 padding，所以 sticky 的
+     子元素要用它的負值才貼得到真正的頂邊。兩邊寫死同一個數字，
+     改一邊就會漏掉另一邊。 */
+  padding: var(--canvas-pad-top) var(--pad-x) 56px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-block);
+}
+
+/* 一次編排好的進場，勝過到處散落的微互動。
+   每個區塊晚 40ms，眼睛會照著順序讀下去 —— 這也順便教會使用者版面的層級。 */
+@media (prefers-reduced-motion: no-preference) {
+  .canvas > * {
+    animation: rise 0.52s cubic-bezier(0.22, 0.86, 0.24, 1) backwards;
+  }
+  .canvas > *:nth-child(1) {
+    animation-delay: 0.02s;
+  }
+  .canvas > *:nth-child(2) {
+    animation-delay: 0.06s;
+  }
+  .canvas > *:nth-child(3) {
+    animation-delay: 0.1s;
+  }
+  .canvas > *:nth-child(4) {
+    animation-delay: 0.14s;
+  }
+  .canvas > *:nth-child(5) {
+    animation-delay: 0.18s;
+  }
+  .canvas > *:nth-child(6) {
+    animation-delay: 0.22s;
+  }
+  .canvas > *:nth-child(n + 7) {
+    animation-delay: 0.26s;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(9px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 有 sticky 子元素的區塊只能淡入，不能位移。
+   transform 會讓這個元素變成子元素的容器塊，工作面的 sticky 就改成
+   相對它計算 —— 進場那半秒工作面會跟著偏 9px，而分頁在背景時動畫會
+   停在起始影格，那 9px 就永遠不會還回來。
+
+   進場的節奏本來就是靠 opacity 的時間差在帶，位移只是加強。這一頁的
+   視線入口是工作面本身，不需要再多一次位移去指它。 */
+@media (prefers-reduced-motion: no-preference) {
+  .canvas > .remote-layout {
+    animation-name: fade;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.canvas__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+
+/* 標題走明體。中文的個性沒辦法靠換字體以外的方式偷來 ——
+   內嵌 CJK 字型動輒數 MB，但 Noto Serif TC 是系統就有的，
+   而它跟 ui-rounded 的距離正好是「有人設計過」跟「預設值」的距離。 */
+.canvas__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 27px;
+  font-weight: 600;
+  line-height: 1.34;
+  letter-spacing: 0.005em;
+}
+
+/* ---------- 排版 ---------- */
+
+/* 小型標籤式 eyebrow。中文不用 uppercase —— 它對漢字無效，卻會把夾在
+   中間的英文喊成大寫（「Codex 選單」→「CODEX 選單」看起來像另一個東西）。
+   純拉丁的標籤才加 .eyebrow--latin 拿到大寫與寬字距。 */
+.eyebrow {
+  margin: 0 0 11px;
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink-faint);
+}
+.eyebrow--latin {
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  font-size: 11px;
+}
+
+/* 識別字（model id、端點）用等寬，跟周圍的說明文字分開。 */
+.literal,
+.eyebrow .literal {
+  font-family: var(--font-mono);
+  font-size: 0.93em;
+  letter-spacing: 0;
+}
+
+.prose {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 14px;
+  line-height: 1.8;
+  max-width: 62ch;
+}
+
+/* 註腳。左邊那條線用漸層淡出，像毛筆收尾，不是實心色塊。 */
+.note {
+  margin: 0;
+  padding: 3px 0 3px 17px;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  line-height: 1.78;
+  border-left: 2px solid transparent;
+  border-image: linear-gradient(
+      180deg,
+      var(--lavender) 0%,
+      color-mix(in srgb, var(--lavender) 24%, transparent) 100%
+    )
+    1;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--lavender-wash);
+  color: var(--lavender-ink);
+  padding: 1px 6px;
+  border-radius: 5px;
+}
+
+/* ---------- 版面工具 ----------
+   .grid2 刻意不等分。等分兩欄是最沒有決定的版面 —— 1.35:1 讓主要的那張
+   卡拿到更多空間，三張並列時第三張會落到下一行、寬度較大，形成編排節奏
+   而不是規則的方格。 */
+.grid2 {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 18px;
+  align-items: start;
+}
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+/* 一排指標卡要等高。
+   預設是 align-items: start（卡片各自照內容高度收），那對「內容量差很多」
+   的區塊才對；但同一排的指標卡高度不一會讓底緣參差，看起來像沒排好。
+
+   等高的前提是每張卡都撐得起那個高度 —— 純粹拉高會變成一張卡下面一片空白，
+   那比不等高更糟。所以套這個 class 之前先確認內容夠。 */
+.grid--even {
+  align-items: stretch;
+}
+.grid--even > .card {
+  display: flex;
+  flex-direction: column;
+}
+/* 同一排的卡片圓角必須一致。
+   平常 hero 用更開的圓角（36/40/32/38）、tile 用小的（--r-md）是對的 ——
+   圓角本來就該跟著盒子大小走。但這一排等高之後三張是同尺寸的同儕，
+   角度不同就會讀成「沒對齊」。
+
+   統一取 --r-lg：跟這頁其他卡片同一個值，整頁的邊角語彙才是一套。
+   主從差異交給暈染、留白與數字大小，不靠圓角。 */
+.grid--even > .card {
+  border-radius: var(--r-lg);
+}
+/* 光暈數字在 flex 欄裡不能被拉滿寬。
+   .metric 是 inline-block，它的光暈 ::before 用負的 inset（左右各 -26%）
+   往外撐；一旦被 align-items: stretch 拉成整欄寬，那個負值就變成
+   實際的 70px 溢出，整個內容區就出現水平捲軸。 */
+.grid--even > .card > .metric {
+  align-self: flex-start;
+}
+/* 每張卡的最後一塊往下推，三張卡的頁尾就落在同一條基線上。
+   不這樣做的話，內容少的那兩張會在底部留一大片空白（量到 146px 與 150px），
+   看起來就是「被拉高的」而不是「排好的」。 */
+.grid--even > .card > *:last-child {
+  margin-top: auto;
+}
+/* 補充列在等高卡裡收緊：這裡的行距是為了填滿高度，不是為了呼吸。 */
+.grid--even > .card > .rows {
+  padding-top: 12px;
+}
+.grid--even > .card > .rows .rows__item {
+  padding: 7px 2px;
+  font-size: 12.5px;
+}
+@media (max-width: 1080px) {
+  .grid3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 820px) {
+  .grid2,
+  .grid3 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.rowline {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.scroll-x {
+  overflow-x: auto;
+}
+
+/* 給讀屏軟體的文字。圖示旁邊的狀態必須有可讀名稱，
+   否則「✓ / – / !」對聽的人完全等價。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "name": "cross-provider-compact-gate",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "deepseek-luna-deepseek-compact",
+      "category": "long-context",
+      "tags": ["compact", "round-trip", "cross-provider"],
+      "source": {"kind": "fixture", "path": "canonical-gate"},
+      "prompt": "Read CONSTRAINTS.md and gate.py, implement normalize_label, and create DECISIONS.md containing CANONICAL_GATE_STABLE. Then read EVAL_CONTEXT.md exactly once to trigger compaction. Keep the patch focused.",
+      "phases": [
+        {
+          "model": {"named": "gpt-5.6-luna"},
+          "reasoningEffort": "xhigh",
+          "prompt": "Continue the existing task on Luna without restarting. Preserve DECISIONS.md, verify the current implementation, and create phase-luna.txt containing luna-continued."
+        },
+        {
+          "model": "current",
+          "prompt": "Resume on the original model using the same session and workspace. Preserve prior decisions and create phase-return.txt containing original-continued."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 15000,
+      "timeoutSeconds": 240,
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "CANONICAL_GATE_STABLE"},
+        {"path": "phase-luna.txt", "contains": "luna-continued"},
+        {"path": "phase-return.txt", "contains": "original-continued"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 256,
+        "maxInputTokens": 300000,
+        "maxOutputTokens": 30000
+      }
+    }
+  ]
+}

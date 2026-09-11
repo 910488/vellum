@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "name": "switch-matrix-6",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "switch-same-model",
+      "category": "continuity",
+      "tags": [
+        "continuity",
+        "same-model",
+        "switch-matrix"
+      ],
+      "transitionMode": "same_model",
+      "source": {
+        "kind": "fixture",
+        "path": "continuity"
+      },
+      "prompt": "Implement normalize_records so it trims strings, discards empty results, removes duplicates, and preserves first-seen order. Record the immutable decision PUBLIC_SIGNATURE_STABLE in DECISIONS.md. Keep the patch focused and run a local check.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue the same task. Preserve DECISIONS.md and create phase-one.txt containing phase-one."
+        },
+        {
+          "model": "current",
+          "prompt": "Continue without redoing completed work. Preserve every prior decision and create phase-two.txt containing phase-two."
+        }
+      ],
+      "verification": [
+        "python /hidden/grader.py"
+      ],
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {
+          "path": "DECISIONS.md",
+          "contains": "PUBLIC_SIGNATURE_STABLE"
+        },
+        {
+          "path": "phase-one.txt",
+          "contains": "phase-one"
+        },
+        {
+          "path": "phase-two.txt",
+          "contains": "phase-two"
+        }
+      ]
+    },
+    {
+      "id": "switch-directed",
+      "category": "continuity",
+      "tags": [
+        "continuity",
+        "ordered-pair",
+        "switch-matrix"
+      ],
+      "transitionMode": "ordered_pair",
+      "source": {
+        "kind": "fixture",
+        "path": "continuity"
+      },
+      "prompt": "Implement normalize_records so it trims strings, discards empty results, removes duplicates, and preserves first-seen order. Record the immutable decision PUBLIC_SIGNATURE_STABLE in DECISIONS.md. Keep the patch focused.",
+      "phases": [
+        {
+          "model": "next",
+          "prompt": "Take over this existing task. Do not repeat completed investigation. Preserve DECISIONS.md, verify the implementation, and create phase-one.txt containing phase-one."
+        }
+      ],
+      "verification": [
+        "python /hidden/grader.py"
+      ],
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "continuityCheckpoints": [
+        {
+          "path": "DECISIONS.md",
+          "contains": "PUBLIC_SIGNATURE_STABLE"
+        },
+        {
+          "path": "phase-one.txt",
+          "contains": "phase-one"
+        }
+      ]
+    },
+    {
+      "id": "switch-all-round-trips",
+      "category": "continuity",
+      "tags": [
+        "continuity",
+        "round-trip",
+        "switch-matrix"
+      ],
+      "transitionMode": "all_round_trips",
+      "source": {
+        "kind": "fixture",
+        "path": "continuity"
+      },
+      "prompt": "Implement normalize_records so it trims strings, discards empty results, removes duplicates, and preserves first-seen order. Record the immutable decision PUBLIC_SIGNATURE_STABLE in DECISIONS.md.",
+      "phases": [
+        {
+          "model": "next",
+          "prompt": "Continue this task on the new model. Preserve the decision and create phase-one.txt containing phase-one."
+        },
+        {
+          "model": "current",
+          "prompt": "Resume on the original model. Do not restart. Preserve all prior work and create phase-two.txt containing phase-two."
+        }
+      ],
+      "verification": [
+        "python /hidden/grader.py"
+      ],
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "requireTerminalSse": true,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "continuityCheckpoints": [
+        {
+          "path": "DECISIONS.md",
+          "contains": "PUBLIC_SIGNATURE_STABLE"
+        },
+        {
+          "path": "phase-one.txt",
+          "contains": "phase-one"
+        },
+        {
+          "path": "phase-two.txt",
+          "contains": "phase-two"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+schema_version = 2
+listen = "0.0.0.0:15721"
+data_dir = "/var/lib/vellum/data"
+history_dir = "/var/lib/vellum/history"
+log_dir = "/var/log/vellum"
+credentials_dir = "/run/secrets"
+require_secrets = false
+strict_upstream = false
+
+# Every endpoint, /health and /readyz included, requires the boundary key held
+# under this credential ID. There is no permissive mode: a proxy that cannot
+# find its key fails to start rather than admitting whoever reaches the port.
+[inbound_access]
+credentialId = "__vellum_proxy_boundary__"
+
+[identity]
+install_id = "install-example"
+host_id = "host-example"
+image_version = "vellum-proxy:local"
+config_hash = "example"
+
+[execution_environment]
+platform = "linux"
+shell = "bash"
+supportsAndAnd = true
+hasUnixUtilities = true
+pathStyle = "posix"
+ampersandSemantics = "posix-background"
+
+[[models]]
+route_id = "mock"
+catalog_id = "vellum-mock"
+name = "Vellum Mock"
+base_url = "http://127.0.0.1:1/v1"
+provider_kind = "openAiCompatible"
+auth_kind = "none"
+wire = "responses"
+server_side_resume = false
+streaming = true
+reasoning = false
+vision = false
+upstream_model = "mock-1"
+context_window = 128000

@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "name": "continuity-12",
+  "version": "1",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "continuity-same-model",
+      "category": "continuity",
+      "tags": ["continuity", "same-model"],
+      "transitionMode": "same_model",
+      "source": {"kind": "fixture", "path": "continuity"},
+      "prompt": "Implement normalize_records so it trims strings, discards empty results, removes duplicates, and preserves first-seen order. Record the immutable decision PUBLIC_SIGNATURE_STABLE in DECISIONS.md. Keep the patch focused and run a local check.",
+      "phases": [
+        {"model": "current", "prompt": "Continue the same task. Preserve DECISIONS.md and create phase-one.txt containing phase-one."},
+        {"model": "current", "prompt": "Continue without redoing completed work. Preserve every prior decision and create phase-two.txt containing phase-two."}
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "PUBLIC_SIGNATURE_STABLE"},
+        {"path": "phase-one.txt", "contains": "phase-one"},
+        {"path": "phase-two.txt", "contains": "phase-two"}
+      ]
+    },
+    {
+      "id": "continuity-ordered-pair",
+      "category": "continuity",
+      "tags": ["continuity", "ordered-pair"],
+      "transitionMode": "ordered_pair",
+      "source": {"kind": "fixture", "path": "continuity"},
+      "prompt": "Implement normalize_records so it trims strings, discards empty results, removes duplicates, and preserves first-seen order. Record the immutable decision PUBLIC_SIGNATURE_STABLE in DECISIONS.md. Keep the patch focused.",
+      "phases": [
+        {"model": "next", "prompt": "Take over this existing task. Do not repeat completed investigation. Preserve DECISIONS.md, verify the implementation, and create phase-one.txt containing phase-one."}
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "PUBLIC_SIGNATURE_STABLE"},
+        {"path": "phase-one.txt", "contains": "phase-one"}
+      ]
+    },
+    {
+      "id": "continuity-round-trip",
+      "category": "continuity",
+      "tags": ["continuity", "round-trip"],
+      "transitionMode": "round_trip",
+      "source": {"kind": "fixture", "path": "continuity"},
+      "prompt": "Implement normalize_records so it trims strings, discards empty results, removes duplicates, and preserves first-seen order. Record the immutable decision PUBLIC_SIGNATURE_STABLE in DECISIONS.md.",
+      "phases": [
+        {"model": "next", "prompt": "Continue this task on the new model. Preserve the decision and create phase-one.txt containing phase-one."},
+        {"model": "current", "prompt": "Resume on the original model. Do not restart. Preserve all prior work and create phase-two.txt containing phase-two."}
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "requireTerminalSse": true,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "PUBLIC_SIGNATURE_STABLE"},
+        {"path": "phase-one.txt", "contains": "phase-one"},
+        {"path": "phase-two.txt", "contains": "phase-two"}
+      ]
+    }
+  ]
+}

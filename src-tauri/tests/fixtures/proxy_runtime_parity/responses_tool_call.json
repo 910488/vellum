@@ -1,0 +1,19 @@
+{
+  "usage": {
+    "input_tokens": 7,
+    "output_tokens": 2,
+    "total_tokens": 9
+  },
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "type": "function_call",
+      "id": "fc_1",
+      "call_id": "call_abc123",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Taipei\"}",
+      "status": "completed"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vellum — 帳號額度預覽台</title>
+    <style>
+      /* 只給預覽台用的控制列，不屬於 app 的設計語彙。
+         擺右下：工作面是 sticky 的，控制列放上面會壓到它，
+         而壓到的正好是這一頁最需要看清楚的那一塊。 */
+      .devbar {
+        position: fixed;
+        z-index: 99;
+        right: 14px;
+        bottom: 14px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px;
+        border-radius: 999px;
+        background: rgba(128, 128, 128, 0.16);
+        backdrop-filter: blur(8px);
+        font: 600 11px/1 ui-monospace, monospace;
+      }
+      .devbar label {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 0 4px;
+      }
+      .devbar label span {
+        opacity: 0.5;
+      }
+      .devbar select {
+        border: 0;
+        cursor: pointer;
+        padding: 5px 6px;
+        border-radius: 999px;
+        background: rgba(128, 128, 128, 0.28);
+        color: inherit;
+        font: inherit;
+      }
+      .devbar select option {
+        background: #23232b;
+        color: #eee;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/dev/models-preview.tsx"></script>
+  </body>
+</html>

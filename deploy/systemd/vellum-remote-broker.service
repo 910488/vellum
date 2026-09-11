@@ -1,0 +1,18 @@
+[Unit]
+Description=Vellum Remote Broker
+After=network-online.target vellum-codex-app-server.service
+Wants=vellum-codex-app-server.service
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+Environment=LOG_FORMAT=json
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/vellum/remote %h/.local/share/vellum/run %h/.config/vellum
+ExecStart=%h/.local/bin/vellum-remote-broker %h/.config/vellum/remote.toml
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

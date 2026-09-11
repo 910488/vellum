@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "bridge": {
+    "upstream": "http://127.0.0.1:15721",
+    "port": 15722,
+    "mode": "S0"
+  },
+  "artifacts": {
+    "codex": "${REPO_ROOT}/target/enhanced-artifacts/6576e4fb712f27bd963b6a6b559d0ba77df7cbed/windows/codex.exe"
+  },
+  "commands": [
+    {
+      "id": "omen-enhanced-debug-smoke",
+      "cwd": "${REPO_ROOT}/target/vellum-evals/20260910-073536-44832/cases/case-a9da50ad2bdabc52/verification-workspace",
+      "env": {
+        "VELLUM_EXECUTION_PLANE": "enhanced-codex",
+        "VELLUM_RUNTIME_DIGEST": "sha256:bb05070e998aec5cb3243da063ba55c24f84cbecb52b9e387161bd126c00c4cb",
+        "VELLUM_ENHANCED_COMMIT": "6576e4fb712f27bd963b6a6b559d0ba77df7cbed",
+        "VELLUM_ENHANCED_ABLATION_PROFILE": "E5",
+        "VELLUM_ENHANCED_DEBUG_LOG": "${REPO_ROOT}/target/enhanced-debug-smoke/omen-events-qualified.jsonl"
+      },
+      "command": [
+        "${REPO_ROOT}/target/enhanced-artifacts/6576e4fb712f27bd963b6a6b559d0ba77df7cbed/windows/codex.exe",
+        "exec", "--ephemeral", "--json", "--sandbox", "read-only",
+        "--model", "vlm-c1f84e8c6d-omen-alpha",
+        "-c", "model_provider=\"vellum\"",
+        "-c", "model_reasoning_effort=\"low\"",
+        "-c", "model_providers.vellum.base_url=\"${VELLUM_LAB_BASE_URL}/v1\"",
+        "-c", "model_providers.vellum.supports_websockets=false",
+        "Read TASK.md and src/solution.py, use one focused read-only shell command to inspect them, then report whether the implementation matches the requirement. Do not edit files."
+      ],
+      "allowFailure": true
+    },
+    {
+      "id": "qwen-enhanced-debug-smoke",
+      "cwd": "${REPO_ROOT}/target/vellum-evals/20260910-073536-44832/cases/case-a9da50ad2bdabc52/verification-workspace",
+      "env": {
+        "VELLUM_EXECUTION_PLANE": "enhanced-codex",
+        "VELLUM_RUNTIME_DIGEST": "sha256:bb05070e998aec5cb3243da063ba55c24f84cbecb52b9e387161bd126c00c4cb",
+        "VELLUM_ENHANCED_COMMIT": "6576e4fb712f27bd963b6a6b559d0ba77df7cbed",
+        "VELLUM_ENHANCED_ABLATION_PROFILE": "E5",
+        "VELLUM_ENHANCED_DEBUG_LOG": "${REPO_ROOT}/target/enhanced-debug-smoke/qwen-events-qualified.jsonl"
+      },
+      "command": [
+        "${REPO_ROOT}/target/enhanced-artifacts/6576e4fb712f27bd963b6a6b559d0ba77df7cbed/windows/codex.exe",
+        "exec", "--ephemeral", "--json", "--sandbox", "read-only",
+        "--model", "vlm-beb60d2887-qwen",
+        "-c", "model_provider=\"vellum\"",
+        "-c", "model_reasoning_effort=\"low\"",
+        "-c", "model_providers.vellum.base_url=\"${VELLUM_LAB_BASE_URL}/v1\"",
+        "-c", "model_providers.vellum.supports_websockets=false",
+        "Read TASK.md and src/solution.py, use one focused read-only shell command to inspect them, then report whether the implementation matches the requirement. Do not edit files."
+      ],
+      "allowFailure": true
+    }
+  ]
+}

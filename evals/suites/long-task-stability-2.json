@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "name": "long-task-stability-2",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "stateless-canonical-resume",
+      "category": "long-context",
+      "tags": ["deepseek", "canonical", "stateless-snapshot", "compact-storm"],
+      "transitionMode": "same_model",
+      "source": {"kind": "fixture", "path": "canonical-gate"},
+      "prompt": "Read CONSTRAINTS.md and gate.py once. Implement normalize_label, create DECISIONS.md containing STATELESS_CANONICAL_REUSED, then read EVAL_CONTEXT.md once so automatic compaction has enough input. Do not repeat successful inspection commands.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue the existing task without repeating the initial investigation. Preserve DECISIONS.md, run the focused verification, and create resume.txt containing canonical-resume-ok."
+        },
+        {
+          "model": "current",
+          "prompt": "Perform one final focused verification without re-reading EVAL_CONTEXT.md. Preserve all prior decisions and stop."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 15000,
+      "timeoutSeconds": 360,
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "STATELESS_CANONICAL_REUSED"},
+        {"path": "resume.txt", "contains": "canonical-resume-ok"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 512,
+        "maxInputTokens": 300000,
+        "maxOutputTokens": 30000
+      }
+    },
+    {
+      "id": "ollama-long-stream-tool-continuation",
+      "category": "tool-recovery",
+      "tags": ["ollama", "long-stream", "finish-reason", "tool-continuation"],
+      "transitionMode": "same_model",
+      "source": {"kind": "fixture", "path": "continuity"},
+      "prompt": "Inspect README.md and continuity.py, write a concise architecture note to ARCHITECTURE.md, implement normalize_records, and run one focused check. Use native tools for inspection and editing; do not stop after analysis.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue from the existing tool results. Do not repeat successful inspection. Fix any remaining defect, run the hidden-facing local check, and create stream-complete.txt containing terminal-and-tools-ok."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "timeoutSeconds": 420,
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "ARCHITECTURE.md", "contains": "normalize_records"},
+        {"path": "stream-complete.txt", "contains": "terminal-and-tools-ok"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 512,
+        "maxInputTokens": 300000,
+        "maxOutputTokens": 60000
+      }
+    }
+  ]
+}

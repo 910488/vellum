@@ -1,0 +1,10 @@
+codex-cli 0.142.5
+protocol: v2
+sha256: ed3876ba3f0d615256174caa177bfd10feb2e9925de692d01fe900adaacb887e
+
+This pin was generated with:
+  codex app-server generate-json-schema --out <directory>
+
+The generated JSON is intentionally not hand-maintained. Regenerate it during
+the release qualification workflow and accept a new hash only after facade
+bootstrap replay passes.

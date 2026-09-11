@@ -1,0 +1,19 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "datasetRevision": "verified-parquet-a45b1fe4",
+  "datasetSha256": "a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd",
+  "instances": [
+    "psf__requests-1142",
+    "psf__requests-2931",
+    "pallets__flask-5014",
+    "pytest-dev__pytest-10081",
+    "pytest-dev__pytest-10051",
+    "pylint-dev__pylint-4970",
+    "pylint-dev__pylint-4604",
+    "mwaskom__seaborn-3069",
+    "astropy__astropy-12907",
+    "pydata__xarray-2905",
+    "scikit-learn__scikit-learn-10297",
+    "sphinx-doc__sphinx-10466"
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "name": "compact-smoke",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "mbpp-compact-058",
+      "category": "long-context",
+      "source": {"kind": "mbpp", "task_id": "58", "multi_file": true},
+      "prompt": "Inspect TASK.md and the repository. Record the required API and implementation constraints, then implement the task and test it.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "phases": [
+        {
+          "prompt": "Continue from the established constraints. Re-check the implementation, fix anything incomplete, and finish the task.",
+          "model": "current"
+        }
+      ],
+      "forcedContextWindow": 24000,
+      "timeoutSeconds": 600,
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "maxInputTokens": 400000,
+        "maxOutputTokens": 30000
+      }
+    }
+  ]
+}

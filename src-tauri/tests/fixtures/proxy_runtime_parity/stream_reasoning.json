@@ -1,0 +1,36 @@
+{
+  "usage": {
+    "input_tokens": 8,
+    "output_tokens": 12,
+    "total_tokens": 20
+  },
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "id": "rs_stream_1",
+      "type": "reasoning",
+      "status": "completed",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "Thought through the turn."
+        }
+      ]
+    },
+    {
+      "id": "msg_stream_rs_1",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "The answer is 42.",
+          "annotations": []
+        }
+      ],
+      "phase": "final_answer"
+    }
+  ]
+}

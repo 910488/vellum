@@ -1,0 +1,14 @@
+[package]
+name = "vellum-codex-gate-child"
+version = "0.2.4"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Enhanced Runtime bridge gate peer (not part of the daily Desktop package)"
+
+[[bin]]
+name = "vellum-codex-gate-child"
+path = "src/main.rs"
+
+[dependencies]
+vellum = { path = "../../src-tauri" }

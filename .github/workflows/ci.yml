@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: Secret scan (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan repository history
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --config /repo/.gitleaks.toml --log-opts="--all"
+
+  offline-gates:
+    name: Windows offline harness gates
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # No `version:` here on purpose. The action refuses to run when a version
+      # is given in both places, and `packageManager` in package.json is the
+      # one that also governs local builds — keeping the pin in a single place
+      # is what stops CI and a developer machine drifting apart.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Unified QA offline lane
+        run: pnpm qa -- --lane offline --out-dir qa/reports/generated/ci-offline
+
+      - name: Test remote workspace crates (beyond the offline lane)
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --test delegation_turn_loop
+          cargo test -p vellum-remote-protocol --lib
+          cargo test -p vellum-remote-broker --lib
+          cargo test -p vellum-remote-broker --test approval_request_id
+          cargo test -p vellum-proxy-daemon --all-targets
+          cargo test -p vellum-remote-agent --lib
+
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo clippy -p vellum-remote-protocol -p vellum-remote-broker -p vellum-remote-testkit -p vellum-proxy-runtime -p vellum-proxy-daemon -p vellum-remote-agent --all-targets -- -D warnings
+      - name: Compile live-smoke feature
+        run: |
+          cargo check -p vellum-remote-testkit --features live-smoke --tests
+          cargo clippy -p vellum-remote-testkit --features live-smoke --all-targets -- -D warnings
+
+      - name: Upload offline gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-harness-gates
+          path: |
+            target/vellum-evals/**
+            qa/reports/generated/ci-offline/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  remote-linux:
+    name: Linux remote broker gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test remote crates (including Unix transport)
+        run: |
+          cargo test -p vellum-remote-protocol --all-targets
+          cargo test -p vellum-remote-broker --all-targets
+          cargo test -p vellum-proxy-runtime --all-targets
+          cargo test -p vellum-proxy-daemon --all-targets
+          cargo test -p vellum-remote-agent --all-targets
+
+      - name: Clippy remote crates
+        run: |
+          cargo clippy -p vellum-remote-protocol -p vellum-remote-broker -p vellum-remote-testkit -p vellum-proxy-runtime -p vellum-proxy-daemon -p vellum-remote-agent --all-targets -- -D warnings
+      - name: Compile live-smoke feature
+        run: |
+          cargo check -p vellum-remote-testkit --features live-smoke --tests
+          cargo clippy -p vellum-remote-testkit --features live-smoke --all-targets -- -D warnings
+
+  proxy-image-gate:
+    name: Proxy container image build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build proxy image (linux/amd64)
+        run: |
+          docker build -f deploy/proxy/Dockerfile -t vellum-proxy:ci .
+
+      - name: Static image contract checks
+        run: |
+          docker image inspect vellum-proxy:ci --format '{{.Config.User}}' | grep -E '^65532:65532$|^65532$'
+          docker image inspect vellum-proxy:ci --format '{{json .Config.Entrypoint}}' | grep vellum-proxy-daemon
+
+  macos-offline-gates:
+    name: macOS offline parity gates
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and renderer tests
+        run: |
+          pnpm typecheck
+          pnpm test
+
+      - name: Test Rust library and contracts
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          cargo test --manifest-path src-tauri/Cargo.toml --test contract
+          cargo test --manifest-path src-tauri/Cargo.toml --test delegation_turn_loop
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Quota-free protocol replay
+        run: |
+          cargo run -p vellum-eval --bin vellum-eval -- protocol-replay
+          cargo run -p vellum-eval --bin vellum-eval -- app-replay --suite desktop-protocol-replay
+          cargo run -p vellum-eval --bin vellum-eval -- app-replay --suite canonical-compaction-12

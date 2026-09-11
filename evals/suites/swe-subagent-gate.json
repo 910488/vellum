@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "name": "swe-terminal-gate-subagent",
+  "version": "verified-parquet-a45b1fe4",
+  "defaultRepeat": 3,
+  "tasks": [
+    {
+      "id": "swe-psf__requests-1142-subagent",
+      "category": "swe-bench",
+      "tags": [
+        "swe-bench",
+        "15-min-fix",
+        "subagent"
+      ],
+      "source": {
+        "kind": "swe_bench",
+        "instance_id": "psf__requests-1142",
+        "dataset_revision": "verified-parquet-a45b1fe4",
+        "repository": "https://github.com/psf/requests.git",
+        "commit": "22623bd8c265b78b161542663ee980738441c307",
+        "image_digest": "sha256:64ac3483a165db2706f67b59e064095d0646e4db397d1573443b307c45763d1b",
+        "bundle_sha256": "073c9c6b4957da5aaad21f24d1e5666da00a1e707eeb6e848536a0d9f635d929",
+        "bundle_url": "https://github.com/910488/vellum/releases/download/swebench-grader-psf-requests-1142-a3ba3a231e3c/psf__requests-1142.tar"
+      },
+      "prompt": "requests.get is ALWAYS sending content length\nHi,\n\nIt seems like that request.get always adds 'content-length' header to the request.\nI think that the right behavior is not to add this header automatically in GET requests or add the possibility to not send it.\n\nFor example http://amazon.com returns 503 for every get request that contains 'content-length' header.\n\nThanks,\n\nOren\n\n---\nBefore you change anything, dispatch a sub-agent to explore the repository and report back where the Content-Length header is set for GET requests. Use the sub-agent spawn tool for that exploration rather than reading the files yourself. Wait for its findings, then apply the fix.",
+      "verification": [
+        "bash /hidden/eval.sh"
+      ],
+      "graderImage": "sweb.eval.x86_64.psf__requests-1142:cfg-64ac3483a165",
+      "graderImageArchive": {
+        "url": "https://github.com/910488/vellum/releases/download/swebench-grader-psf-requests-1142-a3ba3a231e3c/psf__requests-1142.image.tar.gz",
+        "sha256": "a3ba3a231e3c7a48f8410b5d7942911763bfa2ad2295b7cb6d79032a099f7055",
+        "compression": "gzip",
+        "sizeBytes": 417299341,
+        "uncompressedSizeBytes": 430561280
+      },
+      "timeoutSeconds": 2700,
+      "forcedContextWindow": 24000,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true
+      },
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 8192,
+        "pids": 512,
+        "diskMb": 12288,
+        "maxInputTokens": 400000,
+        "maxOutputTokens": 60000
+      }
+    }
+  ]
+}

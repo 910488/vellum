@@ -1,0 +1,46 @@
+[package]
+name = "vellum-remote-agent"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Host lifecycle agent for Vellum remote proxy management"
+
+[[bin]]
+name = "vellum-remote-agent"
+path = "src/main.rs"
+
+[lib]
+name = "vellum_remote_agent"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+fs2 = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = "0.4"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+toml = { workspace = true }
+ulid = { workspace = true }
+vellum-proxy-runtime = { path = "../vellum-proxy-runtime" }
+
+[features]
+default = []
+# Compiles the leftover unauthenticated broker listener into the agent.
+# Production / release builds leave this off; the live Remote path is the
+# native app-server only.
+diagnostic-broker = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

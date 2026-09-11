@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "name": "compaction-replay-gate",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "humaneval-same-model-multiturn",
+      "category": "long-context",
+      "tags": ["humaneval", "same-model", "multiturn", "compaction-comparison"],
+      "transitionMode": "same_model",
+      "source": {"kind": "human_eval", "task_id": "HumanEval/0"},
+      "prompt": "Read TASK.md and solution.py. Establish the exact contract and edge cases, implement the function, and record the invariant CONTRACT_PRESERVED in DECISIONS.md. Run a focused check.",
+      "phases": [
+        {"model": "current", "prompt": "Continue the same task without repeating repository investigation. Preserve DECISIONS.md, inspect only what is necessary, and strengthen edge-case coverage."},
+        {"model": "current", "prompt": "Finish the existing task. Keep CONTRACT_PRESERVED, run the final focused tests, and do not redo completed work."}
+      ],
+      "verification": ["python3 -I /hidden/grader.py"],
+      "forcedContextWindow": 24000,
+      "timeoutSeconds": 150,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "CONTRACT_PRESERVED"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 512,
+        "maxInputTokens": 240000,
+        "maxOutputTokens": 24000
+      }
+    },
+    {
+      "id": "humaneval-cross-model-multiturn",
+      "category": "model-switch",
+      "tags": ["humaneval", "cross-model", "multiturn", "compaction-comparison"],
+      "transitionMode": "ordered_pair",
+      "source": {"kind": "human_eval", "task_id": "HumanEval/2"},
+      "prompt": "Read TASK.md and solution.py. Determine the public contract, implement the function, and record SWITCH_CONTRACT_STABLE in DECISIONS.md. Leave a tested, focused workspace for the next model.",
+      "phases": [
+        {"model": "next", "prompt": "Take over this exact session and workspace. Do not restart the investigation. Preserve SWITCH_CONTRACT_STABLE, verify the prior implementation, fix only real defects, and finish the task."}
+      ],
+      "verification": ["python3 -I /hidden/grader.py"],
+      "forcedContextWindow": 24000,
+      "timeoutSeconds": 150,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "SWITCH_CONTRACT_STABLE"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 512,
+        "maxInputTokens": 240000,
+        "maxOutputTokens": 24000
+      }
+    },
+    {
+      "id": "grok-repeat-tool-regression",
+      "category": "long-context",
+      "tags": ["grok", "repeat-regression", "tool-duplication", "compaction-comparison"],
+      "transitionMode": "same_model",
+      "source": {"kind": "fixture", "path": "continuity"},
+      "prompt": "Inspect README.md and continuity.py once. Implement normalize_records without changing its public signature, record both PUBLIC_SIGNATURE_STABLE and NO_REPEAT_INVESTIGATION in DECISIONS.md, run one focused check, and stop.",
+      "phases": [
+        {"model": "current", "prompt": "Continue from the existing state. Do not repeat reads or commands that already succeeded. Preserve NO_REPEAT_INVESTIGATION and create phase-one.txt containing phase-one."},
+        {"model": "current", "prompt": "Complete the task without repeating investigation or tool calls. Preserve all prior work and create phase-two.txt containing phase-two."}
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 24000,
+      "timeoutSeconds": 150,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "PUBLIC_SIGNATURE_STABLE"},
+        {"path": "DECISIONS.md", "contains": "NO_REPEAT_INVESTIGATION"},
+        {"path": "phase-one.txt", "contains": "phase-one"},
+        {"path": "phase-two.txt", "contains": "phase-two"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 512,
+        "maxInputTokens": 240000,
+        "maxOutputTokens": 24000
+      }
+    }
+  ]
+}

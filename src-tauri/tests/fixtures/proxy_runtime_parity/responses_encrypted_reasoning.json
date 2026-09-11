@@ -1,0 +1,25 @@
+{
+  "usage": {
+    "input_tokens": 9,
+    "output_tokens": 2,
+    "total_tokens": 11
+  },
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_t2",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Second reply",
+          "annotations": []
+        }
+      ],
+      "phase": "final_answer"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+*
+!Cargo.toml
+!Cargo.lock
+!crates/**
+!src-tauri/**
+!third_party/codex-0.150/**
+!deploy/proxy/**
+!deploy/remote-bundle/**
+
+# Re-including `src-tauri/**` above also re-includes its local Cargo output.
+# On developer machines this directory can be tens of gigabytes and makes
+# Docker Desktop spend an hour uploading build context before compilation.
+src-tauri/target/
+src-tauri/resources/remote/manifest.json
+src-tauri/resources/remote/linux-amd64/
+src-tauri/resources/remote/linux-arm64/
+target/
+artifacts/
+node_modules/
+dist/
+
+# The prebuilt ARM64 proxy Dockerfile consumes this one release binary.
+!target/aarch64-unknown-linux-gnu/release/vellum-proxy-daemon

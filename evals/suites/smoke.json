@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "name": "smoke",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "he-short-000",
+      "category": "short-fix",
+      "source": {"kind": "human_eval", "task_id": "HumanEval/0"},
+      "prompt": "Read TASK.md and solution.py, implement the requested function, run useful checks, and finish only when the implementation is correct.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "timeoutSeconds": 600
+    },
+    {
+      "id": "he-short-002",
+      "category": "short-fix",
+      "source": {"kind": "human_eval", "task_id": "HumanEval/2"},
+      "prompt": "Implement the public function in solution.py according to TASK.md. Inspect the existing code, test edge cases, and keep the patch focused.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "timeoutSeconds": 600
+    },
+    {
+      "id": "mbpp-multi-056",
+      "category": "multi-file",
+      "source": {"kind": "mbpp", "task_id": "56", "multi_file": true},
+      "prompt": "Implement TASK.md. Keep the public API in src/solution.py and reusable logic in src/helpers.py. Run your own checks before finishing.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "timeoutSeconds": 420
+    },
+    {
+      "id": "mbpp-retry-057",
+      "category": "tool-recovery",
+      "source": {"kind": "mbpp", "task_id": "57", "multi_file": false},
+      "prompt": "Implement TASK.md in solution.py. If a model request is temporarily rejected, recover without discarding completed repository work.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "faults": [{"atRequest": 2, "kind": "http429"}],
+      "timeoutSeconds": 420
+    },
+    {
+      "id": "mbpp-compact-058",
+      "category": "long-context",
+      "source": {"kind": "mbpp", "task_id": "58", "multi_file": true},
+      "prompt": "Inspect TASK.md and the repository. Record the required API and implementation constraints, then implement the task and test it.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "phases": [{"prompt": "Continue from the established constraints. Re-check the implementation, fix anything incomplete, and finish the task.", "model": "current"}],
+      "forcedContextWindow": 24000,
+      "timeoutSeconds": 600,
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "maxInputTokens": 400000,
+        "maxOutputTokens": 30000
+      }
+    },
+    {
+      "id": "mbpp-resume-059",
+      "category": "multi-file",
+      "source": {"kind": "mbpp", "task_id": "59", "multi_file": true},
+      "prompt": "Inspect TASK.md, determine the exact public behavior, and begin a correct implementation. Leave the workspace in a clear state for the next agent turn.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "phases": [{"prompt": "Resume this existing task with the same model. Use the prior investigation and workspace state, complete the implementation, and run checks.", "model": "current"}],
+      "timeoutSeconds": 600
+    }
+  ]
+}

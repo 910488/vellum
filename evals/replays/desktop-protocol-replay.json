@@ -1,0 +1,495 @@
+{
+  "cases": [
+    {
+      "id": "zstd-body-is-rebuilt-as-json",
+      "operation": "zstd_rebuild",
+      "input": {
+        "model": "vlm-compatible",
+        "input": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "expected": {
+        "/body/model": "vlm-compatible",
+        "/contentEncodingForwarded": false,
+        "/contentType": "application/json"
+      }
+    },
+    {
+      "id": "grok-deduplicates-exec",
+      "operation": "prepare_grok",
+      "model": "grok-4.5",
+      "input": {
+        "model": "vlm-grok",
+        "input": [
+          {
+            "type": "additional_tools",
+            "tools": [
+              {
+                "type": "function",
+                "name": "exec",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "run"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "exec",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "/model": "grok-4.5",
+        "/tools/0/name": "exec"
+      },
+      "absent": [
+        "/tools/1",
+        "/additional_tools"
+      ]
+    },
+    {
+      "id": "duplicate-schema-conflict-fails-closed",
+      "operation": "prepare_grok",
+      "input": {
+        "input": [],
+        "tools": [
+          {
+            "type": "function",
+            "name": "exec",
+            "parameters": {
+              "type": "object"
+            }
+          },
+          {
+            "type": "function",
+            "name": "exec",
+            "parameters": {
+              "type": "object",
+              "required": [
+                "command"
+              ]
+            }
+          }
+        ]
+      },
+      "expectedError": "different parameter schemas"
+    },
+    {
+      "id": "top-level-fetch-overrides-stale-additional-tool",
+      "operation": "prepare_grok",
+      "model": "grok-4.5",
+      "input": {
+        "model": "vlm-grok",
+        "input": [
+          {
+            "type": "additional_tools",
+            "tools": [
+              {
+                "type": "function",
+                "name": "_fetch",
+                "parameters": {
+                  "type": "object",
+                  "required": [
+                    "legacy_request"
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "custom",
+            "name": "_fetch",
+            "description": "Current Codex fetch tool"
+          }
+        ]
+      },
+      "expected": {
+        "/model": "grok-4.5",
+        "/tools/0/name": "_fetch",
+        "/tools/0/parameters/required/0": "input"
+      },
+      "absent": [
+        "/tools/1"
+      ]
+    },
+    {
+      "id": "compatible-fetch-prefers-custom-over-generated-wrapper",
+      "operation": "prepare_compatible",
+      "model": "GLM-5.2",
+      "input": {
+        "model": "vlm-glm",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "_fetch",
+            "description": "Generated compatibility wrapper",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "request": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "request"
+              ]
+            }
+          },
+          {
+            "type": "custom",
+            "name": "_fetch",
+            "description": "Current Codex fetch tool"
+          }
+        ]
+      },
+      "expected": {
+        "/model": "GLM-5.2",
+        "/tools/0/name": "_fetch",
+        "/tools/0/parameters/required/0": "input"
+      },
+      "absent": [
+        "/tools/1",
+        "/tools/0/parameters/properties/request"
+      ]
+    },
+    {
+      "id": "chat-glm-fetch-prefers-custom-over-generated-wrapper",
+      "operation": "prepare_compatible_chat",
+      "model": "GLM-5.2",
+      "input": {
+        "model": "vlm-glm",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "_fetch",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "request": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "request"
+              ]
+            }
+          },
+          {
+            "type": "custom",
+            "name": "_fetch"
+          }
+        ]
+      },
+      "expected": {
+        "/model": "GLM-5.2",
+        "/tools/0/function/name": "_fetch",
+        "/tools/0/function/parameters/required/0": "input"
+      },
+      "absent": [
+        "/tools/1",
+        "/tools/0/function/parameters/properties/request"
+      ]
+    },
+    {
+      "id": "chat-glm-preserves-namespace-for-fetch-helpers",
+      "operation": "prepare_compatible_chat",
+      "model": "GLM-5.2",
+      "input": {
+        "model": "vlm-glm",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+          }
+        ],
+        "tools": [
+          {
+            "type": "namespace",
+            "name": "codex_app",
+            "tools": [
+              {
+                "type": "function",
+                "name": "_fetch",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "request": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "request"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "namespace",
+            "name": "plugin_management",
+            "tools": [
+              {
+                "type": "function",
+                "name": "_fetch",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "cursor": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cursor"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "custom",
+            "name": "_fetch"
+          }
+        ]
+      },
+      "expected": {
+        "/model": "GLM-5.2",
+        "/tools/0/function/name": "codex_app___fetch",
+        "/tools/1/function/name": "plugin_management___fetch",
+        "/tools/2/function/name": "_fetch",
+        "/tools/2/function/parameters/required/0": "input"
+      }
+    },
+    {
+      "id": "official-id-prefixes-remain-canonical",
+      "operation": "sanitize_official",
+      "input": {
+        "input": [
+          {
+            "type": "function_call",
+            "id": "call_foreign",
+            "call_id": "call_foreign",
+            "name": "exec",
+            "arguments": "{}"
+          },
+          {
+            "type": "reasoning",
+            "id": "resp_vellum_reasoning",
+            "encrypted_content": "foreign"
+          }
+        ]
+      },
+      "expectedPrefixes": {
+        "/input/0/id": "fc_"
+      },
+      "absent": [
+        "/input/1"
+      ]
+    },
+    {
+      "id": "grok-readable-reasoning-is-not-an-openai-item-reference",
+      "operation": "prepare_official_handoff",
+      "model": "gpt-5.4-mini",
+      "input": {
+        "model": "vlm-official",
+        "store": false,
+        "input": [
+          {
+            "type": "reasoning",
+            "id": "rs_f22b4d95-9206-964f-bc93-56bd6574794c",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "readable Grok state"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+          }
+        ]
+      },
+      "expected": {
+        "/model": "gpt-5.4-mini",
+        "/input/0/content": "continue"
+      },
+      "absent": [
+        "/input/1"
+      ]
+    },
+    {
+      "id": "vellum-synthetic-reasoning-is-removed-from-full-official-snapshot",
+      "operation": "prepare_official_handoff",
+      "model": "gpt-5.4-mini",
+      "input": {
+        "model": "vlm-official",
+        "input": [
+          {
+            "type": "reasoning",
+            "id": "resp_vellum_1786621788663_reasoning",
+            "summary": [{"type": "summary_text", "text": "foreign reasoning"}]
+          },
+          {
+            "type": "message",
+            "id": "resp_vellum_1786621788663_message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "visible answer"}]
+          },
+          {"role": "user", "content": "continue with GPT"}
+        ]
+      },
+      "expected": {
+        "/model": "gpt-5.4-mini",
+        "/input/0/content/0/text": "visible answer",
+        "/input/1/content": "continue with GPT"
+      },
+      "expectedPrefixes": {
+        "/input/0/id": "msg_"
+      },
+      "absent": ["/input/2"]
+    },
+    {
+      "id": "foreign-reasoning-is-not-forwarded",
+      "operation": "strip_cross_realm",
+      "input": {
+        "input": [
+          {
+            "type": "reasoning",
+            "id": "rs_foreign",
+            "encrypted_content": "opaque"
+          },
+          {
+            "role": "user",
+            "content": "continue"
+          }
+        ]
+      },
+      "expected": {
+        "/input/0/role": "user"
+      },
+      "absent": [
+        "/input/1"
+      ]
+    },
+    {
+      "id": "desktop-websocket-text-and-binary-match",
+      "operation": "websocket_shape",
+      "input": {
+        "type": "response.create",
+        "model": "vlm-grok",
+        "input": [
+          {
+            "role": "user",
+            "content": "continue"
+          }
+        ],
+        "stream": true
+      },
+      "expected": {
+        "/type": "response.create",
+        "/model": "vlm-grok",
+        "/stream": true
+      }
+    },
+    {
+      "id": "official-and-third-party-materialize-local-compaction",
+      "operation": "compaction_materialization",
+      "input": {
+        "summary": {
+          "type": "message",
+          "role": "user",
+          "content": "preserved decision"
+        }
+      },
+      "expected": {
+        "/official/0/content": "preserved decision",
+        "/thirdParty/0/content": "preserved decision"
+      }
+    },
+    {
+      "id": "grok-to-official-recovers-compaction-without-encrypted-content",
+      "operation": "grok_to_official_compaction",
+      "input": {
+        "compactionId": "cmp_desktop_switch",
+        "replacement": {
+          "type": "message",
+          "role": "developer",
+          "content": "preserved cross-provider decisions"
+        }
+      },
+      "expected": {
+        "/input/0/type": "compaction",
+        "/input/0/id": "cmp_desktop_switch",
+        "/input/0/encrypted_content": "opaque-official-state",
+        "/input/1/role": "user",
+        "/input/1/content": "continue"
+      },
+      "absent": [
+        "/input/2"
+      ]
+    },
+    {
+      "id": "third-party-readable-retains-summary-only",
+      "operation": "third_party_readable",
+      "input": {
+        "input": [
+          {
+            "type": "reasoning",
+            "id": "rs_grok_readable",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "keep the parser decision"
+              }
+            ],
+            "encrypted_content": "opaque-byte-sequence"
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+          }
+        ]
+      },
+      "expected": {
+        "/input/0/summary/0/text": "keep the parser decision",
+        "/input/1/content": "continue"
+      },
+      "absent": [
+        "/input/0/encrypted_content"
+      ]
+    }
+  ]
+}

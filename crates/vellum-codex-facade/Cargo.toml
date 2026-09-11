@@ -1,0 +1,26 @@
+[package]
+name = "vellum-codex-facade"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pinned Codex App Server facade over Vellum Harness Manager"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+uuid = { workspace = true }
+vellum-harness-protocol = { path = "../vellum-harness-protocol" }
+vellum-harness-runtime = { path = "../vellum-harness-runtime" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

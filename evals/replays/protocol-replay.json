@@ -1,0 +1,122 @@
+{
+  "cases": [
+    {
+      "id": "responses-message-to-chat",
+      "operation": "responses_to_chat",
+      "input": {
+        "model": "model-a",
+        "stream": true,
+        "input": [{"role": "user", "content": "hello"}]
+      },
+      "expected": {
+        "/model": "model-a",
+        "/messages/0/role": "user",
+        "/messages/0/content": "hello",
+        "/stream": true
+      }
+    },
+    {
+      "id": "chat-message-to-responses",
+      "operation": "chat_to_responses",
+      "model": "model-a",
+      "input": {
+        "id": "chatcmpl-1",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+      },
+      "expected": {
+        "/model": "model-a",
+        "/output/0/type": "message",
+        "/output/0/role": "assistant"
+      }
+    },
+    {
+      "id": "grok-to-official-removes-synthetic-reasoning-id",
+      "operation": "sanitize_official",
+      "input": {
+        "input": [
+          {"type": "message", "role": "assistant", "reasoning_content": "private", "content": "visible"},
+          {"type": "reasoning", "summary": [{"type": "summary_text", "text": "foreign"}]},
+          {
+            "type": "reasoning",
+            "id": "resp_vellum_1785249670601_reasoning",
+            "encrypted_content": "synthetic"
+          },
+          {"type": "reasoning", "id": "rs_official_replay", "encrypted_content": "opaque"}
+        ]
+      },
+      "expected": {
+        "/input/0/content": "visible",
+        "/input/1/id": "rs_official_replay",
+        "/input/1/encrypted_content": "opaque"
+      },
+      "absent": ["/input/0/reasoning_content", "/input/2"]
+    },
+    {
+      "id": "cross-realm-removes-encrypted-reasoning",
+      "operation": "strip_cross_realm",
+      "input": {
+        "input": [
+          {"type": "message", "role": "assistant", "content": "visible", "encrypted_content": "foreign"},
+          {"type": "reasoning", "encrypted_content": "opaque"}
+        ]
+      },
+      "expected": {
+        "/input/0/content": "visible"
+      },
+      "absent": ["/input/0/encrypted_content", "/input/1"]
+    },
+    {
+      "id": "third-party-to-official-normalizes-item-id-prefixes",
+      "operation": "sanitize_official",
+      "input": {
+        "input": [
+          {
+            "type": "message",
+            "id": "resp_vellum_1785249670601_message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "visible"}]
+          },
+          {
+            "type": "function_call",
+            "id": "call_1f25ce1d5b244415912270b7",
+            "call_id": "call_1f25ce1d5b244415912270b7",
+            "name": "shell_command",
+            "arguments": "{}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call_1f25ce1d5b244415912270b7",
+            "output": "ok"
+          },
+          {
+            "type": "custom_tool_call",
+            "id": "fc_4d647f67-f38d-9151-a08a-aa7d58f4578a_0",
+            "call_id": "call_patch",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch"
+          }
+        ]
+      },
+      "expected": {
+        "/input/1/call_id": "call_1f25ce1d5b244415912270b7",
+        "/input/2/call_id": "call_1f25ce1d5b244415912270b7",
+        "/input/3/call_id": "call_patch"
+      },
+      "expectedPrefixes": {
+        "/input/0/id": "msg_",
+        "/input/1/id": "fc_",
+        "/input/3/id": "ctc_"
+      }
+    },
+    {
+      "id": "proxy-error-preserves-context",
+      "operation": "error_envelope",
+      "input": {},
+      "expected": {
+        "/error/type": "vellum_proxy_error",
+        "/error/code": 429
+      }
+    }
+  ]
+}

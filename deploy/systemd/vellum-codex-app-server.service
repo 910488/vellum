@@ -1,0 +1,18 @@
+[Unit]
+Description=Vellum Codex App Server
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=CODEX_HOME=%h/.local/share/vellum/codex-home
+Environment=RUST_LOG=info
+Environment=LOG_FORMAT=json
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/vellum/run
+ExecStart=%h/.codex/packages/standalone/current/codex app-server --listen unix://%h/.local/share/vellum/run/codex-app-server.sock
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

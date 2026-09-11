@@ -1,0 +1,386 @@
+/* ============================================================
+   Vellum — Shinkai Pastel design tokens
+   ------------------------------------------------------------
+   語彙：新海誠水彩 —— 東方水墨的暈染 + 日系動畫的光影。
+
+   這一版的重點是「執行方式」，不是換色票。同一套粉彩色，做成
+   「每張卡都是同一個玻璃盒」就是模板；做成有光源方向、有紙張顆粒、
+   有主從關係，才是水彩。三件事在這裡定：
+
+   1. 光是有方向的。光從右上來，所以卡片上緣受光、下緣落影 ——
+      不是四邊都描一圈白線（那是 glassmorphism 的胎記）。
+   2. 紙是有顆粒的。水彩畫在紙上，紙有纖維；純漸層填色看起來就是數位的。
+   3. 顏色要有主從。薰衣草紫是主，奶茶杏是「只用在最重要那一個數字」的
+      銳利強調，淺天藍退到只做大氣層。三個強調色權重相同 = 沒有強調色。
+
+   單一事實來源。元件一律透過 token 取色，不得在元件內硬寫色碼，
+   否則暗色模式會漏掉。
+   ============================================================ */
+
+:root {
+  /* ---- 底：米白偏暖霧面 + 淡藍天光 ---- */
+  --ground: #f7f4ee;
+  --ground-tint: #e6eef7;
+  --ground-deep: #ece6dc;
+
+  /* ---- 暈染面 ----
+     alpha 不能太低，否則背景光斑會透上來，讓文字對比度隨光斑改變。 */
+  --surface: rgba(255, 255, 255, 0.72);
+  --surface-solid: #fdfbf7;
+  --surface-sunk: rgba(255, 255, 255, 0.34);
+
+  /* ---- 光與影：有方向 ----
+     --rim-light  受光的上緣
+     --rim-shade  背光的下緣
+     --pool       水彩邊緣的顏料淤積（inset），讓暈染有邊界而不是硬切 */
+  --rim-light: rgba(255, 255, 255, 0.92);
+  --rim-shade: rgba(120, 108, 150, 0.14);
+  --pool: rgba(124, 106, 180, 0.055);
+  --edge: rgba(120, 108, 150, 0.13);
+
+  /* ---- 墨：中性色偏紫，不使用純灰 ----
+       --ink        主要文字            13.6:1
+       --ink-soft   次要文字             6.0:1
+       --ink-faint  標籤與說明           5.0:1  仍是文字，必須過 AA
+       --ink-ghost  純裝飾，不承載文字 */
+  --ink: #3a3550;
+  --ink-soft: #625b7c;
+  --ink-faint: #6f6889;
+  --ink-ghost: #8b84a3;
+
+  /* ---- 主色：薰衣草紫（主）---- */
+  --lavender: #9c8bce;
+  --lavender-deep: #7c6ab4;
+  --lavender-wash: rgba(156, 139, 206, 0.14);
+
+  /* ---- 銳利強調：奶茶杏（只給主角數字與生效指示）---- */
+  --apricot: #e3c6a6;
+  --apricot-deep: #c9a57e;
+  --apricot-wash: rgba(227, 198, 166, 0.2);
+
+  /* ---- 大氣層：淺天藍光暈（只做背景，不做元件）---- */
+  --skyglow: #a9cfec;
+  --skyglow-wash: rgba(169, 207, 236, 0.22);
+
+  /* ---- 數據色：低彩度粉彩 ---- */
+  --coral: #e4a29c;
+  --haze: #8aa9c4;
+  --honey: #dfb279;
+  --sage: #9fc0a8;
+
+  /* ---- 狀態訊號：與強調色分離 ---- */
+  --ok: #8fb89a;
+  --warn: #dfb279;
+  --crit: #dd9089;
+
+  /* ---- 前景／背景配對 ----
+     粉彩可以當底色，不能當文字色 —— 一個色相沒辦法兩邊都成立。
+     量過的實數（light）：--ok 疊在自己的 18% wash 上只有 1.9:1，
+     --warn 1.7:1，--crit 2.1:1。狀態 pill 是整個 app 最需要看清楚的字，
+     卻是最糊的。所以每個語意拆兩個值：--x 給底色與圖形，--x-ink 給文字。 */
+  --ok-ink: #2f6b45;
+  --warn-ink: #8a5a15;
+  --crit-ink: #9c332b;
+  --lavender-ink: #5b4a90;
+  --apricot-ink: #7d5520;
+
+  /* ---- 實心強調面（按鈕、完成的步驟、命中的來源）----
+     白字要站得住，漸層「起點」也必須夠深 —— 原本起點是 --lavender，
+     白字只有 3.0:1。 */
+  --accent-from: #7c6ab4;
+  --accent-to: #6f5aa6;
+  --on-accent: #ffffff;
+  /* 疊在「實心訊號色」上的字色。訊號色（--warn 等）在亮色與暗色主題下
+     都是亮的，所以這個值刻意不跟著主題翻轉 —— 翻轉才會出事：暗色下
+     --warn-ink 等於 --warn，用同色系當底又當字，alpha 拉再高也沒有對比度。 */
+  --on-signal: #2a2418;
+
+  /* ---- 陰影：柔、大、低不透明度。水彩不投硬影。 ---- */
+  --shadow-soft: 0 1px 2px rgba(88, 76, 128, 0.05),
+    0 10px 26px -8px rgba(88, 76, 128, 0.13);
+  --shadow-lift: 0 2px 4px rgba(88, 76, 128, 0.06),
+    0 22px 48px -12px rgba(88, 76, 128, 0.2);
+
+  /* ---- 圓角：手繪的邊不會是 CNC 切出來的 ----
+     四角刻意不等值。差 2–4px 肉眼幾乎讀不出「不對稱」，但整體會少掉
+     那種「每個盒子都一模一樣」的模板感。 */
+  --r-lg: 30px 34px 27px 32px;
+  --r-md: 20px 22px 18px 21px;
+  --r-sm: 12px 13px 11px 12px;
+  --r-pill: 999px;
+
+  /* ---- 間距：區塊 28、橫向 24（依設計語彙）---- */
+  --gap-block: 28px;
+  --pad-x: 24px;
+  /* 內容區的上緣留白。sticky 的元素要用它的負值當 top 才貼得到頂邊 ——
+     捲動容器的 padding 不會擋住底下捲上來的內容。 */
+  --canvas-pad-top: 32px;
+
+  /* ---- 字：三個聲音，各有職責 ----
+     display  Palatino（Zapf 的書法骨架）+ 明體 —— 標題與主角數字。
+              東方水墨的重量從這裡來，而且它完全不是 ui-rounded／Inter
+              那種預設味。
+     body     圓體 —— 正文可讀性優先。
+     mono     Cascadia Mono —— model id、端點、token 數、HTTP 碼。
+
+     字型堆疊是逐字元 fallback 的：拉丁字體放前面、CJK 放後面，
+     拉丁走 Palatino、漢字走明體 —— 一個 stack 兩種聲音。
+
+     這裡的預設值是繁體中文。四個語言各自的覆寫在檔案下方的
+     「逐語言字型」區 —— 漢字字形不是一套，見那一段的說明。 */
+  --font-cjk-round: "Microsoft JhengHei UI", "Microsoft JhengHei", "PingFang TC",
+    "Noto Sans TC", ui-rounded, system-ui, sans-serif;
+  --font-cjk-serif: "Noto Serif TC", "Source Han Serif TC", "PMingLiU",
+    "Songti TC", serif;
+  --font-display: "Palatino Linotype", "Book Antiqua", Palatino,
+    var(--font-cjk-serif);
+  --font-body: var(--font-cjk-round);
+  --font-mono: "Cascadia Mono", Consolas, ui-monospace, "SF Mono", monospace;
+
+  /* ---- 字距：拉丁與漢字要分開 ----
+     大字級的拉丁字要收緊（Palatino 在 100px 以上用預設字距會鬆成
+     一排孤立的字母）；漢字方框本來就相接，再收就會相撞。
+     同一個 -0.03em 不可能兩邊都對，所以拆成 token。 */
+  --track-display: -0.03em;
+  --track-title: -0.014em;
+
+  /* ---- 紙張顆粒 ----
+     水彩畫在紙上。純 CSS 漸層沒有纖維，看起來就是數位的 ——
+     這層 feTurbulence 是整套語彙裡最便宜也最有效的一筆。
+     SVG 屬性的引號一律 percent-encode，避免與 CSS 的引號打架。 */
+  --grain: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22180%22 height=%22180%22%3E%3Cfilter id=%22g%22%3E%3CfeTurbulence type=%22fractalNoise%22 baseFrequency=%220.86%22 numOctaves=%224%22 stitchTiles=%22stitch%22/%3E%3CfeColorMatrix type=%22saturate%22 values=%220%22/%3E%3C/filter%3E%3Crect width=%22180%22 height=%22180%22 filter=%22url(%23g)%22/%3E%3C/svg%3E");
+  --grain-opacity: 0.34;
+}
+
+/* ---- 暗色：深夜藍黑底配同色系霧光 ---- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #12141c;
+    --ground-tint: #1a2030;
+    --ground-deep: #0d0f16;
+
+    --surface: rgba(255, 255, 255, 0.075);
+    --surface-solid: #1a1d28;
+    --surface-sunk: rgba(255, 255, 255, 0.028);
+
+    --rim-light: rgba(255, 255, 255, 0.14);
+    --rim-shade: rgba(0, 0, 0, 0.36);
+    --pool: rgba(179, 163, 224, 0.05);
+    --edge: rgba(255, 255, 255, 0.07);
+
+    --ink: #e6e3f0;
+    --ink-soft: #b4aecb;
+    --ink-faint: #9a93b8;
+    --ink-ghost: #6f6889;
+
+    --lavender: #b3a3e0;
+    --lavender-deep: #c8bbec;
+    --lavender-wash: rgba(179, 163, 224, 0.16);
+
+    --apricot: #e5cbae;
+    --apricot-deep: #efdcc6;
+    --apricot-wash: rgba(229, 203, 174, 0.14);
+
+    --skyglow: #a9cfec;
+    --skyglow-wash: rgba(169, 207, 236, 0.15);
+
+    --coral: #e9afa9;
+    --haze: #9dbbd4;
+    --honey: #e7c08c;
+    --sage: #a9c9b1;
+
+    --ok: #9ac4a5;
+    --warn: #e7c08c;
+    --crit: #e79e97;
+
+    /* 暗色下粉彩本身就是正確的前景，所以 -ink 等於本色；
+       反過來是實心強調面出問題 —— 白字疊在淺紫上只有 1.8:1，改深色字。 */
+    --ok-ink: #9ac4a5;
+    --warn-ink: #e7c08c;
+    --crit-ink: #e79e97;
+    --lavender-ink: #c8bbec;
+    --apricot-ink: #efdcc6;
+    --accent-from: #b3a3e0;
+    --accent-to: #9d8bd0;
+    --on-accent: #171a24;
+    /* 疊在「實心訊號色」上的字色。訊號色（--warn 等）在亮色與暗色主題下
+       都是亮的，所以這個值刻意不跟著主題翻轉 —— 翻轉才會出事：暗色下
+       --warn-ink 等於 --warn，用同色系當底又當字，alpha 拉再高也沒有對比度。 */
+    --on-signal: #2a2418;
+
+    --shadow-soft: 0 1px 3px rgba(0, 0, 0, 0.3),
+      0 12px 30px -8px rgba(0, 0, 0, 0.42);
+    --shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.34),
+      0 26px 54px -12px rgba(0, 0, 0, 0.5);
+
+    --grain-opacity: 0.2;
+  }
+}
+
+/* ---- 手動切換必須勝過 media query，兩個方向都要寫 ---- */
+:root[data-theme="dark"] {
+  --ground: #12141c;
+  --ground-tint: #1a2030;
+  --ground-deep: #0d0f16;
+  --surface: rgba(255, 255, 255, 0.075);
+  --surface-solid: #1a1d28;
+  --surface-sunk: rgba(255, 255, 255, 0.028);
+  --rim-light: rgba(255, 255, 255, 0.14);
+  --rim-shade: rgba(0, 0, 0, 0.36);
+  --pool: rgba(179, 163, 224, 0.05);
+  --edge: rgba(255, 255, 255, 0.07);
+  --ink: #e6e3f0;
+  --ink-soft: #b4aecb;
+  --ink-faint: #9a93b8;
+  --ink-ghost: #6f6889;
+  --lavender: #b3a3e0;
+  --lavender-deep: #c8bbec;
+  --lavender-wash: rgba(179, 163, 224, 0.16);
+  --apricot: #e5cbae;
+  --apricot-deep: #efdcc6;
+  --apricot-wash: rgba(229, 203, 174, 0.14);
+  --skyglow: #a9cfec;
+  --skyglow-wash: rgba(169, 207, 236, 0.15);
+  --coral: #e9afa9;
+  --haze: #9dbbd4;
+  --honey: #e7c08c;
+  --sage: #a9c9b1;
+  --ok: #9ac4a5;
+  --warn: #e7c08c;
+  --crit: #e79e97;
+  --ok-ink: #9ac4a5;
+  --warn-ink: #e7c08c;
+  --crit-ink: #e79e97;
+  --lavender-ink: #c8bbec;
+  --apricot-ink: #efdcc6;
+  --accent-from: #b3a3e0;
+  --accent-to: #9d8bd0;
+  --on-accent: #171a24;
+  /* 疊在「實心訊號色」上的字色。訊號色（--warn 等）在亮色與暗色主題下
+     都是亮的，所以這個值刻意不跟著主題翻轉 —— 翻轉才會出事：暗色下
+     --warn-ink 等於 --warn，用同色系當底又當字，alpha 拉再高也沒有對比度。 */
+  --on-signal: #2a2418;
+  --shadow-soft: 0 1px 3px rgba(0, 0, 0, 0.3),
+    0 12px 30px -8px rgba(0, 0, 0, 0.42);
+  --shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.34),
+    0 26px 54px -12px rgba(0, 0, 0, 0.5);
+  --grain-opacity: 0.2;
+}
+
+:root[data-theme="light"] {
+  --ground: #f7f4ee;
+  --ground-tint: #e6eef7;
+  --ground-deep: #ece6dc;
+  --surface: rgba(255, 255, 255, 0.72);
+  --surface-solid: #fdfbf7;
+  --surface-sunk: rgba(255, 255, 255, 0.34);
+  --rim-light: rgba(255, 255, 255, 0.92);
+  --rim-shade: rgba(120, 108, 150, 0.14);
+  --pool: rgba(124, 106, 180, 0.055);
+  --edge: rgba(120, 108, 150, 0.13);
+  --ink: #3a3550;
+  --ink-soft: #625b7c;
+  --ink-faint: #6f6889;
+  --ink-ghost: #8b84a3;
+  --lavender: #9c8bce;
+  --lavender-deep: #7c6ab4;
+  --lavender-wash: rgba(156, 139, 206, 0.14);
+  --apricot: #e3c6a6;
+  --apricot-deep: #c9a57e;
+  --apricot-wash: rgba(227, 198, 166, 0.2);
+  --skyglow: #a9cfec;
+  --skyglow-wash: rgba(169, 207, 236, 0.22);
+  --coral: #e4a29c;
+  --haze: #8aa9c4;
+  --honey: #dfb279;
+  --sage: #9fc0a8;
+  --ok: #8fb89a;
+  --warn: #dfb279;
+  --crit: #dd9089;
+  --ok-ink: #2f6b45;
+  --warn-ink: #8a5a15;
+  --crit-ink: #9c332b;
+  --lavender-ink: #5b4a90;
+  --apricot-ink: #7d5520;
+  --accent-from: #7c6ab4;
+  --accent-to: #6f5aa6;
+  --on-accent: #ffffff;
+  /* 疊在「實心訊號色」上的字色。訊號色（--warn 等）在亮色與暗色主題下
+     都是亮的，所以這個值刻意不跟著主題翻轉 —— 翻轉才會出事：暗色下
+     --warn-ink 等於 --warn，用同色系當底又當字，alpha 拉再高也沒有對比度。 */
+  --on-signal: #2a2418;
+  --shadow-soft: 0 1px 2px rgba(88, 76, 128, 0.05),
+    0 10px 26px -8px rgba(88, 76, 128, 0.13);
+  --shadow-lift: 0 2px 4px rgba(88, 76, 128, 0.06),
+    0 22px 48px -12px rgba(88, 76, 128, 0.2);
+  --grain-opacity: 0.34;
+}
+
+/* ============================================================
+   逐語言字型
+   ------------------------------------------------------------
+   漢字不是一套字。同一個碼位在繁中、簡中、日文有不同的正確字形 ——
+   直、骨、今、令、高、青、每、海 都不一樣。用繁中字型渲染日文，
+   日本人第一眼就看得出來，那個感覺跟英文被排成 Comic Sans 一樣。
+
+   上面 :root 的預設值是繁中（也是 I18N_FALLBACK_LOCALE）。這裡把
+   另外三個語言接上各自的字。i18n/locale.ts 的 applyDocumentLang()
+   會把 <html lang> 設成 zh-Hant-TW / zh-Hans-CN / ja / en，
+   CSS 的 :lang() 是「相等或以此為前綴」比對，所以 :lang(zh-Hans)
+   吃得到 zh-Hans-CN。
+
+   :root:lang(x) 是兩個 pseudo-class（0,2,0），一定贏純 :root（0,1,0），
+   不需要 !important。
+
+   為什麼不是用 JS 換 class：字型必須在第一次繪製就正確，
+   否則會看到一次錯字形的閃爍；:lang() 由 <html lang> 直接驅動，沒有這個洞。
+   ============================================================ */
+
+/* ---- 日文 ----
+   Yu Mincho（游明朝）Win8.1+ 內建、Yu Gothic UI Win10+ 內建，
+   所以不必內嵌任何字。Hiragino 給 macOS。
+   MS Mincho／MS Gothic 是最後的保底，字面難看但至少字形是對的。 */
+:root:lang(ja) {
+  --font-cjk-round: "Yu Gothic UI", "Yu Gothic", YuGothic, "Hiragino Sans",
+    "Noto Sans JP", Meiryo, "MS PGothic", system-ui, sans-serif;
+  --font-cjk-serif: "Noto Serif JP", "Yu Mincho", YuMincho,
+    "Hiragino Mincho ProN", "MS PMincho", serif;
+}
+
+/* ---- 簡體中文 ----
+   PingFang SC 給 macOS、Microsoft YaHei UI 給 Windows。
+   襯線這一端 Windows 只有 SimSun（新宋體），字面偏舊但字形正確；
+   有裝 Noto Serif SC / 思源宋體的話會先吃到好的那個。 */
+:root:lang(zh-Hans) {
+  --font-cjk-round: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Noto Sans SC", "Source Han Sans SC", system-ui, sans-serif;
+  --font-cjk-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC",
+    SimSun, serif;
+}
+
+/* ---- 英文 ----
+   原本英文介面的正文會落到 --font-cjk-round 的第一順位（JhengHei），
+   拿到的是中文字型附帶的拉丁字 —— 那套拉丁字是為了跟漢字等高而設計的，
+   單獨用起來鬆散、字重不勻。
+
+   換成 Candara：人文主義無襯線，筆畫末端有外張的喇叭口，跟 Palatino
+   的寬頭筆骨架是同一個血緣，而且它是 Windows 內建。刻意不用 Segoe UI／
+   Inter —— 那是「沒有選過字」的長相。
+
+   數字用 lining figures 的字才行：這個 app 到處是 token 數與百分比，
+   Corbel 雖然也漂亮但預設是舊體數字（oldstyle），落在表格裡會跳。 */
+:root:lang(en) {
+  --font-cjk-round: Candara, "Segoe UI Variable Text", "Segoe UI", system-ui,
+    sans-serif;
+  --font-cjk-serif: "Palatino Linotype", "Book Antiqua", Palatino, Georgia,
+    serif;
+}
+
+/* ---- 字距：漢字不收，拉丁收 ----
+   拉丁字母之間本來就有側邊留白，大字級要靠負字距補回來；
+   漢字是等寬方框、彼此已經相接，同一個負值會讓它們相撞。 */
+:root:lang(zh-Hant),
+:root:lang(zh-Hans),
+:root:lang(ja) {
+  --track-title: 0.012em;
+}

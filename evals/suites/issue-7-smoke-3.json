@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "name": "issue-7-smoke-3",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "issue7-he-000",
+      "category": "short-fix",
+      "tags": ["issue-7", "streaming", "shell-verification"],
+      "source": {"kind": "human_eval", "task_id": "HumanEval/0"},
+      "prompt": "Read TASK.md and solution.py, inspect repository state with the native shell tool, implement the documented function, and run a useful local verification command before finishing.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "timeoutSeconds": 180,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true
+      }
+    },
+    {
+      "id": "issue7-he-001",
+      "category": "short-fix",
+      "tags": ["issue-7", "streaming", "apply-patch"],
+      "source": {"kind": "human_eval", "task_id": "HumanEval/1"},
+      "prompt": "Implement the function described by TASK.md. Use the native apply_patch tool for the focused source change, inspect the result, and run a verification command before finishing.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "timeoutSeconds": 180,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true
+      }
+    },
+    {
+      "id": "issue7-he-002",
+      "category": "short-fix",
+      "tags": ["issue-7", "streaming", "direct-harness"],
+      "source": {"kind": "human_eval", "task_id": "HumanEval/2"},
+      "prompt": "Inspect TASK.md and solution.py, implement the requested public function with the Codex native tools, test edge cases through shell_command, and keep the patch focused.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "timeoutSeconds": 180,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true
+      }
+    }
+  ]
+}

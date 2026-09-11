@@ -1,0 +1,14 @@
+[package]
+name = "vellum-codex-app-server"
+version = "0.2.4"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stdio App Server bridge sidecar (not part of the daily Desktop package)"
+
+[[bin]]
+name = "vellum-codex-app-server"
+path = "src/main.rs"
+
+[dependencies]
+vellum = { path = "../../src-tauri" }

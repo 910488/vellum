@@ -1,0 +1,5162 @@
+/* ============================================================
+   components：暈染卡片、光暈數字、裝飾式分隔、表單、狀態
+   ------------------------------------------------------------
+   一條貫穿全檔的規則：光從右上來。
+
+   所以卡片不是四邊描一圈白線（那是 glassmorphism 的胎記，也是「每張卡
+   長得一模一樣」的主因），而是上緣受光、下緣落影、邊緣有顏料淤積。
+   同一個 box-shadow 裡三件事：inset 上緣亮、inset 下緣暗、外部柔影。
+   ============================================================ */
+
+/* ---------- 常駐狀態列 ----------
+   系統層級的一行。做得比卡片安靜 —— 它要一直在，但不能一直在喊。
+   底線用漸層淡出，不是實心 1px：實心線會把它切成一個「區塊」，
+   漸層才讓它像光帶。 */
+.statusbar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 11px var(--pad-x);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface) 76%, transparent) 0%,
+    transparent 100%
+  );
+  font-size: 13px;
+  min-height: 54px;
+  flex-wrap: wrap;
+}
+.statusbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--edge) 12%,
+    var(--edge) 82%,
+    transparent 100%
+  );
+}
+
+.statusbar__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  flex: none;
+}
+.statusbar__state--ok {
+  color: var(--ok-ink);
+}
+.statusbar__state--warn {
+  color: var(--warn-ink);
+}
+.statusbar__state--quiet {
+  color: var(--ink-faint);
+}
+/* 生效中的那顆點會呼吸。全 app 只有這一個持續動的東西 ——
+   因為它是唯一「正在發生」的事。 */
+.statusbar__state--ok .pill__dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 26%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .statusbar__state--ok .pill__dot {
+    animation: breathe 2.8s ease-in-out infinite;
+  }
+}
+@keyframes breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 26%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 8%, transparent);
+  }
+}
+
+.remote-login-spinner {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  margin-right: 0.45em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: -0.1em;
+  animation: remote-login-spin 0.7s linear infinite;
+}
+
+@keyframes remote-login-spin {
+  to { transform: rotate(360deg); }
+}
+
+.statusbar__model {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+.statusbar__model b {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+}
+/* 沒在服務中的模型名稱降一階 —— 粗體加深色會讀成「正在跑」 */
+.statusbar__model--stale {
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+.statusbar__sep {
+  color: var(--ink-faint);
+  font-size: 12.5px;
+}
+.statusbar__muted {
+  color: var(--ink-faint);
+  font-size: 12.5px;
+}
+/* 端點在窄視窗先讓位 —— 它是最不需要立刻知道的一項 */
+.statusbar__endpoint {
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.statusbar__spacer {
+  flex: 1;
+  min-width: 0;
+}
+@media (max-width: 920px) {
+  .statusbar__endpoint {
+    display: none;
+  }
+}
+
+/* ---------- 導覽 ----------
+   五頁之間沒有先後關係，所以不編號；也不畫貫穿的墨線 —— 那是家具不是資訊。
+
+   對齊改回靠左：右對齊的清單左緣是鋸齒的，而閱讀是從左邊開始的，
+   掃起來會不舒服。創意不該花在「把字推到讀不順的位置」。
+
+   真正的手法在墨跡上：目前所在那一項的底色是一團**往右滲開**的墨 ——
+   左緣收圓角、右緣不收並且蓋掉分界線，而且用多段 alpha 讓右側像被紙吸開，
+   不是一個色塊的直角邊。它會滲進右邊的內容區，把「這一頁」跟「這塊內容」
+   連成一體。 */
+.rail {
+  position: relative;
+  padding: 26px 0 26px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rail::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 1px;
+  background: linear-gradient(180deg, transparent 0%, var(--edge) 22%, var(--edge) 100%);
+}
+
+.navitem {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 10px 18px 11px 22px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  color: var(--ink-soft);
+  font-family: var(--font-display);
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* 標籤與徽章同一行，副標在下一行 */
+.navitem__top {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+/* 副標只出現在當前項。走正文圓體，跟明體的標籤分層 —— 同一個字體只是
+   縮小的話，會讀成「同一件事的小字」，而不是「另一層資訊」。 */
+.navitem__blurb {
+  position: relative;
+  z-index: 1;
+  font-family: var(--font-body);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0;
+  color: var(--ink-faint);
+}
+
+/* 往右滲開的墨。右邊多段 alpha = 紙吸開的邊，不是直角。 */
+.navitem::before {
+  content: "";
+  position: absolute;
+  inset: 2px -1px 2px 8px;
+  border-radius: 18px 0 0 16px;
+  background: linear-gradient(
+    90deg,
+    var(--lavender-wash) 0%,
+    var(--lavender-wash) 62%,
+    color-mix(in srgb, var(--lavender-wash) 62%, transparent) 82%,
+    color-mix(in srgb, var(--lavender-wash) 28%, transparent) 94%,
+    transparent 100%
+  );
+  box-shadow: inset 0 1px 0 var(--rim-light);
+  opacity: 0;
+  transition: opacity 0.22s ease;
+  pointer-events: none;
+}
+.navitem:hover::before {
+  opacity: 0.5;
+}
+.navitem[aria-current="page"]::before {
+  opacity: 1;
+}
+
+.navitem__label {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-width: 0;
+  transition: transform 0.22s cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+.navitem:hover {
+  color: var(--ink);
+}
+.navitem:hover .navitem__label {
+  transform: translateX(2px);
+}
+.navitem[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+.navitem[aria-current="page"] .navitem__label {
+  transform: translateX(3px);
+}
+
+/* 實心訊號色 + 固定深墨。導覽底下沒有卡片，而暗色主題的 --warn-ink 就等於
+   --warn，同色系 wash 當底又當字，alpha 拉再高也沒有對比度（量到 3.35:1）。 */
+.navitem__badge {
+  position: relative;
+  z-index: 1;
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--on-signal);
+  background: var(--warn);
+  border-radius: var(--r-pill);
+  padding: 1px 7px;
+}
+
+/* ---------- 暈染卡片 ----------
+   三層 box-shadow 做一件事：讓它看起來是「紙上的一塊濕染」而不是
+   「浮在空中的玻璃磚」。
+     inset 0 1px 0 rim-light   上緣受光
+     inset 0 -1px 0 rim-shade  下緣落影
+     inset 0 0 34px pool       邊緣顏料淤積
+     外部 shadow-soft          離地高度 */
+.card {
+  position: relative;
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-lg);
+  padding: 26px 26px 28px;
+  backdrop-filter: blur(10px) saturate(1.08);
+  -webkit-backdrop-filter: blur(10px) saturate(1.08);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 -1px 0 var(--rim-shade),
+    inset 0 0 34px var(--pool), var(--shadow-soft);
+}
+
+/* Only hidden/minimized windows use the inexpensive surface. Foreground
+   rendering keeps the original glass quality. */
+html[data-performance="low"] .card {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* 主角卡：光暈更強、留白更大、圓角更開。每頁最多一張。 */
+.card--hero {
+  padding: 32px 32px 34px;
+  border-radius: 36px 40px 32px 38px;
+  background: linear-gradient(
+      152deg,
+      color-mix(in srgb, var(--apricot-wash) 60%, transparent) 0%,
+      transparent 52%
+    ),
+    var(--surface);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 -1px 0 var(--rim-shade),
+    inset 0 0 46px var(--pool), var(--shadow-lift);
+}
+
+.card--tile {
+  border-radius: var(--r-md);
+  padding: 18px 20px 20px;
+}
+
+/* 第三層表面：次要資訊不需要暈染。
+   八張同重量的卡疊起來，眼睛沒有入口。 */
+.card--quiet {
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  padding: 2px 2px 6px;
+}
+
+.card__cap {
+  margin: 0 0 13px;
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  color: var(--ink-faint);
+}
+.card__sub {
+  margin: 11px 0 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* ---------- 通報 ----------
+   三級：說明／注意／失敗。這個語彙原本不存在 —— `.notice` 在三個樣式表裡
+   一條規則都沒有，所以錯誤跟「正在讀取…」畫出來一模一樣，只能靠讀完
+   整句話才知道哪個是壞消息。
+
+   不靠顏色單獨表意：句首的 .notice__tag 永遠寫著那三個字，灰階或色盲
+   都讀得到。色只是把它從一頁文字裡拉出來。
+
+   左緣一道筆觸而不是四邊描框 —— 框會把它變成另一張卡，它不是卡，
+   它是夾在內容裡的一句話。 */
+.notice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 12px;
+  padding: 11px 16px 12px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  line-height: 1.76;
+  color: var(--ink-soft);
+  background: var(--surface-sunk);
+  box-shadow: inset 2px 0 0 var(--ink-ghost);
+}
+.notice__tag {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 12.5px;
+  line-height: 1.76;
+  white-space: nowrap;
+  color: var(--ink-faint);
+}
+.notice__body {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* 補救動作跟訊息同一塊 —— 「怎麼辦」跟「發生什麼事」分開放，
+   等於要人自己把兩件事接起來。 */
+.notice__acts {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+/* 機器原字串。人話在上面，這裡是給要回報 issue 的人用的。 */
+.notice__raw {
+  grid-column: 2;
+  margin: 8px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.notice--warn {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--warn) 13%, transparent);
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+.notice--warn .notice__tag {
+  color: var(--warn-ink);
+}
+.notice--error {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--crit) 13%, transparent);
+  box-shadow: inset 2px 0 0 var(--crit);
+}
+.notice--error .notice__tag {
+  color: var(--crit-ink);
+}
+
+/* ---------- 確認 ----------
+   原生 <dialog>。理由跟 .tray 用 <details> 一樣：焦點鎖、Esc、
+   aria-modal、惰性背景全部由瀏覽器做，自己接一定會漏掉其中一項。
+
+   換掉 window.confirm 不只是為了長相 —— 它會鎖住 JS thread，
+   背景操作的輪詢會跟著停在原地。 */
+.dialog {
+  width: min(520px, calc(100vw - 48px));
+  max-height: calc(100vh - 96px);
+  margin: auto;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-lg);
+  color: var(--ink);
+  background: linear-gradient(
+      152deg,
+      color-mix(in srgb, var(--apricot-wash) 55%, transparent) 0%,
+      transparent 54%
+    ),
+    var(--surface-solid);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 -1px 0 var(--rim-shade),
+    var(--shadow-lift);
+}
+.dialog::backdrop {
+  background: color-mix(in srgb, var(--ground-deep) 62%, transparent);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+.dialog__form {
+  display: grid;
+  gap: 16px;
+  padding: 26px 28px 24px;
+  overflow-y: auto;
+}
+.dialog__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: var(--track-title);
+}
+/* 後果拆成固定三格，不是一整段話。一段話的確認視窗沒人讀完 ——
+   讀完也記不住哪一句是「不會動到」。 */
+.dialog__facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px 16px;
+  font-size: 13px;
+  line-height: 1.72;
+}
+.dialog__fact-key {
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+.dialog__fact-val {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.dialog__acts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 2px;
+}
+/* 破壞性確認：打出主機名稱才解鎖。這一顆的後果比整頁其他動作加起來大，
+   多一道摩擦是對的 —— 而且它順便逼你確認自己選對了哪一台。 */
+.dialog__gate {
+  display: grid;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+.dialog__gate input {
+  padding: 9px 13px;
+  border: none;
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.dialog__gate input:focus-visible {
+  outline: 2px solid var(--lavender);
+  outline-offset: 1px;
+}
+
+/* ---------- Remote Manager ---------- */
+.remote-layout { display: grid; grid-template-columns: minmax(190px, 0.32fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.remote-hosts { display: flex; flex-direction: column; gap: 7px; }
+.remote-host { border: 0; border-radius: var(--r-md); padding: 14px 16px; text-align: left; color: var(--ink-soft); background: color-mix(in srgb, var(--surface) 54%, transparent); cursor: pointer; box-shadow: inset 0 1px 0 var(--rim-light); }
+.remote-host:hover, .remote-host--active { color: var(--ink); background: var(--lavender-wash); }
+.remote-host b, .remote-host span, .remote-host small { display: block; }
+.remote-host span { margin-top: 4px; font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.remote-host small { margin-top: 7px; color: var(--ink-faint); }
+/* 探測失敗標在那一台上，不是升級成全頁警告。它是那台主機的屬性。 */
+.remote-host--unreachable small { color: var(--crit-ink); }
+/* 重新整理已探測過的主機時，舊結果留著，只加一個小標記——不清空整列。 */
+.remote-host__refreshing { color: var(--ink-faint); font-style: normal; }
+.remote-detail { display: grid; gap: 18px; min-width: 0; }
+.remote-title-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; }
+.remote-title { margin: 0; font-family: var(--font-display); font-size: 24px; }
+
+/* ---------- 工作面 ----------
+   這一頁上唯一一塊「現在怎樣、我該按什麼」的答案。
+
+   原本的版面是資料在上、動作在中、結果在下：按下 Bootstrap 的當下，
+   進度在十九行狀態與兩張卡以下，眼睛要跑三個地方才能把因果接起來。
+   工作面把三者疊在同一個位置 —— 按鈕跑起來的時候直接原地變成進度，
+   失敗就原地變成錯誤。因與果同一格。**這一點是它存在的理由，而且跟它
+   會不會跟著捲動無關。**
+
+   它曾經是 sticky 的。理由是「按下去以後進度不該捲出視線」，但代價是
+   往下看主機細節、帳號、工作階段時，一張不透明的大卡永遠壓在最上面，
+   而那時候它已經沒有話要說了。捲動時最需要的是完整的一屏，不是一塊
+   常駐的抬頭 —— 所以現在它跟其他卡一樣捲走。
+
+   底色仍然是不透明的（--surface-solid）：它是這一頁的主角面，
+   玻璃面會讓底下的字透上來。 */
+.worktop {
+  display: grid;
+  gap: 15px;
+  padding: 21px 24px 23px;
+  border-radius: 30px 34px 27px 32px;
+  background: linear-gradient(
+      152deg,
+      color-mix(in srgb, var(--apricot-wash) 70%, transparent) 0%,
+      transparent 56%
+    ),
+    var(--surface-solid);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 -1px 0 var(--rim-shade),
+    inset 0 0 40px var(--pool), var(--shadow-lift);
+}
+.worktop__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.worktop__name { margin: 0; font-family: var(--font-display); font-size: 22px; font-weight: 600; letter-spacing: var(--track-title); }
+.worktop__where { margin: 5px 0 0; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-faint); overflow-wrap: anywhere; }
+.worktop__head-status { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+/* 重新整理時頁面不清空，只在狀態徽章下面換一句話——「更新中」而不是凍結。 */
+.worktop__updated { margin: 0; font-size: 11px; color: var(--ink-faint); white-space: nowrap; }
+.worktop__updated--live { color: var(--ink-soft); }
+/* 一句話的結論。這是整頁最重要的一行，所以它比十九行狀態大一級。 */
+.worktop__verdict { margin: 0; font-size: 14.5px; line-height: 1.72; color: var(--ink); }
+.worktop__verdict b { font-weight: 700; }
+.worktop__acts { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+/* 維護收在右邊，跟主要動作之間留一段空 —— 它不是同一類事。 */
+.worktop__aside { margin-left: auto; }
+
+/* 進行中：原地取代按鈕。
+   只有一條 percent 是不夠的 —— 從 10% 停在那裡的時候，人分不出
+   「還在跑」跟「卡住了」。所以現在這一步在做什麼、第幾步、跑了多久，
+   三個都要在，而且都是後端本來就有或前端算得出來的真值。 */
+.worktop__run { display: grid; gap: 9px; }
+.worktop__phase { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; font-size: 14px; }
+.worktop__phase b { font-weight: 700; }
+.worktop__tick { font-size: 12px; color: var(--ink-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.worktop__run .meter { margin-top: 2px; }
+
+/* ---------- 帳號登記簿 ----------
+   一列一個 Desktop 帳號，回答同一個問題：這台主機自己有沒有那個帳號的
+   grant，以及現在用的是不是它。上一版是一個裸 <ul> —— 瀏覽器預設的圓點，
+   信箱、狀態、按鈕三段擠在同一行沒有間隔，四個語言下各歪各的。
+
+   它不是一條鏈（每一列彼此獨立），所以刻意**不用** `.seam` 的直筆觸；
+   狀態用 `.state` 的三態筆觸，跟這個 app 其他地方講「狀態」的方式一致。
+
+   欄寬全部釘在 grid 上、不逐列各算 —— 逐列 fit-content 在繁中換成英文時
+   一定會歪。動作欄永遠存在，沒有按鈕時是空的，狀態才不會左右跳。 */
+.accounts { display: grid; margin-top: 14px; }
+.accounts__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(5.5em, auto);
+  align-items: center;
+  gap: 6px 18px;
+  padding: 12px 2px;
+}
+.accounts__row + .accounts__row {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg, transparent 0%, var(--edge) 6%, var(--edge) 94%, transparent 100%) 1;
+}
+.accounts__who { display: grid; gap: 3px; min-width: 0; }
+.accounts__who b {
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+/* 正在用的那一個把信箱提到主要墨色；其餘退一階。整列不上底色 ——
+   底色會讓「正在使用」看起來像被選取，那是兩件事。 */
+.accounts__row--active .accounts__who b { color: var(--ink); }
+.accounts__who b { color: var(--ink-soft); }
+.accounts__why { font-size: 11.5px; line-height: 1.65; color: var(--crit-ink); overflow-wrap: anywhere; }
+.accounts__row > .state { justify-self: end; }
+.accounts__act { justify-self: end; }
+/* Grok 是另一家的帳號。緊貼在登記簿下面會被讀成第五列，所以隔開一段。 */
+.accounts + .rows { margin-top: 10px; }
+
+.remote-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 21px; align-items: center; }
+.remote-mobile-empty { margin: 4px 0 0; color: var(--ink-faint); font-size: 13px; }
+.remote-mobile-name-input { max-width: 220px; }
+.remote-mobile-expiry { color: var(--ink-faint); }
+.remote-models { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 18px 0; }
+.remote-model { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: var(--r-sm); background: color-mix(in srgb, var(--surface) 65%, transparent); }
+.remote-model span, .remote-model small { display: block; min-width: 0; }
+.remote-model small { margin-top: 3px; color: var(--ink-faint); overflow-wrap: anywhere; }
+
+/* 卡住的原因。原本這裡把 nativeDaemonAppOwned 這種機器碼直接當文字
+   丟給人看 —— 那是給 issue tracker 的，不是給使用者的。現在一行是
+   一句人話加一顆補救按鈕，原碼退到 .notice__raw。 */
+.remote-blockers { display: grid; gap: 9px; margin-top: 15px; }
+.remote-maintenance-list, .remote-session-list { display: grid; gap: 8px; margin-top: 15px; }
+.remote-maintenance-list > div, .remote-session { display: grid; gap: 6px; padding: 11px 13px; border-radius: var(--r-sm); background: color-mix(in srgb, var(--surface) 65%, transparent); }
+.remote-maintenance-list > div { grid-template-columns: auto 1fr; align-items: center; }
+.remote-session > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.remote-session code { overflow-wrap: anywhere; }
+.remote-session small { color: var(--ink-faint); overflow-wrap: anywhere; }
+
+/* 維護動作：一列一行，動作名／一句後果／按鈕。
+   不是一排按鈕 —— 這些事一年按不到一次，光看動詞沒人知道後果，
+   而說明放進 tooltip 等於只服務「已經知道那是什麼」的人。 */
+.remote-chore { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 16px; align-items: center; padding: 13px 2px; }
+.remote-chore + .remote-chore { border-top: 1px solid transparent; border-image: linear-gradient(90deg, transparent 0%, var(--edge) 8%, var(--edge) 92%, transparent 100%) 1; }
+.remote-chore b { grid-column: 1; font-size: 13.5px; font-weight: 600; }
+.remote-chore small { grid-column: 1; font-size: 12px; line-height: 1.7; color: var(--ink-faint); }
+.remote-chore .btn { grid-column: 2; grid-row: 1 / span 2; justify-self: end; }
+
+/* 危險區。跟其他動作之間隔一道線與一段空白 —— 這一顆不該跟
+   「匯出診斷包」出現在同一排，肌肉記憶會按錯。 */
+.remote-danger { display: grid; gap: 11px; padding: 18px 20px 19px; border-radius: var(--r-md); background: color-mix(in srgb, var(--crit) 7%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--crit) 22%, transparent); }
+.remote-danger p { margin: 0; font-size: 12.5px; line-height: 1.72; color: var(--ink-soft); }
+.remote-danger .btn { justify-self: start; }
+
+@media (max-width: 850px) { .remote-layout { grid-template-columns: 1fr; } .remote-hosts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .remote-models { grid-template-columns: 1fr; } .worktop { position: static; } }
+
+/* ---------- 光暈數字 ----------
+   大號數字 + 徑向光暈。字體走 display（Palatino 的書法骨架）——
+   老式襯線的數字有真正的粗細對比，跟 ui-rounded 的數字完全不同重量。 */
+.metric {
+  position: relative;
+  display: inline-block;
+  line-height: 1;
+  isolation: isolate;
+}
+.metric__value {
+  position: relative;
+  font-family: var(--font-display);
+  font-size: 54px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.metric__unit {
+  margin-left: 4px;
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--ink-faint);
+}
+/* 光暈：橢圓、偏下，像光從數字底下透出來 */
+.metric::before {
+  content: "";
+  position: absolute;
+  inset: -34% -26% -42%;
+  border-radius: 50%;
+  background: radial-gradient(
+    60% 60% at 42% 62%,
+    var(--glow, var(--lavender)) 0%,
+    transparent 70%
+  );
+  filter: blur(18px);
+  opacity: 0.32;
+  z-index: -1;
+}
+.metric--sm .metric__value {
+  font-size: 35px;
+}
+.metric--sm .metric__unit {
+  font-size: 14px;
+}
+
+/* ---------- 裝飾式分隔：小圓點 + 細線 ---------- */
+.ruler {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+.ruler::before,
+.ruler::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--edge) 26%,
+    var(--edge) 74%,
+    transparent
+  );
+}
+.ruler__dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--lavender);
+  opacity: 0.6;
+  flex: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--lavender) 12%, transparent);
+}
+
+/* ---------- 量條 ----------
+   槽是凹的（inset 影），填色是濕染（漸層）。 */
+.meter {
+  position: relative;
+  height: 8px;
+  margin-top: 15px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 1px 2px var(--rim-shade);
+  overflow: hidden;
+}
+/* 門檻刻度。畫在條上而不是寫在旁邊 —— 「還差多遠」是空間關係，
+   用一個數字表達等於要人自己心算。 */
+.meter__mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ink-soft);
+  opacity: 0.55;
+}
+.meter__fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--skyglow), var(--lavender));
+  box-shadow: inset 0 1px 0 var(--rim-light);
+  transition: width 0.62s cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+.meter--honey .meter__fill {
+  background: linear-gradient(90deg, var(--apricot), var(--honey));
+}
+.meter--coral .meter__fill {
+  background: linear-gradient(90deg, var(--apricot), var(--coral));
+}
+
+/* ---------- 狀態：筆畫 ----------
+   第三版了。第一版是膠囊（每個 AI dashboard 都長那樣），第二版是方形墨記
+   （還是一個「圖示」，而且方塊在這套語彙裡很硬）。
+
+   這一版不加任何形狀：狀態就是那兩三個字，底下拖一道筆畫。三態靠**筆觸**
+   區分 —— 濕的實筆、斷開的乾筆、快要沒有的細線。這是水墨裡本來就有的語言，
+   而且它完全不是一個「元件」，是排版。 */
+.state {
+  position: relative;
+  display: inline-block;
+  padding-bottom: 6px;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.state::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 1px;
+  border-radius: 2px;
+}
+
+/* 生效中：濕的實筆。收尾淡出（提筆），底下透一點暈 —— 墨還沒乾。 */
+.state--ok::after {
+  height: 3px;
+  background: linear-gradient(
+    90deg,
+    var(--ok) 0%,
+    var(--ok) 74%,
+    color-mix(in srgb, var(--ok) 40%, transparent) 92%,
+    transparent 100%
+  );
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--ok) 38%, transparent);
+}
+
+/* 待生效：乾筆。筆畫斷斷續續 —— 寫了，但還沒寫完。 */
+.state--warn::after {
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--warn) 0 6px,
+    transparent 6px 10px
+  );
+  opacity: 0.9;
+}
+
+/* 已停用：快要沒有的細線，字也退一階。 */
+.state--quiet {
+  color: var(--ink-faint);
+  font-weight: 600;
+}
+.state--quiet::after {
+  height: 1px;
+  background: linear-gradient(90deg, var(--ink-ghost) 0%, transparent 88%);
+}
+
+/* ---------- pill ---------- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  background: var(--lavender-wash);
+  color: var(--lavender-ink);
+}
+.pill--ok {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  color: var(--ok-ink);
+}
+.pill--warn {
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  color: var(--warn-ink);
+}
+.pill--crit {
+  background: color-mix(in srgb, var(--crit) 18%, transparent);
+  color: var(--crit-ink);
+}
+.pill--quiet {
+  background: var(--surface-sunk);
+  color: var(--ink-faint);
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.pill__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+/* ---------- 狀態列（點線分隔取代 list 框線） ---------- */
+.rows {
+  display: flex;
+  flex-direction: column;
+}
+.rows__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 2px;
+  font-size: 13.5px;
+}
+/* 分隔線兩端淡出，不要碰到卡片邊 —— 實心到底的線會把卡片切成格子 */
+.rows__item + .rows__item {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 8%,
+      var(--edge) 92%,
+      transparent 100%
+    )
+    1;
+}
+/* 標籤預設不縮，值才折行 —— 一整欄的標籤對齊比值的整齊更重要。
+   但只有 shrink 為 0 時，夠長的標籤（英文、日文常常是中文的兩三倍長）
+   會把值推出卡片外，所以留 shrink：正常情況不動，撐不下才讓標籤折行。 */
+.rows__key {
+  color: var(--ink-soft);
+  flex: 0 1 auto;
+}
+.rows__val {
+  min-width: 0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* 補充說明與歷史資訊。刻意不給 pill 的形狀 ——
+   「最近使用」是歷史，「重啟後生效」是提示，兩者都不是狀態；
+   跟狀態長得一樣就會被誤讀成狀態。
+
+   也不能 nowrap：中文的提示是一句短語，換成英文或日文就是一整句
+   （「此端點不提供額度查詢」→「This endpoint does not provide quota lookup」），
+   釘住不折行的結果是它直接長到卡片外面去。 */
+.rows__hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 按鈕 ----------
+   主按鈕是實色 + 上緣受光，不是漸層。紫色漸層是 AI 介面最常見的
+   一筆，而它在這裡也沒有必要 —— 實色的對比度還更好（5.7:1）。 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 18px;
+  border-radius: var(--r-pill);
+  font-size: 13px;
+  font-weight: 700;
+  border: none;
+  cursor: pointer;
+  background: var(--accent-to);
+  color: var(--on-accent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--rim-light) 40%, transparent),
+    0 3px 10px -2px color-mix(in srgb, var(--accent-to) 46%, transparent);
+  transition: transform 0.16s ease, box-shadow 0.16s ease,
+    background-color 0.16s ease;
+}
+.btn:hover {
+  background: var(--accent-from);
+  transform: translateY(-1px);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--rim-light) 46%, transparent),
+    0 6px 16px -3px color-mix(in srgb, var(--accent-to) 52%, transparent);
+}
+.btn:active {
+  transform: translateY(0);
+}
+.btn--soft {
+  background: var(--surface);
+  color: var(--ink-soft);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 0 0 1px var(--edge);
+}
+.btn--soft:hover {
+  background: var(--surface-solid);
+  color: var(--ink);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 0 0 1px var(--edge),
+    var(--shadow-soft);
+}
+/* 危險動作。實心珊瑚色 —— 不是「紅色按鈕」那種反射動作，而是這套色票裡
+   唯一不出現在別處的填色，所以它在一頁上永遠只代表一件事。
+   必須排在 .btn 後面：兩者權重相同，先寫的那個會被蓋掉。 */
+.btn--danger {
+  background: var(--crit);
+  color: var(--on-signal);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--rim-light) 40%, transparent),
+    0 3px 10px -2px color-mix(in srgb, var(--crit) 50%, transparent);
+}
+.btn--danger:hover {
+  background: color-mix(in srgb, var(--crit) 88%, var(--ink));
+  color: var(--on-signal);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* 表格列裡的動作。一般按鈕（9px 18px）會把列撐高，破壞一排列的掃視節奏。 */
+.btn--mini {
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.btn--mini:hover {
+  transform: none;
+}
+
+/* ---------- 表單 ---------- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.field__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+.field__hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.input {
+  width: 100%;
+  padding: 10px 13px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 1px 2px var(--rim-shade), inset 0 0 0 1px var(--edge);
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  color: var(--ink);
+  transition: box-shadow 0.18s ease, background-color 0.18s ease;
+}
+.input::placeholder {
+  color: var(--ink-faint);
+}
+.input:focus {
+  outline: none;
+  background: var(--surface-solid);
+  box-shadow: inset 0 0 0 1px var(--lavender-deep),
+    0 0 0 3px color-mix(in srgb, var(--lavender) 20%, transparent);
+}
+.input-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 13px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+}
+
+/* 疊起來的欄位群（執行檔位置這種一次要填好幾條路徑的地方）。
+   .field 只管自己內部的標籤與控制項，彼此之間的距離要有人管；
+   而這種欄位不能塞進 .rows —— 右欄是給數值的，路徑會被切斷。 */
+.fieldstack {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+/* 欄位加動作（金鑰、位址）。用 .rowline 排會壞：`.input` 是 width: 100%，
+   在 flex 裡它吃掉整列，按鈕被擠到下一行，同一張卡裡的動作就不在同一條線上。
+   所以輸入框負責伸縮、按鈕釘住自己的寬度。 */
+.keyfield {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.keyfield .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.keyfield .btn {
+  flex: 0 0 auto;
+}
+
+/* 不是選擇的路徑：偵測到的官方 core、組建自己帶的 bridge、系統目前的
+   CODEX_CLI_PATH。跟輸入框同一個框線與等寬字，但沒有輸入框的凹陷 ——
+   凹陷是「這裡等你打字」的訊號，而這幾條打了字只會驗證失敗。 */
+.field--fact .field__value {
+  padding: 10px 13px;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 交接 ----------
+   Enhanced Runtime 不是一組可以任意調的開關，是一次有先後的交接：
+   驗執行檔 → 換掉 CODEX_CLI_PATH 並重開 Codex Desktop → 看 Desktop
+   有沒有真的接上。
+
+   每一段是一張自己的紙，不是清單的一行。理由不是「卡片比較好看」——
+   每一段底下都掛著只屬於它的欄位與按鈕，攤平排在一起時，中間只剩留白
+   在分界，看不出哪個輸入框是哪一段的事。有了紙的邊界，份量才跟得上
+   狀態：正在做的那一張抬起來並攤開，做完的躺平收起來，還沒輪到的留在
+   底下。桌上同一時間只攤開一件事。
+
+   三張紙之間仍然有一道墨線串著 —— 它們是一條流程，不是三個選項。 */
+/* ---------- 注入 ----------
+
+   一顆開關，配一台把過程照原樣印出來的微型終端機。
+
+   之前這裡是三段式交接：三張紙、三顆按鈕、一條把它們串起來的墨線。那個
+   排版忠實地畫出了因果，問題是因果是實作的事 —— 使用者要問的只有一句
+   「我到底開了沒有」，而那句話的答案被拆在三張紙上。
+
+   所以份量重新分配：狀態字最大，因為那是唯一的問題；開關就在它旁邊，
+   因為那是唯一的動作；過程掉進終端機裡，因為過程只有在出錯的時候才需要
+   被讀，而出錯的時候要讀的是原文，不是進度。 */
+
+.inject {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 20px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-radius: var(--r-md);
+  background: var(--surface-solid);
+  box-shadow: inset 0 0 0 1px var(--edge), var(--shadow-lift);
+}
+.inject__copy {
+  display: grid;
+  gap: 6px;
+  /* 說明那一行是整段裡最長的東西，要能收縮才不會把開關擠出這一列。 */
+  flex: 1 1 18em;
+  min-width: 0;
+}
+.inject__state {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: var(--track-title);
+  color: var(--ink);
+}
+.inject__mean {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink-soft);
+}
+/* 擋住的原因。它住在狀態底下，不是另一條等寬的橫幅 —— 它講的是同一件事
+   的下一句，不是新的主題。左邊那道杏色細線是唯一的區別，份量剛好夠讓眼睛
+   停一下，不夠讓它變成一個新的區塊。 */
+.inject__blocked {
+  margin-top: 2px;
+  padding-left: 11px;
+  border-left: 2px solid var(--apricot-deep);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink);
+}
+
+/* ---------- 微型終端機 ----------
+
+   等寬字是因為這裡印的是要被拿去核對的東西：雜湊、路徑、pid。它們對齊了
+   才比得動。
+
+   高度上限用 em 不用 ch —— ch 量的是 "0" 的寬度，漢字不是那個寬度，四種
+   語言在同一個固定值下會停在四個不同的位置。 */
+.term__scroll {
+  max-height: 15em;
+  overflow-y: auto;
+  /* 托盤的內距是給一般內容的；終端機自己要多一點左右呼吸，行首那個記號
+     才不會貼著邊。 */
+  padding: 9px 3px 7px;
+  scroll-behavior: smooth;
+}
+/* 正在跑的時候把托盤的標題列點亮，因為那時候使用者可能把它收起來了。 */
+.tray--running > .tray__head {
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--lavender-deep) 38%, transparent);
+}
+.term__line {
+  display: grid;
+  /* 記號欄釘死，文字欄自己換行。路徑跟雜湊都比這個欄位寬。 */
+  grid-template-columns: 1.1em minmax(0, 1fr);
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.term__line + .term__line {
+  margin-top: 2px;
+}
+.term__mark {
+  color: var(--ink-ghost);
+  user-select: none;
+}
+/* 指令列是分節點，所以它前面留白、字重高一階；輸出行退到次要。 */
+.term__line--cmd {
+  color: var(--ink);
+  font-weight: 600;
+}
+.term__line--cmd:not(:first-child) {
+  margin-top: 10px;
+}
+.term__line--cmd .term__mark {
+  color: var(--lavender-deep);
+}
+.term__line--out {
+  color: var(--ink-soft);
+}
+.term__line--ok {
+  color: var(--ink);
+}
+.term__line--ok .term__mark {
+  color: var(--ok);
+}
+.term__line--fail {
+  color: var(--ink);
+}
+.term__line--fail .term__mark {
+  color: var(--warn);
+}
+.term__line--idle {
+  color: var(--ink-faint);
+}
+/* 還在跑的時候才有游標。它證明的是「還沒結束」—— 沒有它，最後一行讀起來
+   就像結論，而那正是等 90 秒 Desktop 重啟時最容易誤讀的地方。 */
+.term__caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 1.05em;
+  margin-left: 1.9em;
+  vertical-align: text-bottom;
+  background: var(--lavender-deep);
+  animation: term-blink 1.1s steps(2, start) infinite;
+}
+@keyframes term-blink {
+  to {
+    visibility: hidden;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .term__caret {
+    animation: none;
+  }
+  .term__scroll {
+    scroll-behavior: auto;
+  }
+}
+
+.handover__warn {
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: var(--r-sm);
+  background: var(--apricot-wash);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 34%, transparent);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink);
+}
+.handover__literal {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+.handover__act {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+}
+.handover__act .rows__hint {
+  flex: 1 1 14em;
+}
+.lore .fieldstack {
+  margin-top: 14px;
+}
+
+/* 終端機之後還有別的事要講（每條路由落在哪一邊）。沒有標題的話它會讀成
+   終端機的續篇 —— 同樣的左界、同樣的字級，眼睛沒有理由斷開。 */
+.handover__section {
+  margin: 26px 0 0;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: var(--track-title);
+  color: var(--ink);
+}
+.handover__section + .note {
+  margin-top: 8px;
+}
+
+/* 排查時才要看的資料：digest、pid、阻擋原因、上次驗證報告。收起來不是
+   藏起來 —— 它平常不該跟「我現在要設定什麼」搶同一塊視線。 */
+.lore {
+  margin-top: 22px;
+}
+.lore__summary {
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-soft);
+}
+.lore__summary::-webkit-details-marker {
+  display: none;
+}
+.lore__summary::before {
+  content: "\25B8";
+  display: inline-block;
+  margin-right: 7px;
+  transition: transform 0.16s ease;
+}
+.lore[open] > .lore__summary::before {
+  transform: rotate(90deg);
+}
+.lore__blockers {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--warn-ink);
+  overflow-wrap: anywhere;
+}
+.lore .handover__act {
+  margin-top: 14px;
+}
+
+/* ---------- 偏好橫幅 ----------
+   只有一個控制項的頁面級偏好（語言）。做成整張卡的話，一個下拉會佔掉
+   grid2 的主欄，把真正的主角擠到窄欄去 —— 版面上的份量要對得起內容。
+
+   說明在左、控制項在右釘住寬度：控制項不跟著文字長度浮動，換語言時
+   它待在原地；文字長的語言只會讓左邊那欄多折一行。 */
+.prefstrip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(9.5em, 13em);
+  align-items: center;
+  gap: 10px 24px;
+}
+.prefstrip__copy {
+  min-width: 0;
+}
+.prefstrip__copy .card__cap {
+  margin-bottom: 5px;
+}
+.prefstrip__copy .note {
+  margin: 0;
+}
+@media (max-width: 760px) {
+  .prefstrip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .prefstrip > .input {
+    justify-self: start;
+    min-width: 13em;
+  }
+}
+
+/* 分段選擇：取代 radio group */
+.segment {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  flex-wrap: wrap;
+}
+/* 折行時把該行剩下的寬度分給選項。容器是 inline-flex，單行時沒有多餘寬度、
+   長相不變；一旦某個語言的字長到要折行，短的那一行才會被撐滿 ——
+   否則折下來的選項會孤零零靠左，看起來像壞掉而不是排版。 */
+.segment__opt {
+  flex: 1 1 auto;
+  padding: 5px 14px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  cursor: pointer;
+  transition: background-color 0.18s ease;
+}
+.segment__opt[aria-pressed="true"] {
+  background: var(--surface-solid);
+  color: var(--ink);
+  box-shadow: inset 0 1px 0 var(--rim-light), var(--shadow-soft);
+}
+
+/* 開關 */
+.toggle {
+  width: 42px;
+  height: 24px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 1px 2px var(--rim-shade), inset 0 0 0 1px var(--edge);
+  position: relative;
+  cursor: pointer;
+  flex: none;
+  transition: background-color 0.22s ease;
+}
+.toggle::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--surface-solid);
+  box-shadow: 0 1px 3px rgba(88, 76, 128, 0.28);
+  transition: transform 0.22s cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+.toggle[aria-checked="true"] {
+  background: var(--accent-to);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--rim-light) 34%, transparent);
+}
+.toggle[aria-checked="true"]::after {
+  transform: translateX(18px);
+}
+/* 扳不動的時候：還讀得到現在是開是關，只是碰不得。停用的開關比消失的
+   開關誠實 —— 消失了就沒有東西能說明「為什麼現在不能扳」。 */
+.toggle:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+/* ---------- 步驟流程 ---------- */
+.steps {
+  display: flex;
+  flex-direction: column;
+}
+.step {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 15px;
+  padding-bottom: 22px;
+  position: relative;
+}
+.step:last-child {
+  padding-bottom: 0;
+}
+.step::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 33px;
+  bottom: 2px;
+  width: 1px;
+  background: linear-gradient(180deg, var(--edge), transparent);
+}
+.step:last-child::before {
+  display: none;
+}
+.step__bead {
+  width: 29px;
+  height: 29px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  background: var(--surface);
+  color: var(--lavender-ink);
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 0 0 1px var(--edge),
+    var(--shadow-soft);
+}
+.step--done .step__bead {
+  background: var(--accent-to);
+  color: var(--on-accent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--rim-light) 36%, transparent),
+    0 3px 9px -2px color-mix(in srgb, var(--accent-to) 44%, transparent);
+}
+.step__title {
+  margin: 4px 0 5px;
+  font-size: 14px;
+  font-weight: 700;
+}
+.step__body {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* ---------- 探測結果 ----------
+   註：JSX 用的是 .detect__row，之前 CSS 只定義了 .detect__item，
+   所以探測結果那幾列一直是完全沒有樣式的。兩個都寫。 */
+.detect {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.detect__row,
+.detect__item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 13px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-size: 13px;
+}
+.detect__row > span,
+.detect__name {
+  flex: 1;
+  color: var(--ink-soft);
+  min-width: 0;
+}
+.detect__row > strong,
+.detect__val {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.detected-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  max-height: 156px;
+  margin-top: 10px;
+  padding: 10px;
+  overflow-y: auto;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.detected-models code {
+  padding: 4px 7px;
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-size: 11.5px;
+}
+
+/* ---------- 來源鏈 ---------- */
+.chain {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chain__link {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 11px 14px;
+  border-radius: var(--r-sm);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-size: 13px;
+  color: var(--ink-faint);
+}
+/* 命中的那一層是唯一有暈染的 —— 其餘只是輪廓 */
+.chain__link--hit {
+  background: linear-gradient(
+    100deg,
+    var(--lavender-wash),
+    color-mix(in srgb, var(--apricot-wash) 70%, transparent)
+  );
+  box-shadow: inset 0 1px 0 var(--rim-light), inset 0 0 24px var(--pool);
+  color: var(--ink);
+}
+.chain__ord {
+  width: 21px;
+  height: 21px;
+  border-radius: 6px 7px 6px 7px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: 11.5px;
+  font-weight: 700;
+  background: var(--surface-sunk);
+  color: var(--ink-soft);
+}
+.chain__link--hit .chain__ord {
+  background: var(--accent-to);
+  color: var(--on-accent);
+}
+.chain__label {
+  flex: 1;
+}
+.chain__val {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 審查發現：嚴重度色條 ---------- */
+.finding {
+  display: grid;
+  grid-template-columns: 3px 1fr;
+  gap: 15px;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.finding + .finding {
+  margin-top: 10px;
+}
+.finding__stripe {
+  background: var(--warn);
+}
+.finding--crit .finding__stripe {
+  background: var(--crit);
+}
+.finding--low .finding__stripe {
+  background: var(--haze);
+}
+.finding__body {
+  padding: 12px 14px 13px 0;
+}
+.finding__title {
+  margin-bottom: 3px;
+  font-size: 13.5px;
+  font-weight: 700;
+}
+.finding__meta {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+
+/* ---------- 各 Provider 累計用量：一條長條 + 排名讀數 ----------
+   這張卡回答的是「誰吃掉我的量」，那是個比例問題。舊版是一排
+   「名稱 → N tokens」，要回答它得先心算除法；所以主角改成長度，
+   絕對數字退成佐證。
+
+   長條沿用 .stackbar（Context 的前後對照也用它），只是這裡不是主角，
+   所以壓扁。互動也照抄那邊已經成立的慣例：指到一段，其餘變淡，
+   下面對應的那列同時亮起。 */
+.usageshare__bar {
+  height: 30px;
+  border-radius: 9px 10px 8px 9px;
+}
+/* 極小的段仍然要看得見、指得到，但寬度不能說謊 —— 只給一個下限，
+   比例本身仍由 flex-grow 決定。 */
+.usageshare__bar .stackbar__seg {
+  min-width: 3px;
+}
+.usageshare__rows {
+  margin-top: 14px;
+  display: grid;
+  gap: 1px;
+}
+/* auto / 1fr / auto / auto：名稱那欄吃掉剩餘寬度並允許收縮（min-width: 0），
+   數字兩欄各自靠自己的內容寬。不用 ch —— 對漢字那是壞的單位，
+   四種語言下固定寬欄位一定歪。 */
+.usageshare__row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: default;
+  transition: background 0.16s ease, opacity 0.16s ease;
+}
+.usageshare__rows[data-hovered="true"] .usageshare__row {
+  opacity: 0.42;
+}
+.usageshare__rows[data-hovered="true"] .usageshare__row[data-active="true"] {
+  opacity: 1;
+  background: var(--surface-sunk);
+}
+.usageshare__row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--lavender-deep);
+}
+.usageshare__swatch {
+  align-self: center;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px 3px 2px 3px;
+}
+.usageshare__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--ink);
+}
+/* 這個數字來自 Codex 個人檔案，不是 proxy 記到的 —— 兩者不是同一種量測，
+   卡片下緣那句註記講的就是它。逐列標出來，讀者才知道哪幾列適用。 */
+.usageshare__source {
+  margin-left: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-ghost);
+}
+.usageshare__share {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--ink);
+}
+.usageshare__tokens {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+}
+@media (max-width: 620px) {
+  /* 窄畫面把絕對數字收到第二行，佔比留在名稱旁邊 —— 先答問題，再給佐證。 */
+  .usageshare__row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+  .usageshare__tokens {
+    grid-column: 2 / -1;
+  }
+}
+
+/* ---------- 壓縮前後對照 ---------- */
+.beforeafter {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 18px;
+  align-items: center;
+}
+.beforeafter__col {
+  text-align: center;
+}
+.beforeafter__arrow {
+  font-size: 20px;
+  color: var(--ink-faint);
+}
+/* 指到任一段時，其餘變淡 —— 讀數列講的是哪一段，圖上就要看得出來。
+   兩條長條都會反應，所以「系統段」在前後兩條同時亮起，對照關係自己浮現。 */
+.stackbar[data-hovered="true"] .stackbar__seg {
+  opacity: 0.3;
+}
+.stackbar[data-hovered="true"] .stackbar__seg[data-active="true"] {
+  opacity: 1;
+}
+.stackbar__seg {
+  transition: opacity 0.16s ease;
+}
+
+.stackbar {
+  display: flex;
+  height: 76px;
+  border-radius: 12px 13px 11px 12px;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--edge), inset 0 1px 3px var(--rim-shade);
+}
+/* 每一段都是可聚焦的按鈕：滑過或 Tab 到它，下面的讀數列就會顯示明細。
+   顏色本身不帶意義（意義在讀數列裡），所以不需要圖例。 */
+.stackbar__seg {
+  display: block;
+  flex-basis: 0;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  cursor: pointer;
+  opacity: 0.58;
+  transition: flex-grow 0.62s cubic-bezier(0.22, 0.86, 0.24, 1),
+    filter 0.16s ease, opacity 0.16s ease;
+}
+.stackbar__seg:hover,
+.stackbar__seg:focus-visible {
+  filter: brightness(1.12) saturate(1.2);
+  outline: none;
+}
+.stackbar__seg:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--lavender-deep);
+}
+/* 有段被指到時，其他段退開 —— 對比讓被指的那段自己浮出來 */
+.stackbar:hover .stackbar__seg:not(:hover) {
+  filter: saturate(0.55) opacity(0.6);
+}
+
+.stackbar-legend {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+.stackbar-legend__item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--ink-soft);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  text-align: left;
+  cursor: pointer;
+}
+.stackbar-legend__item[data-active="true"],
+.stackbar-legend__item:hover,
+.stackbar-legend__item:focus-visible {
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--lavender-deep);
+  outline: none;
+}
+.stackbar-legend__swatch {
+  grid-row: 1 / 3;
+  width: 10px;
+  height: 28px;
+  border-radius: 4px;
+  opacity: 0.72;
+}
+.stackbar-legend__label {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stackbar-legend__value {
+  overflow: hidden;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 900px) {
+  .stackbar-legend {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ---------- 托盤 ----------
+   模型清單這種「數量不固定、可能很長」的東西收進托盤：收起來只佔一行，
+   但數量一定看得到 —— 收合不能把「裡面有沒有東西」也藏掉。 */
+.tray {
+  margin-top: 4px;
+}
+.tray__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink-soft);
+  list-style: none;
+  transition: background-color 0.18s ease;
+}
+.tray__head::-webkit-details-marker {
+  display: none;
+}
+.tray__head:hover {
+  background: var(--surface);
+  color: var(--ink);
+}
+.tray[open] .tray__head {
+  border-radius: 12px 13px 0 0;
+  background: var(--surface);
+}
+
+/* 收合指示：一個小三角，展開時轉 90 度 */
+.tray__chev {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 4.5px 0 4.5px 6px;
+  border-color: transparent transparent transparent var(--ink-faint);
+  transition: transform 0.2s cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+.tray[open] .tray__chev {
+  transform: rotate(90deg);
+}
+
+.tray__label {
+  flex: 1;
+  min-width: 0;
+  /* 注入托盤的標題是終端機的最後一行，長度不受控。收合狀態下它只是個
+     摘要，截斷比換行成三列好 —— 完整的那一行拉開來就在第一眼的位置。 */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* 數量是收合狀態下唯一的資訊，而它疊在雙層 surface 上（托盤頭本身有底色，
+   底下還有卡片），暗色主題量到 4.16:1 —— 升一階。 */
+.tray__count {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+/* 托盤內部是「凹進去的」—— 它在卡片的表面之下 */
+.tray__body {
+  padding: 2px 12px 6px;
+  border-radius: 0 0 12px 13px;
+  background: var(--surface);
+  box-shadow: inset 0 1px 2px var(--rim-shade);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .tray[open] .tray__body {
+    animation: tray-open 0.24s cubic-bezier(0.22, 0.86, 0.24, 1);
+  }
+}
+@keyframes tray-open {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- 壓縮明細：逐條帳 ----------
+   上一版把「原文」與「摘要」做成左右並排的兩張卡。兩邊高度差很大，
+   align-items:start 之下右邊長、左邊短，中間就空出一大片；收合的托盤又只有
+   一行字，整塊看起來是空的。
+
+   改成上下流：原文在上、轉折在中、摘要在下 —— 閱讀順序就是時間順序。
+   而且每一列自己要有資訊量：角色、窺視文字、佔比長條、token 數，四樣東西
+   把一列填滿。列與列之間只用細線分隔，讀起來是一張帳，不是一疊盒子。 */
+.ledger {
+  display: flex;
+  flex-direction: column;
+  margin-top: 4px;
+}
+/* 帳裡的托盤要「平」—— 有底色的盒子疊起來就是上一版那種空洞感 */
+.ledger .tray {
+  margin-top: 0;
+}
+.ledger .tray__head {
+  background: none;
+  box-shadow: none;
+  border-radius: var(--r-sm);
+  padding: 9px 8px;
+}
+.ledger .tray__head:hover {
+  background: var(--surface-sunk);
+}
+.ledger .tray[open] .tray__head {
+  background: none;
+  border-radius: var(--r-sm);
+}
+.ledger .tray + .tray {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 6%,
+      var(--edge) 94%,
+      transparent 100%
+    )
+    1;
+}
+.ledger .tray__body {
+  background: none;
+  box-shadow: none;
+  padding: 0 8px 8px;
+}
+
+.ledger__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+/* 角色欄固定寬，右邊的窺視文字才會對齊成一欄 */
+.ledger__role {
+  flex: none;
+  width: 4.2em;
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-faint);
+}
+.ledger__role--user {
+  color: var(--lavender-ink);
+}
+/* 「工具輸出」是角色，是資訊 —— 不能用只給裝飾的 --ink-ghost
+   （量到 light 3.45:1、dark 2.90:1）。它已經靠字面跟其他角色區分了，
+   不需要再靠變淡來降階。 */
+.ledger__role--tool {
+  color: var(--ink-faint);
+}
+.ledger__peek {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+/* 佔比長條：讓「這條有多重」不用讀數字就看得出來 */
+.ledger__share {
+  flex: none;
+  width: 56px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  overflow: hidden;
+}
+.ledger__share i {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--lavender);
+  opacity: 0.75;
+}
+.ledger--kept .ledger__share i {
+  background: var(--sage);
+}
+
+/* 供應商列（現況頁的漸進揭露）。收合時一列講完：誰、什麼狀態、端點。 */
+.prov {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 0;
+}
+.prov__name {
+  flex: none;
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+/* 狀態筆畫在這裡不需要再撐一行的高度 */
+.prov .state {
+  flex: none;
+  font-size: 12.5px;
+  padding-bottom: 5px;
+}
+.prov__host {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  text-align: right;
+}
+
+/* 原文用等寬並保留換行 —— 工具輸出的排版本身就是資訊 */
+.ledger__text {
+  margin: 2px 0 4px;
+  padding: 12px 14px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 1px 2px var(--rim-shade);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+/* 原文 → 摘要 的轉折。一行字加兩道線，讓上下兩塊有明確的因果方向。 */
+.turn {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 6px 0;
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+.turn::before,
+.turn::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: linear-gradient(90deg, transparent, var(--edge) 30%, var(--edge) 70%, transparent);
+}
+
+/* ---------- 供應商一列（現況頁的漸進揭露）----------
+   收合時這一行要講完「誰、什麼狀態、在哪」。Today.tsx 早就在用這幾個
+   類別了，但 CSS 一直沒補 —— 跟當初 .detect__row 一樣的漏。 */
+.prov {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  flex: 1;
+  min-width: 0;
+}
+.prov__name {
+  flex: none;
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+/* 端點是最不需要立刻讀到的一項，所以它負責被截斷 */
+.prov__host {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  text-align: right;
+}
+/* 筆畫狀態在這一行裡不需要額外下方留白 */
+.prov .state {
+  padding-bottom: 5px;
+  font-size: 13px;
+}
+@media (max-width: 860px) {
+  .prov__host {
+    display: none;
+  }
+}
+
+/* ---------- 結構化摘要 ----------
+   摘要有 17 個欄位，不是一段散文。照欄位排、空欄位不出現 ——
+   一個空的「卡住」標題比沒有標題更糟。兩欄流式排列，短欄位不會各佔一整行。 */
+.summary {
+  columns: 2;
+  column-gap: 26px;
+}
+@media (max-width: 900px) {
+  .summary {
+    columns: 1;
+  }
+}
+.summary__group {
+  break-inside: avoid;
+  margin-bottom: 15px;
+}
+.summary__label {
+  margin: 0 0 5px;
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+.summary__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.summary__list li {
+  position: relative;
+  padding-left: 14px;
+  font-size: 13px;
+  line-height: 1.72;
+  color: var(--ink);
+}
+/* 項目符號是一筆短線，不是圓點 —— 跟卡片裡其他的點區分開 */
+.summary__list li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.72em;
+  width: 6px;
+  height: 1px;
+  background: var(--lavender);
+  opacity: 0.7;
+}
+
+/* ---------- 長條的讀數列 ----------
+   滑過（或鍵盤聚焦）任一段，下面這一列即時顯示那一段的明細。
+   做成固定高度的讀數列而不是浮動 tooltip：不會被卡片邊緣裁掉、
+   不會擋住底下的東西、鍵盤使用者也拿得到，而且不造成版面跳動。 */
+.readout {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-height: 46px;
+  margin-top: 14px;
+  padding: 10px 15px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-size: 13px;
+}
+.readout__swatch {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px 3px 2px 3px;
+}
+.readout__label {
+  flex: none;
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: var(--ink);
+}
+.readout__stat {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+}
+.readout__note {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+}
+.readout--idle .readout__label,
+.readout--idle .readout__note {
+  color: var(--ink-faint);
+}
+
+/* ---------- 固定欄位列 ----------
+   記號欄寬度釘死，名稱才不會被「已探測 / 需補充」的字數差推著跑。
+   這個毛病在探測結果與 ChatGPT 帳號清單都出現過 —— 同一個解法兩邊共用。 */
+.kv {
+  display: grid;
+  grid-template-columns: 5.6em minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 9px 13px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-size: 13px;
+}
+.kv + .kv {
+  margin-top: 7px;
+}
+.kv__mark {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.kv__label {
+  color: var(--ink-soft);
+  min-width: 0;
+}
+/* 值可能是端點網址或授權碼 —— 給它換行的權利，不要讓它撐破卡片 */
+.kv__value {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .kv {
+    grid-template-columns: 5.6em minmax(0, 1fr);
+  }
+  .kv__value {
+    grid-column: 1 / -1;
+    text-align: left;
+  }
+}
+
+/* 帳號列：狀態靠左固定寬、動作一律靠右。
+   「改用這個」只在非預設帳號出現，不釘住位置的話每一列的按鈕都會錯開。 */
+.acct {
+  display: grid;
+  /* 「使用 Reset」那一欄沒有了 —— 動作回到每一張券自己那一列。Reset 那格
+     改成 minmax：出錯時裡面會多一顆重試按鈕，釘死寬度會把它擠出去。 */
+  grid-template-columns: 5.6em minmax(13em, 16em) minmax(6.8em, auto) 8.2em 5.4em;
+  gap: 12px;
+  align-items: center;
+  justify-content: end;
+}
+.acct__actions {
+  display: contents;
+}
+.acct .btn,
+.acct .pill {
+  justify-content: center;
+  white-space: nowrap;
+}
+/* 一個帳號有幾條上限就列幾條，短的在上面。ChatGPT 的 5 小時視窗與每週
+   視窗會同時見效，只顯示其中一條就會出現「還剩八成卻送不出去」。 */
+.acct__quota {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.acct__quota-window {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+/* 位置固定，份量跟著實情走：剩最少的那一條是現在擋著你的，其餘退一階。
+   把大字釘在第一列會在週視窗見底、5 小時剛重置時指錯人。 */
+.acct__quota-window:not(.acct__quota-window--lead) .acct__quota-line strong {
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.acct__quota-window:not(.acct__quota-window--lead) .meter {
+  height: 5px;
+  opacity: 0.72;
+}
+.acct__quota-line {
+  display: grid;
+  grid-template-columns: 3.2em minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+}
+.acct__quota-line strong {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums lining-nums;
+  color: var(--ink);
+}
+.acct__quota .meter {
+  height: 7px;
+  margin-top: 0;
+}
+/* 不釘 nowrap：視窗長度加重置時刻，換成英文或日文就是一整句，
+   釘住不折行的結果是它長到欄位外面去。 */
+.acct__quota small {
+  font-family: var(--font-display);
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--ink-faint);
+}
+
+.runtime-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 10.5em;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+}
+.runtime-control__copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.runtime-control > .btn {
+  width: 100%;
+  justify-content: center;
+}
+@media (max-width: 760px) {
+  .runtime-control {
+    grid-template-columns: 1fr;
+  }
+  .runtime-control > .btn {
+    width: auto;
+    justify-self: start;
+  }
+}
+@media (max-width: 1120px) {
+  .acct {
+    grid-template-columns: 5.6em minmax(0, 1fr);
+  }
+  .acct__actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+}
+
+/* ---------- 監看板 ----------
+   一家供應商一條。欄位釘死，好幾家疊起來才掃得動：
+     誰 / 跑什麼模型 / 額度 / 數字
+   沒在服務的整條退到 55% —— 不隱藏（你仍然要知道它在那裡），
+   但也不准它跟正在服務的搶注意力。 */
+.watch {
+  display: flex;
+  flex-direction: column;
+  margin-top: 6px;
+}
+/* 動作獨立一欄、寬度釘死，每一列的按鈕才會對齊成一直行。
+   把按鈕塞進額度欄會讓它跟著百分比的字數左右浮動 —— 那正是之前
+   探測結果與帳號清單踩過的同一個坑。 */
+.watch__row {
+  display: grid;
+  grid-template-columns: minmax(11em, 1.1fr) minmax(0, 1.6fr) 15em 6.4em;
+  gap: 16px;
+  align-items: center;
+  padding: 13px 4px;
+}
+.watch__act {
+  display: flex;
+  justify-content: flex-end;
+}
+.watch__row + .watch__row {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 4%,
+      var(--edge) 96%,
+      transparent 100%
+    )
+    1;
+}
+.watch__row[data-serving="false"] {
+  opacity: 0.55;
+}
+
+/* 工作階段清單的搜尋。推到標題那一列的右端，寬度隨容器縮 ——
+   不用 ch 給寬度：同樣的 20ch 在四種語言下是四種寬度。 */
+.sessionsearch {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  flex: 0 1 22em;
+  min-width: 9em;
+}
+.sessionsearch__field {
+  padding: 7px 30px 7px 12px;
+  font-size: 12.5px;
+}
+/* Safari／Chrome 給 type=search 的原生清除鍵不吃主題的顏色，關掉它，
+   自己畫一顆 —— 讀屏軟體也才有名字可以念。 */
+.sessionsearch__field::-webkit-search-cancel-button {
+  display: none;
+}
+.sessionsearch__clear {
+  position: absolute;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: none;
+  color: var(--ink-faint);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.sessionsearch__clear:hover {
+  color: var(--ink);
+  background: var(--surface-sunk);
+}
+
+/* 「上下文」頁把工作階段列當成可挑選的項目。整列是一顆按鈕，不是列裡放一顆
+   按鈕——可點的範圍要跟看起來可點的範圍一樣大。 */
+/* 可選的清單往外長，讓每一列的內距吃掉的是卡片邊距，不是文字的位置。
+   只加內距的話，列裡的標題會比上面那排「工作階段」欄名多縮 16px，一整欄
+   看起來是歪的；把清單同量往外推，反白與標記線得到餘裕，文字仍與欄名對齊。 */
+.watch--picklist {
+  margin-inline: -16px -12px;
+}
+
+.watch__row--pick {
+  width: 100%;
+  /* 這個變體會被選、會反白、左緣還會多一道標記線，所以它需要比唯讀的
+     `.watch__row` 更寬的內距：4px 的時候標題等於貼著標記線長出來，選中
+     的那一列讀起來像被擠到牆角。右邊也一起放寬，否則反白的底色會在右
+     端切齊文字，看起來像沒填滿。 */
+  padding-inline: 16px 12px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.watch__row--pick:hover {
+  background: var(--surface-sunk);
+}
+/* 選中的那一列用左緣一道實線標記，不用整列反白：反白會蓋掉列內用底色表達的
+   用量條，那條才是這頁真正要讀的東西。 */
+.watch__row--pick[data-picked="true"] {
+  background: var(--surface-sunk);
+  box-shadow: inset 2px 0 0 var(--accent-from);
+}
+
+.watch__who {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+}
+.watch__name {
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--ink);
+  /* 一列就是一行。`sessionLabel` 是按字數截的，而 16 個漢字的寬度是 16 個
+     拉丁字母的兩倍 —— 光靠字數擋不住換行，列高就會參差，清單也就不好掃了。
+     真正該決定截在哪裡的是寬度，交給 CSS。
+     （能生效是因為 .watch__who 有 min-width: 0，grid 子項少了它不會縮。） */
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 同一家可能同時被兩個 session 用不同模型打 —— 這一欄才是多 session 的重點 */
+.watch__models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+.watch__model {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  color: var(--ink-soft);
+}
+
+.watch__quota {
+  display: grid;
+  grid-template-columns: 3.2em 1fr;
+  grid-template-areas: "pct bar" "reset reset";
+  gap: 4px 9px;
+  align-items: center;
+}
+.watch__pct {
+  grid-area: pct;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.watch__bar {
+  position: relative;
+  grid-area: bar;
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 1px 1px var(--rim-shade);
+  overflow: hidden;
+}
+.watch__bar > i {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--apricot), var(--honey));
+}
+/* 壓縮門檻的刻度。跟指標卡上的 .meter__mark 同一個做法 ——
+   「還差多遠」是空間關係，寫成數字等於要人自己心算。 */
+.watch__bar > b {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ink-soft);
+  opacity: 0.5;
+}
+.watch__reset {
+  grid-area: reset;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+.watch__err {
+  color: var(--crit-ink);
+  font-size: 12px;
+}
+
+/* 待生效的補救說明跨滿整列，不要擠進上面任何一欄 */
+.watch__remedy {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--warn-ink);
+}
+
+@media (max-width: 1100px) {
+  .watch__row {
+    grid-template-columns: minmax(9em, 1fr) minmax(0, 1fr) 12em 6.4em;
+  }
+}
+@media (max-width: 780px) {
+  .watch__row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+}
+
+/* ---------- 模型選單的勾選表 ----------
+   欄位釘死：勾 / 模型 id / 視窗 / 能力。原本是一排裸 checkbox 加 <code>，
+   每個模型名稱長度不同就整排歪掉。 */
+.menu {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 4px;
+}
+.menu__row {
+  display: grid;
+  /* The last column holds every trailing button (verify / rename / vision) as
+     one flex group, not one grid column per button — the verify button only
+     renders for OpenCode Zen models still awaiting capability verification,
+     and a fixed column count sized for the common case silently dropped it
+     onto its own wrapped row whenever it appeared. */
+  /* 視窗那一欄比別欄寬，因為它多掛了一支就地編輯的鉛筆。留在同一欄裡而不是
+     另開一欄：多一欄會讓沒有鉛筆的那幾種列（未進目錄的模型）空出一格。 */
+  grid-template-columns: 18px minmax(0, 1fr) 11.5em 8.5em auto;
+  gap: 12px;
+  align-items: center;
+  padding: 9px 4px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background-color 0.16s ease;
+}
+.menu__row:hover {
+  background: var(--surface-sunk);
+}
+.menu__row + .menu__row {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 4%,
+      var(--edge) 96%,
+      transparent 100%
+    )
+    1;
+}
+/* The checkbox and the model id belong to one label, but must still sit in the
+   row grid as if they were direct children. */
+.menu__pick {
+  display: contents;
+  cursor: pointer;
+}
+/* One grid cell holding every trailing button, however many render — see the
+   comment on .menu__row's grid-template-columns. */
+.menu__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.menu__box {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent-to);
+  cursor: pointer;
+}
+.menu__vision {
+  /* Body font, not mono: this is a word (圖片 / 画像 / Images), not a code
+     token, and --font-mono is a Latin-only stack whose CJK fallback is
+     whatever the OS picks — which is how you end up with Japanese text in
+     Chinese glyph forms. The row's other mono cells are ASCII only. */
+  font-family: var(--font-body);
+  font-size: 11.5px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--edge);
+  background: none;
+  color: var(--ink-faint);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    color 0.16s ease,
+    border-color 0.16s ease,
+    background-color 0.16s ease;
+}
+.menu__vision:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+.menu__vision[aria-pressed="true"] {
+  color: var(--accent-to);
+  border-color: var(--accent-to);
+  background: color-mix(in srgb, var(--accent-to) 12%, transparent);
+}
+.menu__vision:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+/* Takes the id cell's grid slot while editing, so the row does not reflow. */
+.menu__rename {
+  grid-column: 2;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 4px 8px;
+}
+.rename {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 14px;
+}
+.rename__label {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.rename__current {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--ink);
+  background: none;
+  padding: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 26em;
+}
+.rename__input {
+  flex: 1 1 12em;
+  min-width: 8em;
+  max-width: 22em;
+  padding: 5px 9px;
+  font-size: 12.5px;
+}
+/* Full-width so the hint never squeezes the controls onto separate lines. */
+.rename__hint {
+  flex-basis: 100%;
+  margin: 0;
+}
+.rename__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+/* Holds the id and its optional Free badge as one grid cell — see the
+   comment where this wraps `.menu__id` in Models.tsx. */
+.menu__id-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.menu__id {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: none;
+  padding: 0;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* 沒勾的模型整列退一階 —— 一眼看出「這些不會出現在選單裡」 */
+.menu__row:has(.menu__box:not(:checked)) .menu__id {
+  color: var(--ink-faint);
+}
+.menu__win,
+.menu__caps {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* 數字靠右、鉛筆貼在數字後面。用 flex 而不是靠 text-align，因為鉛筆是按鈕，
+   要能單獨吃到 focus ring 而不撐開整列高度。 */
+.menu__win {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+/* 手動指定過的視窗值要看得出來是人設的，但不該喊。改用實心的墨色＋一條細底線，
+   而不是換顏色——換顏色會跟表裡「有問題」的黃色搶語意。 */
+.menu__winval[data-manual="true"] {
+  color: var(--ink);
+  border-bottom: 1px dashed var(--edge);
+}
+.menu__pencil {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--ink-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    background 120ms ease;
+}
+/* 平常收起來，滑到那一列或用鍵盤移進去才浮出：每一列都掛一支鉛筆的話，整張表
+   會變成一排圖示，讀不到真正的內容。 */
+.menu__row:hover .menu__pencil,
+.menu__pencil:focus-visible,
+.menu__pencil[disabled] {
+  opacity: 1;
+}
+.menu__pencil:hover:not([disabled]) {
+  color: var(--ink);
+  background: var(--surface);
+}
+.menu__pencil[disabled] {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.menu__winput {
+  width: 100%;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 3px 6px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.menu__diagnostic {
+  grid-column: 2 / -1;
+  grid-row: 2;
+  color: var(--warn-ink);
+  font-size: 11.5px;
+  line-height: 1.5;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.menu__foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 4%,
+      var(--edge) 96%,
+      transparent 100%
+    )
+    1;
+}
+@media (max-width: 900px) {
+  .menu__row {
+    grid-template-columns: 18px minmax(0, 1fr) 9.5em auto;
+  }
+  .menu__caps {
+    display: none;
+  }
+}
+
+/* ---------- 各 Provider 審查次數 ----------
+   欄寬釘死，數字欄靠右。表頭一次講完欄位，不在每一格重複標籤 ——
+   每列都掛「主要」「備援」兩個小字，那是把表頭的工作攤到每一格去做。 */
+.revstat {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.revstat__col-count {
+  width: 5.2em;
+}
+.revstat__col-time {
+  width: 7em;
+}
+.revstat th {
+  padding: 10px 2px 8px;
+  font-family: var(--font-display);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+  text-align: left;
+}
+.revstat th:not(:first-child),
+.revstat td:not(:first-child) {
+  text-align: center;
+}
+.revstat td {
+  padding: 10px 2px;
+  vertical-align: baseline;
+}
+.revstat tbody tr {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 4%,
+      var(--edge) 96%,
+      transparent 100%
+    )
+    1;
+}
+.revstat__who {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+.revstat__name {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.revstat__model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.revstat__n {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+.revstat__n--bad {
+  color: var(--crit-ink);
+}
+.revstat__when {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+@media (max-width: 820px) {
+  .revstat__col-count {
+    width: 4.6em;
+  }
+  .revstat__col-time,
+  .revstat th:last-child,
+  .revstat td:last-child {
+    display: none;
+  }
+}
+
+/* ---------- 分頁 ---------- */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 6%,
+      var(--edge) 94%,
+      transparent 100%
+    )
+    1;
+}
+.pager__at {
+  font-family: var(--font-display);
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.pager__at b {
+  font-weight: 700;
+  color: var(--ink);
+}
+.pager__total {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* ---------- 用量熱區圖 ----------
+   一欄一週、一列一個星期幾。三種模式共用同一個格陣：每日看深淺、
+   每週與累計看「由下往上填幾格」。共用格陣讓切換時格子位置不動，
+   眼睛不用重新找基準。
+
+   色階四階固定門檻，不用連續漸層 —— 人眼分不出連續灰階的細微差。
+   色相走薰衣草（主色）：這是「用量」不是「狀態」，不該用訊號色。 */
+.heat {
+  --heat-gap: clamp(2px, 0.32vw, 5px);
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  overflow: visible;
+  padding-top: 14px;
+  padding-bottom: 0;
+}
+
+.heat__body {
+  position: relative;
+  min-width: 0;
+  width: 100%;
+}
+.heat__grid {
+  display: grid;
+  grid-template-rows: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--heat-columns), minmax(0, 1fr));
+  grid-auto-flow: column;
+  gap: var(--heat-gap);
+}
+
+.heat__cell {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 5px;
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--edge) 72%, transparent);
+  cursor: pointer;
+  transform-origin: center bottom;
+}
+.heat__cell--void {
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--edge) 72%, transparent);
+  cursor: default;
+}
+.heat__cell[data-level="1"] {
+  background: color-mix(in srgb, var(--accent-to) 32%, var(--surface-sunk));
+  box-shadow: none;
+}
+.heat__cell[data-level="2"] {
+  background: color-mix(in srgb, var(--accent-to) 54%, var(--surface-sunk));
+  box-shadow: none;
+}
+.heat__cell[data-level="3"] {
+  background: color-mix(in srgb, var(--accent-to) 76%, var(--surface-sunk));
+  box-shadow: none;
+}
+.heat__cell[data-level="4"] {
+  background: var(--accent-to);
+  box-shadow: none;
+}
+/* 每日模式只標示該日；每週與累計模式才標示整欄。 */
+.heat__cell[data-on="true"] {
+  box-shadow: 0 0 0 1.5px var(--accent-to);
+}
+
+/* 由左往右的波浪。
+   換模式時整個格陣重新掛載（key 綁 mode），所以這個動畫會重跑一次。
+   延遲綁在「欄」而不是「格」上：同一欄同時動，波才是一道直的鋒面
+   而不是一團雜訊。 */
+@media (prefers-reduced-motion: no-preference) {
+  .heat__grid .heat__cell {
+    animation: heat-wave 0.62s cubic-bezier(0.22, 0.86, 0.24, 1) backwards;
+    animation-delay: calc(var(--col) * 18ms);
+  }
+}
+@keyframes heat-wave {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.62);
+  }
+  58% {
+    opacity: 1;
+    transform: translateY(-4px) scale(1.08);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 月份軸。欄距與格陣完全一致，標籤才會落在該月第一欄的正上方。 */
+.heat__months {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-columns: repeat(var(--heat-columns), minmax(0, 1fr));
+  gap: var(--heat-gap);
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--ink-faint);
+}
+.heat__months span {
+  white-space: nowrap;
+  /* 讓標籤可以溢出自己那一欄，否則 13px 寬裝不下「10月」 */
+  overflow: visible;
+}
+
+/* 模式切換：每日 / 每週 / 累計 */
+.heat__modes {
+  display: flex;
+  gap: 18px;
+  margin-left: auto;
+}
+.heat__mode {
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 2px 0;
+  border-radius: 0;
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  transition: color 0.16s ease;
+}
+.heat__mode:hover {
+  color: var(--ink);
+  background: none;
+}
+.heat__mode[aria-pressed="true"] {
+  color: var(--ink);
+  font-weight: 700;
+  background: none;
+}
+
+.heat__head {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+.heat__head--after-stats {
+  margin-top: 22px;
+}
+.heat__plot {
+  margin-top: 4px;
+}
+.heat__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 750;
+  color: var(--ink);
+}
+
+.heat__tooltip {
+  position: absolute;
+  z-index: 4;
+  top: -36px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  max-width: 260px;
+  padding: 8px 12px;
+  border: 1px solid var(--edge-strong);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 12px;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.heat__tooltip strong {
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .heat {
+    --heat-gap: 2px;
+  }
+}
+
+/* ---------- 用量統計列 ----------
+   五個數字一排，中間用細線分隔。數字在上、標籤在下 ——
+   掃的是數字，標籤只在需要確認時才讀。 */
+.stats {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  border-radius: var(--r-md);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  overflow: hidden;
+}
+.stats__cell {
+  padding: 10px 14px;
+  text-align: center;
+  min-width: 0;
+}
+.stats__cell + .stats__cell {
+  border-left: 1px solid var(--edge);
+}
+.stats__num {
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums lining-nums;
+  line-height: 1.25;
+}
+.stats__label {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.usage-card {
+  padding-top: 20px;
+  padding-bottom: 20px;
+}
+@media (max-width: 900px) {
+  .stats {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(2, 1fr);
+    grid-auto-columns: auto;
+  }
+  .stats__cell + .stats__cell {
+    border-left: none;
+    box-shadow: inset 0 1px 0 var(--edge);
+  }
+}
+
+/* ---------- 請求列 ----------
+   欄位釘死才對得齊：時間 / 供應商·模型 / token / 耗時 / 狀態。
+   錯誤訊息換到第二行 —— 塞在同一行會把整列撐爆（上游的錯誤字串可以很長）。
+
+   供應商·模型欄以前是無上限的 1fr，一整列 1116px 常常有 600px+ 是空白，
+   同時 connection／帳號 A·B／子代理數這些短資訊卻各自佔一整行 ——
+   一筆請求因此從 43px 長到 100px 以上。現在幫這欄設上限，多出來的寬度
+   讓給第六欄 `.req__extra`：那些短資訊改成同一列内的 flex 群組，
+   擠不下才換行，而不是預設就各自另起一行。 */
+.req {
+  display: grid;
+  grid-template-columns: 4.6em minmax(0, 260px) 8.4em 4.2em 4.6em minmax(0, 1fr);
+  gap: 4px 12px;
+  align-items: baseline;
+  padding: 10px 2px;
+  font-size: 13px;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 2.8rem;
+}
+/* 同一列內的次要資訊（串流品質、connection、帳號 A·B、子代理數）——
+   跟 .req__meta 的差別只在於「放進哪個容器」：這裡是 flex，
+   所以裡面照樣用 .req__meta／.req__quality，grid-column 對 flex
+   子項不生效，樣式不用重寫一份。 */
+.req__extra {
+  grid-column: 6;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-width: 0;
+}
+/* 系統事件的壓縮列。欄位不是請求列那一組：沒有耗時，而且多一段完整句子
+   的明細。所以每一格都指定位置，沒有一格靠自動排位 —— 原因欄不是每一列
+   都有，交給自動排位就會讓明細跳格，而那正是它原本擠在 4.6em 裡的原因。 */
+.req--event {
+  /* 最後一欄吃掉剩下的寬度。不是為了原因欄——它常常是空的——而是為了
+     底下那行明細：它 `grid-column: 1 / -1`，格線沒有 1fr 的話整個 grid
+     只有內容那麼寬，明細就會提早折行，右邊留一片沒人用的空白。 */
+  grid-template-columns: 4.6em minmax(0, 150px) 9.6em 6em minmax(0, 1fr);
+}
+.req--event .req__time { grid-column: 1; }
+.req--event .req__who { grid-column: 2; }
+.req--event .req__tok { grid-column: 3; }
+.req--event .req__status {
+  grid-column: 4;
+  text-align: left;
+}
+/* 原因是這一列的一個欄位，不是另起一行的註腳 —— 覆蓋 .req__meta 的
+   `grid-column: 2 / -1`。 */
+.req--event .req__meta {
+  grid-column: 5;
+  margin-top: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 明細是一段句子，只有一種讀法：整列寬，遇到邊界就折行。 */
+.req__detail {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.req + .req {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 4%,
+      var(--edge) 96%,
+      transparent 100%
+    )
+    1;
+}
+.req__time {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.req__who {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.req__model {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  margin-left: 7px;
+}
+.req__tok,
+.req__dur {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--ink-soft);
+}
+.req__status {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+.req__status--ok {
+  color: var(--ink-faint);
+}
+.req__status--bad {
+  color: var(--crit-ink);
+}
+/* subagent run 狀態：只有真的 completed 才給肯定色 —— requested／running／
+   ambiguous／unlinked 一律是「還沒有答案」，failed／cancelled 是「壞了」，
+   兩者都不能跟 completed 撞色。 */
+.req__status--good {
+  color: var(--ok-ink);
+}
+.req__status--warn {
+  color: var(--warn-ink);
+}
+/* 錯誤自己一行，跨滿整列，最多兩行後截斷 —— 完整內容留在 title */
+.req__err {
+  grid-column: 2 / -1;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--crit-ink);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.req__meta {
+  grid-column: 2 / -1;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+/* .req__extra 是 flex，不是 grid —— 裡面的 .req__meta 不吃上面那條
+   grid-column 規則（對 flex 子項無效），這裡只補一個 flex 情境才需要的
+   nowrap，讓每個小徽章自己別在行內斷字。 */
+.req__extra .req__meta {
+  margin-top: 0;
+  white-space: nowrap;
+}
+.req__extra .req__quality {
+  white-space: nowrap;
+}
+.req__meta--subagents {
+  color: var(--accent-from);
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.req__meta--subagents:hover {
+  text-decoration: underline;
+}
+.req__cached {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+/* 串流品質徽章：與 transport outcome（req__status）分開顯示。品質差
+   不一定代表請求失敗——end_flush 的 transport 可以成功，但串流資格
+   不合格。incremental 給肯定色；其餘一律警告色，不跟 status 混淆。 */
+.req__quality {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+.req__quality--incremental {
+  color: var(--ok-ink);
+}
+.req__quality--end_flush,
+.req__quality--buffered,
+.req__quality--no_delta {
+  color: var(--warn-ink);
+}
+@media (max-width: 900px) {
+  .req {
+    grid-template-columns: 4.6em minmax(0, 1fr) 4.6em;
+  }
+  .req__tok,
+  .req__dur {
+    display: none;
+  }
+  /* 第六欄在窄版不存在了，次要資訊改回自己一行 —— 橫向空間不夠時，
+     跟其他欄擠在同一行反而更難讀。 */
+  .req__extra {
+    grid-column: 1 / -1;
+    margin-top: 2px;
+  }
+  /* 事件列窄版收成三欄。token 變化是這一列的主要數字，不能跟請求列的
+     耗時一起被藏掉；outcome 與原因退到第二排。 */
+  .req--event {
+    grid-template-columns: 4.6em minmax(0, 1fr) 9.6em;
+  }
+  .req--event .req__tok {
+    display: block;
+    grid-column: 3;
+    text-align: right;
+  }
+  .req--event .req__status {
+    grid-column: 2;
+  }
+  .req--event .req__meta {
+    grid-column: 3;
+    text-align: right;
+  }
+}
+
+/* ---------- Subagent run（可展開的時間軸） ----------
+   一個 run 一列，用原生 <details> —— 展開／收合的可及性、鍵盤操作跟 .tray
+   同一套道理，不用自己接 state。收起來時看到的只有真實狀態（見上面
+   .req__status--good / --warn / --bad 的配色規則）；展開才看到
+   requested → child → completed 的時間軸，以及各步驟自己的成敗色。 */
+.subrun {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 4%,
+      var(--edge) 96%,
+      transparent 100%
+    )
+    1;
+}
+.subrun:first-child {
+  border-top: none;
+}
+.subruns__stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.subruns__stat--good {
+  color: var(--ok-ink);
+}
+.subruns__stat--warn {
+  color: var(--warn-ink);
+}
+.subruns__stat--bad {
+  color: var(--crit-ink);
+}
+.subrun__summary {
+  display: grid;
+  grid-template-columns: 12px 4.6em minmax(0, 1fr) 8.4em 4.2em 5.6em;
+  gap: 12px;
+  align-items: baseline;
+  padding: 10px 2px;
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+.subrun__provider {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subrun__summary::-webkit-details-marker {
+  display: none;
+}
+.subrun__chev {
+  align-self: center;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 4.5px 0 4.5px 6px;
+  border-color: transparent transparent transparent var(--ink-faint);
+  transition: transform 0.2s cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+.subrun[open] .subrun__chev {
+  transform: rotate(90deg);
+}
+.subrun__body {
+  padding: 2px 2px 12px 24px;
+}
+.subrun__timeline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.subrun__timeline-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.subrun__arrow {
+  color: var(--ink-faint);
+}
+.subrun__step {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+.subrun__step--neutral {
+  color: var(--ink-faint);
+}
+.subrun__step--done {
+  color: var(--ok-ink);
+}
+.subrun__step--pending {
+  color: var(--warn-ink);
+}
+.subrun__step--bad {
+  color: var(--crit-ink);
+}
+.subrun__meta {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.subrun__locate {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent-from);
+  cursor: pointer;
+}
+.subrun__locate:hover {
+  text-decoration: underline;
+}
+
+/* Desktop-native sub-agent capability. This is deliberately an app/runtime
+   status, not a standalone `codex --version` warning. */
+.subagent-capability {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--edge);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  font-size: 12px;
+}
+.subagent-capability__state {
+  font-weight: 700;
+}
+.subagent-capability--ready .subagent-capability__state {
+  color: var(--ok-ink);
+}
+.subagent-capability--blocked .subagent-capability__state {
+  color: var(--crit-ink);
+}
+.subagent-capability__detail {
+  color: var(--ink-faint);
+}
+@media (max-width: 900px) {
+  .subrun__summary {
+    grid-template-columns: 12px 4.6em minmax(0, 1fr) 5.6em;
+  }
+  .subrun__summary .req__tok {
+    display: none;
+  }
+  .subrun__provider {
+    display: none;
+  }
+}
+
+/* ---------- 空狀態 ---------- */
+.empty {
+  text-align: center;
+  padding: 34px 20px;
+  color: var(--ink-faint);
+  font-size: 13.5px;
+}
+/* 這個符號不帶資訊（意思在下面那句話裡），所以在 JSX 標了 aria-hidden；
+   但它畢竟是畫出來的字，還是給它過得了 AA 的顏色。 */
+.empty__glyph {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 24px;
+  color: var(--ink-faint);
+}
+
+/* ---------- 走勢圖 ---------- */
+.spark {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+}
+/* ============================================================
+   初次設定 —— 一張犢皮紙
+   ------------------------------------------------------------
+   vellum ＝ 犢皮紙。寫滿了就把字刮掉重寫（palimpsest），刮不乾淨
+   的舊字跡會從底下透出來 —— 那正是這個程式對上下文做的事。
+
+   所以這裡不做精靈，做那張紙：四幕寫在同一張紙上，刮掉的字留在
+   左頁邊，沒寫的地方是空白格線。進度因此不需要 stepper，品牌
+   因此不需要 logo —— 紙、格線、刮痕與襯線就是品牌。
+
+   排版慣例全部用真的：folio（葉碼）、marginalia（眉批）、
+   register（登記簿）、glossary（詞條）、colophon（牌記）。
+   每一個都比它取代掉的那個範本元件更貼近語意 ——
+   三個並排的卡片沒有閱讀順序，眉批有主從。
+
+   動態：字由左往右揭開（寫字的方向），刮痕由左往右畫過。
+   全部只在換幕時發生一次，到位後靜止 —— base.css 已經為了對比度
+   把散景光斑改成靜止的，同一條紀律在這裡也成立。
+   ============================================================ */
+
+.sheet {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: [margin] 158px [text] minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  column-gap: 46px;
+  height: 100%;
+  max-width: 1140px;
+  margin: 0 auto;
+  padding: 0 var(--pad-x);
+}
+
+/* ---------- 語言 ----------
+   絕對定位，不進網格：它是一個在正文開始之前就要處理掉的選擇，
+   不該把大字的版面往下推。只在序幕出現。 */
+.sheet__lang {
+  position: absolute;
+  z-index: 2;
+  top: 30px;
+  right: var(--pad-x);
+}
+
+.langpick {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-faint);
+  transition: color 0.18s ease;
+}
+.langpick:hover {
+  color: var(--ink-soft);
+}
+
+/* 語意留給原生 select，外觀全部自己來。 */
+.langpick select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 5px 19px 5px 2px;
+  font-family: var(--font-body);
+  font-size: 12.5px;
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-color: var(--edge);
+  text-underline-offset: 5px;
+}
+/* 展開的清單是作業系統畫的，繼承不到頁面的色 —— 要明寫，
+   否則深色主題下會是白底黑字的一塊。 */
+.langpick option {
+  background: var(--surface-solid);
+  color: var(--ink);
+}
+
+/* 箭頭用兩條邊框轉 45 度畫，不用字符也不用 SVG ——
+   currentColor 才跟得上 hover 與明暗主題。 */
+.langpick::after {
+  content: "";
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  border-right: 1.4px solid currentColor;
+  border-bottom: 1.4px solid currentColor;
+  transform: translateY(-72%) rotate(45deg);
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+/* ---------- 左頁邊 ----------
+   手稿的頁邊與版心之間有一道界欄。做成上下淡出的漸層而不是實線 ——
+   實線是家具，淡出的線是畫上去的。 */
+.sheet__margin {
+  position: relative;
+  grid-column: margin;
+  padding-top: 78px;
+}
+.sheet__margin::after {
+  content: "";
+  position: absolute;
+  top: 66px;
+  bottom: 26px;
+  right: -23px;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--edge) 12%,
+    var(--edge) 72%,
+    transparent 100%
+  );
+}
+
+.sheet__text {
+  grid-column: text;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 78px 0 52px;
+  display: flex;
+  flex-direction: column;
+  gap: 34px;
+}
+
+.sheet__error {
+  margin: 0;
+}
+
+/* 頁腳。橫過整張紙的收尾線，兩端淡出。 */
+.sheet__foot {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 15px 0 20px;
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--edge) 14%,
+      var(--edge) 86%,
+      transparent 100%
+    )
+    1;
+}
+.sheet__forward {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+}
+
+/* 回上一幕做成文字不做成按鈕。一屏兩顆同重量的按鈕會讓人先停下來
+   比較，而這裡沒有東西需要比較 —— 只有一個方向是往前的。 */
+.sheet__back {
+  border: none;
+  background: none;
+  padding: 5px 2px;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+  cursor: pointer;
+  text-decoration-line: underline;
+  text-decoration-color: var(--edge);
+  text-underline-offset: 5px;
+  transition: color 0.18s ease, text-decoration-color 0.18s ease;
+}
+.sheet__back:hover {
+  color: var(--ink-soft);
+  text-decoration-color: var(--ink-ghost);
+}
+
+.sheet__aside {
+  max-width: 22em;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--ink-faint);
+}
+
+/* ============================================================
+   頁邊：重寫本
+   ------------------------------------------------------------
+   這是進度，但它不是 stepper。差別在還沒發生的那幾幕**讀不到**：
+   stepper 把四個標籤一次攤開，這張紙只顯示寫過的字。
+
+   空白格線仍然回答「還有幾步」—— 那是使用者真正需要的那半個資訊。
+   另外半個（下一步叫什麼）本來就該留到下一步。
+   ============================================================ */
+.palimpsest {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* 每一行一個固定的行高，整疊才讀得出「這是格線」。 */
+.palimpsest__line,
+.palimpsest__unwrit {
+  position: relative;
+  height: 52px;
+}
+
+/* 還沒寫到的：只剩格線。線收在右側 68%，因為手寫的行不會頂到頁緣。 */
+.palimpsest__unwrit::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 32%;
+  bottom: 15px;
+  height: 1px;
+  background: var(--edge);
+  opacity: 0.72;
+}
+
+.palimpsest__hit {
+  display: flex;
+  align-items: baseline;
+  gap: 11px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  text-align: left;
+  cursor: default;
+}
+.palimpsest__line[data-scraped] .palimpsest__hit {
+  cursor: pointer;
+}
+
+/* 葉碼。漢字序號，不是 01/02/03 —— 後者是規格書的編號，
+   前者是手稿的葉碼，而且它跟這套語彙的明體是同一個聲音。 */
+/* 葉碼。漢字是一個等寬方框，羅馬數字是 I 到 IV —— 寬度差三倍。
+   給一個共同的最小寬度，四幕的標籤才會落在同一條左緣上；
+   靠左對齊而不是置中，因為手稿的葉碼是貼著版口寫的。 */
+.folio {
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--apricot-ink);
+  flex: none;
+  /* 1.2em 是量出來的：Palatino 21px 的 "III" 是 24.5px，
+     單一漢字是 24.1px。取 25.2px 兩邊都蓋得住，四幕的標籤
+     才會落在同一條左緣上（否則英文會差 0.4px 的鋸齒）。 */
+  min-width: 1.2em;
+  font-variant-numeric: tabular-nums;
+}
+.palimpsest__label {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--ink);
+}
+
+/* 正在寫的那一行：底下一道濕的實筆，收尾淡出（提筆）。
+   跟 ui.tsx 的 .state--ok 是同一個筆觸。 */
+.palimpsest__line:not([data-scraped])::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 32%;
+  bottom: 13px;
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    var(--lavender-deep) 0%,
+    var(--lavender-deep) 72%,
+    color-mix(in srgb, var(--lavender-deep) 34%, transparent) 92%,
+    transparent 100%
+  );
+  transform-origin: left center;
+}
+
+/* 刮過的：字退到只剩痕跡，但仍然可讀 —— 它們被刮掉了，不是被刪掉了。
+   所以還可以點回去。 */
+.palimpsest__line[data-scraped] .folio {
+  color: var(--ink-ghost);
+}
+.palimpsest__line[data-scraped] .palimpsest__label {
+  color: var(--ink-faint);
+  font-weight: 500;
+}
+.palimpsest__line[data-scraped]:hover .palimpsest__label {
+  color: var(--ink-soft);
+}
+
+/* 刮痕。壓在字上的一道橫痕，刻意歪 1.4 度而且兩端不齊 ——
+   刮刀不是尺，正的橫線會讀成 strikethrough（那是「刪除」的意思，
+   跟「刮掉重寫」剛好相反）。 */
+.palimpsest__line[data-scraped]::after {
+  content: "";
+  position: absolute;
+  left: -3px;
+  right: 38%;
+  top: 13px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--ink-ghost) 55%, transparent) 8%,
+    color-mix(in srgb, var(--ink-ghost) 78%, transparent) 46%,
+    color-mix(in srgb, var(--ink-ghost) 40%, transparent) 88%,
+    transparent 100%
+  );
+  transform: rotate(-1.4deg);
+  transform-origin: left center;
+}
+
+/* 刮痕只在「剛剛被刮掉」的那一刻畫一次。
+   選擇器從不符合變成符合時 CSS 動畫就會啟動 —— 所以這裡不需要
+   任何 state，換幕時剛變成 scraped 的那一行自己會畫。 */
+@media (prefers-reduced-motion: no-preference) {
+  .palimpsest__line[data-scraped]::after {
+    animation: scrape 0.44s cubic-bezier(0.3, 0.78, 0.32, 1) backwards;
+  }
+  .palimpsest__line:not([data-scraped])::after {
+    animation: layink 0.52s cubic-bezier(0.24, 0.82, 0.28, 1) backwards;
+    animation-delay: 0.12s;
+  }
+}
+@keyframes scrape {
+  from {
+    transform: rotate(-1.4deg) scaleX(0);
+  }
+  to {
+    transform: rotate(-1.4deg) scaleX(1);
+  }
+}
+@keyframes layink {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* ============================================================
+   序幕 —— 空白的紙
+   ============================================================ */
+.overture {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding-top: 26px;
+}
+
+/* 名字寫在第一道格線上。不是 logo 磚 ——
+   Rail.tsx 早就把品牌區拿掉了（「不需要每次抬頭確認它叫什麼」），
+   把圖示貼回角落是每個範本都做的事。名字還是要講，但用寫的。
+
+   字距收到 -0.03em：Palatino 在 130px 用預設字距會鬆成一排孤立的
+   字母；大字級本來就要收。 */
+.writ {
+  display: flex;
+  margin: 0;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--edge);
+  align-self: stretch;
+  font-family: var(--font-display);
+  font-size: clamp(58px, 10.5vw, 128px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: var(--track-display);
+  color: var(--ink);
+}
+.writ__ch {
+  display: inline-block;
+  white-space: pre;
+}
+
+.overture__gloss {
+  max-width: 30em;
+  margin: 26px 0 0;
+}
+.overture__gloss p {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(16px, 1.75vw, 20px);
+  font-weight: 500;
+  line-height: 1.85;
+  color: var(--ink-soft);
+}
+/* 引語與後文的間隔。拉丁文需要一個詞距；漢字與假名的句號「。」
+   自帶右側空白，再補一個就多出半個字的洞。這是排版的事，
+   所以在這裡處理，不寫進翻譯字串 —— 寫死的空格四個語言只能對一個。
+
+   CJK 的粗體另外壓一階：明體沒有真正的粗體字重時瀏覽器會合成，
+   合成粗體會把筆畫糊在一起，700 比 600 糊得更明顯。 */
+.overture__gloss b {
+  font-weight: 700;
+  color: var(--ink);
+  margin-inline-end: 0.32em;
+}
+:root:lang(zh-Hant) .overture__gloss b,
+:root:lang(zh-Hans) .overture__gloss b,
+:root:lang(ja) .overture__gloss b {
+  margin-inline-end: 0;
+  font-weight: 600;
+}
+/* 轉折那一句才是重點 —— 沒有它，前一句只是一個好聽的字源。
+   所以它有自己的間距與一道起筆的短劃。 */
+.overture__turn {
+  margin-top: 18px !important;
+  padding-top: 18px;
+  position: relative;
+}
+.overture__turn::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 34px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--apricot-deep);
+}
+
+.overture__what {
+  margin: 32px 0 0;
+  font-size: 12.5px;
+  letter-spacing: 0.03em;
+  color: var(--ink-faint);
+}
+
+.overture__go {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  margin-top: 40px;
+}
+/* 序幕與終幕的按鈕比列內按鈕大一階。9px/18px 在一片留白裡
+   會像掉在地上的東西。 */
+.overture__go > .btn,
+.launch > .btn {
+  padding: 13px 34px;
+  font-size: 14.5px;
+}
+
+/* 序幕的編排。字是被寫上去的，所以由左往右揭開，不是淡入。
+     0.10  V e l l u m 逐字，每字晚 70ms
+     0.66  典故
+     0.80  轉折
+     0.94  它是什麼
+     1.06  動作 */
+@media (prefers-reduced-motion: no-preference) {
+  .writ__ch {
+    animation: penstroke 0.6s cubic-bezier(0.32, 0.76, 0.3, 1) backwards;
+    animation-delay: calc(var(--i) * 70ms + 100ms);
+  }
+  .overture__gloss > p:first-child,
+  .overture__turn,
+  .overture__what,
+  .overture__go {
+    animation: settle 0.66s cubic-bezier(0.2, 0.85, 0.24, 1) backwards;
+  }
+  .overture__gloss > p:first-child {
+    animation-delay: 0.66s;
+  }
+  .overture__turn {
+    animation-delay: 0.8s;
+  }
+  .overture__what {
+    animation-delay: 0.94s;
+  }
+  .overture__go {
+    animation-delay: 1.06s;
+  }
+}
+
+/* 由左往右揭開，同時從基線往上落一點 —— 落筆的手勢。 */
+@keyframes penstroke {
+  from {
+    opacity: 0;
+    clip-path: inset(0 100% -30% 0);
+    transform: translateY(0.1em);
+  }
+  to {
+    opacity: 1;
+    clip-path: inset(0 -8% -30% 0);
+    transform: none;
+  }
+}
+@keyframes settle {
+  from {
+    opacity: 0;
+    transform: translateY(11px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ============================================================
+   每一幕
+   ============================================================ */
+.acthead {
+  max-width: 26em;
+}
+.acthead__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(34px, 4.4vw, 54px);
+  font-weight: 600;
+  line-height: 1.16;
+  /* 襯線字的左側白空間比方框多，切齊方框反而看起來凸出來。 */
+  text-indent: -0.04em;
+  letter-spacing: var(--track-title);
+  color: var(--ink);
+}
+.acthead__lead {
+  margin: 16px 0 0;
+  font-size: clamp(14.5px, 1.35vw, 16.5px);
+  line-height: 1.85;
+  color: var(--ink-soft);
+  max-width: 32em;
+}
+
+/* 一幕之內逐塊到位，間隔 100ms —— 主畫面是 40ms（那邊要「快點讓我
+   看到數字」），這裡要「照著順序讀」。標題自己走揭開的動畫。 */
+@media (prefers-reduced-motion: no-preference) {
+  .acthead__title {
+    animation: unveil 0.68s cubic-bezier(0.3, 0.76, 0.3, 1) backwards;
+    animation-delay: 0.04s;
+  }
+  .acthead__lead {
+    animation: settle 0.6s cubic-bezier(0.2, 0.85, 0.24, 1) backwards;
+    animation-delay: 0.2s;
+  }
+  .sheet__text > *:nth-child(2) {
+    animation: settle 0.62s cubic-bezier(0.2, 0.85, 0.24, 1) backwards;
+    animation-delay: 0.3s;
+  }
+  .sheet__text > *:nth-child(3) {
+    animation: settle 0.62s cubic-bezier(0.2, 0.85, 0.24, 1) backwards;
+    animation-delay: 0.4s;
+  }
+  .sheet__text > *:nth-child(n + 4) {
+    animation: settle 0.62s cubic-bezier(0.2, 0.85, 0.24, 1) backwards;
+    animation-delay: 0.48s;
+  }
+}
+@keyframes unveil {
+  from {
+    clip-path: inset(0 100% -24% 0);
+  }
+  to {
+    clip-path: inset(0 -4% -24% 0);
+  }
+}
+
+/* ---------- 第一幕：中軸 ----------
+   不用三個方塊加箭頭。「站在中間」是可以直接排出來的：
+   兩端小、中間大，中間那個字落在紙的中線上，兩道格線把它撐開。 */
+/* 五欄，而且兩端與兩道線都必須等寬 —— 中間那個字要落在正中央，
+   否則這一幕的標題（「它站在中間」）就是假的。
+
+   用 max-content 給兩端會歪：右端「ChatGPT · Grok · 自訂」比左端
+   「Codex CLI」寬，1fr 只平分剩下的空間，於是中軸被推向左邊 43px。
+   兩端各給 1fr 才是真的對稱。 */
+.axis {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) minmax(24px, 1fr) max-content
+    minmax(24px, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 0 16px;
+  padding: 6px 0 2px;
+}
+.axis__end,
+.axis__mid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.axis__end b {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+.axis__end i {
+  font-size: 11px;
+  font-style: normal;
+  letter-spacing: 0.05em;
+  color: var(--ink-faint);
+}
+.axis__end--right {
+  text-align: right;
+}
+.axis__mid {
+  align-items: center;
+  text-align: center;
+}
+.axis__mid b {
+  font-family: var(--font-display);
+  font-size: clamp(26px, 3vw, 38px);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.018em;
+  color: var(--ink);
+}
+.axis__mid i {
+  font-size: 11px;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  color: var(--apricot-ink);
+}
+
+/* 兩道格線。往中間變濃 —— 注意力該落在中間那個字上。 */
+.axis__rule {
+  display: block;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--ink-ghost) 22%, transparent) 0%,
+    color-mix(in srgb, var(--lavender) 82%, transparent) 100%
+  );
+}
+.axis__rule:last-of-type {
+  background: linear-gradient(
+    270deg,
+    color-mix(in srgb, var(--ink-ghost) 22%, transparent) 0%,
+    color-mix(in srgb, var(--lavender) 82%, transparent) 100%
+  );
+}
+
+@media (max-width: 900px) {
+  .axis {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+    text-align: left;
+  }
+  .axis__rule {
+    width: 40px;
+    justify-self: start;
+  }
+  .axis__mid,
+  .axis__end--right {
+    align-items: flex-start;
+    text-align: left;
+  }
+}
+
+/* ---------- 眉批 ----------
+   術語靠右、釋義靠左，中間自然出現一道欄溝。這是註疏的排法：
+   長短不一，眼睛照著讀下去。三個並排的方塊沒有閱讀順序。 */
+/* 量度用 ch 對中文是陷阱：ch 是「0」的寬度，漢字大約是它的兩倍，
+   所以 62ch 看起來像 62 個字、實際只放得下 28 個。註疏欄本來就窄，
+   再砍一半就變成一行五個字的細長條。量度給 dd，不給整個網格。 */
+.marginalia {
+  display: grid;
+  grid-template-columns: fit-content(11em) minmax(0, 1fr);
+  column-gap: 24px;
+  row-gap: 15px;
+  margin: 0;
+}
+.marginalia dd {
+  max-width: 40em;
+}
+.marginalia dt {
+  font-family: var(--font-display);
+  font-size: 13.5px;
+  font-weight: 700;
+  line-height: 1.7;
+  letter-spacing: 0.03em;
+  text-align: right;
+  color: var(--ink);
+}
+.marginalia dd {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.78;
+  color: var(--ink-soft);
+}
+
+@media (max-width: 760px) {
+  .marginalia {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 4px;
+  }
+  .marginalia dt {
+    text-align: left;
+    margin-top: 12px;
+  }
+}
+
+/* ---------- 第二幕：登記簿 ----------
+   三家是同一種東西的三個條目，排成列才對得齊，也才裝得下
+   「登入中要顯示一組代碼」這種會長高的狀態 ——
+   卡片格會被最高的那張撐開，列不會。 */
+/* 登記簿的第一欄是**真的一欄**，三個條目共用。
+   原本是「每一列自己一個 grid + 底下全部縮排 6.5rem」，那在繁體中文
+   剛好成立（ChatGPT／Grok／自訂端點 都是 3–4 個字），但一換到英文，
+   "Custom endpoint" 會把欄撐寬、而縮排是死的 —— 第二欄整份歪掉。
+
+   做法是 display: contents 把 .entry 的盒子拿掉，讓名字與內文成為
+   .register 的直接格子，於是欄寬由 max-content 決定 ——
+   它自己會長到四個語言裡最長的那個名字，下層再也不需要硬寫偏移。
+
+   刻意不用 subgrid：vite.config 的 build.target 是 chrome110，
+   subgrid 要 117。這個寫法在 110 就成立，不必靠 @supports 退化。
+
+   盒子沒了，框線與側筆就得掛回兩個格子上 —— 兩格各畫一段下框線，
+   接起來就是連續的一條。 */
+.register {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 20px;
+}
+
+.entry {
+  display: contents;
+}
+.entry__name,
+.entry__body {
+  padding: 18px 0 20px;
+  border-bottom: 1px solid var(--edge);
+}
+.entry:first-child .entry__name,
+.entry:first-child .entry__body {
+  border-top: 1px solid var(--edge);
+}
+.entry__name {
+  position: relative;
+  grid-column: 1;
+}
+.entry__body {
+  grid-column: 2;
+  min-width: 0;
+}
+
+/* 已接上的：頁緣一道濕筆。不變綠、不加勾 ——
+   顏色是狀態的第二個訊號，第一個永遠是 State 那三個字。
+   .entry 已經沒有盒子（display: contents），所以掛在名字那一格上。 */
+.entry[data-linked] .entry__name::before {
+  content: "";
+  position: absolute;
+  left: -18px;
+  top: 20px;
+  bottom: 22px;
+  width: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    var(--ok) 0%,
+    color-mix(in srgb, var(--ok) 26%, transparent) 100%
+  );
+}
+
+.entry__line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content max-content;
+  align-items: baseline;
+  gap: 8px 18px;
+}
+.entry__name {
+  grid-column: 1;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  text-wrap: balance;
+}
+.entry__claim {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--lavender-ink);
+  min-width: 0;
+}
+.entry__state,
+.entry__act {
+  flex: none;
+}
+.entry__act {
+  justify-self: end;
+}
+
+/* 縮排由 subgrid 的第二欄負責，這裡不再需要任何 margin-left。 */
+.entry__detail {
+  margin-top: 7px;
+  margin-bottom: 0;
+  max-width: 34em;
+  font-size: 13px;
+  line-height: 1.78;
+  color: var(--ink-soft);
+}
+.entry__accts {
+  margin-top: 9px;
+  margin-bottom: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+.entry__accts li {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.entry__blocked {
+  margin-top: 8px;
+  margin-bottom: 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--warn-ink);
+}
+
+/* 一次性代碼。整個初次設定只有這一個東西需要使用者照著輸入，
+   所以它是唯一一塊刻意做大的等寬排版。 */
+.plate {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 13px;
+  padding: 13px 18px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--lavender-wash), inset 0 1px 2px var(--rim-shade);
+}
+.plate__cap {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+.plate__code {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  line-height: 1.24;
+  color: var(--lavender-ink);
+  user-select: all;
+}
+.plate__uri {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.entry__form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 15px;
+  align-items: start;
+  margin-top: 16px;
+  max-width: 38em;
+}
+.entry__formact {
+  grid-column: 1 / -1;
+}
+
+/* 窄視窗：登記簿的兩欄收成一欄，名字回到自己那一行。
+   保留 subgrid 但把外層改成單欄，比切回 block 少一次版面重排。 */
+@media (max-width: 900px) {
+  .register {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .entry__name {
+    grid-column: 1;
+    margin-bottom: 6px;
+  }
+  .entry__body {
+    grid-column: 1;
+  }
+  .entry__line {
+    grid-template-columns: minmax(0, 1fr) max-content;
+    gap: 8px 14px;
+  }
+  .entry__claim {
+    grid-column: 1 / -1;
+  }
+  .entry__form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- 第三幕：詞條 ----------
+   01/02/03 假裝這四件事有先後，但它們沒有 —— 是四個同時成立的事實。
+   詞條就是詞條：術語吊在左，釋義接在右。 */
+/* 術語欄由整份詞條共用，不是每一列各算各的。
+
+   原本每一列自己是一個 grid，於是 fit-content 是「照這一列的術語」
+   算寬度 —— 四列四個寬度，四個釋義的左緣落在 491 / 472 / 452 / 448，
+   量出來差 43px。繁中看不出來（四個術語都是 4–6 個字，差幾像素），
+   英文一放大就歪成階梯。
+
+   跟登記簿同一個解法：display: contents 把列的盒子拿掉，dt 與 dd
+   成為 .glossary 的直接格子，欄寬因此只算一次。
+   （不用 subgrid —— build.target 是 chrome110，subgrid 要 117。） */
+.glossary {
+  margin: 0;
+  display: grid;
+  grid-template-columns: fit-content(13em) minmax(0, 1fr);
+  column-gap: 26px;
+}
+.glossary__row {
+  display: contents;
+}
+/* 盒子沒了，框線改掛在兩個格子上 —— 兩段接起來就是連續的一條。 */
+.glossary__term,
+.glossary__def {
+  padding: 17px 0;
+  border-top: 1px dotted var(--edge);
+}
+.glossary__row:last-child .glossary__term,
+.glossary__row:last-child .glossary__def {
+  border-bottom: 1px dotted var(--edge);
+}
+
+/* 四條逐條到位，間隔 110ms。這一幕的重點就是一條一條讀 ——
+   整塊一起淡入的話會被當成一段掃過去。
+   --i 仍然掛在 .glossary__row 上，display: contents 不影響自訂屬性繼承，
+   所以同一列的兩個格子拿到同一個延遲、一起到位。 */
+@media (prefers-reduced-motion: no-preference) {
+  .glossary__term,
+  .glossary__def {
+    animation: settle 0.58s cubic-bezier(0.2, 0.85, 0.24, 1) backwards;
+    animation-delay: calc(var(--i) * 110ms + 320ms);
+  }
+}
+
+.glossary__term {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+.glossary__def {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.82;
+  color: var(--ink-soft);
+}
+/* 出處註。跟在句末，不另起一行 —— 它是這一條的來源，不是一個動作。 */
+.glossary__where {
+  display: inline;
+  margin-left: 9px;
+  padding-left: 11px;
+  border-left: 1px solid var(--edge);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--apricot-ink);
+}
+
+/* 窄視窗：兩欄收成一欄。列的盒子已經沒了（display: contents），
+   所以收欄要改在 .glossary 上，術語與釋義之間的框線也要重新分配 ——
+   術語只留上框、釋義不再自己開一條，否則一列會出現兩條線。 */
+@media (max-width: 760px) {
+  .glossary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .glossary__term {
+    flex-direction: row;
+    gap: 0.35em;
+    flex-wrap: wrap;
+    padding-bottom: 0;
+  }
+  .glossary__def {
+    padding-top: 7px;
+    border-top: 0;
+  }
+  .glossary__row:last-child .glossary__term {
+    border-bottom: 0;
+  }
+}
+
+/* ---------- 第四幕：牌記 ----------
+   colophon：手稿末尾記「這份東西的狀態」。最後一幕該回答的正好
+   就是這個 —— 不是慶祝，是「按下去之後呢」。 */
+.launch {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+
+.colophon {
+  max-width: 40em;
+  padding: 4px 0 0;
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg, var(--edge) 0%, transparent 88%) 1;
+}
+.colophon .rows__item {
+  align-items: baseline;
+}
+.colophon .rows__val {
+  text-align: right;
+}
+
+/* ---------- 窄視窗 ----------
+   頁邊在放不下的時候不是縮小，是躺平：葉碼與標題排成一列橫過頂端，
+   界欄變成一道橫線。縮小會讓刮痕與格線糊成一團。 */
+@media (max-width: 880px) {
+  .sheet {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    column-gap: 0;
+  }
+  .sheet__margin {
+    grid-column: 1;
+    padding-top: 22px;
+    padding-bottom: 14px;
+  }
+  .sheet__margin::after {
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: auto;
+    height: 1px;
+    background: linear-gradient(90deg, var(--edge) 0%, transparent 92%);
+  }
+  .sheet__text {
+    grid-column: 1;
+    padding-top: 30px;
+  }
+  .palimpsest {
+    display: flex;
+    gap: 22px;
+    flex-wrap: wrap;
+  }
+  .palimpsest__line,
+  .palimpsest__unwrit {
+    height: 40px;
+    flex: none;
+    min-width: 76px;
+  }
+  .palimpsest__unwrit {
+    min-width: 34px;
+  }
+  .palimpsest__unwrit::after,
+  .palimpsest__line:not([data-scraped])::after,
+  .palimpsest__line[data-scraped]::after {
+    right: 0;
+  }
+}
+
+/* ---------- 執行階段警告 ----------
+
+   接管失敗要當著使用者的面講，但不能擋住他。所以是浮在右下角的一疊，
+   不是 modal：不搶焦點、不惰性化背景、不阻止任何操作 —— Proxy 已經在跑，
+   第三方對話也還通，只是走原生 Codex。降級不該用「完全不能用」來通知。
+
+   寬度上限讓它讀得完又不吃掉畫布；`pointer-events` 只給卡片自己，讓卡片
+   之間的縫隙仍然可以點到底下的東西。 */
+.alerts {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 30;
+  display: grid;
+  gap: 10px;
+  width: min(420px, calc(100vw - 44px));
+  pointer-events: none;
+}
+.runtime-indicator {
+  position: relative;
+  flex: none;
+}
+.runtime-indicator__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+  color: var(--ink-faint);
+  font: 700 12px var(--font-body);
+  cursor: pointer;
+}
+.runtime-indicator__button--ok { color: var(--ok-ink); }
+.runtime-indicator__button--warn { color: var(--warn-ink); }
+.runtime-indicator__button:hover { background: var(--lavender-wash); }
+.runtime-popover {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 10px);
+  left: 0;
+  width: min(430px, calc(100vw - 32px));
+  /* 沒有上界的話，展開的托盤會把浮層拉到視窗外，而且它是 absolute，
+     不會把捲軸交給任何人。 */
+  max-height: min(70vh, 640px);
+  overflow-y: auto;
+  /* 橫向沒有第二個維度可讀：一條左右捲軸只會把句子的後半藏起來，而且
+     `overflow-y: auto` 會把未指定的 x 軸算成 auto，所以它得寫出來。內容
+     一律在這個寬度裡折行——下面的 `overflow-wrap` 是配套，不是備案。 */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 18px 20px;
+  border-radius: var(--r-md);
+  background: var(--surface-solid);
+  /* 沒有這條 inset 邊，#fdfbf7 的浮層落在 #f7f4ee 的頁面上每個通道只差
+     六到九階，柔又散的 --shadow-lift 也撐不出輪廓 —— 它是不透明的，但讀
+     起來像半透明。其他實心浮起面板（.inject）用的就是這組。 */
+  box-shadow: inset 0 0 0 1px var(--edge), var(--shadow-lift);
+  color: var(--ink);
+}
+/* 差異句子裡帶的是方法名（`codex/event/agentMessageDelta`），中間沒有
+   空白可以斷 —— 不給 anywhere 它就會自己撐出一條左右捲軸。 */
+.runtime-popover p,
+.runtime-popover li { color: var(--ink-soft); line-height: 1.5; overflow-wrap: anywhere; }
+.runtime-popover dl {
+  display: grid;
+  /* 標籤欄也要能縮：`max-content` 撐不下時是把整個 grid 推寬，不是折行。 */
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+  gap: 7px 14px;
+  margin: 14px 0 0;
+  font-size: 12px;
+}
+.runtime-popover dt { color: var(--ink-faint); }
+.runtime-popover dd { margin: 0; overflow-wrap: anywhere; font-family: var(--font-mono); }
+.runtime-popover ul { margin: 14px 0 0; padding-left: 18px; font-size: 12px; }
+/* 差異與診斷收在托盤裡。浮層常駐的是三行狀態，其餘要點開才看得到:
+   四個 blocker 加兩個差異攤開來會比整張卡還長，而且沒有人是為了讀 PID
+   才點開它的。 */
+.runtime-popover__tray {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--edge);
+}
+.runtime-popover__tray > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.runtime-popover__tray > summary:hover { color: var(--ink); }
+.runtime-popover__tray > p { margin: 10px 0 0; font-size: 12px; }
+.runtime-popover__tray > ul { margin-top: 10px; }
+.runtime-popover__tray > dl { font-size: 11px; }
+/* 落在要路由的方法上的差異就是擋下來的原因，不能跟其他項長得一樣。 */
+.runtime-popover__routed { color: var(--ink); font-weight: 600; }
+.alerts > * {
+  pointer-events: auto;
+  box-shadow: var(--lift, 0 10px 30px rgb(0 0 0 / 0.16));
+}
+/* 卡片裡的 notice 疊在不透明的面上，所以「13% 色 + transparent」讀起來
+   只是一條淡色帶。但 .alerts 是 fixed，浮在任意內容上面 —— 同一個底就是
+   87% 透明，後面的字會透上來，整塊變得讀不出來。這裡把同樣的色調改成疊
+   在 --surface-solid 上：色相與濃度不變，只是有了底。
+   另外 .alerts > * 的 box-shadow 跟 .notice--warn/--error 同權重又在後面，
+   會把左側那條色棒整條蓋掉，所以一併在這裡補回來。 */
+.alerts > .notice {
+  background-color: var(--surface-solid);
+  box-shadow: inset 2px 0 0 var(--ink-ghost), inset 0 0 0 1px var(--edge),
+    var(--lift, 0 10px 30px rgb(0 0 0 / 0.16));
+}
+.alerts > .notice--warn {
+  background-color: color-mix(in srgb, var(--warn) 13%, var(--surface-solid));
+  box-shadow: inset 2px 0 0 var(--warn), inset 0 0 0 1px var(--edge),
+    var(--lift, 0 10px 30px rgb(0 0 0 / 0.16));
+}
+.alerts > .notice--error {
+  background-color: color-mix(in srgb, var(--crit) 13%, var(--surface-solid));
+  box-shadow: inset 2px 0 0 var(--crit), inset 0 0 0 1px var(--edge),
+    var(--lift, 0 10px 30px rgb(0 0 0 / 0.16));
+}
+@media (max-width: 720px) {
+  .alerts {
+    right: 12px;
+    left: 12px;
+    bottom: 12px;
+    width: auto;
+  }
+}
+/* Enhanced Core observations */
+/* ---------- 交接鏈 ----------
+   一筆連續的墨線。線畫在每一節的 ::before 上、上下貼齊，所以相鄰的兩節接
+   得起來，整條讀起來是一筆而不是四段。
+
+   狀態靠筆觸，不靠圖示：完成的是濕的實筆（帶一點暈開的光），停住的那一節
+   斷成乾筆，還沒輪到的收成快要沒有的細線。這三種筆觸跟 `.state` 的三態是
+   同一套 —— 那邊是橫的、這邊是直的，講的是同一件事。
+
+   刻意沒有的東西：編號、圓圈節點、箭頭。有了那些它就變成 stepper，而
+   stepper 描述的是「使用者要走的流程」；這條線描述的是「系統已經完成到
+   哪」，兩者不是同一種圖。 */
+.seam {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+}
+.seam__link {
+  position: relative;
+  display: grid;
+  gap: 5px;
+  padding: 13px 0 13px 24px;
+}
+/* 線本身。left 對齊卡片內縮的第一個字，寬 3px —— 比 1px 的分隔線重，
+   因為它是內容不是格線。 */
+.seam__link::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+}
+/* 濕的實筆。 */
+.seam__link--done::before {
+  background: linear-gradient(180deg, var(--ok) 0%, var(--ok) 100%);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--ok) 34%, transparent);
+}
+/* 乾筆：斷斷續續 —— 寫到這裡停了。 */
+.seam__link--open::before {
+  background: repeating-linear-gradient(
+    180deg,
+    var(--warn) 0 6px,
+    transparent 6px 11px
+  );
+}
+/* 還沒輪到：快要沒有的細線，而且靠向線的中心，讓它明顯比前面輕。 */
+.seam__link--pending::before {
+  left: 5px;
+  width: 1px;
+  background: var(--ink-ghost);
+  opacity: 0.42;
+}
+/* 收尾提筆：最後一節的線往下淡出，不要硬切在卡片的留白裡。 */
+.seam__link:last-child::before {
+  mask-image: linear-gradient(180deg, #000 0%, #000 62%, transparent 100%);
+}
+.seam--tight .seam__link { padding-block: 8px; }
+.seam--tight .seam__label { font-size: 13.5px; }
+.seam__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.seam__label {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: var(--track-title);
+  color: var(--ink);
+}
+.seam__mark { flex: 0 0 auto; }
+/* 證據比標題退一階，而且整塊再內縮一點 —— 它屬於上面那一行，不是下一節。 */
+.seam__body { display: block; padding-left: 2px; }
+.seam__body .rows__item { padding: 7px 2px; font-size: 12.5px; }
+.seam__body .rows__item:first-child { padding-top: 4px; }
+.seam__body .tray { margin-top: 6px; }
+
+/* ---------- Enhanced Core ---------- */
+.enhanced-core { display: grid; gap: var(--gap-block); }
+.enhanced-core__tools { display: flex; gap: 8px; align-items: center; }
+
+/* 主角數字與那一句話並排。數字負責「現在有幾個 turn 在跑」，
+   句子負責「這是什麼狀況」—— 兩個都給了，才不用去別的地方接因果。 */
+.enhanced-core__verdict {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  margin: 6px 0 4px;
+}
+.enhanced-core__says {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: var(--track-title);
+  color: var(--ink);
+}
+.enhanced-core__aside { margin: 7px 0 0; font-size: 12.5px; color: var(--ink-faint); }
+.enhanced-core__verdict + .notice { margin-top: 16px; }
+.notice + .notice { margin-top: 9px; }
+
+/* 阻擋原因。掛在線的下方並且對齊線的縮排，看得出它屬於這條鏈；
+   左邊那道短豎線用停住那一節的顏色，把「為什麼」接回「哪一節」。 */
+.enhanced-core__why {
+  margin: 4px 0 0;
+  padding: 12px 0 2px 24px;
+  border-left: 3px solid transparent;
+  margin-left: 4px;
+}
+.enhanced-core__why-cap {
+  margin: 0 0 7px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-soft);
+}
+.enhanced-core__why ul { margin: 0; padding-left: 17px; display: grid; gap: 6px; }
+.enhanced-core__why li { font-size: 12.5px; line-height: 1.72; color: var(--ink-soft); overflow-wrap: anywhere; }
+.enhanced-core__why--at-artifact,
+.enhanced-core__why--at-armed,
+.enhanced-core__why--at-adopted,
+.enhanced-core__why--at-inPlace { border-left-color: color-mix(in srgb, var(--warn) 62%, transparent); }
+
+/* ---------- 工作階段 ----------
+   不分頁。這是觀測列表，翻頁會讓「剛剛那條 thread」變成要翻找的東西。
+   給一個上限高度、自己捲 —— 一屏看完大半，其餘往下捲一段就到，
+   而且卡片外的版面完全不動。 */
+/* 欄寬掛在清單上，每列用 subgrid 共用同一組。thread id 那欄因此跟著
+   「最長的那一個」量 —— 各列自己撐滿 1.6fr 的話，紫底會比字長一大截，
+   看起來是鬆的。minmax(0, …) 讓它在窄視窗仍能收、交給省略號。
+   model 那欄也照最長的量，兩側各夾一條 1fr 的空欄把它推到 id 與狀態
+   的正中間 —— 整欄置中，但各列的名稱仍共用同一條左緣，不會參差。
+   有空欄就不能靠自動排入，下面每個欄位都指定自己的欄號。 */
+.sessions {
+  display: grid;
+  grid-template-columns: 5.5em minmax(0, max-content) 1fr minmax(0, max-content) 1fr 5.5em auto;
+  column-gap: 14px;
+  margin-top: 12px;
+  max-height: 21em;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.sessions__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: baseline;
+  gap: 4px 14px;
+  padding: 9px 4px;
+  font-size: 12.5px;
+}
+.sessions__row + .sessions__row {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg, transparent 0%, var(--edge) 6%, var(--edge) 94%, transparent 100%) 1;
+}
+/* 兩個執行面用一道左緣的筆觸區分，不用色塊 —— 色塊會跟狀態搶同一種語意。 */
+.sessions__plane {
+  grid-column: 1;
+  position: relative;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--ink-faint);
+}
+.sessions__row--enhanced-codex .sessions__plane { color: var(--lavender-ink); }
+.sessions__id { grid-column: 2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-soft); }
+.sessions__model { grid-column: 4; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sessions__state { grid-column: 6; font-weight: 600; }
+.sessions__state--running { color: var(--ok-ink); }
+.sessions__state--approval { color: var(--warn-ink); }
+.sessions__state--failed { color: var(--crit-ink); }
+.sessions__state--unloaded, .sessions__state--attached { color: var(--ink-faint); font-weight: 400; }
+.sessions__when { grid-column: 7; color: var(--ink-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sessions__parent { grid-column: 2 / -1; color: var(--ink-faint); font-size: 11.5px; }
+
+/* ---------- 這次壓縮的原文 ---------- */
+
+/* 指示在上、結果在下。並排時兩邊高度差很大，中間會空掉一大片。 */
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  margin-top: 4px;
+}
+.transcript__block {
+  min-width: 0;
+}
+/* 原文照原樣印：這裡的換行與縮排是 prompt 的一部分，重排等於改了它。
+   `pre-wrap` 而不是 `pre` —— 橫向捲軸讀長段落是最難讀的一種。
+   自己捲到一個高度就停，不然這一塊會把整頁撐到看不到底。 */
+.transcript__text {
+  max-height: 22em;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 14px 16px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunk);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  /* 行高給得比別處鬆：這是一整段要讀的字，不是一列要掃的值。
+     漢字與等寬拉丁混排時，太緊會糊成一片。 */
+  font-size: 12.5px;
+  line-height: 1.85;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+}
+
+/* ---------- ChatGPT 帳號的 Reset 到期清單 ---------- */
+
+.acct__resets {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* 托盤的把手。長得跟藥丸一樣，因為它本來就是那顆藥丸 —— 只是現在拉得動。
+   刻意不做成 .btn：那一列已經有兩顆按鈕，第三顆會讓「Reset 3」看起來是一
+   個動作，但它只是一個讀數，動作在托盤裡面。 */
+.pill--tap {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  transition: filter 120ms ease;
+}
+.pill--tap:hover {
+  filter: brightness(1.08);
+}
+.pill__caret {
+  width: 0;
+  height: 0;
+  margin-left: 1px;
+  border-inline: 3.5px solid transparent;
+  border-top: 4px solid currentColor;
+  opacity: 0.75;
+  transition: transform 160ms cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+.pill__caret[data-open="true"] {
+  transform: rotate(180deg);
+}
+
+/* 清單自己占 .acct 這個 grid 的一整列。不另外包一層 DOM 掛在 .rows__item
+   之間：那會把 `.rows__item + .rows__item` 的分隔線切斷，一整張卡的節奏
+   就散了。 */
+.resets {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  margin-top: 12px;
+  padding: 12px 16px 14px;
+  border-radius: var(--r-md);
+  /* 拉出來的東西要浮在頁面上，不是陷進去 —— 用 --surface 配上抬起的陰影，
+     跟 .tray[open] 的抽屜同一種身分。凹陷的 --surface-sunk 讀起來會是「這
+     一列的一部分」，那正好是它不是的東西。 */
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--edge), var(--shadow-lift);
+  text-align: left;
+  font-weight: 400;
+  transform-origin: top;
+  animation: resets-pull 180ms cubic-bezier(0.22, 0.86, 0.24, 1);
+}
+
+/* 拉出來的那一下。動的是高度與位移，不是 opacity 單獨淡入 —— 淡入看起來
+   像是東西本來就在那裡、只是剛剛才被看見。 */
+@keyframes resets-pull {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scaleY(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .resets {
+    animation: none;
+  }
+  .pill__caret {
+    transition: none;
+  }
+}
+.resets__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.resets__none {
+  padding: 4px 0 2px;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+}
+
+/* 一列就是一張券：左邊兩行（它是什麼、它什麼時候死），右邊是它自己的動作。
+   中間不放固定寬度的欄位 —— 同一個名稱在四種語言下是四種長度，釘死欄寬
+   只會讓其中三種歪。 */
+.resets__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 0;
+}
+.resets__row + .resets__row {
+  border-top: 1px solid var(--edge);
+}
+.resets__row[data-spendable="false"] {
+  opacity: 0.6;
+}
+.resets__what {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.resets__name {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.resets__when {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.resets__date {
+  color: var(--ink-soft);
+}
+.resets__left {
+  color: var(--ink-faint);
+}
+/* 只有快到期的那張把「剩多久」染色。全部染色等於沒有染色。 */
+.resets__row[data-tone="soon"] .resets__left {
+  color: var(--warn-ink);
+  font-weight: 700;
+}
+/* 用不了的那幾張右邊沒有按鈕，改成一個狀態字 —— 留一顆按不動的按鈕在那裡
+   只是讓人去試它為什麼按不動。 */
+.resets__state {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.resets__row .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* 托盤一拉開，這一列就從一行變成一段。列標籤（帳號的 email）仍垂直置中
+   的話會浮在半空，跟它真正對應的那排藥丸差了半個清單的高度。 */
+.rows__item:has(.resets) {
+  align-items: flex-start;
+}
+.rows__item:has(.resets) .rows__key {
+  padding-top: 5px;
+}

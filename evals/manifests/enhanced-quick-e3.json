@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "name": "enhanced-quick-e3",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "e3-pending-plan-stop",
+      "category": "continuity",
+      "tags": ["enhanced-quick", "target", "e3"],
+      "source": {"kind": "fixture", "path": "enhanced-e3-continuation"},
+      "prompt": "Your first action must be an update_plan call with three pending steps: inspect solution.py; implement pending_total as the sum of non-negative values; run a focused check. Then complete every step and mark the plan complete. Do not read INSTRUCTIONS.md before creating the plan.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "faults": [{"atRequest": 2, "kind": "normal_stop"}],
+      "expectedHarness": {"minToolCalls": 2, "requireTerminalSse": true, "minEnhancedEvents": {"enhanced.session.features_applied": 1}},
+      "timeoutSeconds": 180,
+      "limits": {"cpu": 2, "memoryMb": 4096, "pids": 256, "diskMb": 1024, "maxInputTokens": 200000, "maxOutputTokens": 10000}
+    },
+    {
+      "id": "e3-short-control",
+      "category": "short-fix",
+      "tags": ["enhanced-quick", "control", "short"],
+      "source": {"kind": "human_eval", "task_id": "HumanEval/0"},
+      "prompt": "Read TASK.md and solution.py, implement the requested function, run a focused check, and finish.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "expectedHarness": {"minToolCalls": 1, "requireTerminalSse": true, "minEnhancedEvents": {"enhanced.session.features_applied": 1}},
+      "timeoutSeconds": 180,
+      "limits": {"cpu": 2, "memoryMb": 4096, "pids": 256, "diskMb": 1024, "maxInputTokens": 200000, "maxOutputTokens": 10000}
+    },
+    {
+      "id": "e3-multifile-control",
+      "category": "multi-file",
+      "tags": ["enhanced-quick", "control", "multi-file"],
+      "source": {"kind": "mbpp", "task_id": "56", "multi_file": true},
+      "prompt": "Implement TASK.md using the existing module boundaries, run a focused check, and finish.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "expectedHarness": {"minToolCalls": 1, "requireTerminalSse": true, "minEnhancedEvents": {"enhanced.session.features_applied": 1}},
+      "timeoutSeconds": 180,
+      "limits": {"cpu": 2, "memoryMb": 4096, "pids": 256, "diskMb": 1024, "maxInputTokens": 200000, "maxOutputTokens": 10000}
+    }
+  ]
+}

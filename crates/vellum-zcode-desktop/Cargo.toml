@@ -1,0 +1,24 @@
+[package]
+name = "vellum-zcode-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Control channel, session binding, and lifecycle for the ZCode Desktop host tap"
+
+[dependencies]
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+vellum-harness-protocol = { path = "../vellum-harness-protocol" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

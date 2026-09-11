@@ -1,0 +1,23 @@
+[package]
+name = "vellum-harness-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runtime registry and native process supervision for Vellum harnesses"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+vellum-harness-protocol = { path = "../vellum-harness-protocol" }
+vellum-acp-client = { path = "../vellum-acp-client" }
+vellum-zcode-desktop = { path = "../vellum-zcode-desktop" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

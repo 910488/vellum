@@ -1,0 +1,34 @@
+{
+  "id": "chatcmpl-1",
+  "object": "response",
+  "store": false,
+  "status": "completed",
+  "model": "test-model",
+  "output": [
+    {
+      "type": "message",
+      "id": "chatcmpl-1_message",
+      "role": "assistant",
+      "status": "completed",
+      "phase": "final_answer",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Hi from the chat adapter.",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 4,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 6,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 10
+  }
+}

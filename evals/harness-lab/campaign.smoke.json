@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "bridge": {
+    "upstream": "http://127.0.0.1:15721",
+    "port": 15722,
+    "mode": "S0"
+  },
+  "artifacts": {
+    "codex": "${REPO_ROOT}/target/enhanced-artifacts/f37e6d9c527922b40a2813a0b7062731a91946bc/windows/codex.exe"
+  },
+  "commands": [
+    {
+      "id": "omen-read-only-smoke",
+      "cwd": "${REPO_ROOT}/target/vellum-evals/20260910-073536-44832/cases/case-a9da50ad2bdabc52/verification-workspace",
+      "command": [
+        "${REPO_ROOT}/target/enhanced-artifacts/f37e6d9c527922b40a2813a0b7062731a91946bc/windows/codex.exe",
+        "exec", "--ephemeral", "--json", "--sandbox", "read-only",
+        "--model", "vlm-c1f84e8c6d-omen-alpha",
+        "-c", "model_provider=\"vellum\"",
+        "-c", "model_reasoning_effort=\"low\"",
+        "-c", "model_providers.vellum.base_url=\"${VELLUM_LAB_BASE_URL}/v1\"",
+        "-c", "model_providers.vellum.supports_websockets=false",
+        "Read TASK.md and src/solution.py, run one focused read-only check, and report whether the implementation matches the requirement. Do not edit files."
+      ]
+    }
+  ]
+}

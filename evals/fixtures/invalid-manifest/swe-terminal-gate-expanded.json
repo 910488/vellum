@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "name": "swe-terminal-gate-expanded",
+  "version": "verified-parquet-a45b1fe4",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "swe-psf__requests-2931",
+      "category": "swe-bench",
+      "tags": [
+        "swe-bench",
+        "15-min---1-hour"
+      ],
+      "source": {
+        "kind": "swe_bench",
+        "instance_id": "psf__requests-2931",
+        "dataset_revision": "verified-parquet-a45b1fe4",
+        "repository": "https://github.com/psf/requests.git",
+        "commit": "5f7a3a74aab1625c2bb65f643197ee885e3da576",
+        "image_digest": "sha256:a9b4f8e7916bbdbb675e34fc8e6655e162d90a80ce1876debf4395f95cb24cea",
+        "bundle_sha256": "20750d0c418df58631c70a8611bd8689b778e05e0de45febd251fc3276456d9f",
+        "bundle_url": "https://invalid.local/swe-terminal-gate/psf__requests-2931.tar"
+      },
+      "prompt": "Request with binary payload fails due to calling to_native_string\nIntroduced with https://github.com/kennethreitz/requests/issues/2844\n\n```\nimport requests\nrequests.put(\"http://httpbin.org/put\", data=u\"ööö\".encode(\"utf-8\"))\n```\n\nThis works with 2.8.1, but not with 2.9.\n\n",
+      "verification": [
+        "bash /hidden/eval.sh"
+      ],
+      "graderImage": "sweb.eval.x86_64.psf__requests-2931:latest",
+      "timeoutSeconds": 240,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true,
+        "minCompactions": 1,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 8192,
+        "pids": 512,
+        "diskMb": 12288,
+        "maxInputTokens": 400000,
+        "maxOutputTokens": 60000
+      },
+      "phases": [
+        {
+          "model": {
+            "named": "gpt-5.6-luna"
+          },
+          "reasoningEffort": "xhigh",
+          "prompt": "Continue the same SWE-bench task in the existing session and workspace as the reviewing implementer. Inspect only the current diff and focused evidence, correct any remaining issue, run the narrowest relevant test, and finish without restarting repository discovery."
+        },
+        {
+          "model": "current",
+          "prompt": "Return to DeepSeek in the same session and workspace. Use the prior investigation, compact checkpoint, and GPT review; do not repeat repository discovery. Make only a necessary final correction, run one focused verification, and deliver the result."
+        }
+      ],
+      "forcedContextWindow": 24000
+    },
+    {
+      "id": "swe-pallets__flask-5014",
+      "category": "swe-bench",
+      "tags": [
+        "swe-bench",
+        "15-min-fix"
+      ],
+      "source": {
+        "kind": "swe_bench",
+        "instance_id": "pallets__flask-5014",
+        "dataset_revision": "verified-parquet-a45b1fe4",
+        "repository": "https://github.com/pallets/flask.git",
+        "commit": "7ee9ceb71e868944a46e1ff00b506772a53a4f1d",
+        "image_digest": "sha256:6a60954dcecc82b456784ea02122b4bf26122b62bfa644884fd269a526ab5143",
+        "bundle_sha256": "c22ed533a9d0c5229046e4ab4f19f4f7322fb02f1840aec6b0350c4c497c293b",
+        "bundle_url": "https://invalid.local/swe-terminal-gate/pallets__flask-5014.tar"
+      },
+      "prompt": "Require a non-empty name for Blueprints\nThings do not work correctly if a Blueprint is given an empty name (e.g. #4944).\r\nIt would be helpful if a `ValueError` was raised when trying to do that.\n",
+      "verification": [
+        "bash /hidden/eval.sh"
+      ],
+      "graderImage": "sweb.eval.x86_64.pallets__flask-5014:latest",
+      "timeoutSeconds": 240,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "requireTerminalSse": true,
+        "minCompactions": 1,
+        "requireSessionResume": true,
+        "requireModelSwitch": true
+      },
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 8192,
+        "pids": 512,
+        "diskMb": 12288,
+        "maxInputTokens": 400000,
+        "maxOutputTokens": 60000
+      },
+      "phases": [
+        {
+          "model": {
+            "named": "gpt-5.6-luna"
+          },
+          "reasoningEffort": "xhigh",
+          "prompt": "Continue the same SWE-bench task in the existing session and workspace as the reviewing implementer. Inspect only the current diff and focused evidence, correct any remaining issue, run the narrowest relevant test, and finish without restarting repository discovery."
+        },
+        {
+          "model": "current",
+          "prompt": "Return to DeepSeek in the same session and workspace. Use the prior investigation, compact checkpoint, and GPT review; do not repeat repository discovery. Make only a necessary final correction, run one focused verification, and deliver the result."
+        }
+      ],
+      "forcedContextWindow": 24000
+    }
+  ]
+}

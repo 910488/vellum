@@ -1,0 +1,139 @@
+name: Desktop Builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/desktop-build.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "enhanced-runtime.lock.json"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "scripts/**"
+      - "src/**"
+      - "src-tauri/**"
+      - "vite.config.ts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  remote-payload:
+    name: Embedded Remote Manager payload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Linux deployment payloads
+        run: bash scripts/build-local-release.sh stage-only
+
+      - name: Upload embedded payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-remote-payload-${{ github.sha }}
+          path: src-tauri/resources/remote
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-dmg:
+    name: macOS DMG
+    needs: remote-payload
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download embedded payload
+        uses: actions/download-artifact@v4
+        with:
+          name: vellum-remote-payload-${{ github.sha }}
+          path: src-tauri/resources/remote
+
+      - name: Build DMG
+        run: pnpm exec tauri build --bundles dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-macos-dmg-${{ github.sha }}
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-installer:
+    name: Windows installer
+    needs: remote-payload
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download embedded payload
+        uses: actions/download-artifact@v4
+        with:
+          name: vellum-remote-payload-${{ github.sha }}
+          path: src-tauri/resources/remote
+
+      - name: Build NSIS installer
+        run: pnpm exec tauri build --bundles nsis
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-windows-nsis-${{ github.sha }}
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

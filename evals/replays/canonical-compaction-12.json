@@ -1,0 +1,160 @@
+{
+  "cases": [
+    {
+      "id": "official-standalone-multi-item-output",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "source": [{"type": "message", "role": "user", "content": "remember 27"}],
+        "canonical": [
+          {"type": "compaction", "id": "cmp_case_01", "encrypted_content": "opaque-01"},
+          {"type": "message", "id": "msg_keep_01", "role": "user", "content": "retained"}
+        ]
+      },
+      "expected": {
+        "/journal/schemaVersion": 3,
+        "/journal/kind": "Official",
+        "/journal/canonicalItems/0/encrypted_content": "opaque-01",
+        "/journal/canonicalItems/1/id": "msg_keep_01"
+      }
+    },
+    {
+      "id": "missing-ciphertext-restores-exact-official-item",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "canonical": [{"type": "compaction", "id": "cmp_case_02", "encrypted_content": "opaque-02"}],
+        "resume": [
+          {"type": "compaction", "id": "cmp_case_02"},
+          {"type": "message", "role": "user", "content": "continue"}
+        ]
+      },
+      "expected": {
+        "/resume/0/id": "cmp_case_02",
+        "/resume/0/encrypted_content": "opaque-02",
+        "/resume/1/content": "continue"
+      }
+    },
+    {
+      "id": "retained-item-is-not-duplicated",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "canonical": [
+          {"type": "compaction", "id": "cmp_case_03", "encrypted_content": "opaque-03"},
+          {"type": "message", "id": "msg_keep_03", "role": "user", "content": "retained"}
+        ],
+        "resume": [
+          {"type": "compaction", "id": "cmp_case_03"},
+          {"type": "message", "id": "msg_keep_03", "role": "user", "content": "retained"},
+          {"type": "message", "role": "user", "content": "new"}
+        ]
+      },
+      "expected": {
+        "/resume/0/id": "cmp_case_03",
+        "/resume/1/id": "msg_keep_03",
+        "/resume/2/content": "new"
+      },
+      "absent": ["/resume/3"]
+    },
+    {
+      "id": "official-to-third-party-fails-without-portable-window",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "target": "third_party",
+        "canonical": [{"type": "compaction", "id": "cmp_case_04", "encrypted_content": "opaque-04"}]
+      },
+      "expectedError": "no validated portable handoff window"
+    },
+    {
+      "id": "official-to-third-party-uses-portable-window",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "target": "third_party",
+        "canonical": [{"type": "compaction", "id": "cmp_case_05", "encrypted_content": "opaque-05"}],
+        "portable": [{"type": "message", "role": "developer", "content": "portable checkpoint"}]
+      },
+      "expected": {
+        "/journal/portableAvailable": true,
+        "/resume/0/content": "portable checkpoint",
+        "/resume/1/content": "continue"
+      }
+    },
+    {
+      "id": "canonical-hash-is-recorded",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "canonical": [{"type": "compaction", "id": "cmp_case_06", "encrypted_content": "opaque-06"}]
+      },
+      "expectedPrefixes": {"/journal/canonicalHash": ""}
+    },
+    {
+      "id": "source-window-remains-audit-only",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "source": [{"type": "message", "role": "user", "content": "large source"}],
+        "canonical": [{"type": "compaction", "id": "cmp_case_07", "encrypted_content": "opaque-07"}]
+      },
+      "expected": {
+        "/journal/sourceItems/0/content": "large source",
+        "/journal/canonicalItems/0/encrypted_content": "opaque-07"
+      },
+      "absent": ["/resume/0/content"]
+    },
+    {
+      "id": "local-canonical-materializes-for-official",
+      "operation": "compaction_materialization",
+      "input": {
+        "summary": {"type": "message", "role": "developer", "content": "local checkpoint"}
+      },
+      "expected": {
+        "/official/0/content": "local checkpoint",
+        "/thirdParty/0/content": "local checkpoint"
+      }
+    },
+    {
+      "id": "server-side-suffix-starts-at-latest-compaction",
+      "operation": "server_side_canonical_compaction",
+      "input": {
+        "output": [
+          {"type": "message", "id": "old-output", "role": "assistant", "content": "before"},
+          {"type": "compaction", "id": "cmp_case_09", "encrypted_content": "opaque-09"},
+          {"type": "message", "id": "retained-output", "role": "assistant", "content": "after"}
+        ]
+      },
+      "expected": {
+        "/kind": "Official",
+        "/trigger": "official_context_management",
+        "/canonicalItems/0/id": "cmp_case_09",
+        "/canonicalItems/1/id": "retained-output"
+      },
+      "absent": ["/canonicalItems/2"]
+    },
+    {
+      "id": "second-compaction-has-independent-canonical-window",
+      "operation": "official_canonical_compaction",
+      "input": {
+        "canonical": [
+          {"type": "compaction", "id": "cmp_case_10", "encrypted_content": "opaque-10"},
+          {"type": "message", "id": "after-10", "role": "user", "content": "latest"}
+        ]
+      },
+      "expected": {
+        "/resume/0/id": "cmp_case_10",
+        "/resume/1/id": "after-10",
+        "/resume/2/content": "continue"
+      }
+    },
+    {
+      "id": "empty-official-output-fails-closed",
+      "operation": "official_canonical_compaction",
+      "input": {"canonical": []},
+      "expectedError": "requires a compaction item id"
+    },
+    {
+      "id": "output-without-compaction-fails-closed",
+      "operation": "server_side_canonical_compaction",
+      "input": {
+        "output": [{"type": "message", "role": "assistant", "content": "no compaction"}]
+      },
+      "expectedError": "contained no compaction item"
+    }
+  ]
+}

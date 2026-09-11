@@ -1,0 +1,19 @@
+{
+  "seq": 9,
+  "harnessId": "deepseek-harness",
+  "threadId": "vellum_thread",
+  "nativeSessionId": "native-3",
+  "nativeEventId": null,
+  "occurredAt": "2026-08-30T12:00:03Z",
+  "event": {
+    "type": "toolCallCompleted",
+    "data": {
+      "toolCallId": "call-1",
+      "name": "read_file",
+      "result": {
+        "ok": true
+      },
+      "isError": false
+    }
+  }
+}

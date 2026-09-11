@@ -1,0 +1,35 @@
+{
+  "usage": {
+    "input_tokens": 6,
+    "output_tokens": 4,
+    "total_tokens": 10
+  },
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_provider_private",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "Thought about the answer."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_2",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "The answer is 42.",
+          "annotations": []
+        }
+      ],
+      "phase": "final_answer"
+    }
+  ]
+}

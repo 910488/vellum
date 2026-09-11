@@ -1,0 +1,15 @@
+{
+  "seq": 7,
+  "harnessId": "grok-build",
+  "threadId": "vellum_thread",
+  "nativeSessionId": "native-1",
+  "nativeEventId": null,
+  "occurredAt": "2026-08-30T12:00:00Z",
+  "event": {
+    "type": "assistantDelta",
+    "data": {
+      "messageId": "m-1",
+      "delta": "hello"
+    }
+  }
+}

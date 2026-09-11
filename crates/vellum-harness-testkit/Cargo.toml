@@ -1,0 +1,30 @@
+[package]
+name = "vellum-harness-testkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scripted fake ACP agent for deterministic Vellum harness tests"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+vellum-acp-client = { path = "../vellum-acp-client" }
+vellum-codex-facade = { path = "../vellum-codex-facade" }
+vellum-harness-protocol = { path = "../vellum-harness-protocol" }
+vellum-harness-runtime = { path = "../vellum-harness-runtime" }
+
+[lib]
+name = "vellum_harness_testkit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fake-acp-agent"
+path = "src/main.rs"

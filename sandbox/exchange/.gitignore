@@ -1,0 +1,4 @@
+# Sandbox writes run artifacts here. Keep the directory, not its contents —
+# the .wsb mapping needs the folder to exist on the host before launch.
+*
+!.gitignore

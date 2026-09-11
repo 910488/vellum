@@ -1,0 +1,148 @@
+{
+  "schemaVersion": 1,
+  "name": "compaction-engine-ab",
+  "version": "1.0.3",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "engine-ab-single-resume",
+      "category": "long-context",
+      "tags": ["engine-ab", "single-resume", "stage-0"],
+      "source": {"kind": "fixture", "path": "compaction-engine-ab/single-resume"},
+      "prompt": "Inspect CONSTRAINTS.md and resume.py. Implement normalize_label, create DECISIONS.md containing ENGINE_AB_SINGLE_RESUME, then read EVAL_CONTEXT.md exactly once to trigger compaction. Do not re-read files after compaction. Preserve the decision and stop.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue the existing task without repeating repository investigation. Verify the implementation and write resume.txt containing continued."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 15000,
+      "timeoutSeconds": 300,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "ENGINE_AB_SINGLE_RESUME"},
+        {"path": "resume.txt", "contains": "continued"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 256,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 16000
+      }
+    },
+    {
+      "id": "engine-ab-goal-revision",
+      "category": "long-context",
+      "tags": ["engine-ab", "goal-revision"],
+      "source": {"kind": "fixture", "path": "compaction-engine-ab/goal-revision"},
+      "prompt": "Inspect the repository. Stop work on feature A in alpha.py. Do not modify alpha.py. Implement feature B in beta.py instead, then read EVAL_CONTEXT.md exactly once to trigger compaction. Record GOAL_REVISION_TO_B in DECISIONS.md.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue the existing task. Finish feature B in beta.py. Do not resume feature A and do not change alpha.py."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 15000,
+      "timeoutSeconds": 300,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "GOAL_REVISION_TO_B"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 256,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 16000
+      }
+    },
+    {
+      "id": "engine-ab-tool-continuity",
+      "category": "long-context",
+      "tags": ["engine-ab", "tool-continuity"],
+      "source": {"kind": "fixture", "path": "compaction-engine-ab/tool-continuity"},
+      "prompt": "Inspect CONSTRAINTS.md and compute.py. Use a shell tool to compute the product of the values in data.json, write that integer to RESULT.txt, record TOOL_RESULTS_PRESERVED in DECISIONS.md, then read EVAL_CONTEXT.md exactly once to trigger compaction.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue from the prior tool result. Do not re-read data.json or recompute the product. Write phase-one.txt containing phase-one and leave RESULT.txt unchanged."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 15000,
+      "timeoutSeconds": 300,
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "TOOL_RESULTS_PRESERVED"},
+        {"path": "phase-one.txt", "contains": "phase-one"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 256,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 16000
+      }
+    },
+    {
+      "id": "engine-ab-double-compaction",
+      "category": "long-context",
+      "tags": ["engine-ab", "double-compaction"],
+      "source": {"kind": "fixture", "path": "compaction-engine-ab/double-compaction"},
+      "prompt": "Inspect CONSTRAINTS.md and continuity.py. Implement normalize_records, record DOUBLE_COMPACTION_STABLE in DECISIONS.md, then read EVAL_CONTEXT.md exactly once to trigger the first compaction.",
+      "phases": [
+        {
+          "model": "current",
+          "prompt": "Continue after the first compact boundary. Create phase-one.txt containing phase-one. Do not restart investigation."
+        },
+        {
+          "model": "current",
+          "prompt": "Continue after the second compact boundary. Create phase-two.txt containing phase-two. Preserve the original decision and phase-one."
+        }
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "forcedContextWindow": 15000,
+      "timeoutSeconds": 420,
+      "expectedHarness": {
+        "minToolCalls": 3,
+        "minCompactions": 2,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "continuityCheckpoints": [
+        {"path": "DECISIONS.md", "contains": "DOUBLE_COMPACTION_STABLE"},
+        {"path": "phase-one.txt", "contains": "phase-one"},
+        {"path": "phase-two.txt", "contains": "phase-two"}
+      ],
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 256,
+        "maxInputTokens": 220000,
+        "maxOutputTokens": 20000
+      }
+    }
+  ]
+}

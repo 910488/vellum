@@ -1,0 +1,116 @@
+[package]
+name = "vellum"
+version = "0.2.9"
+description = "Vellum — 本機代理管理器"
+authors = ["Josh Huang"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.85.0"
+autobins = false
+default-run = "vellum-proxy-desktop"
+
+# Discord 會把單純名為 vellum.exe 的程序誤判為同名遊戲。
+# 保留產品名稱與資料目錄不變，只讓實際程序使用不會碰撞的唯一名稱。
+[[bin]]
+name = "vellum-proxy-desktop"
+path = "src/main.rs"
+
+# Eval CLI, App Server sidecar, and gate-child live in their own packages so
+# daily `cargo check -p vellum` does not link those binaries.
+
+[lib]
+name = "vellum_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+doctest = false
+
+[build-dependencies]
+tauri-build = { version = "2.4.0", features = [] }
+sha2.workspace = true
+
+[dependencies]
+tauri = { version = "2.8.2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+tauri-plugin-log = "2"
+thiserror = "2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# --- 接線用：探測、壓縮、審查要發 HTTP ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# 鎖 1.50：離線快取只到 1.50.0（1.53 會拉未快取的 tokio-macros 2.7）。
+tokio = { version = "=1.50.0", features = ["rt-multi-thread", "macros", "time", "process", "sync", "io-util", "io-std", "fs", "signal", "net"] }
+
+# --- 憑證與歷史落盤加密（doc/09 從 cc-switch 搬來）---
+aes-gcm = "0.10"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+zeroize = "1"
+
+# --- 歷史落盤（doc/05）---
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Non-poisoning lock: a panic in one history op must not brick later .lock()
+# callers (std::sync::Mutex poisons; see history.rs).
+parking_lot = "0.12"
+dirs = "6"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+fs2 = { workspace = true }
+url = "2"
+async-trait = "0.1"
+toml_edit = "0.22"
+toml = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+async-stream = "0.3"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+zstd = { workspace = true }
+tempfile = "3"
+tar = "0.4"
+flate2 = "1"
+zip.workspace = true
+pdf-extract = "0.12"
+hayro = "0.4"
+ulid = "1"
+hex = "0.4"
+vellum-remote-protocol = { path = "../crates/vellum-remote-protocol" }
+vellum-proxy-runtime = { path = "../crates/vellum-proxy-runtime" }
+vellum-zcode-desktop = { path = "../crates/vellum-zcode-desktop" }
+vellum-enhanced-codex = { path = "../crates/vellum-enhanced-codex" }
+
+# Windows DPAPI（金鑰用目前使用者帳戶包住，見 crypto.rs）。
+# `is_pid_alive` asks the OS whether a recorded eval PID is still running, and
+# on every non-Windows target that question is `kill(pid, 0)`.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+vellum-proxy-testkit = { path = "../crates/vellum-proxy-testkit" }
+vellum-remote-agent = { path = "../crates/vellum-remote-agent" }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+# No `panic = "abort"` here on purpose: web.run parses attacker-controlled
+# HTML/PDF and SearchEngine::run fences that pipeline with catch_unwind.
+# Aborting turns any parser bug back into a whole-process kill (0xC0000409,
+# 2026-08-05/08-10). src/web_search.rs carries a compile_error! guard that
+# fails the build if this line is ever re-added.
+strip = true

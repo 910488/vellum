@@ -1,0 +1,32 @@
+{
+  "name": "official_sse_parser_incremental",
+  "commitHint": "issue-1-dod-benchmark",
+  "recordedAtUnix": 1785641902,
+  "sizes": [
+    {
+      "sizeMib": 1,
+      "inputBytes": 1048828,
+      "wallMs": 10.7341,
+      "nsPerByte": 10.234375893854855,
+      "peakTrackerUtf8Bytes": 46861,
+      "note": "peakTrackerUtf8Bytes is the incremental buffer, not full process RSS"
+    },
+    {
+      "sizeMib": 16,
+      "inputBytes": 16777469,
+      "wallMs": 172.6551,
+      "nsPerByte": 10.290890717783475,
+      "peakTrackerUtf8Bytes": 47504,
+      "note": "peakTrackerUtf8Bytes is the incremental buffer, not full process RSS"
+    },
+    {
+      "sizeMib": 64,
+      "inputBytes": 67109118,
+      "wallMs": 695.5269,
+      "nsPerByte": 10.364119224454715,
+      "peakTrackerUtf8Bytes": 48062,
+      "note": "peakTrackerUtf8Bytes is the incremental buffer, not full process RSS"
+    }
+  ],
+  "conclusion": "cost-per-byte remains approximately linear; peakTrackerUtf8Bytes is the incremental SSE buffer only (not process-wide peak RSS) and stays bounded independent of transcript size"
+}

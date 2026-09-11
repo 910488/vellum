@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "qwenCode": {
+    "repository": "https://github.com/QwenLM/qwen-code.git",
+    "commit": "2488d12d8b3a71d405658c1f6ff44218602f96bf",
+    "sourceSha256": "sha256:cba68218a6ca33b8dd9a68e12e513e401b01b65322a029cb75a891f47bdbfcd9",
+    "module": "packages/core/dist/src/services/loopDetectionService.js",
+    "license": "Apache-2.0"
+  },
+  "deepseekHarness": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness.git",
+    "commit": "dd6322d604e00eec1ba5e0c8541159906a21094a",
+    "role": "interface-reference-only",
+    "license": "MIT"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "name": "enhanced-quick-e1",
+  "version": "1.0.0",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "e1-exact-tool-replay",
+      "category": "tool-recovery",
+      "tags": ["enhanced-quick", "target", "e1"],
+      "source": {"kind": "fixture", "path": "enhanced-e1-replay"},
+      "prompt": "Your first action must be running `python run_once.py` exactly once. Report its printed sentinel and finish. Do not edit the script or delete or rewrite side-effect.log.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "faults": [{"atRequest": 1, "kind": "replay_tool_call"}],
+      "expectedHarness": {"minToolCalls": 1, "requireTerminalSse": true, "minEnhancedEvents": {"enhanced.session.features_applied": 1}},
+      "timeoutSeconds": 180,
+      "limits": {"cpu": 2, "memoryMb": 4096, "pids": 256, "diskMb": 1024, "maxInputTokens": 200000, "maxOutputTokens": 10000}
+    },
+    {
+      "id": "e1-short-control",
+      "category": "short-fix",
+      "tags": ["enhanced-quick", "control", "short"],
+      "source": {"kind": "human_eval", "task_id": "HumanEval/0"},
+      "prompt": "Read TASK.md and solution.py, implement the requested function, run a focused check, and finish.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "expectedHarness": {"minToolCalls": 1, "requireTerminalSse": true, "minEnhancedEvents": {"enhanced.session.features_applied": 1}},
+      "timeoutSeconds": 180,
+      "limits": {"cpu": 2, "memoryMb": 4096, "pids": 256, "diskMb": 1024, "maxInputTokens": 200000, "maxOutputTokens": 10000}
+    },
+    {
+      "id": "e1-multifile-control",
+      "category": "multi-file",
+      "tags": ["enhanced-quick", "control", "multi-file"],
+      "source": {"kind": "mbpp", "task_id": "56", "multi_file": true},
+      "prompt": "Implement TASK.md using the existing module boundaries, run a focused check, and finish.",
+      "verification": ["python3 -I /hidden/grader.py"],
+      "expectedHarness": {"minToolCalls": 1, "requireTerminalSse": true, "minEnhancedEvents": {"enhanced.session.features_applied": 1}},
+      "timeoutSeconds": 180,
+      "limits": {"cpu": 2, "memoryMb": 4096, "pids": 256, "diskMb": 1024, "maxInputTokens": 200000, "maxOutputTokens": 10000}
+    }
+  ]
+}

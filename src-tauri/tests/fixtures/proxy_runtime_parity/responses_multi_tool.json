@@ -1,0 +1,51 @@
+{
+  "usage": {
+    "input_tokens": 18,
+    "output_tokens": 16,
+    "total_tokens": 34
+  },
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "type": "function_call",
+      "id": "fc_2",
+      "call_id": "call_weather_taipei",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Taipei\"}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call",
+      "id": "fc_3",
+      "call_id": "call_weather_tokyo",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Tokyo\"}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_weather_taipei",
+      "output": "{\"temp\":32}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_weather_tokyo",
+      "output": "{\"temp\":28}"
+    },
+    {
+      "type": "message",
+      "id": "msg_3",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Both cities are warm today.",
+          "annotations": []
+        }
+      ],
+      "phase": "commentary"
+    }
+  ]
+}

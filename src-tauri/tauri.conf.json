@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vellum",
+  "version": "0.2.9",
+  "identifier": "com.vellum.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:3100",
+    "beforeDevCommand": "pnpm run build:sidecar:dev && pnpm run dev:renderer",
+    "beforeBuildCommand": "pnpm run build:renderer && pnpm run build:sidecar"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Vellum",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 940,
+        "minHeight": 620,
+        "maximized": true,
+        "resizable": true,
+        "center": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "nsis"],
+    "resources": ["resources/remote/**/*", "binaries/*"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["TradChinese", "English"]
+      }
+    }
+  }
+}

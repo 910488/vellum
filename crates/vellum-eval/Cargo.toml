@@ -1,0 +1,15 @@
+[package]
+name = "vellum-eval"
+version = "0.2.4"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Vellum evaluation CLI (not part of the daily Desktop package)"
+
+[[bin]]
+name = "vellum-eval"
+path = "src/main.rs"
+
+[dependencies]
+vellum = { path = "../../src-tauri" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Published RFC 6455 WebSocket handshake example, not a credential"
+regexes = [
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+]

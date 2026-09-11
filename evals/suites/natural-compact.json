@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "name": "natural-compact",
+  "version": "1",
+  "defaultRepeat": 1,
+  "tasks": [
+    {
+      "id": "natural-context-continuation",
+      "category": "long-context",
+      "tags": ["long-context", "natural-context"],
+      "source": {"kind": "mbpp", "task_id": "69", "multi_file": true},
+      "prompt": "Investigate the workspace, implement the requested behavior, and preserve all decisions through any automatic context compaction.",
+      "phases": [
+        {"model": "current", "prompt": "Continue from the existing implementation state after any context compaction. Run the focused tests and finish the task without repeating the initial investigation."}
+      ],
+      "verification": ["python /hidden/grader.py"],
+      "timeoutSeconds": 1800,
+      "expectedHarness": {
+        "minToolCalls": 2,
+        "minCompactions": 1,
+        "requireTerminalSse": true,
+        "requireSessionResume": true
+      },
+      "limits": {
+        "cpu": 2,
+        "memoryMb": 4096,
+        "pids": 256,
+        "diskMb": 1024,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 60000
+      }
+    }
+  ]
+}
