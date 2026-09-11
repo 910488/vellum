@@ -177,7 +177,7 @@ pnpm run remote:e2e:full
 ### 部署那一段測的是什麼
 
 `remote_deployment_converges_and_a_second_apply_changes_nothing` 走完整條
-plan → apply → 再 plan → 再 apply,斷言的是 `docs/remote-acceptance.md` 第 9 節
+plan → apply → 再 plan → 再 apply,斷言的是 `docs/remote-acceptance.md` 第 6 節
 與第 10.4 節本來只靠人看畫面確認的那幾件事:
 
 - 第一次 apply 走到 `credentials.boundaryReady`、`proxy.configured`、

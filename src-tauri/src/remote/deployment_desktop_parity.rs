@@ -15,7 +15,7 @@
 //! 3. `to_route()`, which re-derives some fields from `base_url` and
 //!    `upstream_model` instead of reading what Desktop resolved.
 //!
-//! So the parity claim in `docs/remote-acceptance.md` (10.6) -- that remote
+//! So the parity claim in `docs/remote-acceptance.md` (7.6) -- that remote
 //! and local share one runtime configuration surface -- cannot be checked by
 //! reading the types. This module checks it by value: it builds a route
 //! matrix, asks Desktop what it would run, asks the plan what the host will

@@ -423,7 +423,7 @@ fn configure_one_deployable_route(state: &AppState) {
 
 /// Deploy, then ask whether deploying again would change anything.
 ///
-/// `docs/remote-acceptance.md` sections 9 and 10.4 are stated as properties of
+/// `docs/remote-acceptance.md` sections 6 and 7.4 are stated as properties of
 /// a second apply -- `configChanged=false`, `catalogChanged=false`,
 /// `restartRequired=false`, `observedRevision` caught up, and a drift-free
 /// native daemon left alone -- and until now every one of them was checked by
@@ -633,7 +633,7 @@ async fn remote_deployment_converges_and_a_second_apply_changes_nothing() {
     }
 }
 
-/// docs/remote-acceptance.md §11: a host whose native lease is already active
+/// docs/remote-acceptance.md §8: a host whose native lease is already active
 /// but whose boundary key this Desktop has never confirmed.
 ///
 /// That is not a contrived state. It is what a host looks like to a Desktop

@@ -306,7 +306,7 @@ fn strip_desktop_poll_time(catalog: &mut Value) {
 /// true: every apply to an already-converged host re-pushed the image,
 /// stopped the proxy, temporarily restored the native lease and restarted the
 /// daemon -- dropping whatever session that host was carrying, which is the
-/// exact outcome docs/remote-acceptance.md 9 forbids.
+/// exact outcome docs/remote-acceptance.md 6 forbids.
 ///
 /// Pure and host-agnostic, because the response shape is the whole question
 /// and it should be answerable without a live agent.

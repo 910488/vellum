@@ -185,9 +185,6 @@ Additional reliability suites:
   Ordinary one-shot fault injection remains unchanged when this field is
   absent. Gateway traces and task results preserve every HTTP error and label
   expected, recovered, unrecovered, and unexpected observations separately.
-  The complete environment split, rollout-evidence method, paid-run budget,
-  and promotion metrics are defined in
-  `docs/enhanced-harness-qualification.md`.
 - `evals/harness-lab` is a non-product Node sidecar for testing pinned upstream
   harness modules without rebuilding Rust. It replays recorded Codex rollouts
   through Qwen's original loop detector and can proxy live Responses traffic in

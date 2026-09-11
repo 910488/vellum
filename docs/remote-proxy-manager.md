@@ -40,15 +40,14 @@ Codex 原生 daemon 是 thread、turn、approval、workspace 與 session 的唯�
 
 ## 每個 release 必須重跑的 promotion gates
 
-下列項目是 release qualification requirements，不是未完成的架構 backlog。e806 是遠端 OpenAI-compatible API，不是 Jetson 本機 Ollama：
+下列項目是 release qualification requirements，不是未完成的架構 backlog：
 
-1. e806 transport qualification（marker、SSE、typed tool、continuation、credential isolation）；
-2. per-model capability probe（尤其 reasoning/tool/vision/context），未通過 typed-tool probe 的模型只標 chat-only，不進 Codex catalog；
-3. 只有「qualified 且使用者勾選」的模型注入該 host 的 catalog；
-4. Remote deployment 的 public plan 與 runtime config 不含任何 secret；
-5. Provider promotion gates：Luna／DeepSeek／Grok 各跑 HumanEval/0-2、`switch-matrix-6`（三模型 ordered pair 與 round-trip）與 0.2.3 SWE gate `psf__requests-1142`；Verified-12 其餘 11 題為 post-release qualification pending。e806 只標 `API transport qualified`／`Codex protocol qualified`。
+1. per-model capability probe（尤其 reasoning/tool/vision/context），未通過 typed-tool probe 的模型只標 chat-only，不進 Codex catalog；
+2. 只有「qualified 且使用者勾選」的模型注入該 host 的 catalog；
+3. Remote deployment 的 public plan 與 runtime config 不含任何 secret；
+4. Provider gates：Luna／DeepSeek／Grok 各自通過 marker、SSE、typed tools、跨 provider continuation 與原生 detach/resume。
 
-逐項判定與實機步驟見 [remote-acceptance.md](remote-acceptance.md) 的 Gate 1–4。
+逐項判定與實機步驟見 [remote-acceptance.md](remote-acceptance.md)。
 
 ## 現行 inventory、pinned 安裝與 per-host desired state
 

@@ -4,10 +4,7 @@
 push that changes desktop code runs the `Desktop Builds` GitHub Actions
 workflow and publishes both installers as workflow artifacts.
 
-`MAC_OS` is a compatibility/build mirror only and must resolve to the same
-commit as `main`; it is not a separate development line. Before branch or
-worktree operations, follow `docs/git-worktree-branch-policy.md`. Proxy and
-provider changes must also follow `docs/protocol-source-of-truth.md`.
+Proxy and provider changes must follow `docs/protocol-source-of-truth.md`.
 
 ## The Enhanced Runtime bridge sidecar
 

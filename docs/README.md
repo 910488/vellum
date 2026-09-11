@@ -6,21 +6,15 @@ Use the authority order below when documents overlap.
 ## Authority order
 
 1. `protocol-source-of-truth.md` — normative model proxy protocol contract.
-2. `git-worktree-branch-policy.md` — normative Git/worktree/release-branch policy.
-3. Active ADRs under `adr/` — narrow architectural decisions not superseded
-   by the sources above.
-4. Operational and acceptance documents — current procedures only; they do
+2. Active ADRs under `adr/` — narrow architectural decisions not superseded
+   by the protocol contract.
+3. Operational and acceptance documents — current procedures only; they do
    not override the normative contracts.
 
 ## Normative documents
 
 - [Proxy protocol source of truth](protocol-source-of-truth.md)
-- [Git worktree and branch policy](git-worktree-branch-policy.md)
 - [Build and release instructions](../BUILDING.md)
-
-## Public release
-
-- [Public release and history-sanitization checklist](public-release-checklist.md)
 
 ## Standard QA
 
@@ -33,6 +27,7 @@ These are operational. They do not override the protocol contract. `pnpm qa -- -
 ## Remote Manager
 
 - [Current architecture and operations](remote-proxy-manager.md)
+- [Development loop](remote-dev-loop.md)
 - [Acceptance matrix](remote-acceptance.md)
 - [Clean-host acceptance](remote-clean-host-acceptance.md)
 
@@ -52,16 +47,6 @@ artifacts outside the repository; an older result is not a current qualification
 The Codex native app-server daemon is the sole thread/session authority. The
 Broker is diagnostic-only and is not in the production data path.
 
-## Evaluation
-
-- [Enhanced harness improvement and qualification plan](enhanced-harness-qualification.md)
-- [Enhanced harness fast iteration gate](enhanced-harness-fast-iteration.md)
-
-Dated eval reports and qualification runs are kept with their run artifacts,
-outside the repository. They are evidence for the recorded commit and sample
-only; they do not override the protocol contract or establish promotion from a
-single run.
-
 ## Harness Manager
 
 Native-harness work is governed by [ADR-009](adr/ADR-009-native-harness-manager.md)
@@ -75,12 +60,15 @@ that fakes runtime headers. Attach is
 (`vellum-zcode-desktop` control channel). Desktop UI promotion still needs
 a per-release `cjsSha256` pin.
 
-## Enhanced Codex Runtime MVP
+## Enhanced Codex Runtime
 
 Third-party Desktop threads bind to a pinned Enhanced Codex execution plane.
 See [Enhanced Codex Runtime MVP](enhanced-runtime-mvp.md). Official OpenAI /
 GPT traffic stays on unmodified Codex. Do not fold these ports into
 `vellum-proxy-runtime`.
+
+Eval reports and qualification runs are kept with their run artifacts, outside
+the repository. They are evidence for the recorded commit and sample only.
 
 ## Maintenance rules
 
@@ -89,5 +77,3 @@ GPT traffic stays on unmodified Codex. Do not fold these ports into
   external run artifacts, not source documentation.
 - Remove a superseded ADR after its replacement is identified in this index;
   Git history remains the archive.
-- Do not create branch-specific architecture documents. Platform-specific
-  behavior lands through `main`, and `MAC_OS` mirrors `main`.
