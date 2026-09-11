@@ -45,9 +45,10 @@ qa/runs/
 qa/reports/**/*.json
 qa/reports/**/*.html
 
-# Local worktrees and package manager cache
+# Local worktrees, package manager cache and editor/agent settings
 .worktrees/
 .pnpm-store/
+.claude/
 
 # Staged App Server bridge sidecar (scripts/build-sidecar.mjs); built per release.
 src-tauri/binaries/*

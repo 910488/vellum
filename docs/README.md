@@ -5,12 +5,11 @@ Use the authority order below when documents overlap.
 
 ## Authority order
 
-1. `AGENTS.md` — repository-wide execution rules for Codex and contributors.
-2. `protocol-source-of-truth.md` — normative model proxy protocol contract.
-3. `git-worktree-branch-policy.md` — normative Git/worktree/release-branch policy.
-4. Active ADRs under `adr/` — narrow architectural decisions not superseded
+1. `protocol-source-of-truth.md` — normative model proxy protocol contract.
+2. `git-worktree-branch-policy.md` — normative Git/worktree/release-branch policy.
+3. Active ADRs under `adr/` — narrow architectural decisions not superseded
    by the sources above.
-5. Operational and acceptance documents — current procedures only; they do
+4. Operational and acceptance documents — current procedures only; they do
    not override the normative contracts.
 
 ## Normative documents

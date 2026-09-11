@@ -13,7 +13,9 @@ Run this checklist against the exact commit that will become public.
 
 3. Search tracked files for personal paths, private network addresses, account
    identifiers, internal hostnames, and credential-bearing URLs.
-4. Run the repository validation commands from `AGENTS.md` and `BUILDING.md`.
+4. Run `cargo test -p vellum-proxy-runtime --lib`, `pnpm typecheck`, the
+   focused UI tests when UI changed, `git diff --check`, and the build checks
+   in `BUILDING.md`.
 
 ## Git history
 
