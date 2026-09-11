@@ -11,7 +11,7 @@
  * 後者在真 app 裡本來就是 App.tsx 傳下來的。
  *
  * 開發用：
- *   pnpm dev:renderer   然後開 /enhanced-preview.html
+ *   pnpm dev:renderer   然後開 /preview/enhanced.html
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";

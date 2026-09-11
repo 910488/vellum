@@ -12,7 +12,7 @@
  * 不用在這裡重寫一份會跟本體走鐘的假資料。
  *
  * 開發用：
- *   pnpm dev:renderer   然後開 /settings-preview.html
+ *   pnpm dev:renderer   然後開 /preview/settings.html
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";

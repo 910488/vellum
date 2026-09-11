@@ -9,7 +9,7 @@
  * window.__TAURI_INTERNALS__.invoke。
  *
  * 開發用：
- *   pnpm dev:renderer   然後開 /log-preview.html
+ *   pnpm dev:renderer   然後開 /preview/log.html
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";

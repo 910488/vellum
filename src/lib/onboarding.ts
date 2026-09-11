@@ -13,7 +13,7 @@ export const ONBOARDING_COMPLETED_KEY = "vellum.onboarding.completed.v1";
  * 首次設定畫面出不出場。
  *
  * 元件、接線、i18n 資源都留著沒動，開關就只是這一個常數，不必動 App.tsx。
- * 開發預覽台（`onboarding-preview.html`）走的是元件直連，不受這裡影響，
+ * 開發預覽台（`preview/onboarding.html`）走的是元件直連，不受這裡影響，
  * 關掉期間照樣看得到。
  */
 export const ONBOARDING_ENABLED = false;

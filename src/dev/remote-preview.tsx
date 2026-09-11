@@ -11,7 +11,7 @@
  * api.ts 一行都不用改，hasTauri() 也是真的走 Tauri 那一條路。
  *
  * 開發用：
- *   pnpm dev:renderer   然後開 /remote-preview.html
+ *   pnpm dev:renderer   然後開 /preview/remote.html
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";

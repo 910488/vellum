@@ -9,7 +9,7 @@
  * api 瀏覽器 mock 都是真的。
  *
  * 開發用：
- *   pnpm dev:renderer   然後開 /models-preview.html
+ *   pnpm dev:renderer   然後開 /preview/models.html
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";

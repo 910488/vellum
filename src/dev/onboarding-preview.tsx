@@ -14,7 +14,7 @@
  * 是為了在第一到第四幕也能切語言 —— 那幾幕上產品不該掛常駐的語言控制項。
  *
  * 開發用：
- *   pnpm dev:renderer   然後開 /onboarding-preview.html
+ *   pnpm dev:renderer   然後開 /preview/onboarding.html
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
