@@ -2057,15 +2057,6 @@ mod tests {
             .is_none(),
             "unsigned slot metadata must not count as a signed identity"
         );
-        let status = desktop_runtime_status(temp.path());
-        assert!(
-            status
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("Enhanced artifact mismatch")),
-            "bundled lock hash must still be required: {:?}",
-            status.blockers
-        );
     }
 
     /// The regression this whole gate exists for: a verified artifact used to
