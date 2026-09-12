@@ -1,7 +1,7 @@
 /**
  * System status decoding. Headline labels are translation keys.
  */
-import type { EnhancedDesktopRuntimeStatus, Overview, ProxyStatus, RuntimeNotice, RuntimeStatus } from "@/types";
+import type { EnhancedDesktopRuntimeStatus, Overview, ProxyStatus, RuntimeNotice, RuntimeStatus, UpdateAttention, UpdateStatusSnapshot } from "@/types";
 import type { ScreenId } from "@/screens/registry";
 
 export interface SystemStatus {
@@ -9,9 +9,10 @@ export interface SystemStatus {
   runtime: RuntimeStatus | null;
   enhancedRuntime?: EnhancedDesktopRuntimeStatus | null;
   overview: Overview | null;
+  updates?: UpdateStatusSnapshot | null;
 }
 
-export const EMPTY_STATUS: SystemStatus = { proxy: null, runtime: null, enhancedRuntime: null, overview: null };
+export const EMPTY_STATUS: SystemStatus = { proxy: null, runtime: null, enhancedRuntime: null, overview: null, updates: null };
 
 export interface Headline {
   tone: "ok" | "warn" | "quiet";
@@ -27,9 +28,10 @@ export interface Headline {
   error: string | null;
   /** 需要處理、但不是故障的狀態。前端自己組句子。 */
   notice: RuntimeNotice | null;
+  updateAttention: UpdateAttention;
 }
 
-export function headline({ proxy, runtime, enhancedRuntime, overview }: SystemStatus): Headline {
+export function headline({ proxy, runtime, enhancedRuntime, overview, updates }: SystemStatus): Headline {
   const defaultRoute = overview?.route ?? null;
   const telemetry = overview?.lastSuccessfulRoute ?? null;
   const routeId = telemetry?.routeId ?? defaultRoute?.id ?? null;
@@ -45,6 +47,7 @@ export function headline({ proxy, runtime, enhancedRuntime, overview }: SystemSt
     restartRequired: (runtime?.restartRequired ?? false) || (enhancedRuntime?.restartRequired ?? false),
     error: proxy?.lastError ?? null,
     notice: proxy?.notice ?? null,
+    updateAttention: updates?.attention ?? "none",
   };
 
   if (!proxy) return { ...base, modelIsLive: false, tone: "quiet", labelKey: "status.reading" };
@@ -62,12 +65,20 @@ export function headline({ proxy, runtime, enhancedRuntime, overview }: SystemSt
   return { ...base, modelIsLive: true, tone: "ok", labelKey: "status.live" };
 }
 
-export function attention({ runtime, overview }: SystemStatus): Partial<Record<ScreenId, number>> {
+export function attention({ runtime, overview, updates }: SystemStatus): Partial<Record<ScreenId, number>> {
   const result: Partial<Record<ScreenId, number>> = {};
   const findings = overview?.findings.length ?? 0;
   if (findings > 0) result.today = findings;
-  if (runtime?.restartRequired) {
-    result.models = Math.max(1, runtime.restartReasons.length);
+  const modelReasons = (runtime?.restartReasons ?? []).filter((reason) =>
+    reason.code !== "desktopUpdateReady" && reason.code !== "remoteUpdateReady",
+  );
+  if (runtime?.restartRequired && modelReasons.length) {
+    result.models = Math.max(1, modelReasons.length);
+  } else if (runtime?.restartRequired && (runtime.restartReasons.length === 0)) {
+    result.models = 1;
+  }
+  if (updates && updates.attention !== "none") {
+    result.settings = 1;
   }
   return result;
 }

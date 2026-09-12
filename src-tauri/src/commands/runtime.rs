@@ -13,6 +13,15 @@ use tauri::{Manager, State};
 /// is routinely slower than the old "did a new PID appear" check assumed.
 const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+static CODEX_RESTART_FLIGHT: tokio::sync::Mutex<
+    Option<tokio::sync::watch::Receiver<RestartFlight>>,
+> = tokio::sync::Mutex::const_new(None);
+
+#[derive(Clone)]
+enum RestartFlight {
+    Pending,
+    Done(std::sync::Arc<Result<ManagedRestart, String>>),
+}
 
 #[derive(Debug)]
 struct CodexLaunchTarget {
@@ -107,7 +116,7 @@ fn repair_superseded_launch(
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
         // Close admission before checking for idle, otherwise a request can
-        // enter between the check and the lifecycle lock and be cancelled by
+        // enter between the check and the Proxy lifecycle lock and be cancelled by
         // what is meant to be a non-disruptive repair.
         state.set_draining(true);
         let bridge = crate::enhanced_runtime::live_bridge_attestation(&state.data_root());
@@ -300,7 +309,8 @@ pub async fn restart_codex_safely(
     state: State<'_, AppState>,
     force: Option<bool>,
 ) -> AppResult<RestartResult> {
-    let outcome = restart_codex_managed(&state, force.unwrap_or(false)).await?;
+    let force = force.unwrap_or(false);
+    let outcome = shared_restart_codex(&state, force).await?;
     Ok(RestartResult {
         restarted: outcome.restarted,
         notice: outcome.notice,
@@ -309,6 +319,7 @@ pub async fn restart_codex_safely(
 
 /// What a managed restart actually observed. The bridge attestation is kept so
 /// the installed qualification can assert on the same evidence the UI shows.
+#[derive(Clone)]
 pub(crate) struct ManagedRestart {
     pub restarted: bool,
     pub notice: RuntimeNotice,
@@ -360,10 +371,47 @@ pub(crate) fn codex_turn_refusal(
 /// every turn ran on Official Codex. So the Enhanced path waits for the bridge
 /// belonging to *this* launch id to attest that it is ready, and reports
 /// `EnhancedDesktopBridgeNotObserved` if it never does.
+async fn shared_restart_codex(state: &AppState, force: bool) -> AppResult<ManagedRestart> {
+    let mut slot = CODEX_RESTART_FLIGHT.lock().await;
+    let mut rx = if let Some(rx) = slot.as_ref() {
+        rx.clone()
+    } else {
+        let (tx, rx) = tokio::sync::watch::channel(RestartFlight::Pending);
+        *slot = Some(rx.clone());
+        let state = state.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = restart_codex_managed(&state, force).await;
+            let encoded = RestartFlight::Done(std::sync::Arc::new(match result {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.to_string()),
+            }));
+            let _ = tx.send(encoded);
+            *CODEX_RESTART_FLIGHT.lock().await = None;
+        });
+        rx
+    };
+    drop(slot);
+    loop {
+        let snapshot = rx.borrow().clone();
+        match snapshot {
+            RestartFlight::Done(result) => match result.as_ref() {
+                Ok(value) => return Ok(value.clone()),
+                Err(error) => return Err(AppError::Message(error.clone())),
+            },
+            RestartFlight::Pending => {
+                if rx.changed().await.is_err() {
+                    return Err(AppError::Message("restart flight dropped".into()));
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn restart_codex_managed(
     state: &AppState,
     force: bool,
 ) -> AppResult<ManagedRestart> {
+    let _lifecycle = state.lifecycle_lock().lock().await;
     state.set_draining(true);
     for _ in 0..100 {
         if state.active_requests() == 0 {
@@ -404,6 +452,9 @@ pub(crate) async fn restart_codex_managed(
     // The launch lease is a Proxy transaction, not a restart side-effect.
     // Preparing it here while the Proxy is stopped would leave CODEX_CLI_PATH
     // armed for the next Desktop launch with no data plane behind it.
+    if crate::updates::next_start_should_apply_pending(&state.data_root()) {
+        crate::updates::arm_core_pending_apply();
+    }
     let launch = match crate::enhanced_runtime::sync_desktop_launch(
         &state.data_root(),
         &state.routes(),
@@ -417,18 +468,16 @@ pub(crate) async fn restart_codex_managed(
         }
     };
 
-    let stopped = match stop_codex_and_wait(&target).await {
+    let stopped = match stop_codex_and_wait(&target, force).await {
         Ok(stopped) => stopped,
         Err(error) => {
             state.set_draining(false);
             return Err(AppError::Message(format!("無法關閉 Codex 程序：{error}")));
         }
     };
-    if !stopped {
+    if !stopped.exited {
         state.set_draining(false);
-        return Ok(ManagedRestart::refused(RuntimeNotice::new(
-            "restartProcessStillRunning",
-        )));
+        return Ok(ManagedRestart::refused(stopped.notice()));
     }
 
     if let Err(error) = launch_codex(&target) {
@@ -462,6 +511,10 @@ pub(crate) async fn restart_codex_managed(
     state.set_draining(false);
     match observed {
         BridgeObservation::Ready(attestation) => {
+            let _ = crate::updates::conclude_pending_core(
+                &state.data_root(),
+                core_promote_input(&state.data_root(), &attestation, &launch.launch_id, true),
+            );
             state.clear_restart_required();
             Ok(ManagedRestart {
                 restarted: true,
@@ -472,6 +525,10 @@ pub(crate) async fn restart_codex_managed(
             })
         }
         BridgeObservation::Failed(attestation) => {
+            let _ = crate::updates::conclude_pending_core(
+                &state.data_root(),
+                core_promote_input(&state.data_root(), &attestation, &launch.launch_id, false),
+            );
             let reason = attestation
                 .failure_reason
                 .clone()
@@ -497,6 +554,27 @@ pub(crate) enum BridgeObservation {
     Ready(BridgeAttestationV1),
     Failed(BridgeAttestationV1),
     NotObserved(Option<BridgeAttestationV1>),
+}
+
+fn core_promote_input(
+    data_root: &std::path::Path,
+    attestation: &BridgeAttestationV1,
+    launch_id: &str,
+    ready: bool,
+) -> crate::updates::CorePromoteInput {
+    let pending_verified = crate::updates::pending_core(data_root)
+        .is_some_and(|pending| crate::updates::signed_core_digest(data_root, &pending.digest));
+    crate::updates::CorePromoteInput {
+        pending_verified,
+        bridge_compatible: if ready {
+            attestation.is_active_for(launch_id)
+        } else {
+            attestation.matches_launch(launch_id)
+        },
+        official_protocol_ok: attestation.official.initialized && !attestation.official.exited,
+        attestation_ok: ready,
+        user_turn_accepted: attestation.has_open_turn() || attestation.session_features_applied > 0,
+    }
 }
 
 async fn await_bridge_ready(launch: &DesktopRuntimeLaunch) -> BridgeObservation {
@@ -723,70 +801,168 @@ fn launch_codex(target: &CodexLaunchTarget) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StopObservation {
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    pub stderr: String,
+    pub force_used: bool,
+}
+
+impl StopObservation {
+    pub fn notice(&self) -> RuntimeNotice {
+        let mut notice = RuntimeNotice::new("restartProcessStillRunning")
+            .with(
+                "exitCode",
+                self.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            )
+            .with("stderr", truncate_stop_stderr(&self.stderr));
+        if self.force_used {
+            notice = notice.with("forceUsed", "true");
+        }
+        notice
+    }
+}
+
+fn truncate_stop_stderr(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.chars().count() <= 400 {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().take(400).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopAction {
+    Done,
+    ForceKill,
+    Refuse,
+}
+
+/// Force-kill is only allowed when the user overrode the turn guard.
+/// A packaged Desktop surviving a graceful taskkill is not idle evidence.
+pub(crate) fn next_stop_action(force: bool, still_running: bool) -> StopAction {
+    if !still_running {
+        return StopAction::Done;
+    }
+    if force {
+        return StopAction::ForceKill;
+    }
+    StopAction::Refuse
+}
+
+pub(crate) fn stop_observation_from_output(
+    output: &std::process::Output,
+    still_running: bool,
+    force_used: bool,
+) -> StopObservation {
+    StopObservation {
+        exited: !still_running,
+        exit_code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        force_used,
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::ExitStatus> {
+fn stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::Output> {
     let mut command = crate::process::background_command("taskkill");
     command.args(["/PID", &target.pid.to_string(), "/T"]);
-    command.status()
+    command.output()
+}
+
+#[cfg(target_os = "windows")]
+fn force_stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::Output> {
+    let mut command = crate::process::background_command("taskkill");
+    command.args(["/PID", &target.pid.to_string(), "/T", "/F"]);
+    command.output()
 }
 
 #[cfg(not(target_os = "windows"))]
-fn stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::ExitStatus> {
+fn stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::Output> {
     let mut command = crate::process::background_command("kill");
     command.args(["-TERM", &target.pid.to_string()]);
-    command.status()
+    command.output()
 }
 
-async fn stop_codex_and_wait(target: &CodexLaunchTarget) -> std::io::Result<bool> {
-    let status = stop_codex(target)?;
-    if !status.success() {
-        return Ok(false);
-    }
+async fn stop_codex_and_wait(
+    target: &CodexLaunchTarget,
+    force: bool,
+) -> std::io::Result<StopObservation> {
+    let output = stop_codex(target)?;
+    let _ = output.status.success();
 
     #[cfg(target_os = "macos")]
     {
         for _ in 0..50 {
             if !process_is_alive(target.pid) {
-                return Ok(true);
+                return Ok(stop_observation_from_output(&output, false, false));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-
-        let mut command = crate::process::background_command("kill");
-        command.args(["-KILL", &target.pid.to_string()]);
-        let forced = command.status()?;
-        if !forced.success() && process_is_alive(target.pid) {
-            return Ok(false);
-        }
-        for _ in 0..20 {
-            if !process_is_alive(target.pid) {
-                return Ok(true);
+        match next_stop_action(force, true) {
+            StopAction::Done => {
+                return Ok(stop_observation_from_output(&output, false, false));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            StopAction::Refuse => {
+                return Ok(stop_observation_from_output(&output, true, false));
+            }
+            StopAction::ForceKill => {
+                let mut command = crate::process::background_command("kill");
+                command.args(["-KILL", &target.pid.to_string()]);
+                let forced = command.output()?;
+                for _ in 0..20 {
+                    if !process_is_alive(target.pid) {
+                        return Ok(stop_observation_from_output(&forced, false, true));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                return Ok(stop_observation_from_output(
+                    &forced,
+                    process_is_alive(target.pid),
+                    true,
+                ));
+            }
         }
-        Ok(false)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // Wait for the process we just killed, not for "no Codex anywhere".
-        //
-        // This used to poll for any live Codex process, which answers a
-        // different question: is any process that looks like Codex Desktop
-        // alive. Anyone relaunching Codex during these five seconds — a user
-        // who restarted it by hand, or the packaged app bringing itself back —
-        // kept that answer true forever, so a stop that had actually succeeded
-        // was reported as `restartProcessStillRunning`. That refusal loops:
-        // the user restarts Codex to help, and restarting Codex is exactly
-        // what keeps the condition true.
-        for _ in 0..50 {
-            if !crate::enhanced_runtime::process_info::pid_is_alive(target.pid) {
-                return Ok(true);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if wait_for_codex_pid_exit(target.pid, 50).await {
+            return Ok(stop_observation_from_output(&output, false, false));
         }
-        Ok(false)
+        match next_stop_action(force, true) {
+            StopAction::Done => Ok(stop_observation_from_output(&output, false, false)),
+            StopAction::Refuse => Ok(stop_observation_from_output(&output, true, false)),
+            StopAction::ForceKill => {
+                let forced = force_stop_codex(target)?;
+                let still = !wait_for_codex_pid_exit(target.pid, 20).await;
+                Ok(stop_observation_from_output(&forced, still, true))
+            }
+        }
     }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if wait_for_codex_pid_exit(target.pid, 50).await {
+            return Ok(stop_observation_from_output(&output, false, false));
+        }
+        Ok(stop_observation_from_output(&output, true, false))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn wait_for_codex_pid_exit(pid: u32, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if !crate::enhanced_runtime::process_info::pid_is_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -831,7 +1007,6 @@ fn launch_target_identity(_target: &CodexLaunchTarget) -> String {
     }
 }
 
-#[cfg(target_os = "windows")]
 #[cfg(target_os = "windows")]
 pub(crate) fn codex_process_identity() -> Option<String> {
     discover_codex_process()
@@ -956,5 +1131,47 @@ mod restart_guard_tests {
     #[test]
     fn the_user_can_overrule_the_guard() {
         assert!(codex_turn_refusal(Some(&attestation(3)), true).is_none());
+    }
+
+    #[test]
+    fn graceful_stop_does_not_force_kill_without_user_override() {
+        assert_eq!(next_stop_action(false, true), StopAction::Refuse);
+        assert_eq!(next_stop_action(true, true), StopAction::ForceKill);
+        assert_eq!(next_stop_action(false, false), StopAction::Done);
+    }
+
+    #[test]
+    fn stop_failure_records_the_real_exit_code_and_stderr() {
+        let output = std::process::Output {
+            status: dummy_exit(128),
+            stdout: Vec::new(),
+            stderr: b"taskkill: Access denied.\n".to_vec(),
+        };
+        let observation = stop_observation_from_output(&output, true, false);
+        assert!(!observation.exited);
+        assert_eq!(observation.exit_code, Some(128));
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessStillRunning");
+        assert_eq!(
+            notice.params.get("exitCode").map(String::as_str),
+            Some("128")
+        );
+        assert!(notice
+            .params
+            .get("stderr")
+            .is_some_and(|value| value.contains("Access denied")));
+    }
+
+    fn dummy_exit(code: i32) -> std::process::ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        }
     }
 }

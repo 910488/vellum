@@ -180,6 +180,10 @@ export function StatusBar({
       {/* 待重啟是尚未套用的變更，不是故障。只在右側用琥珀色提醒一次；左側
           繼續陳述 Proxy 的真實狀態，避免同一句警告出現兩次。 */}
       {h.restartRequired ? <Pill tone="warn" dot>{t("status.restartCodexRequired")}</Pill> : null}
+      {h.updateAttention === "available" ? <Pill tone="warn" dot>{t("status.updateAvailable")}</Pill> : null}
+      {h.updateAttention === "waitingIdle" ? <Pill tone="warn" dot>{t("status.updateWaitingIdle")}</Pill> : null}
+      {h.updateAttention === "waitingRestart" ? <Pill tone="warn" dot>{t("status.updateWaitingRestart")}</Pill> : null}
+      {h.updateAttention === "failed" ? <Pill tone="warn" dot>{t("status.updateFailed")}</Pill> : null}
 
       {/* 一般通報也維持警告色；只有真正的 provider/proxy 故障才使用紅色，
           讓錯誤與「需要稍後處理」保有清楚的嚴重度差異。 */}

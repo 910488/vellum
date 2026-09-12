@@ -1,0 +1,300 @@
+name: Signed update releases
+
+# Tag-driven drafts. `main` CI stays a build, not a published channel.
+# Assets are built first, hashed into the manifest, then signed. Signing
+# `assets: []` and uploading binaries later would not bind those binaries.
+on:
+  push:
+    tags:
+      - "desktop-v*"
+      - "remote-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (desktop-vX.Y.Z or remote-vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      component: ${{ steps.tag.outputs.component }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          case "$TAG" in
+            desktop-v*) echo "component=desktop" >> "$GITHUB_OUTPUT" ;;
+            remote-v*) echo "component=remote" >> "$GITHUB_OUTPUT" ;;
+            core-v*) echo "core releases remain disabled until runnable-tree hashes are signed" >&2; exit 1 ;;
+            *) echo "unsupported tag $TAG" >&2; exit 1 ;;
+          esac
+          if [[ "$TAG" == *-rc.* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  desktop-remote-payload:
+    name: Embedded Remote Manager payload
+    needs: resolve
+    if: needs.resolve.outputs.component == 'desktop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bash scripts/build-local-release.sh stage-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-only-remote-payload
+          path: src-tauri/resources/remote
+          if-no-files-found: error
+
+  windows-updater:
+    name: Windows NSIS updater asset
+    needs: [resolve, desktop-remote-payload]
+    if: needs.resolve.outputs.component == 'desktop'
+    runs-on: windows-latest
+    environment: release-signing
+    env:
+      VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
+      VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-only-remote-payload
+          path: src-tauri/resources/remote
+      - name: Require embedded update trust
+        shell: pwsh
+        run: |
+          if (-not $env:VELLUM_UPDATE_PUBLIC_KEY -or -not $env:VELLUM_UPDATE_KEY_ID) {
+            throw "VELLUM_UPDATE_PUBLIC_KEY and VELLUM_UPDATE_KEY_ID must be configured"
+          }
+      - run: pnpm exec tauri build --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updater-windows
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  macos-updater:
+    name: macOS updater archives
+    needs: [resolve, desktop-remote-payload]
+    if: needs.resolve.outputs.component == 'desktop'
+    runs-on: macos-latest
+    environment: release-signing
+    env:
+      VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
+      VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-only-remote-payload
+          path: src-tauri/resources/remote
+      - name: Require embedded update trust
+        run: |
+          test -n "$VELLUM_UPDATE_PUBLIC_KEY"
+          test -n "$VELLUM_UPDATE_KEY_ID"
+      - run: pnpm exec tauri build --bundles app,dmg
+      - name: Pack app archives
+        run: |
+          mkdir -p updater
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then ARCH=x64; elif [ "$ARCH" = "arm64" ]; then ARCH=arm64; fi
+          for app in target/release/bundle/macos/*.app; do
+            tar -C "$(dirname "$app")" -czf "updater/$(basename "$app" .app)-macos-$ARCH.app.tar.gz" "$(basename "$app")"
+          done
+          for dmg in target/release/bundle/dmg/*.dmg; do
+            cp "$dmg" "updater/$(basename "$dmg" .dmg)-macos-$ARCH.dmg"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updater-macos
+          path: updater/*
+          if-no-files-found: error
+
+  remote-linux:
+    name: Remote Linux ${{ matrix.arch }} package
+    needs: resolve
+    if: needs.resolve.outputs.component == 'remote'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            docker: amd64
+          - arch: arm64
+            docker: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build Linux remote payloads
+        run: bash scripts/build-local-release.sh stage-only
+      - name: Pack architecture set
+        run: |
+          mkdir -p updater
+          tar -C src-tauri/resources/remote -czf "updater/vellum-remote-linux-${{ matrix.arch }}.tar.gz" "linux-${{ matrix.docker }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updater-remote-${{ matrix.arch }}
+          path: updater/vellum-remote-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  core-from-lockfile:
+    name: Enhanced core from lockfile
+    needs: resolve
+    if: needs.resolve.outputs.component == 'core'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Download pinned core archives
+        run: |
+          mkdir -p updater
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { mkdirSync, writeFileSync, readFileSync } = require("node:fs");
+          const lock = JSON.parse(readFileSync("enhanced-runtime.lock.json", "utf8"));
+          const commit = lock.enhancedCodexCommit;
+          const repo = lock.sourceRepository;
+          if (!commit || !repo || !lock.artifacts) {
+            throw new Error("enhanced-runtime.lock.json is missing download pins");
+          }
+          mkdirSync("updater", { recursive: true });
+          (async () => {
+            for (const [triple, artifact] of Object.entries(lock.artifacts)) {
+              const url = `${repo}/releases/download/vellum-core-${commit}/${artifact.archiveName}`;
+              console.log(`fetch ${triple} ${url}`);
+              const response = await fetch(url, { redirect: "follow" });
+              if (!response.ok) {
+                throw new Error(`download ${artifact.archiveName} failed: HTTP ${response.status}`);
+              }
+              const bytes = Buffer.from(await response.arrayBuffer());
+              const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+              if (digest !== artifact.archiveSha256) {
+                throw new Error(`${artifact.archiveName} hash ${digest} != ${artifact.archiveSha256}`);
+              }
+              writeFileSync(`updater/${artifact.archiveName}`, bytes);
+            }
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updater-core
+          path: updater/*
+          if-no-files-found: error
+
+  sign-and-draft:
+    name: Hash, sign, and draft GitHub Release
+    needs:
+      - resolve
+      - desktop-remote-payload
+      - windows-updater
+      - macos-updater
+      - remote-linux
+      - core-from-lockfile
+    if: |
+      always()
+      && needs.resolve.result == 'success'
+      && !cancelled()
+      && !contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - name: Require signing key
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.VELLUM_UPDATE_SIGNING_KEY }}
+          VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
+          VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ] || [ -z "$VELLUM_UPDATE_PUBLIC_KEY" ] || [ -z "$VELLUM_UPDATE_KEY_ID" ]; then
+            echo "Signing key, public key, and key id must all be configured; refusing to publish."
+            exit 1
+          fi
+      - name: Collect built assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: updater-*
+          path: release-assets
+          merge-multiple: true
+      - name: Write hashed manifest
+        env:
+          COMPONENT: ${{ needs.resolve.outputs.component }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          ASSET_DIR: release-assets
+          VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+        run: node scripts/write-update-manifest.mjs
+      - name: Sign manifest
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.VELLUM_UPDATE_SIGNING_KEY }}
+          VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
+        run: cargo run -p vellum --bin vellum-sign-update -- update-manifest.json "$UPDATE_SIGNING_KEY" update-manifest.json.sig "$VELLUM_UPDATE_PUBLIC_KEY"
+      - name: Create draft with assets and signed manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite published assets."
+            exit 1
+          fi
+          extra=()
+          if [ "$PRERELEASE" = "true" ]; then
+            extra+=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --notes "Signed update $TAG. Publish only after reviewing hashed assets in update-manifest.json." \
+            "${extra[@]}" \
+            update-manifest.json update-manifest.json.sig release-assets/*

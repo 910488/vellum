@@ -506,6 +506,8 @@ pub struct ProxyStatus {
 /// generation and must not wait for the status poll to show prepare/start/stop
 /// stages.
 pub const PROXY_LIFECYCLE_EVENT: &str = "proxy://lifecycle";
+/// Progress for the three independently releasable update layers.
+pub const UPDATES_PROGRESS_EVENT: &str = "updates://progress";
 
 impl Default for ProxyStatus {
     fn default() -> Self {

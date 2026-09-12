@@ -23,6 +23,7 @@ const apiMocks = vi.hoisted(() => ({
   getCodexOAuthStatus: vi.fn(),
   getEnhancedDesktopRuntimeStatus: vi.fn(),
   getProxyStatus: vi.fn(),
+  getUpdateStatus: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({ api: apiMocks }));
@@ -209,6 +210,14 @@ describe("auto review settings save behavior", () => {
       restartReasons: [],
       liveApplied: [],
       activeCatalogVersion: null,
+    });
+    apiMocks.getUpdateStatus.mockResolvedValue({
+      desktop: { component: "desktop", currentVersion: "0.2.9", availableVersion: null, stagedVersion: null, channel: "stable", phase: "idle", applyCondition: "idle", releaseNotes: null, failureReason: null, operationId: null, targetVersion: null, downloadBytes: 0, downloadTotal: 0, liveAutoUpdate: false, hosts: [] },
+      remote: { component: "remote", currentVersion: "0.2.9", availableVersion: null, stagedVersion: null, channel: "stable", phase: "idle", applyCondition: "idle", releaseNotes: null, failureReason: null, operationId: null, targetVersion: null, downloadBytes: 0, downloadTotal: 0, liveAutoUpdate: false, hosts: [] },
+      core: { component: "core", currentVersion: "bundled", availableVersion: null, stagedVersion: null, channel: "stable", phase: "idle", applyCondition: "idle", releaseNotes: null, failureReason: null, operationId: null, targetVersion: null, downloadBytes: 0, downloadTotal: 0, liveAutoUpdate: false, hosts: [] },
+      preferences: { channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false },
+      liveAutoUpdate: false,
+      attention: "none",
     });
     apiMocks.listCatalogVersions.mockResolvedValue([]);
     apiMocks.getProxyStatus.mockResolvedValue({

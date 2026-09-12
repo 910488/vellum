@@ -317,7 +317,7 @@ pub fn configure_desktop_runtime(
         bridge_executable,
     };
     if enabled {
-        verify_settings(&settings)?;
+        verify_settings(data_root, &settings)?;
         if let Some(previous) = previous.as_ref() {
             if previous.bridge_executable != settings.bridge_executable {
                 env_lease::release_configured_bridge(data_root, &previous.bridge_executable)
@@ -583,7 +583,15 @@ fn prepare_desktop_launch_guarded<G>(
     commit_guard: impl FnOnce() -> Result<G, DesktopRuntimeManagerError>,
     save_settings: bool,
 ) -> Result<Option<DesktopRuntimeLaunch>, DesktopRuntimeManagerError> {
-    let identity = verify_settings(&settings)?;
+    let mut settings = settings;
+    if crate::updates::consume_core_pending_apply() {
+        if let Some(pending) = crate::updates::pending_core(data_root) {
+            if pending.path.is_file() && !pending.digest.is_empty() {
+                settings.enhanced_codex_executable = pending.path;
+            }
+        }
+    }
+    let identity = verify_settings(data_root, &settings)?;
     let model_map = TrustedModelProviderMap::from_catalog(routes, models);
     let model_map_path = data_root.join(MODEL_MAP_FILE);
     let model_map_bytes = serde_json::to_vec_pretty(&model_map)?;
@@ -961,7 +969,7 @@ fn status_for_settings(
     {
         status.last_qualification = None;
     }
-    match verify_settings(&verification_settings) {
+    match verify_settings(data_root, &verification_settings) {
         Ok(identity) => {
             status.artifact_ready = true;
             status.enhanced_runtime_digest = Some(identity.enhanced_digest);
@@ -1332,6 +1340,7 @@ fn read_settings(
 }
 
 fn verify_settings(
+    data_root: &Path,
     settings: &DesktopRuntimeSettings,
 ) -> Result<VerifiedIdentity, DesktopRuntimeManagerError> {
     for (name, path) in [
@@ -1377,7 +1386,9 @@ fn verify_settings(
         "sha256:{}",
         hex_sha256_file(&settings.enhanced_codex_executable)?
     );
-    if lock.artifact_for_target(target) != Some(enhanced_hash.as_str()) {
+    if lock.artifact_for_target(target) != Some(enhanced_hash.as_str())
+        && !crate::updates::signed_core_digest(data_root, &enhanced_hash)
+    {
         return Err(DesktopRuntimeManagerError::ArtifactMismatch {
             expected: lock
                 .artifact_for_target(target)

@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod review;
 pub mod runtime;
 pub mod subagent;
+pub mod updates;
 pub mod web_search;
 
 // 必須是 glob：`#[tauri::command]` 會在函式旁邊生成隱藏項目（`__cmd__*`），
@@ -25,4 +26,5 @@ pub use proxy::*;
 pub use review::*;
 pub use runtime::*;
 pub use subagent::*;
+pub use updates::*;
 pub use web_search::*;

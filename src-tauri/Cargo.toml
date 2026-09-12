@@ -15,6 +15,10 @@ default-run = "vellum-proxy-desktop"
 name = "vellum-proxy-desktop"
 path = "src/main.rs"
 
+[[bin]]
+name = "vellum-sign-update"
+path = "src/bin/sign_update.rs"
+
 # Eval CLI, App Server sidecar, and gate-child live in their own packages so
 # daily `cargo check -p vellum` does not link those binaries.
 
@@ -41,7 +45,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # --- 接線用：探測、壓縮、審查要發 HTTP ---
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
 # 鎖 1.50：離線快取只到 1.50.0（1.53 會拉未快取的 tokio-macros 2.7）。
 tokio = { version = "=1.50.0", features = ["rt-multi-thread", "macros", "time", "process", "sync", "io-util", "io-std", "fs", "signal", "net"] }
 
@@ -78,6 +82,8 @@ pdf-extract = "0.12"
 hayro = "0.4"
 ulid = "1"
 hex = "0.4"
+ed25519-dalek = { version = "2.1", features = ["std"] }
+semver = "1"
 vellum-remote-protocol = { path = "../crates/vellum-remote-protocol" }
 vellum-proxy-runtime = { path = "../crates/vellum-proxy-runtime" }
 vellum-zcode-desktop = { path = "../crates/vellum-zcode-desktop" }

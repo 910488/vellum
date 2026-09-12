@@ -42,6 +42,7 @@ pub mod state;
 pub mod support_bundle;
 pub mod thread_runtime_binding;
 pub mod trace;
+pub mod updates;
 pub mod usage;
 pub mod web_search;
 pub mod web_search_pdf;
@@ -78,7 +79,7 @@ fn toggle_proxy_from_tray(app: &tauri::AppHandle) {
     });
 }
 
-fn shutdown_proxy_and_restore(app: &tauri::AppHandle) {
+fn shutdown_proxy_and_restore(app: &tauri::AppHandle, apply_desktop_update: bool) {
     let state = app.state::<AppState>().clone();
     // Exit, tray Stop, and the explicit Stop command share one teardown. This
     // is also where the Enhanced CODEX_CLI_PATH lease is released; keeping a
@@ -86,6 +87,13 @@ fn shutdown_proxy_and_restore(app: &tauri::AppHandle) {
     tauri::async_runtime::block_on(async move {
         if let Err(error) = crate::commands::proxy::stop_proxy_gracefully(&state).await {
             log::error!("[Codex] 結束前還原 Proxy/Enhanced 啟動接管失敗：{error}");
+        }
+        // Hiding the main window leaves this process alive, so an installer
+        // may only start for the tray's explicit process exit.
+        if apply_desktop_update {
+            if let Err(error) = crate::updates::apply_staged_on_exit(&state) {
+                log::error!("[Updates] exit-time desktop apply failed: {error}");
+            }
         }
     });
 }
@@ -130,6 +138,7 @@ pub fn run() {
                 }
             }
             let data_root = app.state::<AppState>().data_root();
+            crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             let boot = crate::boot::record_boot(&data_root);
             crate::trace::install(&data_root);
             log::info!(
@@ -160,7 +169,7 @@ pub fn run() {
                         "show" => show_main_window(app),
                         "toggle_proxy" => toggle_proxy_from_tray(app),
                         "exit" => {
-                            shutdown_proxy_and_restore(app);
+                            shutdown_proxy_and_restore(app, true);
                             app.exit(0);
                         }
                         _ => {}
@@ -197,7 +206,7 @@ pub fn run() {
             // lease before the window disappears.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                shutdown_proxy_and_restore(window.app_handle());
+                shutdown_proxy_and_restore(window.app_handle(), false);
                 let _ = window.hide();
                 #[cfg(target_os = "macos")]
                 if let Err(error) = window
@@ -278,6 +287,14 @@ pub fn run() {
             commands::list_catalog_versions,
             commands::rollback_catalog_version,
             commands::restart_codex_safely,
+            commands::get_update_status,
+            commands::check_updates,
+            commands::set_update_preferences,
+            commands::download_update,
+            commands::apply_update,
+            commands::cancel_update_download,
+            commands::rollback_update,
+            commands::set_remote_update_policy,
             commands::get_enhanced_desktop_runtime_status,
             commands::get_enhanced_runtime_overview,
             commands::list_enhanced_runtime_sessions,

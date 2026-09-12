@@ -251,11 +251,12 @@ export function App() {
     if (manageSpinner) setRefreshing(true);
     const work = (async () => {
       try {
-        const [proxy, runtime, enhancedRuntime, overview] = await Promise.allSettled([
+        const [proxy, runtime, enhancedRuntime, overview, updates] = await Promise.allSettled([
           api.getProxyStatus(),
           api.getRuntimeStatus(),
           api.getEnhancedDesktopRuntimeStatus(),
           api.getOverview(force),
+          api.getUpdateStatus(),
         ]);
         if (statusGeneration === statusLoadGeneration.current) {
           setStatus((current) => ({
@@ -266,9 +267,10 @@ export function App() {
                 ? enhancedRuntime.value
                 : current.enhancedRuntime,
             overview: overview.status === "fulfilled" ? overview.value : current.overview,
+            updates: updates.status === "fulfilled" ? updates.value : current.updates,
           }));
         }
-        const failure = [proxy, runtime, enhancedRuntime, overview].find(
+        const failure = [proxy, runtime, enhancedRuntime, overview, updates].find(
           (result): result is PromiseRejectedResult => result.status === "rejected",
         );
         setRefreshError(failure ? t("common.statusUpdateFailed", { detail: String(failure.reason) }) : null);

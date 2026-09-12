@@ -20,6 +20,7 @@ const apiMocks = vi.hoisted(() => ({
   getRuntimeStatus: vi.fn(),
   getEnhancedDesktopRuntimeStatus: vi.fn(),
   getOverview: vi.fn(),
+  getUpdateStatus: vi.fn(),
   subscribeProxyLifecycle: vi.fn(),
 }));
 
@@ -256,6 +257,14 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
     apiMocks.getRuntimeStatus.mockResolvedValue(runtimeStopped);
     apiMocks.getEnhancedDesktopRuntimeStatus.mockResolvedValue(enhancedIdle);
     apiMocks.getOverview.mockResolvedValue(overview);
+    apiMocks.getUpdateStatus.mockResolvedValue({
+      desktop: { component: "desktop", currentVersion: "0.2.9", availableVersion: null, stagedVersion: null, channel: "stable", phase: "idle", applyCondition: "idle", releaseNotes: null, failureReason: null, operationId: null, targetVersion: null, downloadBytes: 0, downloadTotal: 0, liveAutoUpdate: false, hosts: [] },
+      remote: { component: "remote", currentVersion: "0.2.9", availableVersion: null, stagedVersion: null, channel: "stable", phase: "idle", applyCondition: "idle", releaseNotes: null, failureReason: null, operationId: null, targetVersion: null, downloadBytes: 0, downloadTotal: 0, liveAutoUpdate: false, hosts: [] },
+      core: { component: "core", currentVersion: "bundled", availableVersion: null, stagedVersion: null, channel: "stable", phase: "idle", applyCondition: "idle", releaseNotes: null, failureReason: null, operationId: null, targetVersion: null, downloadBytes: 0, downloadTotal: 0, liveAutoUpdate: false, hosts: [] },
+      preferences: { channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false },
+      liveAutoUpdate: false,
+      attention: "none",
+    });
     apiMocks.startProxy.mockResolvedValue(running);
     apiMocks.stopProxyAndRestore.mockResolvedValue(stopped);
     apiMocks.subscribeProxyLifecycle.mockImplementation(async (onStatus: (status: ProxyStatus) => void) => {

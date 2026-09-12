@@ -197,6 +197,18 @@ describe("attention", () => {
     expect(attention(needsRestart).models).toBe(1);
   });
 
+  it("本體或 Remote 更新不增加模型頁 badge", () => {
+    const updateReady = status({
+      runtime: runtime({
+        restartRequired: true,
+        restartReasons: [{ code: "desktopUpdateReady", params: {} }],
+      }),
+      updates: { attention: "available" } as SystemStatus["updates"],
+    });
+    expect(attention(updateReady).models).toBeUndefined();
+    expect(attention(updateReady).settings).toBe(1);
+  });
+
   it("待重啟但沒給原因時仍然要顯示一個紅點", () => {
     const needsRestart = status({ runtime: runtime({ restartRequired: true, restartReasons: [] }) });
     expect(attention(needsRestart).models).toBe(1);

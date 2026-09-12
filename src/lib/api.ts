@@ -67,6 +67,10 @@ import type {
   DesktopCodexCompatibilityStatus,
   SshTrustStatus,
   PendingHostFingerprint,
+  UpdateStatusSnapshot,
+  UpdateOperation,
+  UpdatePreferences,
+  UpdateComponent,
 } from "@/types";
 import * as mock from "./mockData";
 import { cachedQuery, invalidateCachedQueries } from "./queryCache";
@@ -141,6 +145,37 @@ function delay<T>(value: T, ms = 220): Promise<T> {
  * 瀏覽器預覽沒有 Codex Desktop，也就沒有 bridge attestation。
  * `active` 只能是 false —— 預覽台先假裝 ready，正是要防的那種假陽性。
  */
+function previewLayer(component: UpdateComponent, applyCondition: string): import("@/types").LayerStatus {
+  return {
+    component,
+    currentVersion: "0.2.9",
+    availableVersion: null,
+    stagedVersion: null,
+    channel: "stable",
+    phase: "idle",
+    applyCondition,
+    releaseNotes: null,
+    failureReason: null,
+    operationId: null,
+    targetVersion: null,
+    downloadBytes: 0,
+    downloadTotal: 0,
+    liveAutoUpdate: false,
+    hosts: [],
+  };
+}
+
+function previewUpdateStatus(): UpdateStatusSnapshot {
+  return {
+    desktop: previewLayer("desktop", "restartVellum"),
+    remote: previewLayer("remote", "hostIdle"),
+    core: previewLayer("core", "nextCoreStart"),
+    preferences: { channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false },
+    liveAutoUpdate: false,
+    attention: "none",
+  };
+}
+
 function previewEnhancedRuntimeStatus(): EnhancedDesktopRuntimeStatus {
   return {
     configured: false,
@@ -1154,6 +1189,39 @@ export const api = {
 
   /// `force` skips the check for a Codex Desktop turn still in flight. It is
   /// the user's answer to being told one is running, never a default.
+  getUpdateStatus(): Promise<UpdateStatusSnapshot> {
+    if (!hasTauri()) return delay(previewUpdateStatus());
+    return call<UpdateStatusSnapshot>("get_update_status");
+  },
+  checkUpdates(component?: UpdateComponent): Promise<UpdateStatusSnapshot> {
+    if (!hasTauri()) return delay(previewUpdateStatus());
+    return call<UpdateStatusSnapshot>("check_updates", { component });
+  },
+  setUpdatePreferences(patch: Partial<UpdatePreferences>): Promise<UpdatePreferences> {
+    if (!hasTauri()) return delay({ channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false, ...patch });
+    return afterSettingsChange(call<UpdatePreferences>("set_update_preferences", patch));
+  },
+  downloadUpdate(component: UpdateComponent, hostId?: string): Promise<UpdateOperation> {
+    if (!hasTauri()) return delay({ operationId: "preview", component, phase: "downloading", targetVersion: null });
+    return call<UpdateOperation>("download_update", { component, hostId });
+  },
+  applyUpdate(component: UpdateComponent, hostId?: string): Promise<UpdateOperation> {
+    if (!hasTauri()) return delay({ operationId: "preview", component, phase: "waitingForRestart", targetVersion: null });
+    return call<UpdateOperation>("apply_update", { component, hostId });
+  },
+  cancelUpdateDownload(component: UpdateComponent): Promise<UpdateOperation> {
+    if (!hasTauri()) return delay({ operationId: "preview", component, phase: "available", targetVersion: null });
+    return call<UpdateOperation>("cancel_update_download", { component });
+  },
+  rollbackUpdate(component: UpdateComponent): Promise<UpdateOperation> {
+    if (!hasTauri()) return delay({ operationId: "preview", component, phase: "rolledBack", targetVersion: null });
+    return call<UpdateOperation>("rollback_update", { component });
+  },
+  setRemoteUpdatePolicy(hostId: string, idleAutoUpdate: boolean): Promise<{ hostId: string; idleAutoUpdate: boolean }> {
+    if (!hasTauri()) return delay({ hostId, idleAutoUpdate });
+    return afterSettingsChange(call("set_remote_update_policy", { hostId, idleAutoUpdate }));
+  },
+
   restartCodexSafely(force = false): Promise<RestartResult> {
     if (!hasTauri())
       return delay({ restarted: false, notice: { code: "restartUnavailableInPreview", params: {} } });

@@ -1467,3 +1467,72 @@ export interface RemoteBootstrapResult {
   blockedReasons: string[];
   repairCommands: string[];
 }
+
+export type UpdateComponent = "desktop" | "remote" | "core";
+export type UpdateChannel = "stable" | "preview";
+export type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "verifying"
+  | "staged"
+  | "waitingForIdle"
+  | "waitingForRestart"
+  | "applying"
+  | "validating"
+  | "applied"
+  | "blocked"
+  | "failed"
+  | "rolledBack";
+export type UpdateAttention = "none" | "available" | "waitingIdle" | "waitingRestart" | "failed";
+
+export interface HostUpdateStatus {
+  hostId: string;
+  phase: UpdatePhase;
+  currentVersion: string | null;
+  stagedVersion: string | null;
+  idleAutoUpdate: boolean;
+  failureReason: string | null;
+}
+
+export interface LayerStatus {
+  component: UpdateComponent;
+  currentVersion: string;
+  availableVersion: string | null;
+  stagedVersion: string | null;
+  channel: UpdateChannel;
+  phase: UpdatePhase;
+  applyCondition: string;
+  releaseNotes: string | null;
+  failureReason: string | null;
+  operationId: string | null;
+  targetVersion: string | null;
+  downloadBytes: number;
+  downloadTotal: number;
+  liveAutoUpdate: boolean;
+  hosts: HostUpdateStatus[];
+}
+
+export interface UpdatePreferences {
+  channel: UpdateChannel;
+  autoCheck: boolean;
+  autoDownload: boolean;
+  coreIdleHandoff: boolean;
+}
+
+export interface UpdateStatusSnapshot {
+  desktop: LayerStatus;
+  remote: LayerStatus;
+  core: LayerStatus;
+  preferences: UpdatePreferences;
+  liveAutoUpdate: boolean;
+  attention: UpdateAttention;
+}
+
+export interface UpdateOperation {
+  operationId: string;
+  component: UpdateComponent;
+  phase: UpdatePhase;
+  targetVersion: string | null;
+}

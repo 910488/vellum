@@ -82,14 +82,32 @@ jobs:
           name: vellum-remote-payload-${{ github.sha }}
           path: src-tauri/resources/remote
 
-      - name: Build DMG
-        run: pnpm exec tauri build --bundles dmg
+      - name: Build DMG and app archive
+        env:
+          VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
+          VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+        run: pnpm exec tauri build --bundles app,dmg
+
+      - name: Pack macOS updater archive
+        run: |
+          mkdir -p updater
+          for app in target/release/bundle/macos/*.app; do
+            tar -C "$(dirname "$app")" -czf "updater/$(basename "$app").tar.gz" "$(basename "$app")"
+          done
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: vellum-macos-dmg-${{ github.sha }}
           path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload macOS updater archive (CI only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-macos-updater-${{ github.sha }}
+          path: updater/*.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -128,6 +146,9 @@ jobs:
           path: src-tauri/resources/remote
 
       - name: Build NSIS installer
+        env:
+          VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
+          VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
         run: pnpm exec tauri build --bundles nsis
 
       - name: Upload installer

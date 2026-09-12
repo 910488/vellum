@@ -18,6 +18,7 @@ import { api } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
 import { Btn, Cap, Card, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
+import { UpdateCards } from "@/components/UpdateCards";
 import {
   REVIEW_POLICIES,
   fallbackShare,
@@ -49,6 +50,7 @@ import type {
   ReviewStats,
   Route,
   RuntimeStatus,
+  UpdateStatusSnapshot,
   SubagentMode,
   SubagentCapability,
   SubagentSettings,
@@ -78,6 +80,7 @@ export function Settings({
   const [routes, setRoutes] = useState<Route[]>([]);
   const [models, setModels] = useState<ModelRoute[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [updates, setUpdates] = useState<UpdateStatusSnapshot | null>(null);
   const [codexRestarting, setCodexRestarting] = useState(false);
   const [versions, setVersions] = useState<CatalogVersion[]>([]);
   const [dashboardRouteIds, setDashboardRouteIds] = useState<string[]>([]);
@@ -132,6 +135,7 @@ export function Settings({
         nextSubagentCapability,
         nextSubagentModels,
         nextOauth,
+        nextUpdates,
       ] = await Promise.allSettled([
           api.getReviewSettings(),
           api.listRoutes(),
@@ -144,6 +148,7 @@ export function Settings({
           api.getSubagentCapability(),
           api.listModelRoutes(),
           api.getCodexOAuthStatus(),
+          api.getUpdateStatus(),
         ]);
       if (!alive) return;
       if (nextSettings.status === "fulfilled") {
@@ -170,6 +175,7 @@ export function Settings({
       }
       if (nextModels.status === "fulfilled") setModels(nextModels.value);
       if (nextRuntime.status === "fulfilled") setRuntime(nextRuntime.value);
+      if (nextUpdates.status === "fulfilled") setUpdates(nextUpdates.value);
       if (nextVersions.status === "fulfilled") setVersions(nextVersions.value);
       if (nextStats.status === "fulfilled") setStats(nextStats.value);
       if (nextRoutes.status === "fulfilled") {
@@ -1354,6 +1360,8 @@ export function Settings({
         </Rows>
       </Card>
 
+      <UpdateCards snapshot={updates} onChanged={setUpdates} />
+
       <Card>
         <Cap>{t("settings.page.restore.title")}</Cap>
         <p className="prose" style={{ marginTop: 10 }}>
@@ -1418,6 +1426,7 @@ export function Settings({
               </span>
               <Btn
                 soft
+                disabled={codexRestarting}
                 onClick={() => void restartCodex()}
               >
                 {t("settings.page.advanced.restartAction")}
