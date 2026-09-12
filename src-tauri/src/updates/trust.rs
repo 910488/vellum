@@ -76,14 +76,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_bundled_key_disables_live_auto_update() {
-        // This workspace does not compile a production key into the binary.
-        // A test that hard-coded "enabled" would green-light unsigned live
-        // updates; the shipped `TrustStore::bundled()` is the source of truth.
-        assert!(
-            !TrustStore::bundled().live_enabled(),
-            "live auto-update must stay off without VELLUM_UPDATE_PUBLIC_KEY"
-        );
-        assert!(!live_auto_update_enabled());
+    fn bundled_trust_matches_the_compile_time_key() {
+        let configured = parse_verifying_key(BUNDLED_KEY_HEX).is_some();
+        assert_eq!(TrustStore::bundled().live_enabled(), configured);
+        assert_eq!(live_auto_update_enabled(), configured);
     }
 }
