@@ -24,7 +24,6 @@ jobs:
       VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - name: Require update trust configuration
         run: |
           test -n "$VELLUM_UPDATE_SIGNING_KEY"
@@ -33,7 +32,7 @@ jobs:
       - name: Sign probe and verify key correspondence
         run: |
           printf '{"keyId":"%s"}\n' "$VELLUM_UPDATE_KEY_ID" > update-signing-probe.json
-          cargo run -p vellum --bin vellum-sign-update -- update-signing-probe.json update-signing-probe.sig "$VELLUM_UPDATE_PUBLIC_KEY"
+          node scripts/sign-update-manifest.mjs update-signing-probe.json update-signing-probe.sig
           test "$(wc -c < update-signing-probe.sig)" -eq 64
 
   secret-scan:

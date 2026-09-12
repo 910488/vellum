@@ -15,10 +15,6 @@ default-run = "vellum-proxy-desktop"
 name = "vellum-proxy-desktop"
 path = "src/main.rs"
 
-[[bin]]
-name = "vellum-sign-update"
-path = "src/bin/sign_update.rs"
-
 # Eval CLI, App Server sidecar, and gate-child live in their own packages so
 # daily `cargo check -p vellum` does not link those binaries.
 
