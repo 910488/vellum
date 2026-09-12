@@ -4614,7 +4614,7 @@ mod tests {
         let checkpoint_index = projection
             .messages
             .iter()
-            .position(|message| crate::replay::is_chat_checkpoint_message(message))
+            .position(crate::replay::is_chat_checkpoint_message)
             .expect("the summary is projected as a checkpoint");
         assert_eq!(checkpoint_index, projection.messages.len() - 2);
     }

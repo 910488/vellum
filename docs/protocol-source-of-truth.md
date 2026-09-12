@@ -414,6 +414,13 @@ instruction; a malformed or missing outcome remains a protocol failure.
 
 ## Streaming and error semantics
 
+Trajectory loop detection is diagnostic only. Repeated tool calls, identical
+tool results, or a long sequence of tool exchanges must not inject loop-guard
+instructions, remove the available tools, force a final answer, or reject a
+later continuation. This applies to Desktop and remote proxy execution alike.
+Independent task-recovery policies and transport/resource limits keep their
+own contracts; trajectory observations do not escalate into execution control.
+
 Streaming adapters must:
 
 - parse events incrementally;

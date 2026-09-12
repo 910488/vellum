@@ -94,10 +94,7 @@ use crate::streaming::{
 };
 use crate::task_efficiency::TaskEfficiencyPolicy;
 use crate::task_stall::TaskStallPolicy;
-use crate::trajectory::{
-    analyze_trajectory, decide_loop_guard_scoped, LoopGuardDecision, LoopGuardPolicy,
-    LoopRecoveryState,
-};
+use crate::trajectory::{analyze_trajectory, LoopGuardPolicy};
 use crate::transport::{
     TransportError, UpstreamRequest, UpstreamResponse, UpstreamStream, UpstreamTransport,
 };
@@ -378,7 +375,6 @@ pub struct ProxyRuntime {
     subagent_identity_mode: SubagentIdentityMode,
     parent_cancel: Arc<Mutex<ParentCancelRegistry>>,
     generation_stop: watch::Sender<bool>,
-    loop_recoveries: Arc<Mutex<HashMap<String, LoopRecoveryState>>>,
     efficiency_recoveries: Arc<Mutex<HashMap<String, LiveEfficiencyRecoveryEntry>>>,
 }
 
@@ -787,7 +783,6 @@ impl ProxyRuntime {
             subagent_identity_mode: SubagentIdentityMode::default(),
             parent_cancel: Arc::new(Mutex::new(ParentCancelRegistry::default())),
             generation_stop: watch::channel(false).0,
-            loop_recoveries: Arc::new(Mutex::new(HashMap::new())),
             efficiency_recoveries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -3536,7 +3531,7 @@ impl ProxyRuntime {
             )?;
         }
 
-        // Canonical v2 Trajectory analysis and Loop Guard (spec 66–68)
+        // Trajectory diagnostics and independent task recovery.
         let current_input_items = crate::request::request_input_items(&execution_body);
         if let Ok(portable_items) = crate::compaction::sanitize_portable_history_with_provenance(
             &current_input_items,
@@ -3559,39 +3554,7 @@ impl ProxyRuntime {
                 let candidate = crate::trajectory::select_loop_guard_candidate(&trajectory);
                 let pattern_key = candidate.map(|p| p.pattern_hash.clone());
 
-                let conv_key = conversation_key_from_request(&execution_body)
-                    .or_else(|| conversation_key_from_request(&request.body))
-                    .or_else(|| {
-                        execution_body
-                            .get("previous_response_id")
-                            .or_else(|| request.body.get("previous_response_id"))
-                            .and_then(Value::as_str)
-                            .and_then(|prev| {
-                                self.history.response_conversation_key(prev).ok().flatten()
-                            })
-                    });
-
-                let recovery_state = match (&pattern_key, &conv_key) {
-                    (Some(phash), Some(ckey)) => {
-                        let lookup_key = format!("{ckey}:{}:{phash}", route.route_id);
-                        let map = self
-                            .loop_recoveries
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner());
-                        map.get(&lookup_key).cloned()
-                    }
-                    _ => None,
-                };
-
                 let ledger_policy = InvestigationPolicy::default();
-                let include_semantic = !ledger_policy.mode.injects_recovery();
-                let decision = decide_loop_guard_scoped(
-                    &trajectory,
-                    recovery_state.as_ref(),
-                    &loop_policy,
-                    include_semantic,
-                );
-
                 let mut ledger_recovery = None;
                 let mut ledger_recovery_diagnostic = None;
                 let mut stall_recovery = None;
@@ -3805,12 +3768,6 @@ impl ProxyRuntime {
                             ));
                     }
                 }
-                let action_str = match &decision {
-                    LoopGuardDecision::Allow => "allow",
-                    LoopGuardDecision::Recover { .. } => "recover",
-                    LoopGuardDecision::Finalize { .. } => "finalize",
-                    LoopGuardDecision::Abort { .. } => "abort",
-                };
                 self.diagnostics.record(DiagnosticEvent::TrajectoryDecision(
                     TrajectoryDecisionDiagnostic {
                         tool_exchange_count: trajectory.exchanges.len() as u64,
@@ -3820,435 +3777,311 @@ impl ProxyRuntime {
                             as u64,
                         max_repeat_count: trajectory.max_repeat_count as u64,
                         pattern_hash: pattern_key.clone(),
-                        action: action_str.to_string(),
+                        action: "observe".to_string(),
                     },
                 ));
 
-                // Loop Guard intervention is a Task Efficiency behavior. The
-                // policy already excludes Official, so no provider check here.
+                // Trajectory analysis is diagnostic only. Repeated calls must not
+                // remove tools, inject loop warnings, or terminate a conversation.
                 if recovery_policy.task_efficiency {
-                    match decision {
-                        LoopGuardDecision::Abort {
-                            error_code: _,
-                            message,
-                        } => {
-                            if let Some(mut diag) = pending_task_efficiency_diag.take() {
-                                diag.model_facing_recovery = None;
-                                self.diagnostics
-                                    .record(DiagnosticEvent::TaskEfficiency(diag));
+                    if let Some(eff_state) = efficiency_state_ref.as_mut() {
+                        let live_key = format!("{}:{}", conversation_key, route.route_id);
+                        let activation_req_idx = eval_request_index(&request.metadata.request_id);
+                        let mut registry = self
+                            .efficiency_recoveries
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        registry.retain(|_, entry| {
+                            entry.touched.elapsed() < LIVE_EFFICIENCY_RECOVERY_TTL
+                        });
+                        evict_oldest(&mut registry, |entry| entry.touched);
+                        let entry = registry.entry(live_key).or_insert_with(|| {
+                            LiveEfficiencyRecoveryEntry {
+                                state: Default::default(),
+                                touched: tokio::time::Instant::now(),
                             }
-                            return Err(RuntimeError::ToolLoopLimit(message));
-                        }
-                        LoopGuardDecision::Finalize {
-                            pattern_hash: ref phash,
-                            message,
-                        } => {
-                            let Some(ref ckey) = conv_key else {
-                                return Err(RuntimeError::ToolLoopLimit(
-                                    "tool loop persisted after recovery, but no durable conversation identity was available for a bounded finalization turn".into(),
-                                ));
-                            };
-                            let lookup_key = format!("{ckey}:{}:{phash}", route.route_id);
+                        });
+                        // Single atomic activation: `reconcile_live_efficiency_recovery`
+                        // materializes the active state, request/token anchors and the
+                        // conversion record into BOTH `eff_state` and `entry.state`.
+                        efficiency_recovery =
+                            crate::task_efficiency::reconcile_live_efficiency_recovery(
+                                &mut entry.state,
+                                eff_state,
+                                efficiency_recovery,
+                                activation_req_idx,
+                            );
+                        // Escalation gate is re-checked while the registry entry is
+                        // still held so an L1→L2 transition is written back to the
+                        // live authority, not just the (possibly un-checkpointed)
+                        // reducer state.
+                        if let Some(active) = eff_state.active_action_recovery.as_mut() {
+                            if action_recovery_escalation
+                                && active.level
+                                    == crate::task_efficiency::ActionRecoveryLevel::ConvertEvidence
+                                && (active.post_recovery_tool_results >= 4
+                                    || active.post_recovery_input_tokens >= 25_000)
                             {
-                                let mut map = self
-                                    .loop_recoveries
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                let entry = map.entry(lookup_key).or_insert(LoopRecoveryState {
-                                    pattern_hash: phash.clone(),
-                                    recovery_count: loop_policy.recovery_attempts,
-                                    recovery_exchange_count: trajectory.exchanges.len(),
-                                    finalization_count: 0,
-                                });
-                                if entry.finalization_count > 0 {
-                                    return Err(RuntimeError::ToolLoopLimit(
-                                        "tool loop persisted after the bounded finalization turn"
-                                            .into(),
-                                    ));
-                                }
-                                entry.finalization_count = 1;
-                                entry.recovery_exchange_count = trajectory.exchanges.len();
-                            }
-                            crate::replay::append_synthetic_replay_item(
-                                &mut execution_body,
-                                &mut replay,
-                                json!({
-                                    "type": "message",
-                                    "role": "developer",
-                                    "content": message
-                                }),
-                                format!("synthetic:loop_finalization:{phash}:1"),
-                            )
-                            .map_err(RuntimeError::InvalidRequest)?;
-                            if let Some(object) = execution_body.as_object_mut() {
-                                object.insert("tools".into(), json!([]));
-                                object.insert("tool_choice".into(), json!("none"));
-                                object.insert("parallel_tool_calls".into(), json!(false));
-                            }
-                            if let Some(mut diag) = pending_task_efficiency_diag.take() {
-                                diag.model_facing_recovery = None;
-                                self.diagnostics
-                                    .record(DiagnosticEvent::TaskEfficiency(diag));
+                                active.level =
+                                    crate::task_efficiency::ActionRecoveryLevel::ActionRequired;
                             }
                         }
-                        LoopGuardDecision::Recover {
-                            pattern_hash: ref phash,
-                            message,
-                        } => {
-                            let recovery_count = if let Some(ref ckey) = conv_key {
-                                let lookup_key = format!("{ckey}:{}:{phash}", route.route_id);
-                                let mut map = self
-                                    .loop_recoveries
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                let entry = map.entry(lookup_key).or_insert(LoopRecoveryState {
-                                    pattern_hash: phash.clone(),
-                                    recovery_count: 0,
-                                    recovery_exchange_count: trajectory.exchanges.len(),
-                                    finalization_count: 0,
-                                });
-                                entry.recovery_count = entry.recovery_count.saturating_add(1);
-                                entry.recovery_exchange_count = trajectory.exchanges.len();
-                                entry.recovery_count
-                            } else {
-                                1
-                            };
-                            let synthetic_id =
-                                format!("synthetic:loop_recovery:{phash}:{recovery_count}");
-                            crate::replay::append_synthetic_replay_item(
-                                &mut execution_body,
-                                &mut replay,
-                                json!({
-                                    "type": "message",
-                                    "role": "developer",
-                                    "content": message
-                                }),
-                                synthetic_id,
-                            )
-                            .map_err(RuntimeError::InvalidRequest)?;
-                            if let Some(mut diag) = pending_task_efficiency_diag.take() {
-                                diag.model_facing_recovery = None;
-                                self.diagnostics
-                                    .record(DiagnosticEvent::TaskEfficiency(diag));
-                            }
-                        }
-                        LoopGuardDecision::Allow => {
-                            if let Some(eff_state) = efficiency_state_ref.as_mut() {
-                                let live_key = format!("{}:{}", conversation_key, route.route_id);
-                                let activation_req_idx =
-                                    eval_request_index(&request.metadata.request_id);
-                                let mut registry = self
-                                    .efficiency_recoveries
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                registry.retain(|_, entry| {
-                                    entry.touched.elapsed() < LIVE_EFFICIENCY_RECOVERY_TTL
-                                });
-                                evict_oldest(&mut registry, |entry| entry.touched);
-                                let entry = registry.entry(live_key).or_insert_with(|| {
-                                    LiveEfficiencyRecoveryEntry {
-                                        state: Default::default(),
-                                        touched: tokio::time::Instant::now(),
-                                    }
-                                });
-                                // Single atomic activation: `reconcile_live_efficiency_recovery`
-                                // materializes the active state, request/token anchors and the
-                                // conversion record into BOTH `eff_state` and `entry.state`.
-                                efficiency_recovery =
-                                    crate::task_efficiency::reconcile_live_efficiency_recovery(
-                                        &mut entry.state,
-                                        eff_state,
-                                        efficiency_recovery,
-                                        activation_req_idx,
-                                    );
-                                // Escalation gate is re-checked while the registry entry is
-                                // still held so an L1→L2 transition is written back to the
-                                // live authority, not just the (possibly un-checkpointed)
-                                // reducer state.
-                                if let Some(active) = eff_state.active_action_recovery.as_mut() {
-                                    if action_recovery_escalation
-                                        && active.level
-                                        == crate::task_efficiency::ActionRecoveryLevel::ConvertEvidence
-                                        && (active.post_recovery_tool_results >= 4
-                                            || active.post_recovery_input_tokens >= 25_000)
-                                    {
-                                        active.level =
-                                            crate::task_efficiency::ActionRecoveryLevel::ActionRequired;
-                                    }
-                                }
-                                entry.state.active_action_recovery =
-                                    eff_state.active_action_recovery.clone();
-                                entry.state.recovery_conversions =
-                                    eff_state.recovery_conversions.clone();
-                                if !local_compaction_trigger
-                                    && eff_state.active_action_recovery.is_none()
-                                {
-                                    task_closure_overlay =
-                                        crate::task_efficiency::consume_task_closure_overlay(
-                                            &mut entry.state,
-                                        );
-                                }
-                                entry.touched = tokio::time::Instant::now();
-                            }
-
-                            let model_facing = if let Some(eff_state) =
-                                efficiency_state_ref.as_ref()
-                            {
-                                if let Some(active) = eff_state.active_action_recovery.as_ref() {
-                                    match active.level {
-                                        crate::task_efficiency::ActionRecoveryLevel::ActionRequired => {
-                                            Some("researchSprawlL2".to_string())
-                                        }
-                                        crate::task_efficiency::ActionRecoveryLevel::ConvertEvidence => {
-                                            Some("researchSprawlL1".to_string())
-                                        }
-                                    }
-                                } else if efficiency_recovery.is_some() {
-                                    Some("researchSprawl".to_string())
-                                } else if task_closure_overlay.is_some() {
-                                    Some("taskClosure".to_string())
-                                } else if stall_recovery.is_some() {
-                                    Some("taskStall".to_string())
-                                } else {
-                                    None
-                                }
-                            } else if efficiency_recovery.is_some() {
-                                Some("researchSprawl".to_string())
-                            } else if stall_recovery.is_some() {
-                                Some("taskStall".to_string())
-                            } else {
-                                None
-                            };
-
-                            if let Some(mut diag) = pending_task_efficiency_diag.take() {
-                                if let Some(eff_state) = efficiency_state_ref.as_ref() {
-                                    diag.research_sprawl_recovery_count =
-                                        eff_state.research_sprawl_recovery_total;
-                                    diag.last_recovery_request_index =
-                                        eff_state.last_recovery_request_index;
-                                    diag.recovery_conversions =
-                                        eff_state.recovery_conversions.clone();
-                                    diag.active_action_recovery =
-                                        eff_state.active_action_recovery.clone();
-                                    diag.active_recovery_level =
-                                        eff_state.active_action_recovery.as_ref().map(|a| a.level);
-                                    diag.compactions_since_recovery_activation = eff_state
-                                        .active_action_recovery
-                                        .as_ref()
-                                        .map(|a| a.compactions_since_activation);
-                                }
-                                diag.model_facing_recovery = model_facing;
-                                self.diagnostics
-                                    .record(DiagnosticEvent::TaskEfficiency(diag));
-                            }
-                            if let (Some(eff_recovery), Some(eff_state)) =
-                                (efficiency_recovery.as_ref(), efficiency_state_ref.as_mut())
-                            {
-                                let req_idx = eval_request_index(&request.metadata.request_id);
-                                let synthetic_id = format!(
-                                    "synthetic:task_efficiency_recovery:{}",
-                                    eff_recovery.recovery_count
+                        entry.state.active_action_recovery =
+                            eff_state.active_action_recovery.clone();
+                        entry.state.recovery_conversions = eff_state.recovery_conversions.clone();
+                        if !local_compaction_trigger && eff_state.active_action_recovery.is_none() {
+                            task_closure_overlay =
+                                crate::task_efficiency::consume_task_closure_overlay(
+                                    &mut entry.state,
                                 );
-                                // The marker is a durable replay/rebuild anchor only: it is
-                                // written to persisted history (so a later rebuild can
-                                // reconstruct the recovery epoch) but is NOT added to the
-                                // model-visible execution body. The single model-visible
-                                // execution-control block on this and every subsequent
-                                // ordinary request is the persistent active-recovery
-                                // overlay below (plan §7.1, §18).
-                                let synthetic_item = json!({
-                                    "type": "message",
-                                    "role": "developer",
-                                    "id": synthetic_id,
-                                    "content": eff_recovery.message.clone(),
-                                    "internal_efficiency_recovery": {
-                                        "recovery_count": eff_recovery.recovery_count,
-                                        "request_index": req_idx,
-                                        "cumulative_input_tokens": eff_state.cumulative_input_tokens,
-                                    }
-                                });
-                                history_request_body
-                                    .get_mut("input")
-                                    .and_then(Value::as_array_mut)
-                                    .ok_or_else(|| {
-                                        RuntimeError::InvalidRequest(
-                                            "request body is missing input array".into(),
-                                        )
-                                    })?
-                                    .push(synthetic_item);
-                                self.diagnostics
-                                    .record(DiagnosticEvent::TaskEfficiencyRecovery(
-                                        crate::task_efficiency::TaskEfficiencyRecoveryDiagnostic {
-                                            request_id_hash: sha256_hex(
-                                                &request.metadata.request_id,
-                                            ),
-                                            request_index: req_idx,
-                                            recovery_count: eff_recovery.recovery_count,
-                                            recovery_message_hash: crate::diagnostics::hash_text(
-                                                &eff_recovery.message,
-                                            ),
-                                            input_tokens_since_world_change: eff_state
-                                                .input_tokens_since_world_change,
-                                            tool_results_since_world_change: eff_state
-                                                .tool_results_since_world_change,
-                                        },
-                                    ));
-                            }
+                        }
+                        entry.touched = tokio::time::Instant::now();
+                    }
 
-                            // Persistent Active Recovery Overlay: rematerialized on every
-                            // ordinary provider request via the shared reducer helper so
-                            // exactly one execution-control block reaches the model. Any
-                            // hydrated `synthetic:task_efficiency_recovery:` anchor is
-                            // stripped from the dispatched body (it stays in persisted
-                            // history for rebuilds) (plan §18, §26).
-                            if !local_compaction_trigger {
-                                if let Some(input_arr) = execution_body
-                                    .get_mut("input")
-                                    .and_then(Value::as_array_mut)
-                                {
-                                    let active = efficiency_state_ref
-                                        .as_ref()
-                                        .and_then(|e| e.active_action_recovery.as_ref());
-                                    crate::task_efficiency::apply_active_execution_overlay(
-                                        input_arr, active,
-                                    );
-                                    crate::task_efficiency::apply_task_closure_overlay(
-                                        input_arr,
-                                        task_closure_overlay,
-                                    );
+                    let model_facing = if let Some(eff_state) = efficiency_state_ref.as_ref() {
+                        if let Some(active) = eff_state.active_action_recovery.as_ref() {
+                            match active.level {
+                                crate::task_efficiency::ActionRecoveryLevel::ActionRequired => {
+                                    Some("researchSprawlL2".to_string())
+                                }
+                                crate::task_efficiency::ActionRecoveryLevel::ConvertEvidence => {
+                                    Some("researchSprawlL1".to_string())
                                 }
                             }
+                        } else if efficiency_recovery.is_some() {
+                            Some("researchSprawl".to_string())
+                        } else if task_closure_overlay.is_some() {
+                            Some("taskClosure".to_string())
+                        } else if stall_recovery.is_some() {
+                            Some("taskStall".to_string())
+                        } else {
+                            None
+                        }
+                    } else if efficiency_recovery.is_some() {
+                        Some("researchSprawl".to_string())
+                    } else if stall_recovery.is_some() {
+                        Some("taskStall".to_string())
+                    } else {
+                        None
+                    };
 
-                            let has_active_action_recovery = efficiency_state_ref
+                    if let Some(mut diag) = pending_task_efficiency_diag.take() {
+                        if let Some(eff_state) = efficiency_state_ref.as_ref() {
+                            diag.research_sprawl_recovery_count =
+                                eff_state.research_sprawl_recovery_total;
+                            diag.last_recovery_request_index =
+                                eff_state.last_recovery_request_index;
+                            diag.recovery_conversions = eff_state.recovery_conversions.clone();
+                            diag.active_action_recovery = eff_state.active_action_recovery.clone();
+                            diag.active_recovery_level =
+                                eff_state.active_action_recovery.as_ref().map(|a| a.level);
+                            diag.compactions_since_recovery_activation = eff_state
+                                .active_action_recovery
                                 .as_ref()
-                                .and_then(|e| e.active_action_recovery.as_ref())
-                                .is_some();
-                            if has_active_action_recovery || efficiency_recovery.is_some() {
-                                // Research sprawl recovery has precedence over task stall and ledger recovery
-                            } else if let (Some(stall), Some(stall_state)) =
-                                (stall_recovery.as_ref(), stall_state.as_mut())
-                            {
-                                // The injected marker is an execution-side
-                                // effect. Record it in the durable state now,
-                                // rather than relying on a future request to
-                                // replay a synthetic item that Codex may have
-                                // compacted out of its next input.
-                                crate::task_stall::reconcile_stall_recovery(
-                                    stall_state,
-                                    stall.recovery_count,
-                                    Some(current_input_items.len()),
-                                );
-                                let recovery_message = if self.task_stall_bounded_finalization
+                                .map(|a| a.compactions_since_activation);
+                        }
+                        diag.model_facing_recovery = model_facing;
+                        self.diagnostics
+                            .record(DiagnosticEvent::TaskEfficiency(diag));
+                    }
+                    if let (Some(eff_recovery), Some(eff_state)) =
+                        (efficiency_recovery.as_ref(), efficiency_state_ref.as_mut())
+                    {
+                        let req_idx = eval_request_index(&request.metadata.request_id);
+                        let synthetic_id = format!(
+                            "synthetic:task_efficiency_recovery:{}",
+                            eff_recovery.recovery_count
+                        );
+                        // The marker is a durable replay/rebuild anchor only: it is
+                        // written to persisted history (so a later rebuild can
+                        // reconstruct the recovery epoch) but is NOT added to the
+                        // model-visible execution body. The single model-visible
+                        // execution-control block on this and every subsequent
+                        // ordinary request is the persistent active-recovery
+                        // overlay below (plan §7.1, §18).
+                        let synthetic_item = json!({
+                            "type": "message",
+                            "role": "developer",
+                            "id": synthetic_id,
+                            "content": eff_recovery.message.clone(),
+                            "internal_efficiency_recovery": {
+                                "recovery_count": eff_recovery.recovery_count,
+                                "request_index": req_idx,
+                                "cumulative_input_tokens": eff_state.cumulative_input_tokens,
+                            }
+                        });
+                        history_request_body
+                            .get_mut("input")
+                            .and_then(Value::as_array_mut)
+                            .ok_or_else(|| {
+                                RuntimeError::InvalidRequest(
+                                    "request body is missing input array".into(),
+                                )
+                            })?
+                            .push(synthetic_item);
+                        self.diagnostics
+                            .record(DiagnosticEvent::TaskEfficiencyRecovery(
+                                crate::task_efficiency::TaskEfficiencyRecoveryDiagnostic {
+                                    request_id_hash: sha256_hex(&request.metadata.request_id),
+                                    request_index: req_idx,
+                                    recovery_count: eff_recovery.recovery_count,
+                                    recovery_message_hash: crate::diagnostics::hash_text(
+                                        &eff_recovery.message,
+                                    ),
+                                    input_tokens_since_world_change: eff_state
+                                        .input_tokens_since_world_change,
+                                    tool_results_since_world_change: eff_state
+                                        .tool_results_since_world_change,
+                                },
+                            ));
+                    }
+
+                    // Persistent Active Recovery Overlay: rematerialized on every
+                    // ordinary provider request via the shared reducer helper so
+                    // exactly one execution-control block reaches the model. Any
+                    // hydrated `synthetic:task_efficiency_recovery:` anchor is
+                    // stripped from the dispatched body (it stays in persisted
+                    // history for rebuilds) (plan §18, §26).
+                    if !local_compaction_trigger {
+                        if let Some(input_arr) = execution_body
+                            .get_mut("input")
+                            .and_then(Value::as_array_mut)
+                        {
+                            let active = efficiency_state_ref
+                                .as_ref()
+                                .and_then(|e| e.active_action_recovery.as_ref());
+                            crate::task_efficiency::apply_active_execution_overlay(
+                                input_arr, active,
+                            );
+                            crate::task_efficiency::apply_task_closure_overlay(
+                                input_arr,
+                                task_closure_overlay,
+                            );
+                        }
+                    }
+
+                    let has_active_action_recovery = efficiency_state_ref
+                        .as_ref()
+                        .and_then(|e| e.active_action_recovery.as_ref())
+                        .is_some();
+                    if has_active_action_recovery || efficiency_recovery.is_some() {
+                        // Research sprawl recovery has precedence over task stall and ledger recovery
+                    } else if let (Some(stall), Some(stall_state)) =
+                        (stall_recovery.as_ref(), stall_state.as_mut())
+                    {
+                        // The injected marker is an execution-side
+                        // effect. Record it in the durable state now,
+                        // rather than relying on a future request to
+                        // replay a synthetic item that Codex may have
+                        // compacted out of its next input.
+                        crate::task_stall::reconcile_stall_recovery(
+                            stall_state,
+                            stall.recovery_count,
+                            Some(current_input_items.len()),
+                        );
+                        let recovery_message = if self.task_stall_bounded_finalization
+                            && stall.level == crate::task_stall::StallRecoveryState::Escalated
+                        {
+                            crate::stall_recovery::bounded_finalization_message()
+                        } else {
+                            stall.message.clone()
+                        };
+                        let synthetic_id =
+                            format!("synthetic:task_stall_recovery:{}", stall.recovery_count);
+                        let synthetic_item = json!({
+                            "type": "message",
+                            "role": "developer",
+                            "id": synthetic_id,
+                            "content": recovery_message.clone()
+                        });
+                        crate::replay::append_synthetic_replay_item(
+                            &mut execution_body,
+                            &mut replay,
+                            synthetic_item.clone(),
+                            synthetic_id.clone(),
+                        )
+                        .map_err(RuntimeError::InvalidRequest)?;
+                        history_request_body
+                            .get_mut("input")
+                            .and_then(Value::as_array_mut)
+                            .ok_or_else(|| {
+                                RuntimeError::InvalidRequest(
+                                    "request body is missing input array".into(),
+                                )
+                            })?
+                            .push(synthetic_item);
+                        apply_bounded_stall_finalization(
+                            &mut execution_body,
+                            stall.level,
+                            self.task_stall_bounded_finalization,
+                        );
+                        self.diagnostics.record(DiagnosticEvent::TaskStallRecovery(
+                            crate::task_stall::TaskStallRecoveryDiagnostic {
+                                request_id_hash: sha256_hex(&request.metadata.request_id),
+                                request_index: eval_request_index(
+                                    &request.metadata.request_id,
+                                ),
+                                recovery_count: stall.recovery_count,
+                                recovery_level: stall.level,
+                                intervention: if self.task_stall_bounded_finalization
                                     && stall.level
                                         == crate::task_stall::StallRecoveryState::Escalated
                                 {
-                                    crate::stall_recovery::bounded_finalization_message()
+                                    crate::task_stall::TaskStallIntervention::ToolDisabledFinalization
                                 } else {
-                                    stall.message.clone()
-                                };
-                                let synthetic_id = format!(
-                                    "synthetic:task_stall_recovery:{}",
-                                    stall.recovery_count
-                                );
-                                let synthetic_item = json!({
-                                    "type": "message",
-                                    "role": "developer",
-                                    "id": synthetic_id,
-                                    "content": recovery_message.clone()
-                                });
-                                crate::replay::append_synthetic_replay_item(
-                                    &mut execution_body,
-                                    &mut replay,
-                                    synthetic_item.clone(),
-                                    synthetic_id.clone(),
-                                )
-                                .map_err(RuntimeError::InvalidRequest)?;
-                                history_request_body
-                                    .get_mut("input")
-                                    .and_then(Value::as_array_mut)
-                                    .ok_or_else(|| {
-                                        RuntimeError::InvalidRequest(
-                                            "request body is missing input array".into(),
-                                        )
-                                    })?
-                                    .push(synthetic_item);
-                                apply_bounded_stall_finalization(
-                                    &mut execution_body,
-                                    stall.level,
-                                    self.task_stall_bounded_finalization,
-                                );
-                                self.diagnostics.record(DiagnosticEvent::TaskStallRecovery(
-                                    crate::task_stall::TaskStallRecoveryDiagnostic {
-                                        request_id_hash: sha256_hex(&request.metadata.request_id),
-                                        request_index: eval_request_index(
-                                            &request.metadata.request_id,
-                                        ),
-                                        recovery_count: stall.recovery_count,
-                                        recovery_level: stall.level,
-                                        intervention: if self.task_stall_bounded_finalization
-                                            && stall.level
-                                                == crate::task_stall::StallRecoveryState::Escalated
-                                        {
-                                            crate::task_stall::TaskStallIntervention::ToolDisabledFinalization
-                                        } else {
-                                            crate::task_stall::TaskStallIntervention::Warning
-                                        },
-                                        recovery_message_hash: crate::diagnostics::hash_text(
-                                            &recovery_message,
-                                        ),
-                                        tool_results_since_progress: stall_state
-                                            .tool_results_since_progress,
-                                        post_recovery_no_progress: stall_state
-                                            .post_recovery_tool_results_without_progress,
-                                        last_progress: stall_state.last_progress.clone(),
-                                    },
-                                ));
-                            } else if let Some(recovery) = ledger_recovery {
-                                let recovery_diagnostic = ledger_recovery_diagnostic
-                                    .unwrap_or_else(|| {
-                                        crate::investigation_diagnostics::InvestigationRecoveryDiagnostic {
-                                            ledger_id: recovery.ledger_id.clone(),
-                                            why: "redundant_revisit_without_frontier_or_relevant_progress"
-                                                .into(),
-                                            known_evidence_signatures: Vec::new(),
-                                            missing_state: "independent evidence still absent".into(),
-                                            recovery_count: recovery.recovery_count,
-                                            post_recovery_repeated: recovery.level
-                                                == crate::investigation_reducer::RecoveryState::Escalated,
-                                        }
-                                    });
-                                self.diagnostics
-                                    .record(DiagnosticEvent::InvestigationRecovery(
-                                        recovery_diagnostic,
-                                    ));
-                                let synthetic_id = format!(
-                                    "synthetic:investigation_recovery:{}:{}",
-                                    recovery.ledger_id, recovery.recovery_count
-                                );
-                                let synthetic_item = json!({
-                                    "type": "message",
-                                    "role": "developer",
-                                    "id": synthetic_id,
-                                    "content": recovery.message
-                                });
-                                crate::replay::append_synthetic_replay_item(
-                                    &mut execution_body,
-                                    &mut replay,
-                                    synthetic_item.clone(),
-                                    synthetic_id.clone(),
-                                )
-                                .map_err(RuntimeError::InvalidRequest)?;
-                                history_request_body
-                                    .get_mut("input")
-                                    .and_then(Value::as_array_mut)
-                                    .ok_or_else(|| {
-                                        RuntimeError::InvalidRequest(
-                                            "request body is missing input array".into(),
-                                        )
-                                    })?
-                                    .push(synthetic_item);
+                                    crate::task_stall::TaskStallIntervention::Warning
+                                },
+                                recovery_message_hash: crate::diagnostics::hash_text(
+                                    &recovery_message,
+                                ),
+                                tool_results_since_progress: stall_state
+                                    .tool_results_since_progress,
+                                post_recovery_no_progress: stall_state
+                                    .post_recovery_tool_results_without_progress,
+                                last_progress: stall_state.last_progress.clone(),
+                            },
+                        ));
+                    } else if let Some(recovery) = ledger_recovery {
+                        let recovery_diagnostic = ledger_recovery_diagnostic.unwrap_or_else(|| {
+                            crate::investigation_diagnostics::InvestigationRecoveryDiagnostic {
+                                ledger_id: recovery.ledger_id.clone(),
+                                why: "redundant_revisit_without_frontier_or_relevant_progress"
+                                    .into(),
+                                known_evidence_signatures: Vec::new(),
+                                missing_state: "independent evidence still absent".into(),
+                                recovery_count: recovery.recovery_count,
+                                post_recovery_repeated: recovery.level
+                                    == crate::investigation_reducer::RecoveryState::Escalated,
                             }
-                        }
+                        });
+                        self.diagnostics
+                            .record(DiagnosticEvent::InvestigationRecovery(recovery_diagnostic));
+                        let synthetic_id = format!(
+                            "synthetic:investigation_recovery:{}:{}",
+                            recovery.ledger_id, recovery.recovery_count
+                        );
+                        let synthetic_item = json!({
+                            "type": "message",
+                            "role": "developer",
+                            "id": synthetic_id,
+                            "content": recovery.message
+                        });
+                        crate::replay::append_synthetic_replay_item(
+                            &mut execution_body,
+                            &mut replay,
+                            synthetic_item.clone(),
+                            synthetic_id.clone(),
+                        )
+                        .map_err(RuntimeError::InvalidRequest)?;
+                        history_request_body
+                            .get_mut("input")
+                            .and_then(Value::as_array_mut)
+                            .ok_or_else(|| {
+                                RuntimeError::InvalidRequest(
+                                    "request body is missing input array".into(),
+                                )
+                            })?
+                            .push(synthetic_item);
                     }
                 }
                 if let Some(mut persisted) = pending_recovery_snapshot.take() {
@@ -15164,99 +14997,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_recovery_gets_one_tool_disabled_finalization_before_abort() {
-        let transport = Arc::new(RecordingTransport::new(vec![
-            UpstreamResponse {
-                status: 200,
-                headers: Vec::new(),
-                body: chat_ok_body(),
-            },
-            UpstreamResponse {
-                status: 200,
-                headers: Vec::new(),
-                body: chat_ok_body(),
-            },
-        ]));
-
-        let mut r = chat_route();
-
-        let runtime = ProxyRuntime::new(
-            Arc::new(FixedCatalog { routes: vec![r] }),
-            Arc::new(MemoryCredentialProvider::new()),
-            Arc::new(UnconfiguredOfficialAuthProvider),
-            Arc::new(CountingRequestLifecycle::new()),
-            transport.clone(),
-        );
-
-        let mut input_loop =
-            vec![json!({"type": "message", "role": "user", "content": "solve task"})];
-        // Repeat identical exchange 3 times with valid unique call_ids
-        for i in 0..3 {
-            input_loop.push(json!({
-                "type": "function_call",
-                "call_id": format!("c_loop_{i}"),
-                "name": "get_status",
-                "arguments": "{}"
-            }));
-            input_loop.push(json!({
-                "type": "function_call_output",
-                "call_id": format!("c_loop_{i}"),
-                "output": "status: pending"
-            }));
-        }
-
-        let req1 = request(json!({
-            "model": "vlm-test",
-            "conversation_id": "conv_loop_test",
-            "input": input_loop.clone()
-        }));
-
-        // Strike 1: Recover (appends developer guidance message)
-        let res1 = runtime.execute(req1, "exec_1").await;
-        assert!(
-            res1.is_ok(),
-            "first strike should recover: {:?}",
-            res1.err()
-        );
-
-        let recorded = transport.requests.lock().unwrap();
-        let forwarded_body: Value = serde_json::from_slice(&recorded[0].body).unwrap();
-        let body_str = forwarded_body.to_string();
-        assert!(body_str.contains("The last tool sequence repeated"));
-        drop(recorded);
-
-        // Strike 2: Same loop pattern persists -> one tool-disabled final response.
-        let req2 = request(json!({
-            "model": "vlm-test",
-            "conversation_id": "conv_loop_test",
-            "input": input_loop
-        }));
-
-        let res2 = runtime.execute(req2, "exec_2").await;
-        assert!(res2.is_ok(), "second strike must reach finalization");
-        let recorded = transport.requests.lock().unwrap();
-        assert_eq!(recorded.len(), 2);
-        let finalization_body: Value = serde_json::from_slice(&recorded[1].body).unwrap();
-        assert!(finalization_body.get("tools").is_none());
-        assert!(finalization_body.get("tool_choice").is_none());
-        assert!(finalization_body
-            .to_string()
-            .contains("disabled all tools for this final response"));
-        drop(recorded);
-
-        // Strike 3: the bounded finalization was already consumed, so fail closed.
-        let req3 = request(json!({
-            "model": "vlm-test",
-            "conversation_id": "conv_loop_test",
-            "input": input_loop.clone()
-        }));
-        let res3 = runtime.execute(req3, "exec_3").await;
-        assert!(res3.is_err(), "third strike must abort");
-        match res3.unwrap_err() {
-            RuntimeError::ToolLoopLimit(msg) => {
-                assert!(msg.contains("repeated tool loop") || msg.contains("finalization"));
+    async fn repeated_tools_and_long_tool_streaks_remain_callable() {
+        // Real incidents: distinct successful patches shared an output, and
+        // Omen Alpha made 25 different calls without an assistant message.
+        for scenario in ["identical_calls", "different_patches", "long_streak"] {
+            let transport = Arc::new(RecordingTransport::new(
+                (0..3)
+                    .map(|_| UpstreamResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: chat_ok_body(),
+                    })
+                    .collect(),
+            ));
+            let runtime = ProxyRuntime::new(
+                Arc::new(FixedCatalog {
+                    routes: vec![chat_route()],
+                }),
+                Arc::new(MemoryCredentialProvider::new()),
+                Arc::new(UnconfiguredOfficialAuthProvider),
+                Arc::new(CountingRequestLifecycle::new()),
+                transport.clone(),
+            );
+            let mut input = vec![json!({
+                "type": "message", "role": "user", "content": "continue the task"
+            })];
+            let count = if scenario == "long_streak" { 25 } else { 3 };
+            for i in 0..count {
+                let id = format!("call_{i}");
+                if scenario == "different_patches" {
+                    input.push(json!({
+                        "type": "custom_tool_call", "call_id": id,
+                        "name": "apply_patch",
+                        "input": format!("*** Begin Patch\n*** Update File: a.txt\n@@\n-old{i}\n+new{i}\n*** End Patch")
+                    }));
+                    input.push(json!({
+                        "type": "custom_tool_call_output", "call_id": id,
+                        "output": "Success. Updated the following files: M a.txt"
+                    }));
+                } else {
+                    input.push(json!({
+                        "type": "function_call", "call_id": id, "name": "get_status",
+                        "arguments": if scenario == "long_streak" {
+                            json!({"index": i}).to_string()
+                        } else { "{}".to_string() }
+                    }));
+                    input.push(json!({
+                        "type": "function_call_output", "call_id": id,
+                        "output": "status: pending"
+                    }));
+                }
             }
-            other => panic!("expected ToolLoopLimit error, got {:?}", other),
+            // Repeated requests also cover retries/resumption after a guard
+            // would previously have consumed its finalization allowance.
+            for attempt in 0..3 {
+                runtime
+                    .execute(
+                        request(json!({
+                            "model": "vlm-test", "conversation_id": scenario,
+                            "input": input.clone(),
+                            "tools": [{"type": "function", "name": "get_status",
+                                "parameters": {"type": "object", "properties": {}}}]
+                        })),
+                        &format!("attempt_{attempt}"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let recorded = transport.requests.lock().unwrap();
+            assert_eq!(recorded.len(), 3, "{scenario}");
+            for request in recorded.iter() {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(!body["tools"].as_array().unwrap().is_empty(), "{scenario}");
+                assert_ne!(body["tool_choice"], json!("none"), "{scenario}");
+                let text = body.to_string();
+                assert!(
+                    !text.contains("The last tool sequence repeated"),
+                    "{scenario}"
+                );
+                assert!(
+                    !text.contains("disabled all tools for this final response"),
+                    "{scenario}"
+                );
+            }
         }
     }
 
@@ -15549,7 +15372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn previous_response_only_loop_recovery_is_stateful() {
+    async fn previous_response_only_repeated_tools_keep_running() {
         let mut v2_route = chat_route();
 
         let temp = tempfile::tempdir().unwrap();
@@ -15603,7 +15426,7 @@ mod tests {
         ];
 
         // First turn referencing previous_response_id (without explicit conversation_id)
-        // Hits loop -> triggers recovery (200 OK with recovery instruction)
+        // Replayed repeated calls remain valid continuation input.
         let req1 = request(json!({
             "model": "vlm-test",
             "previous_response_id": "resp_turn_0",
@@ -15611,7 +15434,11 @@ mod tests {
         }));
 
         let res1 = runtime.execute(req1, "exec_turn_1").await;
-        assert!(res1.is_ok(), "first loop strike recovers: {:?}", res1.err());
+        assert!(
+            res1.is_ok(),
+            "first continuation succeeds: {:?}",
+            res1.err()
+        );
 
         // Record turn 1 in history
         store
@@ -15640,7 +15467,7 @@ mod tests {
             json!({"type": "function_call_output", "call_id": "c6", "output": "status: pending"}),
         ];
 
-        // Second turn referencing previous_response_id (resp_turn_1): finalization is sent.
+        // Subsequent turns must not accumulate loop strikes across history.
         let req2 = request(json!({
             "model": "vlm-test",
             "previous_response_id": "resp_turn_1",
@@ -15648,7 +15475,7 @@ mod tests {
         }));
 
         let res2 = runtime.execute(req2, "exec_turn_2").await;
-        assert!(res2.is_ok(), "second strike must reach finalization");
+        assert!(res2.is_ok(), "second continuation succeeds");
 
         let req3 = request(json!({
             "model": "vlm-test",
@@ -15656,14 +15483,7 @@ mod tests {
             "input": loop_items_turn2.clone()
         }));
         let res3 = runtime.execute(req3, "exec_turn_3").await;
-        assert!(
-            res3.is_err(),
-            "third loop strike on stateful continuation must abort"
-        );
-        match res3.err().unwrap() {
-            RuntimeError::ToolLoopLimit(_) => {}
-            other => panic!("expected ToolLoopLimit error, got {:?}", other),
-        }
+        assert!(res3.is_ok(), "replayed continuation must remain callable");
     }
 
     #[tokio::test]
