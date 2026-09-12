@@ -287,7 +287,8 @@ pub fn configure_desktop_runtime(
     let previous = read_settings(data_root)?;
     let (enhanced_codex_executable, bridge_executable) = if enabled {
         (
-            packaged_enhanced_executable(data_root)
+            crate::updates::resolve_enhanced_runtime(data_root)
+                .map(|runtime| runtime.path)
                 .ok_or(DesktopRuntimeManagerError::PackagedEnhancedUnavailable)?,
             packaged_bridge_executable()
                 .ok_or(DesktopRuntimeManagerError::PackagedBridgeUnavailable)?,
@@ -567,7 +568,8 @@ pub(crate) fn sync_proxy_desktop_launch<G>(
     let settings = DesktopRuntimeSettings {
         enabled: true,
         official_codex_executable: PathBuf::from(official.binary),
-        enhanced_codex_executable: packaged_enhanced_executable(data_root)
+        enhanced_codex_executable: crate::updates::resolve_enhanced_runtime(data_root)
+            .map(|runtime| runtime.path)
             .ok_or(DesktopRuntimeManagerError::PackagedEnhancedUnavailable)?,
         bridge_executable: packaged_bridge_executable()
             .ok_or(DesktopRuntimeManagerError::PackagedBridgeUnavailable)?,
@@ -584,14 +586,43 @@ fn prepare_desktop_launch_guarded<G>(
     save_settings: bool,
 ) -> Result<Option<DesktopRuntimeLaunch>, DesktopRuntimeManagerError> {
     let mut settings = settings;
-    if crate::updates::consume_core_pending_apply() {
-        if let Some(pending) = crate::updates::pending_core(data_root) {
-            if pending.path.is_file() && !pending.digest.is_empty() {
-                settings.enhanced_codex_executable = pending.path;
-            }
+    let applying_pending = crate::updates::consume_core_pending_apply();
+    if applying_pending {
+        let pending = crate::updates::pending_core(data_root)
+            .ok_or(DesktopRuntimeManagerError::PendingCoreUnverified)?;
+        if crate::updates::signed_core_identity(data_root, &pending.path, &pending.digest).is_none()
+        {
+            let _ = crate::updates::conclude_pending_core(
+                data_root,
+                crate::updates::CorePromoteInput {
+                    pending_verified: false,
+                    bridge_compatible: false,
+                    official_protocol_ok: false,
+                    attestation_ok: false,
+                    user_turn_accepted: false,
+                },
+            );
+            return Err(DesktopRuntimeManagerError::PendingCoreUnverified);
         }
+        settings.enhanced_codex_executable = pending.path;
     }
-    let identity = verify_settings(data_root, &settings)?;
+    let identity = match verify_settings(data_root, &settings) {
+        Ok(identity) => identity,
+        Err(error) if applying_pending => {
+            let _ = crate::updates::conclude_pending_core(
+                data_root,
+                crate::updates::CorePromoteInput {
+                    pending_verified: false,
+                    bridge_compatible: false,
+                    official_protocol_ok: false,
+                    attestation_ok: false,
+                    user_turn_accepted: false,
+                },
+            );
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let model_map = TrustedModelProviderMap::from_catalog(routes, models);
     let model_map_path = data_root.join(MODEL_MAP_FILE);
     let model_map_bytes = serde_json::to_vec_pretty(&model_map)?;
@@ -1297,7 +1328,7 @@ fn empty_status(data_root: &Path, configured: bool, blockers: Vec<String>) -> De
         official_codex_executable: None,
         enhanced_codex_executable: None,
         bridge_executable: None,
-        core_available: packaged_enhanced_executable(data_root).is_some(),
+        core_available: crate::updates::resolve_enhanced_runtime(data_root).is_some(),
         serving: false,
         protocol: None,
         unverified: false,
@@ -1310,7 +1341,8 @@ fn empty_status(data_root: &Path, configured: bool, blockers: Vec<String>) -> De
 
 fn unconfigured_status(data_root: &Path) -> DesktopRuntimeStatus {
     let mut status = empty_status(data_root, false, Vec::new());
-    status.enhanced_codex_executable = packaged_enhanced_executable(data_root);
+    status.enhanced_codex_executable =
+        crate::updates::resolve_enhanced_runtime(data_root).map(|runtime| runtime.path);
     if status.enhanced_codex_executable.is_none() {
         status
             .blockers
@@ -1386,8 +1418,12 @@ fn verify_settings(
         "sha256:{}",
         hex_sha256_file(&settings.enhanced_codex_executable)?
     );
-    if lock.artifact_for_target(target) != Some(enhanced_hash.as_str())
-        && !crate::updates::signed_core_digest(data_root, &enhanced_hash)
+    let signed_identity = crate::updates::signed_core_identity(
+        data_root,
+        &settings.enhanced_codex_executable,
+        &enhanced_hash,
+    );
+    if lock.artifact_for_target(target) != Some(enhanced_hash.as_str()) && signed_identity.is_none()
     {
         return Err(DesktopRuntimeManagerError::ArtifactMismatch {
             expected: lock
@@ -1407,6 +1443,36 @@ fn verify_settings(
         &settings.enhanced_codex_executable,
         &settings.official_codex_executable,
     )?;
+    if let Some(signed) = signed_identity.as_ref() {
+        if signed.feature_profile != lock.build_profile {
+            return Err(
+                DesktopRuntimeManagerError::SignedFeatureProfileIncompatible {
+                    expected: lock.build_profile.clone(),
+                    actual: signed.feature_profile.clone(),
+                },
+            );
+        }
+        if !crate::updates::CompatRange::new(&signed.protocol_compat)
+            .matches(&desktop_identity.version)
+        {
+            return Err(
+                DesktopRuntimeManagerError::SignedProtocolVersionIncompatible {
+                    range: signed.protocol_compat.clone(),
+                    actual: desktop_identity.version.clone(),
+                },
+            );
+        }
+        let expected = signed
+            .protocol
+            .strip_prefix("sha256:")
+            .unwrap_or(&signed.protocol);
+        if expected != protocol.pinned_schema_sha256 {
+            return Err(DesktopRuntimeManagerError::SignedProtocolMismatch {
+                expected: signed.protocol.clone(),
+                actual: protocol.pinned_schema_sha256.clone(),
+            });
+        }
+    }
     if !protocol.verdict.may_arm() {
         return Err(DesktopRuntimeManagerError::OfficialProtocolIncompatible {
             details: protocol
@@ -1421,15 +1487,23 @@ fn verify_settings(
     manifest
         .verify_against_lock(&lock)
         .map_err(|error| DesktopRuntimeManagerError::Manifest(error.to_string()))?;
+    let (enhanced_digest, enhanced_commit) = if let Some(signed) = signed_identity {
+        (signed.digest, signed.enhanced_commit)
+    } else {
+        (
+            manifest
+                .runtime_digest()
+                .map_err(|error| DesktopRuntimeManagerError::Manifest(error.to_string()))?,
+            manifest.enhanced_commit.clone(),
+        )
+    };
     Ok(VerifiedIdentity {
         official_digest: format!(
             "sha256:{}",
             hex_sha256_file(&settings.official_codex_executable)?
         ),
-        enhanced_digest: manifest
-            .runtime_digest()
-            .map_err(|error| DesktopRuntimeManagerError::Manifest(error.to_string()))?,
-        enhanced_commit: manifest.enhanced_commit.clone(),
+        enhanced_digest,
+        enhanced_commit,
         protocol,
     })
 }
@@ -1475,6 +1549,12 @@ pub enum DesktopRuntimeManagerError {
     OfficialProtocolIncompatible { details: String },
     #[error("cannot read a Codex core's protocol: {0}")]
     ProtocolProbe(String),
+    #[error("signed Enhanced protocol mismatch: expected {expected}, got {actual}")]
+    SignedProtocolMismatch { expected: String, actual: String },
+    #[error("Codex Desktop protocol version {actual} is outside signed core range {range}")]
+    SignedProtocolVersionIncompatible { range: String, actual: String },
+    #[error("signed Enhanced feature profile mismatch: expected {expected}, got {actual}")]
+    SignedFeatureProfileIncompatible { expected: String, actual: String },
     #[error("Enhanced artifact mismatch: expected {expected}, got {actual}")]
     ArtifactMismatch { expected: String, actual: String },
     #[error("App Server bridge does not match the one this release shipped: expected {expected}, got {actual}")]
@@ -1483,6 +1563,8 @@ pub enum DesktopRuntimeManagerError {
     PackagedBridgeUnavailable,
     #[error("this Vellum build does not contain the pinned Enhanced Codex core")]
     PackagedEnhancedUnavailable,
+    #[error("the pending Enhanced core no longer matches its signed runnable tree")]
+    PendingCoreUnverified,
     #[error("no enabled third-party Provider is available for Enhanced Codex")]
     NoThirdPartyProviders,
     #[error("no Official Provider is enabled; Official GPT must keep its own runtime")]
@@ -1911,6 +1993,77 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("Enhanced artifact mismatch")),
             "an unpinned core verified: {:?}",
+            status.blockers
+        );
+    }
+
+    #[test]
+    fn planted_unsigned_slot_json_cannot_skip_the_bundled_lock_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = std::env::current_exe().unwrap();
+        configure_desktop_runtime(temp.path(), binary.clone(), false).unwrap();
+
+        let mut settings = read_settings(temp.path()).unwrap().unwrap();
+        settings.enhanced_codex_executable = binary.clone();
+        settings.bridge_executable = binary.clone();
+        std::fs::write(
+            temp.path().join(SETTINGS_FILE),
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let hash = format!("sha256:{}", hex_sha256_file(&binary).unwrap());
+        let tree = crate::updates::slot_tree_root(temp.path(), "forged");
+        std::fs::create_dir_all(&tree).unwrap();
+        let planted = tree.join("codex.exe");
+        std::fs::copy(&binary, &planted).unwrap();
+        let helper = tree.join("codex-command-runner.exe");
+        std::fs::write(&helper, b"helper").unwrap();
+        crate::updates::CoreSlots {
+            active: Some(crate::updates::CoreSlot {
+                version: "forged".into(),
+                digest: hash.clone(),
+                protocol: "p".into(),
+                protocol_compat: "*".into(),
+                path: settings.enhanced_codex_executable.clone(),
+                helpers: vec![helper.clone()],
+                files: vec![
+                    crate::updates::CoreSlotFile {
+                        path: settings.enhanced_codex_executable.clone(),
+                        size: std::fs::metadata(&binary).unwrap().len(),
+                        sha256: hash.trim_start_matches("sha256:").into(),
+                    },
+                    crate::updates::CoreSlotFile {
+                        path: helper,
+                        size: 6,
+                        sha256: hex_sha256_file(&tree.join("codex-command-runner.exe")).unwrap(),
+                    },
+                ],
+                enhanced_commit: "a".repeat(40),
+                feature_profile: "enhanced-mvp-v1".into(),
+                launch_id: None,
+            }),
+            ..crate::updates::CoreSlots::default()
+        }
+        .save(temp.path())
+        .unwrap();
+
+        assert!(
+            crate::updates::signed_core_identity(
+                temp.path(),
+                &settings.enhanced_codex_executable,
+                &hash
+            )
+            .is_none(),
+            "unsigned slot metadata must not count as a signed identity"
+        );
+        let status = desktop_runtime_status(temp.path());
+        assert!(
+            status
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("Enhanced artifact mismatch")),
+            "bundled lock hash must still be required: {:?}",
             status.blockers
         );
     }

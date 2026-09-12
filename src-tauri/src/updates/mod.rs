@@ -6,6 +6,7 @@
 
 mod apply;
 mod cache;
+mod core_package;
 mod core_slots;
 mod desktop_install;
 mod engine;
@@ -25,11 +26,13 @@ pub use apply::{
     DesktopApplyInput, IdleEvidence, RemoteIdleInput,
 };
 pub use cache::{extract_verified_archive, stage_bytes, CacheError};
+pub use core_package::stage_verified_core;
 pub use core_slots::{
     arm_core_pending_apply, conclude_pending_core, consume_core_pending_apply,
-    next_start_should_apply_pending, pending_core, persist_slots, promote_pending,
-    resolve_enhanced_runtime, rollback_to_previous, signed_core_digest, CoreConclude, CoreSlots,
-    ResolvedCore, RuntimeSource,
+    next_start_should_apply_pending, pending_core, persist_signed_core_trust, persist_slots,
+    promote_pending, resolve_enhanced_runtime, rollback_to_previous, signed_core_digest,
+    signed_core_digest_with, signed_core_identity, signed_core_identity_with, slot_tree_root,
+    CoreConclude, CoreSlot, CoreSlotFile, CoreSlots, ResolvedCore, RuntimeSource,
 };
 pub use engine::{
     apply_staged_on_exit, apply_update, cancel_download, check_updates, download_update,
@@ -45,8 +48,8 @@ pub use remote_host::{idle_from_host_facts, observe_remote_host, AppRemoteBacken
 pub use journal::{Journal, JournalEntry};
 pub use machine::{UpdateEvent, UpdatePhase};
 pub use manifest::{
-    sign_raw, verify_asset_sha256, verify_signed_manifest, AssetRef, CompatRange, UpdateManifest,
-    MANIFEST_SCHEMA_VERSION,
+    sign_raw, verify_asset_sha256, verify_signed_manifest, AssetRef, CompatRange, CoreFile,
+    CoreManifest, CoreTarget, UpdateManifest, MANIFEST_SCHEMA_VERSION,
 };
 pub use select::{select_compatible, Channel, ReleaseCandidate, SelectContext, Selection};
 pub use trust::{live_auto_update_enabled, TrustStore};

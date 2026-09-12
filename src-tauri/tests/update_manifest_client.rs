@@ -10,7 +10,7 @@ use vellum_lib::updates::{
 fn signed_manifest_is_required_even_when_json_is_well_formed() {
     let trust = TrustStore::bundled();
     let raw = br#"{"schemaVersion":1,"component":"desktop","version":"0.3.0","sourceCommit":"c","releaseTag":"desktop-v0.3.0","sequence":1,"keyId":"none","minDesktopVersion":"0.1.0","bridgeApiCompat":"*","remoteProtocolCompat":"*","assets":[{"platform":"windows","arch":"x64","name":"a.bin","size":1,"sha256":"00"}]}"#;
-    assert_eq!(MANIFEST_SCHEMA_VERSION, 1);
+    assert_eq!(MANIFEST_SCHEMA_VERSION, 2);
     assert!(verify_signed_manifest(raw, &[], &trust).is_err());
     assert!(verify_signed_manifest(raw, &[0u8; 64], &trust).is_err());
 }

@@ -11,7 +11,7 @@ use tokio::sync::{watch, Mutex};
 use super::apply::{wait_kind_for, ApplyDecision};
 
 use super::cache::{recover_switch, stage_bytes, HostDisk};
-use super::core_slots::{set_pending, CoreSlot, CoreSlots};
+use super::core_slots::{set_pending, CoreSlots};
 use super::github::{matching_tags, SharedSource};
 use super::journal::{Journal, JournalEntry};
 use super::machine::{transition, UpdateEvent, UpdatePhase, WaitKind};
@@ -58,6 +58,10 @@ struct LayerRecord {
     download_total: u64,
     staged_asset: Option<PathBuf>,
     manifest: Option<UpdateManifest>,
+    #[serde(default)]
+    signed_manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    signed_signature_path: Option<PathBuf>,
 }
 
 impl LayerRecord {
@@ -75,6 +79,8 @@ impl LayerRecord {
             download_total: 0,
             staged_asset: None,
             manifest: None,
+            signed_manifest_path: None,
+            signed_signature_path: None,
         }
     }
 }
@@ -132,16 +138,12 @@ impl ApplyExecutor for FsApplyExecutor {
     }
 
     fn install_core(&self, staged: &Path, version: &str) -> Result<(), String> {
-        let slot = self.root.join("updates").join("core").join(version);
-        let candidate = slot.join("candidate");
-        std::fs::create_dir_all(&candidate).map_err(|error| error.to_string())?;
-        if staged.is_file() {
-            let name = staged.file_name().ok_or("staged core asset has no name")?;
-            std::fs::copy(staged, candidate.join(name)).map_err(|error| error.to_string())?;
-        }
-        super::cache::mark_complete(&candidate).map_err(|error| error.to_string())?;
-        super::cache::commit_candidate(&slot).map_err(|error| error.to_string())?;
-        Ok(())
+        let _ = staged;
+        CoreSlots::load(&self.root)
+            .pending
+            .filter(|slot| slot.version == version)
+            .ok_or_else(|| "verified core candidate is not pending".to_string())
+            .map(|_| ())
     }
 }
 
@@ -218,10 +220,7 @@ impl UpdateEngine {
         let live = self.trust.live_enabled();
         let desktop = self.layer_status(&state, UpdateComponent::Desktop, current_desktop, live);
         let remote = self.layer_status(&state, UpdateComponent::Remote, current_remote, live);
-        // The core archive contract does not yet identify and hash the
-        // extracted executable/helpers. Keep this layer fail-closed until the
-        // signed manifest can bind the runnable tree rather than only its archive.
-        let core = self.layer_status(&state, UpdateComponent::Core, current_core, false);
+        let core = self.layer_status(&state, UpdateComponent::Core, current_core, live);
         let attention = attention_from([&desktop, &remote, &core]);
         UpdateStatusSnapshot {
             desktop,
@@ -240,11 +239,35 @@ impl UpdateEngine {
         current: &str,
         live: bool,
     ) -> LayerStatus {
-        let record = state
+        let mut record = state
             .layers
             .get(component.as_str())
             .cloned()
             .unwrap_or_else(|| LayerRecord::new(current));
+        if component == UpdateComponent::Core
+            && super::pending_core(&self.root).is_none()
+            && record.staged_version.as_deref() == Some(current)
+            && matches!(
+                record.phase,
+                UpdatePhase::WaitingForRestart | UpdatePhase::WaitingForIdle | UpdatePhase::Staged
+            )
+        {
+            record.phase = UpdatePhase::Applied;
+            record.available_version = None;
+            record.target_version = None;
+            record.failure_reason = None;
+        } else if component == UpdateComponent::Core
+            && super::pending_core(&self.root).is_none()
+            && record.staged_version.is_some()
+            && record.staged_version.as_deref() != Some(current)
+            && matches!(
+                record.phase,
+                UpdatePhase::WaitingForRestart | UpdatePhase::WaitingForIdle | UpdatePhase::Staged
+            )
+        {
+            record.phase = UpdatePhase::Failed;
+            record.failure_reason = Some("pendingCoreRejectedBeforeLaunch".into());
+        }
         let hosts = if component == UpdateComponent::Remote {
             state
                 .remote_policies
@@ -342,7 +365,11 @@ impl UpdateEngine {
         let mut state = self.load();
         let components = match component {
             Some(one) => vec![one],
-            None => vec![UpdateComponent::Desktop, UpdateComponent::Remote],
+            None => vec![
+                UpdateComponent::Desktop,
+                UpdateComponent::Remote,
+                UpdateComponent::Core,
+            ],
         };
         for item in components {
             let current = currents.of(item);
@@ -365,6 +392,7 @@ impl UpdateEngine {
                 continue;
             }
             let mut candidates = Vec::new();
+            let mut signed_core_candidates = HashMap::new();
             for release in matching_tags(&listed.releases, item) {
                 let Some(manifest_asset) = release
                     .assets
@@ -389,11 +417,16 @@ impl UpdateEngine {
                     .fetch_bytes(&sig_asset.browser_download_url)
                     .map_err(AppError::Message)?;
                 match verify_signed_manifest(&raw, &sig, &self.trust) {
-                    Ok(manifest) => candidates.push(ReleaseCandidate {
-                        manifest,
-                        github_prerelease: release.prerelease,
-                        published_at: release.published_at.clone(),
-                    }),
+                    Ok(manifest) => {
+                        if item == UpdateComponent::Core {
+                            signed_core_candidates.insert(manifest.release_tag.clone(), (raw, sig));
+                        }
+                        candidates.push(ReleaseCandidate {
+                            manifest,
+                            github_prerelease: release.prerelease,
+                            published_at: release.published_at.clone(),
+                        });
+                    }
                     Err(error) => {
                         record.failure_reason = Some(error.to_string());
                         record.phase = UpdatePhase::Failed;
@@ -411,19 +444,36 @@ impl UpdateEngine {
                 remote_protocol: currents.remote_protocol,
             };
             if let Some(picked) = select_compatible(&candidates, &ctx) {
-                let notes = candidates
-                    .iter()
-                    .find(|c| c.manifest.version == picked.version)
-                    .and_then(|c| c.manifest.release_notes.clone());
-                let manifest = candidates
+                let selected = candidates
                     .into_iter()
-                    .find(|c| c.manifest.version == picked.version)
-                    .map(|c| c.manifest);
+                    .find(|candidate| {
+                        candidate.manifest.version == picked.version
+                            && candidate.manifest.release_tag == picked.release_tag
+                    })
+                    .expect("selection must refer to one of its candidates");
+                let manifest = selected.manifest;
+                if item == UpdateComponent::Core {
+                    let Some((raw, sig)) = signed_core_candidates.remove(&picked.release_tag)
+                    else {
+                        let record = Self::layer_mut(&mut state, item, current);
+                        record.failure_reason = Some("selectedCoreSignatureMissing".into());
+                        record.phase = UpdatePhase::Failed;
+                        continue;
+                    };
+                    if let Err(error) =
+                        persist_checked_manifest(&self.root, item, &manifest.version, &raw, &sig)
+                    {
+                        let record = Self::layer_mut(&mut state, item, current);
+                        record.failure_reason = Some(error.to_string());
+                        record.phase = UpdatePhase::Failed;
+                        continue;
+                    }
+                }
                 let record = Self::layer_mut(&mut state, item, current);
                 record.available_version = Some(picked.version.clone());
                 record.target_version = Some(picked.version);
-                record.release_notes = notes;
-                record.manifest = manifest;
+                record.release_notes = manifest.release_notes.clone();
+                record.manifest = Some(manifest);
                 record.phase = transition(record.phase, &UpdateEvent::FoundAvailable)
                     .unwrap_or(UpdatePhase::Available);
                 record.failure_reason = None;
@@ -507,7 +557,69 @@ impl UpdateEngine {
         let staged = stage_bytes(&dest, &bytes, &asset.sha256, asset.size, &HostDisk);
         match staged {
             Ok(path) => {
-                let _ = super::manifest::verify_asset_file(&path, &asset.sha256);
+                if let Err(error) = super::manifest::verify_asset_file(&path, &asset.sha256) {
+                    record.phase = UpdatePhase::Failed;
+                    record.failure_reason = Some(error.to_string());
+                    let phase = record.phase;
+                    let reason = record.failure_reason.clone();
+                    self.save(&state)?;
+                    self.record_journal(&op, phase, reason)?;
+                    return Ok(op);
+                }
+                if component == UpdateComponent::Core {
+                    let Some(core) = manifest.core.as_ref() else {
+                        record.phase = UpdatePhase::Failed;
+                        record.failure_reason = Some("missingCoreManifest".into());
+                        self.save(&state)?;
+                        return Ok(op);
+                    };
+                    let previous_launch = CoreSlots::load(&self.root)
+                        .active
+                        .and_then(|slot| slot.launch_id);
+                    match load_checked_manifest(&self.root, component, &manifest.version)
+                        .and_then(|(raw, sig)| {
+                            verify_signed_manifest(&raw, &sig, &self.trust)
+                                .map_err(|error| error.to_string())
+                                .and_then(|checked| {
+                                    if checked == manifest {
+                                        Ok((raw, sig))
+                                    } else {
+                                        Err("persisted core manifest does not match the selected release".into())
+                                    }
+                                })
+                        })
+                        .and_then(|(raw, sig)| {
+                            super::stage_verified_core(&self.root, &path, &manifest.version, core)
+                                .and_then(|slot| {
+                                    super::core_slots::persist_signed_core_trust(
+                                        &self.root,
+                                        &manifest.version,
+                                        &raw,
+                                        &sig,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                    set_pending(&self.root, slot).map_err(|error| error.to_string())
+                                })
+                        }) {
+                        Ok(_) => {
+                            debug_assert_eq!(
+                                CoreSlots::load(&self.root)
+                                    .active
+                                    .and_then(|slot| slot.launch_id),
+                                previous_launch
+                            );
+                        }
+                        Err(error) => {
+                            record.phase = UpdatePhase::Failed;
+                            record.failure_reason = Some(error);
+                            let phase = record.phase;
+                            let reason = record.failure_reason.clone();
+                            self.save(&state)?;
+                            self.record_journal(&op, phase, reason)?;
+                            return Ok(op);
+                        }
+                    }
+                }
                 record.staged_asset = Some(path.clone());
                 record.staged_version = Some(manifest.version.clone());
                 let wait = wait_kind_for(component);
@@ -516,36 +628,6 @@ impl UpdateEngine {
                         WaitKind::Idle => UpdatePhase::WaitingForIdle,
                         WaitKind::Restart => UpdatePhase::WaitingForRestart,
                     });
-                if component == UpdateComponent::Core {
-                    let previous_launch = CoreSlots::load(&self.root)
-                        .active
-                        .and_then(|slot| slot.launch_id);
-                    let _ = set_pending(
-                        &self.root,
-                        CoreSlot {
-                            version: manifest.version.clone(),
-                            digest: asset.sha256.clone(),
-                            protocol: manifest
-                                .core
-                                .as_ref()
-                                .map(|core| core.protocol_schema_sha256.clone())
-                                .unwrap_or_default(),
-                            path,
-                            helpers: manifest
-                                .core
-                                .as_ref()
-                                .map(|core| core.helpers.iter().map(PathBuf::from).collect())
-                                .unwrap_or_default(),
-                            launch_id: None,
-                        },
-                    );
-                    debug_assert_eq!(
-                        CoreSlots::load(&self.root)
-                            .active
-                            .and_then(|slot| slot.launch_id),
-                        previous_launch
-                    );
-                }
             }
             Err(error) => {
                 record.phase = UpdatePhase::Failed;
@@ -670,11 +752,19 @@ impl UpdateEngine {
                 };
                 match installed {
                     Ok(()) => {
-                        record.phase = transition(record.phase, &UpdateEvent::StartValidate)
-                            .unwrap_or(UpdatePhase::Validating);
-                        record.phase = transition(record.phase, &UpdateEvent::Succeeded)
-                            .unwrap_or(UpdatePhase::Applied);
-                        record.current_version = version;
+                        if component == UpdateComponent::Core {
+                            // The downloaded tree is pending, but only a live
+                            // bridge attestation may promote it. Keep the UI in
+                            // waiting-for-restart until that observation exists.
+                            super::arm_core_pending_apply();
+                            record.phase = UpdatePhase::WaitingForRestart;
+                        } else {
+                            record.phase = transition(record.phase, &UpdateEvent::StartValidate)
+                                .unwrap_or(UpdatePhase::Validating);
+                            record.phase = transition(record.phase, &UpdateEvent::Succeeded)
+                                .unwrap_or(UpdatePhase::Applied);
+                            record.current_version = version;
+                        }
                         record.failure_reason = None;
                     }
                     Err(error) => {
@@ -707,11 +797,12 @@ impl UpdateEngine {
             .get(component.as_str())
             .map(|layer| layer.current_version.clone())
             .unwrap_or_else(|| "0.0.0".into());
+        if component == UpdateComponent::Core {
+            super::core_slots::rollback_to_previous(&self.root)
+                .map_err(|error| AppError::Message(error.to_string()))?;
+        }
         let record = Self::layer_mut(&mut state, component, &current);
         record.phase = UpdatePhase::RolledBack;
-        if component == UpdateComponent::Core {
-            let _ = super::core_slots::rollback_to_previous(&self.root);
-        }
         let op = new_operation(component, UpdatePhase::RolledBack);
         record.operation_id = Some(op.operation_id.clone());
         self.save(&state)?;
@@ -758,6 +849,40 @@ impl<'a> Currents<'a> {
             UpdateComponent::Core => self.core,
         }
     }
+}
+
+fn checked_manifest_dir(root: &Path, component: UpdateComponent, version: &str) -> PathBuf {
+    root.join("updates")
+        .join("manifests")
+        .join(component.as_str())
+        .join(version)
+}
+
+fn persist_checked_manifest(
+    root: &Path,
+    component: UpdateComponent,
+    version: &str,
+    raw: &[u8],
+    signature: &[u8],
+) -> std::io::Result<()> {
+    let dir = checked_manifest_dir(root, component, version);
+    std::fs::create_dir_all(&dir)?;
+    write_atomic(&dir.join("update-manifest.json"), raw)?;
+    write_atomic(&dir.join("update-manifest.json.sig"), signature)?;
+    Ok(())
+}
+
+fn load_checked_manifest(
+    root: &Path,
+    component: UpdateComponent,
+    version: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let dir = checked_manifest_dir(root, component, version);
+    let raw = std::fs::read(dir.join("update-manifest.json"))
+        .map_err(|_| "signed core manifest is missing after check".to_string())?;
+    let signature = std::fs::read(dir.join("update-manifest.json.sig"))
+        .map_err(|_| "signed core signature is missing after check".to_string())?;
+    Ok((raw, signature))
 }
 
 fn pick_asset(manifest: &UpdateManifest) -> Option<&AssetRef> {
@@ -851,7 +976,6 @@ pub async fn download_update(
     component: UpdateComponent,
     _host_id: Option<String>,
 ) -> AppResult<UpdateOperation> {
-    require_live_component(component)?;
     let engine = super::engine(&state.data_root());
     let core_version = current_core_version(state);
     let currents = current_versions(&core_version);
@@ -887,18 +1011,7 @@ pub fn apply_update(
     component: UpdateComponent,
     host_id: Option<String>,
 ) -> AppResult<UpdateOperation> {
-    require_live_component(component)?;
     apply_update_with_ui(state, component, host_id, true)
-}
-
-fn require_live_component(component: UpdateComponent) -> AppResult<()> {
-    if component == UpdateComponent::Core {
-        return Err(AppError::Message(
-            "Enhanced core update is preview-only until extracted executable and helper hashes are signed"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Called when the Vellum window is closing. Desktop apply is allowed only
@@ -1046,9 +1159,8 @@ fn current_versions(core: &str) -> Currents<'_> {
 }
 
 fn current_core_version(state: &AppState) -> String {
-    CoreSlots::load(&state.data_root())
-        .active
-        .map(|slot| slot.version)
+    super::resolve_enhanced_runtime(&state.data_root())
+        .map(|runtime| runtime.version)
         .filter(|version| super::manifest::parse_version(version).is_some())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
@@ -1068,6 +1180,7 @@ pub fn progress_from(op: &UpdateOperation) -> UpdateProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updates::core_slots::CoreSlot;
     use crate::updates::github::{GithubAsset, GithubRelease, ListedReleases, MemorySource};
     use crate::updates::manifest::{
         sign_raw, AssetRef, CompatRange, DataFormat, MANIFEST_SCHEMA_VERSION,
@@ -1076,6 +1189,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
+    use std::io::Write;
     use std::sync::Arc;
 
     fn signed_fixture(
@@ -1085,6 +1199,42 @@ mod tests {
         bytes: &[u8],
     ) -> (Vec<u8>, Vec<u8>, UpdateManifest) {
         let hash = hex::encode(Sha256::digest(bytes));
+        let core = (component == UpdateComponent::Core).then(|| {
+            use crate::updates::manifest::{CoreFile, CoreManifest, CoreTarget};
+            CoreManifest {
+                upstream_commit: "a".repeat(40),
+                enhanced_commit: "b".repeat(40),
+                feature_profile: "test".into(),
+                protocol_schema_sha256: format!(
+                    "sha256:{}",
+                    hex::encode(Sha256::digest(b"schema"))
+                ),
+                protocol_compat: CompatRange::new(">=1 <2"),
+                targets: vec![CoreTarget {
+                    platform: current_platform().into(),
+                    arch: current_arch().into(),
+                    asset: "payload.zip".into(),
+                    executable: "codex.exe".into(),
+                    helpers: vec!["codex-command-runner.exe".into()],
+                    uncompressed_size: 10,
+                    protocol_schema_sha256: String::new(),
+                    files: vec![
+                        CoreFile {
+                            path: "codex.exe".into(),
+                            size: 4,
+                            sha256: hex::encode(Sha256::digest(b"core")),
+                            executable: true,
+                        },
+                        CoreFile {
+                            path: "codex-command-runner.exe".into(),
+                            size: 6,
+                            sha256: hex::encode(Sha256::digest(b"helper")),
+                            executable: true,
+                        },
+                    ],
+                }],
+            }
+        });
         let manifest = UpdateManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             component,
@@ -1102,15 +1252,33 @@ mod tests {
             assets: vec![AssetRef {
                 platform: current_platform().into(),
                 arch: current_arch().into(),
-                name: "payload.bin".into(),
+                name: if component == UpdateComponent::Core {
+                    "payload.zip".into()
+                } else {
+                    "payload.bin".into()
+                },
                 size: bytes.len() as u64,
                 sha256: hash,
             }],
-            core: None,
+            core,
         };
         let raw = serde_json::to_vec(&manifest).unwrap();
         let sig = sign_raw(&raw, signing).to_vec();
         (raw, sig, manifest)
+    }
+
+    fn core_archive() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("codex.exe", options).unwrap();
+            zip.write_all(b"core").unwrap();
+            zip.start_file("codex-command-runner.exe", options).unwrap();
+            zip.write_all(b"helper").unwrap();
+            zip.finish().unwrap();
+        }
+        bytes.into_inner()
     }
 
     #[tokio::test]
@@ -1118,12 +1286,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let signing = SigningKey::from_bytes(&[3u8; 32]);
         let trust = TrustStore::from_key("test-key", signing.verifying_key());
-        let payload = b"core-bytes";
-        let (raw, sig, _) = signed_fixture(&signing, UpdateComponent::Core, "0.2.0", payload);
+        let payload = core_archive();
+        let (raw, sig, _) = signed_fixture(&signing, UpdateComponent::Core, "0.2.0", &payload);
         let mut releases = HashMap::new();
         releases.insert("https://example/manifest".into(), raw);
         releases.insert("https://example/sig".into(), sig);
-        releases.insert("asset://payload.bin".into(), payload.to_vec());
+        releases.insert("asset://payload.zip".into(), payload);
         let listed = ListedReleases {
             etag: None,
             not_modified: false,
@@ -1158,8 +1326,12 @@ mod tests {
                 version: "bundled".into(),
                 digest: "sha256:old".into(),
                 protocol: "p".into(),
+                protocol_compat: "*".into(),
                 path: PathBuf::from("old"),
                 helpers: Vec::new(),
+                files: Vec::new(),
+                enhanced_commit: String::new(),
+                feature_profile: String::new(),
                 launch_id: Some("launch-keep".into()),
             }),
             ..CoreSlots::default()
@@ -1200,6 +1372,30 @@ mod tests {
         assert_eq!(snap.core.current_version, "bundled");
         assert_eq!(snap.core.staged_version.as_deref(), Some("0.2.0"));
         assert_eq!(snap.core.available_version.as_deref(), Some("0.2.0"));
+
+        super::super::core_slots::promote_pending(dir.path()).unwrap();
+        let promoted = engine.snapshot("0.2.9", "0.2.9", "0.2.0");
+        assert_eq!(promoted.core.phase, UpdatePhase::Applied);
+        assert_eq!(promoted.core.current_version, "0.2.0");
+        assert!(promoted.core.available_version.is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_check_includes_signed_core_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingExecutor::default());
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.0",
+            b"ignored-for-core",
+            recorder,
+        );
+        engine.check(None, currents).await.unwrap();
+        assert_eq!(
+            engine.snapshot("0.2.9", "0.2.9", "bundled").core.phase,
+            UpdatePhase::Available
+        );
     }
 
     #[tokio::test]
@@ -1326,11 +1522,18 @@ mod tests {
     ) -> (UpdateEngine, Currents<'static>) {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let trust = TrustStore::from_key("test-key", signing.verifying_key());
+        let core_payload = (component == UpdateComponent::Core).then(core_archive);
+        let payload = core_payload.as_deref().unwrap_or(payload);
         let (raw, sig, _) = signed_fixture(&signing, component, version, payload);
         let mut releases = HashMap::new();
         releases.insert("https://example/manifest".into(), raw);
         releases.insert("https://example/sig".into(), sig);
-        releases.insert("asset://payload.bin".into(), payload.to_vec());
+        let asset_name = if component == UpdateComponent::Core {
+            "payload.zip"
+        } else {
+            "payload.bin"
+        };
+        releases.insert(format!("asset://{asset_name}"), payload.to_vec());
         let listed = ListedReleases {
             etag: None,
             not_modified: false,
@@ -1665,6 +1868,95 @@ mod tests {
         assert_eq!(
             recorder.remote.lock().unwrap().clone(),
             vec![format!("host-a:{}:0.6.0", op.operation_id)]
+        );
+    }
+
+    #[test]
+    fn core_rollback_does_not_report_success_when_slot_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = SigningKey::from_bytes(&[5u8; 32]);
+        let trust = TrustStore::from_key("test-key", signing.verifying_key());
+        let engine = UpdateEngine::open(
+            dir.path(),
+            trust,
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        );
+        CoreSlots {
+            active: Some(CoreSlot {
+                version: "new".into(),
+                digest: "sha256:new".into(),
+                protocol: "p".into(),
+                protocol_compat: "*".into(),
+                path: PathBuf::from("new"),
+                helpers: Vec::new(),
+                files: Vec::new(),
+                enhanced_commit: String::new(),
+                feature_profile: String::new(),
+                launch_id: None,
+            }),
+            previous: Some(CoreSlot {
+                version: "old".into(),
+                digest: "sha256:old".into(),
+                protocol: "p".into(),
+                protocol_compat: "*".into(),
+                path: PathBuf::from("old"),
+                helpers: Vec::new(),
+                files: Vec::new(),
+                enhanced_commit: String::new(),
+                feature_profile: String::new(),
+                launch_id: None,
+            }),
+            ..CoreSlots::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let mut state = PersistedState::default();
+        state.layers.insert(
+            UpdateComponent::Core.as_str().to_string(),
+            LayerRecord {
+                phase: UpdatePhase::Applied,
+                current_version: "new".into(),
+                available_version: None,
+                staged_version: None,
+                operation_id: None,
+                target_version: None,
+                failure_reason: None,
+                release_notes: None,
+                download_bytes: 0,
+                download_total: 0,
+                staged_asset: None,
+                manifest: None,
+                signed_manifest_path: None,
+                signed_signature_path: None,
+            },
+        );
+        engine.save(&state).unwrap();
+        let slots_path = super::super::core_slots::CoreSlots::path(dir.path());
+        std::fs::remove_file(&slots_path).unwrap();
+        std::fs::create_dir_all(&slots_path).unwrap();
+        let result = engine.rollback(UpdateComponent::Core);
+        assert!(
+            result.is_err(),
+            "slot-save failure must not return RolledBack"
+        );
+        let after = engine.load();
+        assert_eq!(
+            after.layers.get("core").map(|layer| layer.phase),
+            Some(UpdatePhase::Applied),
+            "persisted phase must stay Applied when the slot switch fails"
+        );
+        assert_ne!(
+            after.layers.get("core").map(|layer| layer.phase),
+            Some(UpdatePhase::RolledBack)
         );
     }
 }

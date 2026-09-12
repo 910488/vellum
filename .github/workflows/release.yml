@@ -8,10 +8,11 @@ on:
     tags:
       - "desktop-v*"
       - "remote-v*"
+      - "core-v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (desktop-vX.Y.Z or remote-vX.Y.Z)"
+        description: "Release tag (desktop-vX.Y.Z, remote-vX.Y.Z, or core-vX.Y.Z)"
         required: true
         type: string
 
@@ -38,7 +39,7 @@ jobs:
           case "$TAG" in
             desktop-v*) echo "component=desktop" >> "$GITHUB_OUTPUT" ;;
             remote-v*) echo "component=remote" >> "$GITHUB_OUTPUT" ;;
-            core-v*) echo "core releases remain disabled until runnable-tree hashes are signed" >&2; exit 1 ;;
+            core-v*) echo "component=core" >> "$GITHUB_OUTPUT" ;;
             *) echo "unsupported tag $TAG" >&2; exit 1 ;;
           esac
           if [[ "$TAG" == *-rc.* ]]; then
@@ -173,42 +174,90 @@ jobs:
           if-no-files-found: error
 
   core-from-lockfile:
-    name: Enhanced core from lockfile
+    name: Enhanced core from lockfile (${{ matrix.triple }})
     needs: resolve
     if: needs.resolve.outputs.component == 'core'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+            platform: windows
+          - runner: macos-15
+            triple: aarch64-apple-darwin
+            platform: macos
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+            platform: macos
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Download pinned core archives
+      - name: Download, extract, and probe pinned core archive
+        shell: bash
+        env:
+          CORE_TRIPLE: ${{ matrix.triple }}
+          CORE_PLATFORM: ${{ matrix.platform }}
         run: |
           mkdir -p updater
           node <<'NODE'
           const { createHash } = require("node:crypto");
-          const { mkdirSync, writeFileSync, readFileSync } = require("node:fs");
+          const { execFileSync } = require("node:child_process");
+          const { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } = require("node:fs");
+          const { join } = require("node:path");
+          const { tmpdir } = require("node:os");
+          const { pathToFileURL } = require("node:url");
           const lock = JSON.parse(readFileSync("enhanced-runtime.lock.json", "utf8"));
           const commit = lock.enhancedCodexCommit;
           const repo = lock.sourceRepository;
-          if (!commit || !repo || !lock.artifacts) {
-            throw new Error("enhanced-runtime.lock.json is missing download pins");
+          const triple = process.env.CORE_TRIPLE;
+          const platform = process.env.CORE_PLATFORM;
+          const artifact = lock.artifacts?.[triple];
+          if (!commit || !repo || !artifact) {
+            throw new Error(`enhanced-runtime.lock.json is missing download pin for ${triple}`);
           }
           mkdirSync("updater", { recursive: true });
           (async () => {
-            for (const [triple, artifact] of Object.entries(lock.artifacts)) {
-              const url = `${repo}/releases/download/vellum-core-${commit}/${artifact.archiveName}`;
-              console.log(`fetch ${triple} ${url}`);
-              const response = await fetch(url, { redirect: "follow" });
-              if (!response.ok) {
-                throw new Error(`download ${artifact.archiveName} failed: HTTP ${response.status}`);
+            const url = `${repo}/releases/download/vellum-core-${commit}/${artifact.archiveName}`;
+            console.log(`fetch ${triple} ${url}`);
+            const response = await fetch(url, { redirect: "follow" });
+            if (!response.ok) {
+              throw new Error(`download ${artifact.archiveName} failed: HTTP ${response.status}`);
+            }
+            const bytes = Buffer.from(await response.arrayBuffer());
+            const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+            if (digest !== artifact.archiveSha256) {
+              throw new Error(`${artifact.archiveName} hash ${digest} != ${artifact.archiveSha256}`);
+            }
+            writeFileSync(`updater/${artifact.archiveName}`, bytes);
+            const extractRoot = mkdtempSync(join(tmpdir(), "vellum-core-probe-"));
+            try {
+              execFileSync(
+                process.platform === "win32" ? "python" : "python3",
+                [join(process.cwd(), "scripts", "extract-core-tree.py"), `updater/${artifact.archiveName}`, extractRoot],
+                { stdio: "inherit" },
+              );
+              const { findCoreBinary, hashSchemaDir } = await import(
+                pathToFileURL(join(process.cwd(), "scripts/lib/core-manifest-protocol.mjs")).href
+              );
+              const binary = findCoreBinary(extractRoot, platform);
+              const schemaRoot = mkdtempSync(join(tmpdir(), "vellum-core-schema-"));
+              try {
+                execFileSync(binary, ["app-server", "generate-json-schema", "--out", schemaRoot], {
+                  stdio: "inherit",
+                  timeout: 30000,
+                });
+                const probed = hashSchemaDir(schemaRoot);
+                writeFileSync(`updater/${artifact.archiveName}.protocol-schema-sha256`, `${probed}\n`);
+                console.log(`probed ${triple} protocol ${probed}`);
+              } finally {
+                rmSync(schemaRoot, { recursive: true, force: true });
               }
-              const bytes = Buffer.from(await response.arrayBuffer());
-              const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
-              if (digest !== artifact.archiveSha256) {
-                throw new Error(`${artifact.archiveName} hash ${digest} != ${artifact.archiveSha256}`);
-              }
-              writeFileSync(`updater/${artifact.archiveName}`, bytes);
+            } finally {
+              rmSync(extractRoot, { recursive: true, force: true });
             }
           })().catch((error) => {
             console.error(error);
@@ -217,7 +266,7 @@ jobs:
           NODE
       - uses: actions/upload-artifact@v4
         with:
-          name: updater-core
+          name: updater-core-${{ matrix.triple }}
           path: updater/*
           if-no-files-found: error
 
@@ -272,6 +321,10 @@ jobs:
           ASSET_DIR: release-assets
           VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
         run: node scripts/write-update-manifest.mjs
+      - name: Remove build-only protocol probes
+        if: needs.resolve.outputs.component == 'core'
+        shell: bash
+        run: find release-assets -type f -name '*.protocol-schema-sha256' -delete
       - name: Sign manifest
         env:
           VELLUM_UPDATE_SIGNING_KEY: ${{ secrets.VELLUM_UPDATE_SIGNING_KEY }}

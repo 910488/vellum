@@ -5,6 +5,8 @@
   "qwenCodeSourceCommit": "2b8f73c1e9cf8b355ec46c4623398c27b458b076",
   "deepseekHarnessSourceCommit": "dd6322d604e00eec1ba5e0c8541159906a21094a",
   "buildProfile": "enhanced-mvp-v1",
+  "protocolVersion": "0.142.5",
+  "protocolSchemaSha256": "sha256:ed3876ba3f0d615256174caa177bfd10feb2e9925de692d01fe900adaacb887e",
   "sourceRepository": "https://github.com/910488/enhanced-codex-core",
   "artifacts": {
     "aarch64-apple-darwin": {

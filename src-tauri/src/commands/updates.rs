@@ -20,12 +20,6 @@ pub async fn check_updates(
     state: State<'_, AppState>,
 ) -> AppResult<UpdateStatusSnapshot> {
     let parsed = component.as_deref().and_then(UpdateComponent::parse);
-    if parsed == Some(UpdateComponent::Core) {
-        return Err(crate::error::AppError::Message(
-            "Enhanced core update is preview-only until extracted executable and helper hashes are signed"
-                .into(),
-        ));
-    }
     let snapshot = crate::updates::check_updates(&state, parsed).await?;
     let _ = app.emit(UPDATES_PROGRESS_EVENT, &snapshot.attention);
     Ok(snapshot)

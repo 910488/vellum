@@ -235,6 +235,10 @@ pub fn extract_verified_archive(
 ) -> Result<(), CacheError> {
     fs::create_dir_all(dest)?;
     let canonical_dest = fs::canonicalize(dest)?;
+    let lower = archive.to_string_lossy().to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        return extract_tar_gz(archive, dest, &canonical_dest, declared_uncompressed);
+    }
     let file = File::open(archive)?;
     let mut zip = zip::ZipArchive::new(file).map_err(|error| CacheError::Io(error.to_string()))?;
     let mut written = 0u64;
@@ -278,6 +282,67 @@ pub fn extract_verified_archive(
             .read_to_end(&mut buf)
             .map_err(|error| CacheError::Io(error.to_string()))?;
         target.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+fn extract_tar_gz(
+    archive: &Path,
+    dest: &Path,
+    canonical_dest: &Path,
+    declared_uncompressed: u64,
+) -> Result<(), CacheError> {
+    let file = File::open(archive)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let mut written = 0u64;
+    let entries = tar
+        .entries()
+        .map_err(|error| CacheError::Io(error.to_string()))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| CacheError::Io(error.to_string()))?;
+        let raw = entry
+            .path()
+            .map_err(|error| CacheError::Io(error.to_string()))?
+            .into_owned();
+        let name = raw.to_string_lossy().to_string();
+        if raw.is_absolute()
+            || raw.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(CacheError::ZipSlip(name));
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(CacheError::IllegalLink(name));
+        }
+        let out = dest.join(&raw);
+        if kind.is_dir() {
+            fs::create_dir_all(&out)?;
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(CacheError::IllegalLink(name));
+        }
+        let parent = out.parent().unwrap_or(dest);
+        fs::create_dir_all(parent)?;
+        let canonical_parent = fs::canonicalize(parent)?;
+        if !canonical_parent.starts_with(canonical_dest) {
+            return Err(CacheError::ZipSlip(name));
+        }
+        let size = entry.size();
+        written = written.saturating_add(size);
+        if declared_uncompressed > 0 && written > declared_uncompressed {
+            return Err(CacheError::OverCapacity(declared_uncompressed));
+        }
+        let mut target = File::create(&out)?;
+        std::io::copy(&mut entry, &mut target)?;
     }
     Ok(())
 }

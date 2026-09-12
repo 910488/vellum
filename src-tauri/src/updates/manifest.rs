@@ -1,7 +1,8 @@
 //! Signed update manifest. Signature is over the raw JSON bytes; SHA-256 of
 //! each asset is checked only after the signature verifies.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Component, Path};
 
 use ed25519_dalek::{Signature, Verifier};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use super::trust::TrustStore;
 use super::UpdateComponent;
 
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,10 +66,135 @@ pub struct AssetRef {
 #[serde(rename_all = "camelCase")]
 pub struct CoreManifest {
     pub upstream_commit: String,
+    pub enhanced_commit: String,
     pub feature_profile: String,
-    pub helpers: Vec<String>,
     pub protocol_schema_sha256: String,
     pub protocol_compat: CompatRange,
+    pub targets: Vec<CoreTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreTarget {
+    pub platform: String,
+    pub arch: String,
+    pub asset: String,
+    pub executable: String,
+    pub helpers: Vec<String>,
+    pub uncompressed_size: u64,
+    /// Probed from this target's published `codex` binary. Empty on schema-2
+    /// manifests written before per-target probing; then the core-level hash
+    /// is used only as a compatibility fallback.
+    #[serde(default)]
+    pub protocol_schema_sha256: String,
+    pub files: Vec<CoreFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub executable: bool,
+}
+
+impl CoreManifest {
+    pub fn target(&self, platform: &str, arch: &str) -> Option<&CoreTarget> {
+        self.targets
+            .iter()
+            .find(|target| target.platform == platform && target.arch == arch)
+    }
+
+    fn validate(&self, assets: &[AssetRef]) -> Result<(), ManifestError> {
+        if self.upstream_commit.trim().is_empty()
+            || self.enhanced_commit.trim().is_empty()
+            || !valid_git_sha(&self.upstream_commit)
+            || !valid_git_sha(&self.enhanced_commit)
+            || self.feature_profile.trim().is_empty()
+            || !valid_sha256(&self.protocol_schema_sha256)
+            || self.protocol_compat.0.trim().is_empty()
+            || self.targets.is_empty()
+        {
+            return Err(ManifestError::IncompleteCore);
+        }
+        let mut target_keys = HashSet::new();
+        for target in &self.targets {
+            let key = (target.platform.as_str(), target.arch.as_str());
+            if !target_keys.insert(key)
+                || target.uncompressed_size == 0
+                || target.files.is_empty()
+                || target.helpers.is_empty()
+                || target.asset.trim().is_empty()
+                || !safe_relative_path(&target.executable)
+                || target.helpers.iter().any(|path| !safe_relative_path(path))
+                || (!target.protocol_schema_sha256.is_empty()
+                    && !valid_sha256(&target.protocol_schema_sha256))
+            {
+                return Err(ManifestError::InvalidCoreTree);
+            }
+            let mut paths = HashSet::new();
+            let mut total_size = 0u64;
+            for file in &target.files {
+                let identity = if target.platform == "windows" {
+                    file.path.to_ascii_lowercase()
+                } else {
+                    file.path.clone()
+                };
+                if file.size == 0
+                    || !safe_relative_path(&file.path)
+                    || !valid_sha256(&file.sha256)
+                    || !paths.insert(identity)
+                {
+                    return Err(ManifestError::InvalidCoreTree);
+                }
+                total_size = total_size
+                    .checked_add(file.size)
+                    .ok_or(ManifestError::InvalidCoreTree)?;
+            }
+            let path_key = |path: &str| {
+                if target.platform == "windows" {
+                    path.to_ascii_lowercase()
+                } else {
+                    path.to_string()
+                }
+            };
+            if total_size != target.uncompressed_size
+                || !paths.contains(&path_key(&target.executable))
+                || target
+                    .helpers
+                    .iter()
+                    .any(|helper| !paths.contains(&path_key(helper)))
+                || !target
+                    .files
+                    .iter()
+                    .find(|file| file.path == target.executable)
+                    .is_some_and(|file| file.executable)
+                || target.helpers.iter().any(|helper| {
+                    !target
+                        .files
+                        .iter()
+                        .find(|file| path_key(&file.path) == path_key(helper))
+                        .is_some_and(|file| file.executable)
+                })
+                || !assets.iter().any(|asset| {
+                    asset.name == target.asset
+                        && asset.platform == target.platform
+                        && asset.arch == target.arch
+                })
+            {
+                return Err(ManifestError::InvalidCoreTree);
+            }
+        }
+        if assets
+            .iter()
+            .any(|asset| self.target(&asset.platform, &asset.arch).is_none())
+        {
+            return Err(ManifestError::InvalidCoreTree);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +229,10 @@ pub enum ManifestError {
     BadHash(String),
     #[error("asset {0} is missing")]
     MissingAsset(String),
+    #[error("core update manifest is missing signed runtime metadata")]
+    IncompleteCore,
+    #[error("core update runnable tree is invalid")]
+    InvalidCoreTree,
 }
 
 /// Verify Ed25519 over `raw` then parse. Hashing the JSON is not trust.
@@ -116,7 +246,7 @@ pub fn verify_signed_manifest(
     }
     let parsed: UpdateManifest =
         serde_json::from_slice(raw).map_err(|error| ManifestError::Json(error.to_string()))?;
-    if parsed.schema_version != MANIFEST_SCHEMA_VERSION {
+    if parsed.schema_version == 0 || parsed.schema_version > MANIFEST_SCHEMA_VERSION {
         return Err(ManifestError::Schema(parsed.schema_version));
     }
     if parsed.version.trim().is_empty()
@@ -125,6 +255,16 @@ pub fn verify_signed_manifest(
         || parsed.key_id.trim().is_empty()
     {
         return Err(ManifestError::Incomplete);
+    }
+    if parsed.component == UpdateComponent::Core {
+        if parsed.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(ManifestError::Schema(parsed.schema_version));
+        }
+        parsed
+            .core
+            .as_ref()
+            .ok_or(ManifestError::IncompleteCore)?
+            .validate(&parsed.assets)?;
     }
     let Some(key) = trust.key_for(&parsed.key_id) else {
         return Err(ManifestError::UnknownKey(parsed.key_id));
@@ -136,6 +276,25 @@ pub fn verify_signed_manifest(
     key.verify(raw, &signature)
         .map_err(|_| ManifestError::BadSignature)?;
     Ok(parsed)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn safe_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !value.contains('\\')
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// Asset integrity after a signed manifest has already been accepted.
@@ -322,5 +481,16 @@ mod tests {
         assert!(range.matches("1.4.2"));
         assert!(!range.matches("2.0.0"));
         assert!(!range.matches("0.9.9"));
+    }
+
+    #[test]
+    fn schema_one_remains_valid_for_existing_desktop_releases() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let trust = TrustStore::from_key("k1", signing.verifying_key());
+        let (_, mut manifest) = sample_manifest("k1");
+        manifest.schema_version = 1;
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        let signature = sign_raw(&raw, &signing);
+        verify_signed_manifest(&raw, &signature, &trust).unwrap();
     }
 }

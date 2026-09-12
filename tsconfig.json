@@ -21,6 +21,6 @@
     "paths": { "@/*": ["./src/*"] }
   },
   "include": ["src", "tests"],
-  "exclude": ["tests/stage-unchanged.test.ts", "tests/qa-runner.test.ts", "tests/qa-matrix.test.ts", "tests/qa-sandbox.test.ts"],
+  "exclude": ["tests/stage-unchanged.test.ts", "tests/qa-runner.test.ts", "tests/qa-matrix.test.ts", "tests/qa-sandbox.test.ts", "tests/write-update-manifest.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

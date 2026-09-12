@@ -127,6 +127,25 @@ code mode on every supported Desktop platform. All of them end up in
 `src-tauri/binaries/`, which `tauri.conf.json` already bundles as
 `binaries/*`, and which is where Codex looks for siblings of its own binary.
 
+Independent Core updates use `core-vX.Y.Z` or `core-vX.Y.Z-rc.N` tags in this
+repository. The release workflow downloads every commit-pinned archive from
+`910488/enhanced-codex-core`, checks its archive hash from
+`enhanced-runtime.lock.json`, safely extracts it, and signs a schema-2 update
+manifest containing the relative path, size, SHA-256, and executable role of
+the core and every helper. Each target's `protocolSchemaSha256` is taken by
+probing the extracted `codex` binary (`app-server generate-json-schema`), not
+copied from the lock fixture. `protocolVersion` in the lockfile must still
+match the checked-in protocol fixture. The workflow only creates a draft;
+publishing remains a separate release decision.
+
+At download time Vellum verifies the signed manifest and archive, rejects
+links, traversal paths, undeclared files, missing helpers, size differences,
+and per-file hash differences, then writes an immutable pending slot. The
+active slot changes only after Codex restarts through that pending executable
+and the bridge attestation confirms the launch. A failed launch drops the
+pending slot; an explicit rollback keeps the reverted build as history without
+automatically scheduling it again.
+
 `codex-code-mode-host` links `rusty_v8` and downloads a prebuilt archive from
 GitHub. If that download fails, the rest of the build still succeeds and only
 code mode is affected; retry, or set `V8_FROM_SOURCE=1` to compile V8 locally.
