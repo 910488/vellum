@@ -286,6 +286,8 @@ mod tests {
                 "qwenToolReliability": true,
                 "deepseekContextRecovery": true,
                 "qwenBoundedContinuation": true,
+                "repetitionNotice": false,
+                "intentContinuation": false,
             })
         );
         assert_eq!(config["debugLog"]["enabled"], true);

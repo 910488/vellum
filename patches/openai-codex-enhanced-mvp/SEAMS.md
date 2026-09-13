@@ -1,7 +1,9 @@
 # Codex agent-loop seams
 
-Search the pinned Codex tree (`633ab199cfd724aa78013c006b27a2b3d049fc3b`)
-for these insertion points. The portable crate exposes `EnhancedTurnHooks`.
+Search the Codex tree pinned by `enhanced-runtime.lock.json`
+(`enhancedCodexCommit`; currently `a7b9610e18f9da1cb207cd783ba7f3f467492d77`)
+for these insertion points. Do not use stale hardcoded Codex pins such as
+`633ab199…`. The portable crate exposes `EnhancedTurnHooks`.
 Load `$CODEX_HOME/enhanced-runtime.json` at session start; if the file is
 absent, every hook must `DeferToUpstream`.
 
@@ -163,6 +165,11 @@ vellum-eval enhanced-integration-gate --mode bridge
 vellum-eval enhanced-integration-gate --mode installed --no-active-turn
 ```
 
+`cargo test -p vellum-enhanced-codex --test fork_consistency` requires
+`VELLUM_ENHANCED_CORE_ROOT` to point at a checkout of `910488/enhanced-codex-core`
+at the lock commit. A missing fork is a failure, not a skip: CI checks out that
+commit before the portable/fork byte-compare gate.
+
 ## 6. Divergences found on 2026-09-03, and how they were closed
 
 The fork vendors its own copy of these modules at `codex-rs/core/src/enhanced/`;
@@ -243,7 +250,10 @@ Deserialize`, so the fork could not round-trip its own notifications in a test.
 Nothing checks these two trees against each other. Until something does, treat
 a change to `crates/vellum-enhanced-codex/src/` as incomplete until the same
 change lands in `codex-rs/core/src/enhanced/`. The check is a diff over the
-eleven shared modules: `bounded_continuation`, `config`, `context_pruner`,
-`context_recovery`, `digest`, `gateway`, `hooks`, `lockfile`, `notifications`,
-`telemetry`, `tool_reliability`. `mod.rs`, `runtime.rs`, `reporting.rs` and
-`seams.rs` are fork-only wiring and have no crate counterpart.
+shared modules: `bounded_continuation`, `config`, `context_pruner`,
+`context_recovery`, `digest`, `gateway`, `hooks`, `notifications`,
+`telemetry`, `tool_observation`, `tool_reliability`. `mod.rs`, `runtime.rs`,
+`reporting.rs`, `seams.rs`, `context_projection.rs` and `debug_log.rs` are
+fork-only wiring and must not be overwritten by sync. `lockfile.rs` stays
+shared for pin constants but is not clobbered when Vellum has unrelated
+lockfile work in flight.

@@ -118,3 +118,18 @@ SOFTWARE.
 Qwen Code (Ports A and C) is licensed under the Apache License 2.0
 (copyright 2025 Google LLC and 2025 Qwen); its full text is the repository
 `LICENSE`. Qwen Code ships no NOTICE file at the pinned commit.
+
+---
+
+## Port D — Non-blocking repetition observation and conservative intent continuation
+
+- **Port names:** `repetition_notice`, `intent_continuation` (experimental, default off; not implied by E5)
+- **Source:** Hermes Agent / Claude Code repetition observation (issue #90338 family) and conservative English trailing-continue detection
+- **Original license:** MIT (Anthropic Claude Code / Hermes-style agent loop excerpts as published)
+- **Ported behavior:** same tool + full input + original result three times in dispatch order emits one diagnostic; a model-visible notice only when `repetitionNotice` is on; native wait/poll excluded by native tool semantics; at most one notice per sequence; reset on operation/result change, new user turn, cancel, or idle; resume does not restore ended-turn counts. Intent continuation matches a short English trailing “will continue immediately” family on natural-stop assistant final text only, shares the existing max-two continuation budget, and yields to cancel/steer.
+- **Not ported:** Hermes blocking / forced wrap-up, tool-count caps, LLM-as-judge, Chinese semantic continuation classes, wholesale Hermes system prompt.
+- **Modifications:** rewritten in Rust against the existing Codex tool ledger (no second ledger); diagnostics record hashes, counts, decisions, and reasons only.
+- **Destination path:** `crates/vellum-enhanced-codex/src/tool_observation.rs` and `bounded_continuation.rs`
+  (fork destination: `codex-rs/core/src/enhanced/`)
+
+This is a partial behavioral port of published rules, not a copy of Hermes source files.

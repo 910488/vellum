@@ -1,10 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { OFFLINE_COMMANDS } from "../scripts/qa/lib/commands.mjs";
+import { offlineInjectCoverageEvidence } from "../scripts/qa/lib/orchestrator.mjs";
+import { applyEvidenceGate } from "../scripts/qa/lib/evidence.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runner = path.join(repo, "scripts", "qa", "run.mjs");
@@ -20,6 +22,31 @@ function runQa(args: string[], env: NodeJS.ProcessEnv = process.env) {
     env,
   });
 }
+
+describe("offline inject coverage evidence", () => {
+  it("writes JSON that the evidence gate accepts for .json aliases", () => {
+    const dir = tmp();
+    const body = offlineInjectCoverageEvidence("PASS", "PASS", "enhanced.trait.tool-repeat.offline");
+    expect(() => JSON.parse(body)).not.toThrow();
+    writeFileSync(path.join(dir, "replay.json"), body);
+    expect(applyEvidenceGate("PASS", ["replay.json"], dir)).toMatchObject({
+      verdict: "PASS",
+      missingEvidence: [],
+    });
+  });
+
+  it("does not let a plaintext alias pass a .json evidence gate", () => {
+    const dir = tmp();
+    writeFileSync(
+      path.join(dir, "replay.json"),
+      "cargo-proxy-runtime=PASS\nprotocol-replay=PASS\ncase=enhanced.trait.tool-repeat.offline\n",
+    );
+    expect(applyEvidenceGate("PASS", ["replay.json"], dir)).toMatchObject({
+      verdict: "FAIL",
+      reason: "missing-evidence",
+    });
+  });
+});
 
 describe("shipped pnpm qa runner", () => {
   it("fails non-zero when --lane is missing", () => {

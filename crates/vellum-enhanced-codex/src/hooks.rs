@@ -12,6 +12,9 @@ use super::context_recovery::{
 use super::telemetry::{
     hash_identifier, EnhancedEvent, EnhancedEventFields, EnhancedEventKind, MemoryTelemetry,
 };
+use super::tool_observation::{
+    observation_events, ObservationDecision, ObservationInput, ObservationState,
+};
 use super::tool_reliability::{
     AdmitDecision, LateResultDecision, ProviderToolCallIdentity, ToolCallLedger,
     ToolCallResolution, ToolReliabilityOutcome,
@@ -34,6 +37,7 @@ pub struct EnhancedTurnHooks {
     pub continuation: AutoContinuationBudget,
     pub prune_policy: ToolResultPrunePolicy,
     pub overflow_retries_used: u8,
+    pub observation: ObservationState,
 }
 
 impl EnhancedTurnHooks {
@@ -44,12 +48,14 @@ impl EnhancedTurnHooks {
             continuation: AutoContinuationBudget::default(),
             prune_policy: ToolResultPrunePolicy::default(),
             overflow_retries_used: 0,
+            observation: ObservationState::new(),
         }
     }
 
     pub fn on_new_user_input(&mut self) {
         self.continuation.reset_for_user_input();
         self.overflow_retries_used = 0;
+        self.observation.reset();
     }
 
     pub fn on_assistant_success(&mut self) {
@@ -59,6 +65,7 @@ impl EnhancedTurnHooks {
     pub fn on_turn_idle(&mut self) {
         self.overflow_retries_used = 0;
         release_continuation(&mut self.continuation);
+        self.observation.reset();
     }
 
     pub fn admit_tool_call(
@@ -95,6 +102,30 @@ impl EnhancedTurnHooks {
             return HookDecision::DeferToUpstream;
         }
         HookDecision::Handled(self.ledger.complete_original(provider_call_id))
+    }
+
+    /// Non-blocking observation at original-result completion. Never stops
+    /// the turn, never caps tool count, and never wraps up.
+    pub fn observe_tool_result(
+        &mut self,
+        call_id: &str,
+        input: ObservationInput,
+        telemetry: &mut MemoryTelemetry,
+    ) -> ObservationDecision {
+        let mut decision = self
+            .observation
+            .observe(input, self.features.repetition_notice);
+        for event in observation_events(&decision, call_id) {
+            telemetry.emit(event);
+        }
+        for deferred in self.observation.take_deferred_notices() {
+            for event in observation_events(&deferred, call_id) {
+                telemetry.emit(event);
+            }
+            decision.emit_diagnostic |= deferred.emit_diagnostic;
+            decision.standalone_notice |= deferred.standalone_notice;
+        }
+        decision
     }
 
     pub fn ingest_late_tool_result(
@@ -193,6 +224,10 @@ impl EnhancedTurnHooks {
         }
         if context.user_steer_pending {
             self.overflow_retries_used = 0;
+            self.observation.reset();
+        }
+        if context.cancelled {
+            self.observation.reset();
         }
         let plan = plan_turn_stop(&mut self.continuation, context);
         telemetry.emit(EnhancedEvent::new(
@@ -234,6 +269,8 @@ impl EnhancedTurnHooks {
         value: &Value,
     ) -> Result<(), super::tool_reliability::LedgerError> {
         self.ledger = ToolCallLedger::from_durable_json(value)?;
+        // Resume does not restore ended-turn observation counts.
+        self.observation.reset();
         Ok(())
     }
 }
@@ -316,5 +353,104 @@ mod tests {
         hooks.overflow_retries_used = 1;
         hooks.on_turn_idle();
         assert_eq!(hooks.overflow_retries_used, 0);
+    }
+
+    #[test]
+    fn observation_is_diagnostic_only_unless_repetition_notice_is_on() {
+        use super::super::tool_observation::{
+            ObservationInput, ObservationResultStatus, ObservationReason,
+        };
+        use super::super::tool_reliability::ToolKind;
+
+        fn sample(index: u64) -> ObservationInput {
+            ObservationInput {
+                tool_name: "apply_patch".into(),
+                tool_kind: ToolKind::Function,
+                namespace: String::new(),
+                input_fingerprint: "in".into(),
+                original_result_fingerprint: "ok".into(),
+                dispatch_index: index,
+                result_status: ObservationResultStatus::Success,
+                native_wait_poll: false,
+            }
+        }
+
+        let mut hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        let mut telemetry = MemoryTelemetry::default();
+        hooks.observe_tool_result("c1", sample(0), &mut telemetry);
+        hooks.observe_tool_result("c2", sample(1), &mut telemetry);
+        let third = hooks.observe_tool_result("c3", sample(2), &mut telemetry);
+        assert!(third.emit_diagnostic);
+        assert!(!third.emit_model_notice);
+        assert!(!hooks.features.repetition_notice);
+
+        hooks.features.repetition_notice = true;
+        hooks.observation.reset();
+        hooks.observe_tool_result("c1", sample(0), &mut telemetry);
+        hooks.observe_tool_result("c2", sample(1), &mut telemetry);
+        let noticed = hooks.observe_tool_result("c3", sample(2), &mut telemetry);
+        assert!(noticed.emit_model_notice);
+        assert_eq!(noticed.reason, ObservationReason::RepetitionObserved);
+
+        let restored = ToolCallLedger::identity("c", "shell", &json!({"a": 1}));
+        let mut hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        hooks.admit_tool_call(restored, &mut telemetry);
+        let snapshot = hooks.ledger.to_durable_json();
+        hooks.observe_tool_result("c1", sample(0), &mut telemetry);
+        hooks.observe_tool_result("c2", sample(1), &mut telemetry);
+        hooks.restore_ledger(&snapshot).unwrap();
+        let after_resume = hooks.observe_tool_result("c3", sample(2), &mut telemetry);
+        assert_eq!(after_resume.consecutive_count, 1);
+    }
+
+    #[test]
+    fn out_of_order_observe_path_drains_a_standalone_notice() {
+        use super::super::tool_observation::{
+            ObservationInput, ObservationResultStatus, ObservationReason,
+        };
+        use super::super::tool_reliability::ToolKind;
+
+        fn sample(index: u64) -> ObservationInput {
+            ObservationInput {
+                tool_name: "apply_patch".into(),
+                tool_kind: ToolKind::Function,
+                namespace: String::new(),
+                input_fingerprint: "in".into(),
+                original_result_fingerprint: "ok".into(),
+                dispatch_index: index,
+                result_status: ObservationResultStatus::Success,
+                native_wait_poll: false,
+            }
+        }
+
+        let mut hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        hooks.features.repetition_notice = true;
+        let mut telemetry = MemoryTelemetry::default();
+        hooks.observe_tool_result("c0", sample(0), &mut telemetry);
+        let late_high = hooks.observe_tool_result("c2", sample(2), &mut telemetry);
+        assert!(!late_high.emit_model_notice);
+        let middle = hooks.observe_tool_result("c1", sample(1), &mut telemetry);
+        assert!(
+            !middle.emit_model_notice,
+            "must not attach the notice to the late-completing middle result"
+        );
+        assert!(
+            middle.standalone_notice,
+            "observe_tool_result must surface the deferred standalone notice"
+        );
+        assert!(
+            middle.emit_diagnostic,
+            "the deferred diagnostic must reach the observe path"
+        );
+        assert!(hooks.observation.take_deferred_notices().is_empty());
+        assert_eq!(
+            telemetry.count(super::super::telemetry::EnhancedEventKind::ToolRepetitionObserved),
+            1
+        );
+        assert_eq!(
+            telemetry.count(super::super::telemetry::EnhancedEventKind::ToolRepetitionNoticeAppended),
+            1
+        );
+        assert_eq!(middle.reason, ObservationReason::BelowThreshold);
     }
 }

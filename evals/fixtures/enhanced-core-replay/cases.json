@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 1,
+  "label": "案例衍生重現",
+  "baselineCore": "6576e4fb712f27bd963b6a6b559d0ba77df7cbed",
+  "notes": [
+    "Original workspaces were dirty; native Grok Build cwd is not a fair baseline.",
+    "Custom tool input already handled at baseline core; not a new core fix.",
+    "Omen truncated-SSE 502 envelope is synthesized from protocol SoT; not present as HTTP in the omen rollout.",
+    "Scripted-provider / bridge-surrogate pass is not live-model improvement."
+  ],
+  "sources": [
+    {
+      "id": "grok-native-events",
+      "path": "grok-session/01a093fe-d72b-7db3-8ea3-7bdded4e528c/events.jsonl",
+      "sha256": "sha256:a6f721d19b05714e64d953d74e1957905df5649c0987d6a8c75a3d300846323d",
+      "role": "native-process-contrast"
+    },
+    {
+      "id": "grok-codex-rollout",
+      "path": "codex-sessions/rollout-2026-09-12T12-50-13-01a093f3.jsonl",
+      "sha256": "sha256:4252c293b1c9f4233ad294078daf42743fc0eb88a874fa49854c1db1d0344787",
+      "role": "parser-source"
+    },
+    {
+      "id": "omen-codex-rollout",
+      "path": "codex-sessions/rollout-2026-09-12T13-55-32-01a0942e.jsonl",
+      "sha256": "sha256:b019a9e967c7a637cbbc48ed6ff444901cb05fdbcf78b8246678c351ea47777a",
+      "role": "parser-source"
+    }
+  ],
+  "cases": [
+    {
+      "id": "grok-update-system",
+      "sourceIds": ["grok-codex-rollout", "grok-native-events"],
+      "events": [
+        {"op": "user_turn"},
+        {"op": "admit", "callId": "r1", "tool": "exec_command", "kind": "function", "args": {"cmd": "read runtime.rs"}, "expect": "execute"},
+        {"op": "complete", "callId": "r1", "status": "success", "result": "ok.text.small"},
+        {"op": "admit", "callId": "r2", "tool": "exec_command", "kind": "function", "args": {"cmd": "read state.rs large"}, "expect": "execute"},
+        {"op": "complete", "callId": "r2", "status": "success", "result": "ok.text.medium"},
+        {"op": "admit", "callId": "p1", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nmalformed extra end\n", "expect": "execute"},
+        {"op": "complete", "callId": "p1", "status": "failed", "result": "format_fail.missing_end_patch"},
+        {"op": "admit", "callId": "p2", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nmalformed extra end 2\n", "expect": "execute"},
+        {"op": "complete", "callId": "p2", "status": "failed", "result": "format_fail.missing_end_patch"},
+        {"op": "admit", "callId": "p3", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nunified hunk header\n", "expect": "execute"},
+        {"op": "complete", "callId": "p3", "status": "failed", "result": "format_fail.context_not_found"},
+        {"op": "admit", "callId": "p4", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nunified hunk header 2\n", "expect": "execute"},
+        {"op": "complete", "callId": "p4", "status": "failed", "result": "format_fail.context_not_found"},
+        {"op": "admit", "callId": "p5", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nanchored restart_flight\n", "expect": "execute"},
+        {"op": "complete", "callId": "p5", "status": "success", "result": "Success. Updated the following files:\nM src-tauri/src/commands/runtime.rs"},
+        {"op": "admit", "callId": "p6", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nanchored add_RestartFlight\n", "expect": "execute"},
+        {"op": "complete", "callId": "p6", "status": "success", "result": "Success. Updated the following files:\nM src-tauri/src/commands/runtime.rs"},
+        {"op": "admit", "callId": "p7", "tool": "apply_patch", "kind": "custom", "raw": "*** Begin Patch\nanchored remove_RestartFlight\n", "expect": "execute"},
+        {"op": "complete", "callId": "p7", "status": "success", "result": "Success. Updated the following files:\nM src-tauri/src/commands/runtime.rs"},
+        {"op": "stop", "expect": "allow_stop"}
+      ],
+      "expect": {
+        "customInputPresent": true,
+        "falseBlocks": 0,
+        "notices": 0,
+        "diagnostics": 0,
+        "continuations": 0,
+        "formatFailuresThenRecovery": 4
+      }
+    },
+    {
+      "id": "omen-mcptox",
+      "sourceIds": ["omen-codex-rollout"],
+      "events": [
+        {"op": "user_turn"},
+        {"op": "admit", "callId": "op01", "tool": "exec_command", "kind": "function", "args": {"cmd": "git clone"}, "expect": "execute"},
+        {"op": "complete", "callId": "op01", "status": "success", "result": "ok.exit0"},
+        {"op": "admit", "callId": "op02", "tool": "exec_command", "kind": "function", "args": {"cmd": "rg files"}, "expect": "execute"},
+        {"op": "complete", "callId": "op02", "status": "success", "result": "ok.exit0"},
+        {"op": "admit", "callId": "op03", "tool": "exec_command", "kind": "function", "args": {"cmd": "read README"}, "expect": "execute"},
+        {"op": "complete", "callId": "op03", "status": "success", "result": "ok.exit0.tiny"},
+        {"op": "admit", "callId": "op04", "tool": "exec_command", "kind": "function", "args": {"cmd": "rg notebook P1P3"}, "expect": "execute"},
+        {"op": "complete", "callId": "op04", "status": "failed", "result": "fail.exit1.empty"},
+        {"op": "admit", "callId": "op05", "tool": "exec_command", "kind": "function", "args": {"cmd": "read notebook 80"}, "expect": "execute"},
+        {"op": "complete", "callId": "op05", "status": "success", "result": "ok.text.a"},
+        {"op": "admit", "callId": "op06", "tool": "exec_command", "kind": "function", "args": {"cmd": "read notebook 300"}, "expect": "execute"},
+        {"op": "complete", "callId": "op06", "status": "success", "result": "ok.text.b"},
+        {"op": "admit", "callId": "op07", "tool": "exec_command", "kind": "function", "args": {"cmd": "read notebook 620"}, "expect": "execute"},
+        {"op": "complete", "callId": "op07", "status": "success", "result": "ok.text.c"},
+        {"op": "admit", "callId": "op08", "tool": "exec_command", "kind": "function", "args": {"cmd": "read notebook 940"}, "expect": "execute"},
+        {"op": "complete", "callId": "op08", "status": "success", "result": "ok.text.d"},
+        {"op": "admit", "callId": "op09", "tool": "exec_command", "kind": "function", "args": {"cmd": "read notebook 1260"}, "expect": "execute"},
+        {"op": "complete", "callId": "op09", "status": "success", "result": "ok.text.e"},
+        {"op": "admit", "callId": "op10", "tool": "exec_command", "kind": "function", "args": {"cmd": "read notebook 1580"}, "expect": "execute"},
+        {"op": "complete", "callId": "op10", "status": "success", "result": "ok.text.f"},
+        {"op": "admit", "callId": "op11", "tool": "exec_command", "kind": "function", "args": {"cmd": "json server_names"}, "expect": "execute"},
+        {"op": "complete", "callId": "op11", "status": "success", "result": "ok.exit0.g"},
+        {"op": "admit", "callId": "op12", "tool": "exec_command", "kind": "function", "args": {"cmd": "json filesystem0"}, "expect": "execute"},
+        {"op": "complete", "callId": "op12", "status": "success", "result": "ok.truncated"},
+        {"op": "admit", "callId": "op13", "tool": "exec_command", "kind": "function", "args": {"cmd": "read pure_tool"}, "expect": "execute"},
+        {"op": "complete", "callId": "op13", "status": "success", "result": "ok.text.h"},
+        {"op": "admit", "callId": "op14", "tool": "exec_command", "kind": "function", "args": {"cmd": "git log"}, "expect": "execute"},
+        {"op": "complete", "callId": "op14", "status": "success", "result": "ok.exit0.i"},
+        {"op": "admit", "callId": "op15", "tool": "exec_command", "kind": "function", "args": {"cmd": "python version"}, "expect": "execute"},
+        {"op": "complete", "callId": "op15", "status": "success", "result": "ok.exit0.j"},
+        {"op": "admit", "callId": "op16", "tool": "exec_command", "kind": "function", "args": {"cmd": "http arxiv"}, "expect": "execute"},
+        {"op": "complete", "callId": "op16", "status": "failed", "result": "fail.exit1.k"},
+        {"op": "admit", "callId": "op17", "tool": "exec_command", "kind": "function", "args": {"cmd": "python fetch abs"}, "expect": "execute"},
+        {"op": "complete", "callId": "op17", "status": "success", "result": "ok.html"},
+        {"op": "admit", "callId": "op18", "tool": "exec_command", "kind": "function", "args": {"cmd": "python fetch html"}, "expect": "execute"},
+        {"op": "complete", "callId": "op18", "status": "success", "result": "ok.empty_stdout"},
+        {"op": "admit", "callId": "op19", "tool": "exec_command", "kind": "function", "args": {"cmd": "rg paper P1P3"}, "expect": "execute"},
+        {"op": "complete", "callId": "op19", "status": "success", "result": "ok.text.l"},
+        {"op": "admit", "callId": "op20", "tool": "exec_command", "kind": "function", "args": {"cmd": "python count paradigm"}, "expect": "execute"},
+        {"op": "complete", "callId": "op20", "status": "success", "result": "ok.exit0.m"},
+        {"op": "admit", "callId": "op21", "tool": "exec_command", "kind": "function", "args": {"cmd": "python count risk"}, "expect": "execute"},
+        {"op": "complete", "callId": "op21", "status": "success", "result": "ok.exit0.n"},
+        {"op": "admit", "callId": "op22", "tool": "exec_command", "kind": "function", "args": {"cmd": "python sample tools"}, "expect": "execute"},
+        {"op": "complete", "callId": "op22", "status": "success", "result": "ok.text.o"},
+        {"op": "admit", "callId": "op23", "tool": "exec_command", "kind": "function", "args": {"cmd": "rg paper category"}, "expect": "execute"},
+        {"op": "complete", "callId": "op23", "status": "success", "result": "ok.text.p"},
+        {"op": "admit", "callId": "op24", "tool": "exec_command", "kind": "function", "args": {"cmd": "rg paper domains"}, "expect": "execute"},
+        {"op": "complete", "callId": "op24", "status": "success", "result": "ok.text.q"},
+        {"op": "admit", "callId": "op25", "tool": "exec_command", "kind": "function", "args": {"cmd": "python summary"}, "expect": "execute"},
+        {"op": "complete", "callId": "op25", "status": "success", "result": "ok.exit0.r"},
+        {"op": "user_turn"},
+        {"op": "error", "class": "local.tool_loop_limit", "http": 409, "category": "tool_loop_limit"},
+        {"op": "error", "class": "upstream.truncated_sse", "http": 502, "category": "provider_protocol"},
+        {"op": "stop", "expect": "allow_stop"}
+      ],
+      "expect": {
+        "minDistinctOps": 25,
+        "falseBlocks": 0,
+        "notices": 0,
+        "diagnostics": 0,
+        "continuations": 0,
+        "errorClassesDistinct": ["tool_loop_limit", "provider_protocol"]
+      }
+    },
+    {
+      "id": "shared-counterexamples",
+      "sourceIds": ["grok-codex-rollout", "omen-codex-rollout"],
+      "events": [
+        {"op": "user_turn"},
+        {"op": "admit", "callId": "same-1", "tool": "shell", "kind": "function", "args": {"cmd": "identical"}, "expect": "execute"},
+        {"op": "admit", "callId": "same-1", "tool": "shell", "kind": "function", "args": {"cmd": "identical"}, "expect": "suppress"},
+        {"op": "admit", "callId": "new-1", "tool": "shell", "kind": "function", "args": {"cmd": "identical"}, "expect": "execute"},
+        {"op": "admit", "callId": "collide-1", "tool": "shell", "kind": "function", "args": {"cmd": "a"}, "expect": "execute"},
+        {"op": "admit", "callId": "collide-1", "tool": "shell", "kind": "function", "args": {"cmd": "b"}, "expect": "collision"},
+        {"op": "admit", "callId": "wait-1", "tool": "wait", "kind": "function", "args": {"cell_id": "x"}, "expect": "execute"},
+        {"op": "complete", "callId": "wait-1", "status": "success", "result": "pending", "nativeWaitPoll": true},
+        {"op": "admit", "callId": "wait-2", "tool": "wait", "kind": "function", "args": {"cell_id": "x"}, "expect": "execute"},
+        {"op": "complete", "callId": "wait-2", "status": "success", "result": "pending", "nativeWaitPoll": true},
+        {"op": "admit", "callId": "wait-3", "tool": "wait", "kind": "function", "args": {"cell_id": "x"}, "expect": "execute"},
+        {"op": "complete", "callId": "wait-3", "status": "success", "result": "pending", "nativeWaitPoll": true},
+        {"op": "cancel"},
+        {"op": "steer"},
+        {"op": "resume_ended"},
+        {"op": "parallel_ooo"},
+        {"op": "stop", "expect": "allow_stop"}
+      ],
+      "expect": {
+        "falseBlocks": 0,
+        "notices": 0,
+        "diagnostics": 0,
+        "nativePollNotices": 0
+      }
+    }
+  ]
+}

@@ -5327,6 +5327,38 @@ Keep going", crate::compaction::OFFICIAL_SUMMARY_PREFIX),
     }
 
     #[test]
+    fn glm_empty_tool_result_encodes_as_empty_string_not_null() {
+        for output in [json!(null), json!("")] {
+            let mut request = json!({
+                "model": "glm-4.6",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_empty",
+                    "output": output
+                }]
+            });
+            let profile = HarnessProfile::generic(RuntimeWireFormat::Responses);
+            normalize_compatible_responses_request(&mut request, &profile, false).unwrap();
+            assert_eq!(request["input"][0]["output"], "");
+            assert!(request["input"][0]["output"].is_string());
+        }
+
+        let mut empty_array = json!({
+            "model": "glm-4.6",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_empty_parts",
+                "output": []
+            }]
+        });
+        let profile = HarnessProfile::generic(RuntimeWireFormat::Responses);
+        normalize_compatible_responses_request(&mut empty_array, &profile, false).unwrap();
+        assert!(empty_array["input"][0]["output"].is_string());
+        assert_ne!(empty_array["input"][0]["output"], Value::Null);
+        assert_eq!(empty_array["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn official_responses_preserves_rich_tool_outputs_verbatim() {
         let request = json!({
             "model": "gpt-test",

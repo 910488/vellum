@@ -368,4 +368,28 @@ mod tests {
         );
         assert_eq!(error.to_error_payload()["error"]["code"], 409);
     }
+
+    #[test]
+    fn local_409_is_not_classified_as_truncated_sse_502() {
+        let local = RuntimeError::ToolLoopLimit(
+            "stream disconnected before completion: tool loop limit exceeded".into(),
+        );
+        let truncated = RuntimeError::ProviderProtocol(
+            "connection close without [DONE] or finish_reason".into(),
+        );
+        assert_eq!(local.http_status(), StatusCode::CONFLICT);
+        assert_eq!(local.category(), "tool_loop_limit");
+        assert_eq!(truncated.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(truncated.category(), "provider_protocol");
+        assert_ne!(local.category(), truncated.category());
+        assert_ne!(local.http_status(), truncated.http_status());
+    }
+
+    #[test]
+    fn deterministic_invalid_request_is_not_an_unavailable_retry_class() {
+        let bad = RuntimeError::InvalidRequest("malformed tool arguments".into());
+        assert_eq!(bad.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(bad.category(), "invalid_request");
+        assert_ne!(bad.category(), "provider_unavailable");
+    }
 }

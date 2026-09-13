@@ -1185,6 +1185,8 @@ fn apply_observed_launch(
                     == manifest.feature_profile.deepseek_context_recovery
                 && identity.qwen_bounded_continuation
                     == manifest.feature_profile.qwen_bounded_continuation
+                && identity.repetition_notice == manifest.feature_profile.repetition_notice
+                && identity.intent_continuation == manifest.feature_profile.intent_continuation
         });
     let digests_match = attestation.official.runtime_digest == manifest.official.runtime_digest
         && attestation.enhanced.runtime_digest == manifest.enhanced.runtime_digest

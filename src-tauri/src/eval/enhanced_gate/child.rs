@@ -143,10 +143,9 @@ impl GateChild {
             // The Official plane is the untouched baseline. No port may run
             // here, whatever the launch manifest says.
             Plane::Official => EnhancedRuntimeFeatures::all_off(),
-            Plane::Enhanced => std::env::var("VELLUM_ENHANCED_FEATURE_PROFILE")
-                .ok()
-                .and_then(|value| serde_json::from_str::<EnhancedRuntimeFeatures>(&value).ok())
-                .unwrap_or_else(EnhancedRuntimeFeatures::all_on),
+            Plane::Enhanced => parse_enhanced_features(
+                std::env::var("VELLUM_ENHANCED_FEATURE_PROFILE").ok().as_deref(),
+            )?,
         };
         let store_path = codex_home.join(THREAD_STORE_FILE);
         let store = std::fs::read(&store_path)
@@ -653,6 +652,7 @@ impl GateChild {
                     cancelled: cancel.load(Ordering::SeqCst),
                     user_steer_pending: steer.load(Ordering::SeqCst),
                     unfinished: vec![UnfinishedSignal::StructuredPendingWork],
+                    ..TurnStopContext::default()
                 };
                 match hooks.on_turn_stop(&context, &mut telemetry) {
                     HookDecision::Handled(plan) => {
@@ -783,6 +783,18 @@ impl GateChild {
             Ok(ProviderResponse::parse(&value))
         })
     }
+}
+
+fn parse_enhanced_features(value: Option<&str>) -> std::io::Result<EnhancedRuntimeFeatures> {
+    let Some(value) = value else {
+        return Ok(EnhancedRuntimeFeatures::all_on());
+    };
+    serde_json::from_str(value).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("VELLUM_ENHANCED_FEATURE_PROFILE is invalid: {error}"),
+        )
+    })
 }
 
 #[derive(Debug, Default)]
@@ -1014,5 +1026,24 @@ mod tests {
     fn feature_profiles_are_labelled_from_flags_not_model_names() {
         assert_eq!(profile_label(EnhancedRuntimeFeatures::all_off()), "E0");
         assert_eq!(profile_label(EnhancedRuntimeFeatures::all_on()), "E5");
+    }
+
+    #[test]
+    fn enhanced_feature_profile_defaults_only_when_absent() {
+        assert_eq!(
+            parse_enhanced_features(None).unwrap(),
+            EnhancedRuntimeFeatures::all_on()
+        );
+        let explicit = parse_enhanced_features(Some(
+            r#"{"qwenToolReliability":false,"deepseekContextRecovery":false,"qwenBoundedContinuation":false}"#,
+        ))
+        .unwrap();
+        assert_eq!(explicit, EnhancedRuntimeFeatures::all_off());
+    }
+
+    #[test]
+    fn enhanced_feature_profile_rejects_invalid_or_unknown_flags() {
+        assert!(parse_enhanced_features(Some("not-json")).is_err());
+        assert!(parse_enhanced_features(Some(r#"{"mysteryFlag":true}"#)).is_err());
     }
 }

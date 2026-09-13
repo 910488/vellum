@@ -11,12 +11,16 @@ pub enum RuntimeKind {
     EnhancedCodex,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct FeatureFlags {
     pub qwen_tool_reliability: bool,
     pub deepseek_context_recovery: bool,
     pub qwen_bounded_continuation: bool,
+    #[serde(default)]
+    pub repetition_notice: bool,
+    #[serde(default)]
+    pub intent_continuation: bool,
 }
 
 impl From<FeatureFlags> for EnhancedRuntimeFeatures {
@@ -25,6 +29,8 @@ impl From<FeatureFlags> for EnhancedRuntimeFeatures {
             qwen_tool_reliability: value.qwen_tool_reliability,
             deepseek_context_recovery: value.deepseek_context_recovery,
             qwen_bounded_continuation: value.qwen_bounded_continuation,
+            repetition_notice: value.repetition_notice,
+            intent_continuation: value.intent_continuation,
         }
     }
 }
@@ -35,16 +41,21 @@ impl From<EnhancedRuntimeFeatures> for FeatureFlags {
             qwen_tool_reliability: value.qwen_tool_reliability,
             deepseek_context_recovery: value.deepseek_context_recovery,
             qwen_bounded_continuation: value.qwen_bounded_continuation,
+            repetition_notice: value.repetition_notice,
+            intent_continuation: value.intent_continuation,
         }
     }
 }
 
 /// Feature defaults baked into an Enhanced Runtime release. Eval still selects
 /// an ablation profile per run; this is the binary's compiled default.
+/// New experiments stay off so E5 cannot smuggle them.
 pub const FEATURE_DEFAULTS_MVP: EnhancedRuntimeFeatures = EnhancedRuntimeFeatures {
     qwen_tool_reliability: true,
     deepseek_context_recovery: true,
     qwen_bounded_continuation: true,
+    repetition_notice: false,
+    intent_continuation: false,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

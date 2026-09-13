@@ -17,14 +17,17 @@ pub mod hooks;
 pub mod lockfile;
 pub mod notifications;
 pub mod telemetry;
+pub mod tool_observation;
 pub mod tool_reliability;
 
 pub use bounded_continuation::{
-    commit_continuation, plan_turn_stop, release_continuation, AutoContinuationBudget,
-    ContinuationDecision, ContinuationPlan, ReservedContinuation, TurnStopContext,
-    UnfinishedSignal, CONTINUE_NUDGE, MAX_AUTO_CONTINUATIONS,
+    commit_continuation, plan_turn_stop, release_continuation, trailing_intent_to_continue,
+    AutoContinuationBudget, ContinuationDecision, ContinuationPlan, ReservedContinuation,
+    TurnStopContext, UnfinishedSignal, CONTINUE_NUDGE, MAX_AUTO_CONTINUATIONS,
 };
-pub use config::{AblationProfile, EnhancedRuntimeFeatures};
+pub use config::{
+    AblationProfile, EnhancedRuntimeFeatures, FeatureFlagError, FEATURE_FLAG_KEYS,
+};
 pub use context_pruner::{
     apply_pressure_prune, ContentBlock, ModelVisibleSurface, PruneOutcome, SurfaceItem,
     ToolResultPrunePolicy,
@@ -52,9 +55,14 @@ pub use telemetry::{
     field_name_is_forbidden, hash_identifier, EnhancedEvent, EnhancedEventFields,
     EnhancedEventKind, MemoryTelemetry,
 };
+pub use tool_observation::{
+    fingerprint_original_result, is_native_wait_poll, observation_events, ObservationDecision,
+    ObservationInput, ObservationReason, ObservationResultStatus, ObservationState,
+    NATIVE_WAIT_POLL_TOOLS, REPETITION_NOTICE, REPETITION_THRESHOLD,
+};
 pub use tool_reliability::{
-    AdmitDecision, LateResultDecision, ProviderToolCallIdentity, SyntheticResultKind,
-    SyntheticToolResult, ToolCallLedger, ToolCallResolution,
+    canonical_namespace, AdmitDecision, InputEncoding, LateResultDecision, ProviderToolCallIdentity,
+    SyntheticResultKind, SyntheticToolResult, ToolCallLedger, ToolCallResolution, ToolKind,
 };
 
 #[cfg(test)]

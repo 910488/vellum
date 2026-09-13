@@ -37,6 +37,10 @@ const ALLOWED_EVENT_FIELDS: &[&str] = &[
     "unfinishedSignalCount",
     "outcome",
     "succeeded",
+    "consecutiveCount",
+    "inputFingerprintHash",
+    "resultFingerprintHash",
+    "observationReason",
 ];
 
 pub fn known_event_names() -> Vec<&'static str> {
@@ -52,10 +56,16 @@ pub fn known_event_names() -> Vec<&'static str> {
         EnhancedEventKind::ContextCompactionAvoided.name(),
         EnhancedEventKind::ContextOverflowRetry.name(),
         EnhancedEventKind::ContextOverflowRetryRefused.name(),
+        EnhancedEventKind::ContextProjectionApplied.name(),
+        EnhancedEventKind::ContextProjectionRestored.name(),
+        EnhancedEventKind::ContextProjectionCleared.name(),
         EnhancedEventKind::ContextPressureChecked.name(),
         EnhancedEventKind::ContinuationEvaluated.name(),
         EnhancedEventKind::ContinuationAllowed.name(),
         EnhancedEventKind::ContinuationExhausted.name(),
+        EnhancedEventKind::ToolRepetitionObserved.name(),
+        EnhancedEventKind::ToolRepetitionNoticeAppended.name(),
+        EnhancedEventKind::IntentContinuationDetected.name(),
     ]
 }
 
@@ -162,6 +172,7 @@ pub fn parse_enhanced_identity(params: &Value) -> Result<EnhancedRuntimeIdentity
     let ports = params
         .get("ports")
         .ok_or_else(|| "missing ports".to_string())?;
+    refuse_unknown_port_flags(ports)?;
     Ok(EnhancedRuntimeIdentity {
         enhanced_commit: commit,
         runtime_digest: digest,
@@ -169,6 +180,8 @@ pub fn parse_enhanced_identity(params: &Value) -> Result<EnhancedRuntimeIdentity
         qwen_tool_reliability: bool_field(ports, "qwenToolReliability")?,
         deepseek_context_recovery: bool_field(ports, "deepseekContextRecovery")?,
         qwen_bounded_continuation: bool_field(ports, "qwenBoundedContinuation")?,
+        repetition_notice: optional_bool_field(ports, "repetitionNotice")?,
+        intent_continuation: optional_bool_field(ports, "intentContinuation")?,
     })
 }
 
@@ -210,6 +223,34 @@ fn bool_field(value: &Value, key: &str) -> Result<bool, String> {
         .get(key)
         .and_then(Value::as_bool)
         .ok_or_else(|| format!("missing {key}"))
+}
+
+fn optional_bool_field(value: &Value, key: &str) -> Result<bool, String> {
+    match value.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(format!("{key} must be a boolean")),
+    }
+}
+
+const KNOWN_PORT_FLAGS: &[&str] = &[
+    "qwenToolReliability",
+    "deepseekContextRecovery",
+    "qwenBoundedContinuation",
+    "repetitionNotice",
+    "intentContinuation",
+];
+
+fn refuse_unknown_port_flags(ports: &Value) -> Result<(), String> {
+    let object = ports
+        .as_object()
+        .ok_or_else(|| "ports must be an object".to_string())?;
+    for key in object.keys() {
+        if !KNOWN_PORT_FLAGS.contains(&key.as_str()) {
+            return Err(format!("unknown port flag {key} is not silently ignored"));
+        }
+    }
+    Ok(())
 }
 
 /// The last qualification run, surfaced in Settings so the state a release
@@ -263,6 +304,8 @@ mod tests {
         let identity = parse_enhanced_identity(&complete).unwrap();
         assert_eq!(identity.feature_profile, "E5");
         assert!(!identity.qwen_bounded_continuation);
+        assert!(!identity.repetition_notice);
+        assert!(!identity.intent_continuation);
 
         let mut partial = complete.clone();
         partial["ports"]
@@ -270,6 +313,14 @@ mod tests {
             .unwrap()
             .remove("deepseekContextRecovery");
         assert!(parse_enhanced_identity(&partial).is_err());
+
+        let mut unknown = complete.clone();
+        unknown["ports"]["mysteryFlag"] = json!(true);
+        assert!(
+            parse_enhanced_identity(&unknown)
+                .unwrap_err()
+                .contains("mysteryFlag")
+        );
     }
 
     #[test]
@@ -312,6 +363,8 @@ mod tests {
         let parsed = parse_enhanced_identity(&identity["params"]).unwrap();
         assert_eq!(parsed.feature_profile, "E5");
         assert!(parsed.qwen_bounded_continuation);
+        assert!(!parsed.repetition_notice);
+        assert!(!parsed.intent_continuation);
 
         for kind in [
             EnhancedEventKind::ToolDuplicateSuppressed,

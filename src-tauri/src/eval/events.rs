@@ -12,6 +12,8 @@ pub struct EnhancedRuntimeObservation {
     pub qwen_tool_reliability: Option<bool>,
     pub deepseek_context_recovery: Option<bool>,
     pub qwen_bounded_continuation: Option<bool>,
+    pub repetition_notice: Option<bool>,
+    pub intent_continuation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,6 +95,8 @@ pub fn parse_codex_jsonl(text: &str) -> EventMetrics {
                     qwen_bounded_continuation: ports
                         .get("qwenBoundedContinuation")
                         .and_then(Value::as_bool),
+                    repetition_notice: ports.get("repetitionNotice").and_then(Value::as_bool),
+                    intent_continuation: ports.get("intentContinuation").and_then(Value::as_bool),
                 });
             }
             Some("vellum/enhancedEvent") => {
@@ -605,6 +609,8 @@ mod tests {
         let runtime = parsed.enhanced_runtime.unwrap();
         assert_eq!(runtime.feature_profile.as_deref(), Some("E1"));
         assert_eq!(runtime.qwen_tool_reliability, Some(true));
+        assert_eq!(runtime.repetition_notice, None);
+        assert_eq!(runtime.intent_continuation, None);
         assert_eq!(
             parsed.enhanced_event_counts["enhanced.tool.duplicate_suppressed"],
             2

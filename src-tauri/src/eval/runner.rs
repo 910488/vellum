@@ -4637,6 +4637,10 @@ async fn run_case(
                     == Some(expected.feature_flags.deepseek_context_recovery)
                 && observed.qwen_bounded_continuation
                     == Some(expected.feature_flags.qwen_bounded_continuation)
+                && observed.repetition_notice.unwrap_or(false)
+                    == expected.feature_flags.repetition_notice
+                && observed.intent_continuation.unwrap_or(false)
+                    == expected.feature_flags.intent_continuation
         }),
     };
     if !runtime_attribution {

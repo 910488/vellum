@@ -67,6 +67,10 @@ pub struct EnhancedRuntimeIdentity {
     pub qwen_tool_reliability: bool,
     pub deepseek_context_recovery: bool,
     pub qwen_bounded_continuation: bool,
+    #[serde(default)]
+    pub repetition_notice: bool,
+    #[serde(default)]
+    pub intent_continuation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +411,8 @@ mod tests {
             qwen_tool_reliability: true,
             deepseek_context_recovery: true,
             qwen_bounded_continuation: true,
+            repetition_notice: false,
+            intent_continuation: false,
         });
     }
 

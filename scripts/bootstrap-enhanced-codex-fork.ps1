@@ -4,11 +4,20 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Pin = "633ab199cfd724aa78013c006b27a2b3d049fc3b"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+$LockPath = Join-Path $RepoRoot "enhanced-runtime.lock.json"
+if (-not (Test-Path $LockPath)) {
+    throw "enhanced-runtime.lock.json is missing; the lock is the source pin"
+}
+$Lock = Get-Content -Raw -Path $LockPath | ConvertFrom-Json
+$Pin = [string]$Lock.enhancedCodexCommit
+if (-not $Pin -or $Pin.Length -ne 40) {
+    throw "enhanced-runtime.lock.json is missing a 40-hex enhancedCodexCommit"
+}
 $Source = Join-Path $RepoRoot "crates\vellum-enhanced-codex\src"
 $Dest = Join-Path $CodexRoot "codex-rs\core\src\enhanced"
 $CoreLib = Join-Path $CodexRoot "codex-rs\core\src\lib.rs"
+$ForkOnly = @("runtime.rs", "seams.rs", "reporting.rs", "context_projection.rs", "debug_log.rs", "debug_log_tests.rs", "mod.rs")
 
 if (-not (Test-Path $CodexRoot)) {
     throw "Codex root does not exist: $CodexRoot"
@@ -26,9 +35,13 @@ try {
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 Get-ChildItem -Path $Source -Filter "*.rs" | ForEach-Object {
-    if ($_.Name -ne "lib.rs") {
-        Copy-Item -Force $_.FullName (Join-Path $Dest $_.Name)
+    if ($_.Name -eq "lib.rs") {
+        return
     }
+    if ($ForkOnly -contains $_.Name) {
+        throw "refusing to overwrite fork-only module $($_.Name)"
+    }
+    Copy-Item -Force $_.FullName (Join-Path $Dest $_.Name)
 }
 
 $Lib = [System.IO.File]::ReadAllText((Join-Path $Source "lib.rs"))
@@ -62,7 +75,12 @@ if (-not $HasAllow) {
     }
 }
 $Slim = ($Lines -join "`r`n").TrimEnd() + "`r`n`r`npub mod runtime;`r`npub mod seams;`r`n"
-[System.IO.File]::WriteAllText((Join-Path $Dest "mod.rs"), $Slim)
+$ModRs = Join-Path $Dest "mod.rs"
+if (Test-Path $ModRs) {
+    Write-Host "Keeping existing fork-only $ModRs"
+} else {
+    [System.IO.File]::WriteAllText($ModRs, $Slim)
+}
 
 if (-not (Test-Path $CoreLib)) {
     throw "Codex core lib.rs not found: $CoreLib"

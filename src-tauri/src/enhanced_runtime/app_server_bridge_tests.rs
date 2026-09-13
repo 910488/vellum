@@ -21,6 +21,8 @@ fn desktop_feature_flags_map_to_the_session_loader_profile() {
             qwen_tool_reliability: true,
             deepseek_context_recovery: false,
             qwen_bounded_continuation: true,
+            repetition_notice: false,
+            intent_continuation: false,
         }),
         None,
         "a custom JSON feature set must not be overwritten by an E0 compatibility selector"

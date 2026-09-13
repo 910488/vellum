@@ -2066,4 +2066,89 @@ mod tests {
         assert_eq!(completed["output"][0]["type"], "tool_search_call");
         assert_eq!(completed["output"][0]["call_id"], "call_search");
     }
+
+    #[test]
+    fn empty_reasoning_content_is_omitted_not_replayed_as_blank() {
+        assert_eq!(
+            chat_reasoning_text(&json!({"reasoning_content": ""})),
+            None
+        );
+        assert_eq!(
+            chat_reasoning_text(&json!({"reasoning_content": "   "})),
+            Some("   ")
+        );
+        assert_eq!(
+            chat_reasoning_text(&json!({"reasoning_content": "think"})),
+            Some("think")
+        );
+    }
+
+    #[test]
+    fn grok_custom_tool_input_is_not_dropped() {
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n@@\n- old\n+ 新\n";
+        assert_eq!(
+            custom_tool_input(&json!({"input": patch}).to_string()),
+            patch
+        );
+        assert_eq!(custom_tool_input(patch), patch);
+        assert_eq!(
+            custom_tool_input(&json!({"patch": patch}).to_string()),
+            patch
+        );
+        assert_eq!(custom_tool_input(""), "");
+    }
+
+    #[test]
+    fn omen_malformed_yield_and_tool_markup_are_not_auto_executed() {
+        let yield_text = "yield {\"tool\": \"shell\", \"cmd\": \"rm -rf /\"}";
+        let sanitized = sanitize_model_content(yield_text);
+        assert!(
+            !sanitized.contains("function_call"),
+            "yield text must not become a tool call"
+        );
+        let markup = "hello <tool_call>shell</tool_call> world";
+        let hidden = sanitize_model_content(markup);
+        assert!(!hidden.contains("<tool_call>"));
+        assert!(!hidden.contains("shell") || hidden.contains("hello"));
+        assert!(hidden.contains("hello"));
+        assert!(hidden.contains("world"));
+    }
+
+    #[test]
+    fn qwen_tool_call_id_arriving_on_later_fragment_is_stable() {
+        let mut adapter = ChatSseAdapter::new("qwen3.6");
+        adapter.push_data(
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"name": "shell", "arguments": "{\"c\":"}
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        );
+        adapter.push_data(
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_real_1",
+                            "function": {"arguments": "1}"}
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        );
+        let events = adapter.push_data("[DONE]");
+        let transcript = events.join("");
+        let real = transcript.matches("call_real_1").count();
+        assert!(real >= 1, "real call id must appear");
+        let completed = adapter.completed_response();
+        assert_eq!(completed["output"][0]["call_id"], "call_real_1");
+    }
 }

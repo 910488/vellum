@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "codexUpstreamCommit": "6bc50f104dcc0192e696cdeae721dfc19b507391",
-  "enhancedCodexCommit": "6576e4fb712f27bd963b6a6b559d0ba77df7cbed",
+  "enhancedCodexCommit": "a7b9610e18f9da1cb207cd783ba7f3f467492d77",
   "qwenCodeSourceCommit": "2b8f73c1e9cf8b355ec46c4623398c27b458b076",
   "deepseekHarnessSourceCommit": "dd6322d604e00eec1ba5e0c8541159906a21094a",
   "buildProfile": "enhanced-mvp-v1",
@@ -11,18 +11,18 @@
   "artifacts": {
     "aarch64-apple-darwin": {
       "archiveName": "enhanced-codex-core-aarch64-apple-darwin.tar.gz",
-      "archiveSha256": "sha256:ac1837dab98f9623c855a776ec83487b2f9e7e6d01bfb4e553ce79e5e258c751",
-      "artifactSha256": "sha256:cfc8c2333fbdd9c88b54ea8e813b1c35990d96b317999ca229e3223c9dd08085"
+      "archiveSha256": "sha256:dacd12d34afd03e3ec5712a2a26ed4cf3c6e37dba387eb02bed5a8669bf32da2",
+      "artifactSha256": "sha256:a606494b01676222f614f91082e72df8603e472a1174a33fdbeed9701b9cb916"
     },
     "x86_64-apple-darwin": {
       "archiveName": "enhanced-codex-core-x86_64-apple-darwin.tar.gz",
-      "archiveSha256": "sha256:59adc5896a142686e5e75c42952c21807134c92a828f993591dfa12146909892",
-      "artifactSha256": "sha256:a37205acd088dc92272ca2fd3c293f7979bd2d49ff1e6eb40fa5d1e7ff72e1fc"
+      "archiveSha256": "sha256:0975becd8f17b0c8ec01796ffb908933711bf5c75f014b49510bf991265c7d0c",
+      "artifactSha256": "sha256:ae6473d12d5fd2a3f1dd0afa4c657e2cd261bcbb394d3a8854e9f399ff9f2cf9"
     },
     "x86_64-pc-windows-msvc": {
       "archiveName": "enhanced-codex-core-x86_64-pc-windows-msvc.zip",
-      "archiveSha256": "sha256:8dbe858f10d45f6a7ae14a4ed8ba358d3e8b0577d59f697310b0efcdd786c8e8",
-      "artifactSha256": "sha256:bb05070e998aec5cb3243da063ba55c24f84cbecb52b9e387161bd126c00c4cb"
+      "archiveSha256": "sha256:b19bfa568396e11c197249ec8f2d3eea6a00bb9131b2b4c248eb6344136fb2a4",
+      "artifactSha256": "sha256:6698eae72d72ce205ef3fe9dd8ced64ea4101a40b0ac622659cc859cc3c3b4c9"
     }
   }
 }

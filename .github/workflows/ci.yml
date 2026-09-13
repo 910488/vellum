@@ -58,6 +58,26 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Read Enhanced Core lock commit
+        id: enhanced-lock
+        shell: pwsh
+        run: |
+          $lock = Get-Content enhanced-runtime.lock.json -Raw | ConvertFrom-Json
+          if (-not $lock.enhancedCodexCommit) { throw "enhanced-runtime.lock.json is missing enhancedCodexCommit" }
+          "commit=$($lock.enhancedCodexCommit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Check out Enhanced Codex Core lock commit
+        uses: actions/checkout@v4
+        with:
+          repository: 910488/enhanced-codex-core
+          ref: ${{ steps.enhanced-lock.outputs.commit }}
+          path: .enhanced-codex-core
+
+      - name: Point fork consistency at the lock commit
+        shell: pwsh
+        run: |
+          "VELLUM_ENHANCED_CORE_ROOT=$PWD\.enhanced-codex-core" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # No `version:` here on purpose. The action refuses to run when a version
       # is given in both places, and `packageManager` in package.json is the
       # one that also governs local builds — keeping the pin in a single place
@@ -86,6 +106,9 @@ jobs:
 
       - name: Unified QA offline lane
         run: pnpm qa -- --lane offline --out-dir qa/reports/generated/ci-offline
+
+      - name: Portable Enhanced Core vs lock-commit fork
+        run: cargo test -p vellum-enhanced-codex --test fork_consistency --test event_replay --lib
 
       - name: Test remote workspace crates (beyond the offline lane)
         run: |

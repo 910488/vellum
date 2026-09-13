@@ -115,6 +115,16 @@ pub fn compute_runtime_digest(inputs: &DigestInputs) -> Result<String, DigestErr
         "qwenBoundedContinuation",
         bool_flag(inputs.feature_defaults.qwen_bounded_continuation),
     );
+    feed(
+        &mut hasher,
+        "repetitionNotice",
+        bool_flag(inputs.feature_defaults.repetition_notice),
+    );
+    feed(
+        &mut hasher,
+        "intentContinuation",
+        bool_flag(inputs.feature_defaults.intent_continuation),
+    );
     feed(&mut hasher, "buildProfile", &inputs.build_profile);
     feed(&mut hasher, "targetTriple", &inputs.target_triple);
     feed(&mut hasher, "artifactSha256", &inputs.artifact_sha256);
@@ -167,6 +177,12 @@ mod tests {
         artifact.artifact_sha256 =
             "sha256:0000000000000000000000000000000000000000000000000000000000000001".into();
         assert_ne!(first, compute_runtime_digest(&artifact).unwrap());
+        let mut notice = sample();
+        notice.feature_defaults.repetition_notice = true;
+        assert_ne!(first, compute_runtime_digest(&notice).unwrap());
+        let mut intent = sample();
+        intent.feature_defaults.intent_continuation = true;
+        assert_ne!(first, compute_runtime_digest(&intent).unwrap());
     }
 
     #[test]

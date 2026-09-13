@@ -7,9 +7,9 @@ fork and called from the agent loop.
 ## Required fork
 
 ```text
-origin: openai/codex @ 633ab199cfd724aa78013c006b27a2b3d049fc3b
-fork:   910488/enhanced-codex-core
-branch: vellum/enhanced-mvp
+origin: openai/codex @ the `codexUpstreamCommit` in `enhanced-runtime.lock.json`
+fork:   910488/enhanced-codex-core @ `enhancedCodexCommit` in that lock
+        (currently a7b9610e18f9da1cb207cd783ba7f3f467492d77)
 ```
 
 Do not track `main` / `master` / `latest`.

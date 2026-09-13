@@ -48,6 +48,19 @@ export function casesForLane(lane) {
   return CASES.filter((item) => item.lane === lane);
 }
 
+/** Coverage alias for offline inject cases. Must be JSON: evidence files end in .json. */
+export function offlineInjectCoverageEvidence(runtimeVerdict, replayVerdict, caseId) {
+  return `${JSON.stringify(
+    {
+      cargoProxyRuntime: runtimeVerdict ?? null,
+      protocolReplay: replayVerdict ?? null,
+      case: caseId,
+    },
+    null,
+    2,
+  )}\n`;
+}
+
 export function casesForLaneExpanded(lane) {
   return expandModels(casesForLane(lane));
 }
@@ -177,12 +190,11 @@ async function runOffline(ctx) {
       evidence: matrixCase.evidence,
       commandLog: "offline.cargo-proxy-runtime + offline.protocol-replay",
       async run({ evidenceDir }) {
-        const body = [
-          `cargo-proxy-runtime=${runtime?.verdict}`,
-          `protocol-replay=${replay?.verdict}`,
-          `case=${matrixCase.id}`,
-        ].join("\n");
-        writeLog(evidenceDir, matrixCase.evidence[0], `${body}\n`);
+        writeLog(
+          evidenceDir,
+          matrixCase.evidence[0],
+          offlineInjectCoverageEvidence(runtime?.verdict, replay?.verdict, matrixCase.id),
+        );
         if (runtime?.verdict !== "PASS") {
           return {
             verdict: "FAIL",
