@@ -185,38 +185,16 @@ jobs:
           LOCK_BASE64="$(node -e 'process.stdout.write(require("node:fs").readFileSync("enhanced-runtime.lock.json").toString("base64"))')"
           echo "enhanced_core_lock=$LOCK_BASE64" >> "$GITHUB_OUTPUT"
 
-  desktop-remote-payload:
-    name: Embedded Remote Manager payload
-    needs: resolve
-    if: needs.resolve.outputs.component == 'desktop'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
-      - uses: ./.github/actions/prepare-release-source
-        with:
-          tag: ${{ needs.resolve.outputs.tag }}
-          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: bash scripts/build-local-release.sh stage-only
-      - uses: actions/upload-artifact@v4
-        with:
-          name: build-only-remote-payload
-          path: src-tauri/resources/remote
-          if-no-files-found: error
-
   windows-updater:
     name: Windows NSIS updater asset
-    needs: [resolve, desktop-remote-payload]
+    needs: resolve
     if: needs.resolve.outputs.component == 'desktop'
     runs-on: windows-latest
     environment: release-signing
     env:
       VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
       VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+      VELLUM_DESKTOP_HOT_UPDATE: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -231,17 +209,13 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: build-only-remote-payload
-          path: src-tauri/resources/remote
       - name: Require embedded update trust
         shell: pwsh
         run: |
           if (-not $env:VELLUM_UPDATE_PUBLIC_KEY -or -not $env:VELLUM_UPDATE_KEY_ID) {
             throw "VELLUM_UPDATE_PUBLIC_KEY and VELLUM_UPDATE_KEY_ID must be configured"
           }
-      - run: pnpm exec tauri build --bundles nsis
+      - run: pnpm exec tauri build --bundles nsis --config src-tauri/tauri.hot-update.conf.json
       - uses: actions/upload-artifact@v4
         with:
           name: updater-windows
@@ -250,13 +224,14 @@ jobs:
 
   macos-updater:
     name: macOS updater archives
-    needs: [resolve, desktop-remote-payload]
+    needs: resolve
     if: needs.resolve.outputs.component == 'desktop'
     runs-on: macos-latest
     environment: release-signing
     env:
       VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
       VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
+      VELLUM_DESKTOP_HOT_UPDATE: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -272,15 +247,11 @@ jobs:
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: build-only-remote-payload
-          path: src-tauri/resources/remote
       - name: Require embedded update trust
         run: |
           test -n "$VELLUM_UPDATE_PUBLIC_KEY"
           test -n "$VELLUM_UPDATE_KEY_ID"
-      - run: pnpm exec tauri build --bundles app,dmg
+      - run: pnpm exec tauri build --bundles app,dmg --config src-tauri/tauri.hot-update.conf.json
       - name: Pack app archives
         run: |
           mkdir -p updater
@@ -441,7 +412,6 @@ jobs:
     name: Hash, sign, and create GitHub Release
     needs:
       - resolve
-      - desktop-remote-payload
       - windows-updater
       - macos-updater
       - remote-linux

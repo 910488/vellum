@@ -108,6 +108,11 @@ await stageEnhancedRuntime();
 // it on every `pnpm dev` is not worth it. `binaries/vellum-enhanced-codex.dev-path`
 // names the fork's output instead, and `build.rs` reads that pointer.
 async function stageEnhancedRuntime() {
+  if (process.env.VELLUM_DESKTOP_HOT_UPDATE === "1") {
+    console.log("enhanced core: excluded from the Desktop-only hot update");
+    return;
+  }
+
   const pointer = join(root, "src-tauri", "binaries", "vellum-enhanced-codex.dev-path");
   const pointerValue = existsSync(pointer) ? readFileSync(pointer, "utf8").trim() : "";
   const fromPointer = pointerValue ? dirname(pointerValue) : null;

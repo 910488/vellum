@@ -1,0 +1,5 @@
+{
+  "bundle": {
+    "resources": ["binaries/vellum-codex-app-server*"]
+  }
+}

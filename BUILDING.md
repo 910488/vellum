@@ -78,22 +78,26 @@ The pointer exists because the core is a ~300 MB build output; copying it into
 Settings says this build does not carry a core — which is a broken install, not
 an unfinished setup, and it says so in those words.
 
-### A build without Remote Control
+### Full installers and component-only hot updates
 
-`tauri build` never builds the Remote payload — `scripts/build-local-release.ps1`
-does that, and `src-tauri/resources/remote/` is whatever a previous run staged.
-But an ordinary build still *ships* it: 535 MB of Linux agent images that a
-release not ready to support Remote Control should not be handing to users.
+`Desktop Builds` produces the full offline installers. Before NSIS and DMG are
+built, it stages the Linux Remote Agent, Broker, pinned Codex, and
+`proxy-image.tar` for both architectures. The normal `build-sidecar` path also
+stages the pinned Enhanced Core and its helpers. `tauri.conf.json` then bundles
+all three components into each installer.
 
-`src-tauri/tauri.no-remote.conf.json` is a config overlay that drops that
-resource and keeps `binaries/*`:
+`Publish signed hot update` is different: its selector publishes exactly one
+of `desktop-v*`, `remote-v*`, or `core-v*`. For the `desktop` choice,
+`src-tauri/tauri.hot-update.conf.json` keeps only the Desktop bridge resource,
+and `VELLUM_DESKTOP_HOT_UPDATE=1` prevents `build-sidecar` from staging Core:
 
 ```
-pnpm tauri build --bundles nsis --config src-tauri/tauri.no-remote.conf.json
+VELLUM_DESKTOP_HOT_UPDATE=1 pnpm tauri build --bundles nsis --config src-tauri/tauri.hot-update.conf.json
 ```
 
-Arrays are replaced rather than merged, so this leaves the tracked config
-honest about what a full release contains instead of editing it per build.
+Arrays are replaced rather than merged, so the full-installer default remains
+explicit while the Desktop hot update cannot accidentally absorb a previously
+staged Remote or Core payload.
 
 The Remote screen is still present in the UI. Asked to do anything, it reports
 `ReleaseManifestUnavailable` — an honest failure, not a crash, but not a hidden
@@ -162,7 +166,7 @@ version. `source_ref` selects the Vellum source, and `enhanced_core_release`
 can pin an explicit `vellum-core-<40-hex>` release instead of resolving the
 latest one. Turning off `publish` leaves both signed releases as drafts.
 
-For testing one hot-update surface independently, run the
+For testing or publishing one hot-update surface independently, run the
 `Publish signed hot update` Action. Its `component` selector maps directly to
 the three updater streams: `desktop` builds the Vellum app, `remote` builds the
 Remote package, and `core` builds the Enhanced Codex Core package. Choose
@@ -171,6 +175,10 @@ channel. A release requires an explicit non-prerelease SemVer; a prerelease
 may omit the version, in which case the workflow generates a unique next-patch
 `preview` version. Keep `publish` enabled for an installed Desktop to discover
 the result—draft releases are intentionally invisible to update checks.
+
+This separation applies only to hot updates. `Desktop Builds` intentionally
+continues to produce self-contained NSIS and DMG installers with every
+component for clean/offline installation.
 
 The core release completes before the Desktop build starts. This ordering and
 the immutable Enhanced Core tag ensure that update assets and bundled assets
