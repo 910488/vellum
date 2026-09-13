@@ -2155,7 +2155,7 @@ mod tests {
         assert_eq!(
             candidates
                 .iter()
-                .filter(|candidate| **candidate == PathBuf::from("codex"))
+                .filter(|candidate| candidate.as_path() == Path::new("codex"))
                 .count(),
             1
         );

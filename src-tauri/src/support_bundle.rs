@@ -274,7 +274,7 @@ fn path_replacements(data_root: &Path) -> Vec<(String, &'static str)> {
             }
         }
     }
-    replacements.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    replacements.sort_by_key(|item| std::cmp::Reverse(item.0.len()));
     replacements
 }
 

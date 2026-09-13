@@ -182,22 +182,24 @@ async fn read_json_body(
     request: Request,
     endpoint: &str,
     policy: &ResourcePolicy,
-) -> Result<(axum::http::HeaderMap, Value), Response> {
+) -> Result<(axum::http::HeaderMap, Value), Box<Response>> {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
     let body = match collect_request_body(body, MAX_REQUEST_BODY_BYTES, policy).await {
         Ok((body, _budget)) => body,
-        Err(CollectBodyError::Resource(error)) => return Err(error.into_error_response()),
+        Err(CollectBodyError::Resource(error)) => {
+            return Err(Box::new(error.into_error_response()))
+        }
         Err(CollectBodyError::WireTooLarge | CollectBodyError::Read(_)) => {
-            return Err(request_body_error_response(
+            return Err(Box::new(request_body_error_response(
                 endpoint,
                 RequestBodyError::WireTooLarge,
-            ))
+            )))
         }
     };
     match parse_json_request(&headers, &body) {
         Ok(body) => Ok((headers, body)),
-        Err(error) => Err(request_body_error_response(endpoint, error)),
+        Err(error) => Err(Box::new(request_body_error_response(endpoint, error))),
     }
 }
 
@@ -424,7 +426,7 @@ async fn responses<S: ProxyRuntimeState>(
     let resources = state.proxy_runtime().resource_policy();
     let (headers, body) = match read_json_body(request, "/responses", &resources).await {
         Ok(parsed) => parsed,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let catalog_id = body
         .get("model")
@@ -706,7 +708,7 @@ async fn compact<S: ProxyRuntimeState>(State(state): State<Arc<S>>, request: Req
     let resources = state.proxy_runtime().resource_policy();
     let (headers, body) = match read_json_body(request, "/responses/compact", &resources).await {
         Ok(parsed) => parsed,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let incoming_auth = IncomingAuthContext {
         authorization: headers
@@ -742,7 +744,7 @@ async fn search<S: ProxyRuntimeState>(State(state): State<Arc<S>>, request: Requ
     let resources = state.proxy_runtime().resource_policy();
     let (headers, body) = match read_json_body(request, "/v1/alpha/search", &resources).await {
         Ok(parsed) => parsed,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let incoming_auth = IncomingAuthContext {
         authorization: headers

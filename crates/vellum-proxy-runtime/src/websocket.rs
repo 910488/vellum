@@ -955,9 +955,17 @@ async fn open_official_segment(
         .await
         {
             Bounded::Ready(Ok(socket)) => break socket,
-            Bounded::Ready(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
-                if !refreshed && matches!(response.status().as_u16(), 401 | 403) =>
+            Bounded::Ready(Err(error))
+                if !refreshed
+                    && matches!(
+                        error.as_ref(),
+                        tokio_tungstenite::tungstenite::Error::Http(response)
+                            if matches!(response.status().as_u16(), 401 | 403)
+                    ) =>
             {
+                let tokio_tungstenite::tungstenite::Error::Http(response) = *error else {
+                    unreachable!("guard requires an HTTP handshake error")
+                };
                 match runtime.refresh_official_websocket_auth(plan).await {
                     Ok(true) => refreshed = true,
                     Ok(false) => {
@@ -991,26 +999,17 @@ async fn open_official_segment(
                     }
                 }
             }
-            Bounded::Ready(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
-                let error = websocket_handshake_error(response);
-                tracing::warn!(%error, "Official WebSocket handshake rejected");
-                record_official_handshake_failure(
-                    runtime,
-                    plan,
-                    request_id,
-                    execution_id,
-                    connection_id,
-                    started,
-                    &error,
-                    &handshake_stages,
-                );
-                let _ = send_runtime_failure(client, &error).await;
-                return None;
-            }
             Bounded::Ready(Err(error)) => {
-                let error = RuntimeError::ProviderUnavailable(format!(
-                    "Official WebSocket connection failed: {error}"
-                ));
+                let error = match *error {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        let error = websocket_handshake_error(response);
+                        tracing::warn!(%error, "Official WebSocket handshake rejected");
+                        error
+                    }
+                    error => RuntimeError::ProviderUnavailable(format!(
+                        "Official WebSocket connection failed: {error}"
+                    )),
+                };
                 record_official_handshake_failure(
                     runtime,
                     plan,
@@ -1678,10 +1677,11 @@ fn official_upstream_handshake_request(
 /// `response.create` is not held in the TCP stack after TLS.
 async fn connect_official_upstream(
     request: tokio_tungstenite::tungstenite::http::Request<()>,
-) -> Result<OfficialUpstreamSocket, tokio_tungstenite::tungstenite::Error> {
+) -> Result<OfficialUpstreamSocket, Box<tokio_tungstenite::tungstenite::Error>> {
     connect_async_with_config(request, None, true)
         .await
         .map(|(socket, _)| socket)
+        .map_err(Box::new)
 }
 
 /// Write one Official frame and flush rustls/TCP so the first create is

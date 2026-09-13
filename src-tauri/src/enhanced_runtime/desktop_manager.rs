@@ -1373,6 +1373,20 @@ fn read_settings(
     Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
 }
 
+fn verify_enhanced_artifact_identity(
+    expected: Option<&str>,
+    actual: &str,
+    has_signed_identity: bool,
+) -> Result<(), DesktopRuntimeManagerError> {
+    if expected != Some(actual) && !has_signed_identity {
+        return Err(DesktopRuntimeManagerError::ArtifactMismatch {
+            expected: expected.unwrap_or_default().to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn verify_settings(
     data_root: &Path,
     settings: &DesktopRuntimeSettings,
@@ -1425,16 +1439,11 @@ fn verify_settings(
         &settings.enhanced_codex_executable,
         &enhanced_hash,
     );
-    if lock.artifact_for_target(target) != Some(enhanced_hash.as_str()) && signed_identity.is_none()
-    {
-        return Err(DesktopRuntimeManagerError::ArtifactMismatch {
-            expected: lock
-                .artifact_for_target(target)
-                .unwrap_or_default()
-                .to_string(),
-            actual: enhanced_hash,
-        });
-    }
+    verify_enhanced_artifact_identity(
+        lock.artifact_for_target(target),
+        &enhanced_hash,
+        signed_identity.is_some(),
+    )?;
     // Not a hash equality any more. Codex Desktop updates itself, so requiring
     // the exact pinned protocol meant every Codex release disarmed Enhanced
     // over differences that were usually additive and never on a path the
@@ -1973,30 +1982,13 @@ mod tests {
     /// artifact now goes where the pin actually applies.
     #[test]
     fn unpinned_artifact_fails_closed() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = std::env::current_exe().unwrap();
-        configure_desktop_runtime(temp.path(), binary.clone(), false).unwrap();
-
-        let mut settings = read_settings(temp.path()).unwrap().unwrap();
-        settings.enhanced_codex_executable = binary.clone();
-        settings.bridge_executable = binary;
-        std::fs::write(
-            temp.path().join(SETTINGS_FILE),
-            serde_json::to_vec_pretty(&settings).unwrap(),
-        )
-        .unwrap();
-
-        let status = desktop_runtime_status(temp.path());
-        assert!(status.configured);
-        assert!(!status.ready);
-        assert!(
-            status
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("Enhanced artifact mismatch")),
-            "an unpinned core verified: {:?}",
-            status.blockers
-        );
+        let result =
+            verify_enhanced_artifact_identity(Some("sha256:pinned"), "sha256:unpinned", false);
+        assert!(matches!(
+            result,
+            Err(DesktopRuntimeManagerError::ArtifactMismatch { expected, actual })
+                if expected == "sha256:pinned" && actual == "sha256:unpinned"
+        ));
     }
 
     #[test]

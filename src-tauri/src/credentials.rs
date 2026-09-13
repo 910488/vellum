@@ -133,7 +133,7 @@ pub(crate) fn open_stored_file(
     file_stem: &str,
 ) -> AppResult<(Vec<u8>, String)> {
     match cipher.open(encrypted, file_stem.as_bytes()) {
-        Ok(plaintext) => return Ok((plaintext, file_stem.to_string())),
+        Ok(plaintext) => Ok((plaintext, file_stem.to_string())),
         Err(primary_error) => {
             const SAFE_BOUNDARY_PREFIX: &str = "vellumproxyboundary";
             let Some(suffix) = file_stem.strip_prefix(SAFE_BOUNDARY_PREFIX) else {

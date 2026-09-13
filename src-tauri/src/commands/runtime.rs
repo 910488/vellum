@@ -1171,7 +1171,7 @@ mod restart_guard_tests {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            std::process::ExitStatus::from_raw(code)
+            std::process::ExitStatus::from_raw(code << 8)
         }
     }
 }

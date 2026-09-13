@@ -66,7 +66,7 @@ fn create_route_inner(mut input: CreateRouteInput, state: &AppState) -> AppResul
             return Err(error);
         }
     }
-    refresh_catalog_if_running(&state)?;
+    refresh_catalog_if_running(state)?;
     Ok(routes)
 }
 

@@ -374,6 +374,9 @@ pub fn write_html_report_with_baseline(
                 .iter()
                 .filter(|fault| !fault.expected_injection)
                 .count();
+            let fault_summary = format!(
+                "注入 {expected_faults} · 已恢復 {recovered_faults} · 未恢復 {unrecovered_faults} · 未預期 {unexpected_faults}"
+            );
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
                  <td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>\
@@ -390,9 +393,7 @@ pub fn write_html_report_with_baseline(
                 if result.passed { "PASS" } else { "FAIL" },
                 escape(result.failure_class.as_deref().unwrap_or("—")),
                 escape(&result.protocol_violations.join(", ")),
-                format!(
-                    "注入 {expected_faults} · 已恢復 {recovered_faults} · 未恢復 {unrecovered_faults} · 未預期 {unexpected_faults}"
-                ),
+                fault_summary,
                 format_duration(result.duration_ms),
                 result.metrics.input_tokens + result.metrics.output_tokens,
                 result.acceptance_passed,

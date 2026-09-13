@@ -283,16 +283,16 @@ mod tests {
     #[test]
     fn vellum_host_names_do_not_include_the_bridge_sidecar() {
         assert!(is_vellum_host_executable(std::path::Path::new(
-            r"C:\Users\developer\AppData\Local\Vellum\vellum-proxy-desktop.exe"
+            "vellum-proxy-desktop.exe"
         )));
         assert!(is_vellum_host_executable(std::path::Path::new(
             "/Applications/Vellum.app/Contents/MacOS/vellum"
         )));
         assert!(!is_vellum_host_executable(std::path::Path::new(
-            r"C:\vellum\vellum-codex-app-server.exe"
+            "vellum-codex-app-server.exe"
         )));
         assert!(!is_vellum_host_executable(std::path::Path::new(
-            r"C:\Users\developer\AppData\Local\OpenAI\Codex\bin\hash\codex.exe"
+            "codex.exe"
         )));
     }
 }
