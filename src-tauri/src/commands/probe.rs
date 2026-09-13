@@ -24,6 +24,64 @@ pub async fn discover_endpoint_models(
     .await
 }
 
+/// Refresh every persisted OpenCode Zen / Go route from the provider's live
+/// `/models` endpoint without issuing inference requests. This is the cheap
+/// refresh used when the Models page loads or the user refreshes the app; the
+/// explicit re-probe action below remains responsible for live capability
+/// verification.
+#[tauri::command]
+pub async fn refresh_opencode_model_catalogs(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<Vec<crate::model::Route>> {
+    let routes = state.routes();
+    let targets = routes
+        .into_iter()
+        .filter(|route| {
+            route.provider_kind == crate::model::ProviderKind::OpenAiCompatible
+                && crate::probe::opencode_zen_catalog(&route.base_url).is_some()
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(state.routes());
+    }
+
+    let client = default_client()?;
+    let mut refreshed = Vec::new();
+    let mut failures = Vec::new();
+    for route in targets {
+        let result = async {
+            let key = crate::credentials::load(&state.data_root(), &route.id)?;
+            let discovery = discover_endpoint_with_client(
+                &client,
+                &route.base_url,
+                key.as_deref().filter(|value| !value.trim().is_empty()),
+            )
+            .await?;
+            if !state.merge_route_probe_result(&route.id, &discovery, Vec::new()) {
+                return Err(crate::error::AppError::RouteNotFound(route.id.clone()));
+            }
+            Ok::<(), crate::error::AppError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => refreshed.push(route.id),
+            Err(error) => failures.push(format!("{}: {error}", route.name)),
+        }
+    }
+
+    if !refreshed.is_empty() {
+        crate::commands::overview::refresh_catalog_if_running(&state)?;
+    }
+    if failures.is_empty() {
+        Ok(state.routes())
+    } else {
+        Err(crate::error::AppError::Message(format!(
+            "OpenCode catalog refresh failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
 /// doc/03：探測一個端點。發極小的試探請求，判定 wire / 模型 / 能力。
 ///
 /// `endpoint` 可以是根 URL 或已帶 `/v1`；這裡會正規化。

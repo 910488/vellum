@@ -535,6 +535,11 @@ export const api = {
     return call<Route[]>("list_routes");
   },
 
+  refreshOpenCodeModelCatalogs(): Promise<Route[]> {
+    if (!hasTauri()) return delay(mock.routes());
+    return call<Route[]>("refresh_opencode_model_catalogs");
+  },
+
   selectRoute(routeId: string): Promise<void> {
     if (!hasTauri()) return delay(undefined);
     return afterSettingsChange(call<void>("select_route", { routeId }));

@@ -383,13 +383,24 @@ export function Models({
   useEffect(() => {
     let alive = true;
     refreshParts.current = { version: refreshVersion, done: new Set() };
-    void Promise.allSettled([
-      api.listRoutes(),
-      api.listModelRoutes(),
-      api.getCatalogStatus(),
-      api.getCodexOAuthStatus(),
-      api.getGrokAccountStatus(),
-    ]).then((results) => {
+    // Routes are persisted snapshots. Refresh OpenCode's cheap `/models`
+    // catalogs before reading those snapshots so entering this page, a hard
+    // reload, and the app-wide Refresh action all expose newly published Go /
+    // Zen models without spending quota on inference capability probes.
+    void (async () => {
+      let openCodeRefreshFailure: unknown = null;
+      try {
+        await api.refreshOpenCodeModelCatalogs();
+      } catch (cause) {
+        openCodeRefreshFailure = cause;
+      }
+      const results = await Promise.allSettled([
+        api.listRoutes(),
+        api.listModelRoutes(),
+        api.getCatalogStatus(),
+        api.getCodexOAuthStatus(),
+        api.getGrokAccountStatus(),
+      ]);
       if (!alive) return;
       const [nextRoutes, models, status, oauthStatus, grokStatus] = results;
       if (nextRoutes.status === "fulfilled") setRoutes(nextRoutes.value);
@@ -400,15 +411,17 @@ export function Models({
       const failures = results
         .slice(0, 4)
         .filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      const failureDetails = failures.map((failure) => String(failure.reason));
+      if (openCodeRefreshFailure) failureDetails.unshift(String(openCodeRefreshFailure));
       setError(
-        failures.length
-          ? t("models.ui.errors.partialRefresh", { detail: failures.map((failure) => String(failure.reason)).join(t("common.listSeparator")) })
+        failureDetails.length
+          ? t("models.ui.errors.partialRefresh", { detail: failureDetails.join(t("common.listSeparator")) })
           : null,
       );
       // Grok is optional. A missing CLI does not turn the entire model page
       // refresh into an application failure.
       markRefreshPart("main");
-    });
+    })();
     return () => {
       alive = false;
       pollGeneration.current += 1;

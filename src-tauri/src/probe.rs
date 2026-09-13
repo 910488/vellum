@@ -401,6 +401,7 @@ const OPENCODE_GO_MODEL_METADATA: &[OpenCodeZenModelRow] = &[
         false,
     ),
     ("deepseek-v4-pro", Some(1000000), true, false, false),
+    ("deepseek-v4.1-flash", Some(1000000), true, false, false),
     ("glm-5", Some(202752), true, false, true),
     ("glm-5.1", Some(202752), true, false, false),
     ("glm-5.2", Some(1000000), true, false, false),
@@ -437,7 +438,7 @@ const OPENCODE_GO_MODEL_METADATA: &[OpenCodeZenModelRow] = &[
         false,
         false,
     ),
-    ("omen-alpha", Some(500000), true, false, false),
+    ("omen-alpha", Some(500000), true, false, true),
     ("qwen3.5-plus", Some(262144), true, false, true),
     ("qwen3.6-plus", Some(1000000), true, false, false),
     ("qwen3.7-max", Some(1000000), true, false, false),
@@ -4086,6 +4087,10 @@ mod tests {
         );
         assert_eq!(
             opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "deepseek-v4-flash"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            opencode_zen_known_context_window(OpenCodeZenCatalog::Go, "deepseek-v4.1-flash"),
             Some(1_000_000)
         );
         assert!(opencode_zen_known_reasoning(

@@ -237,6 +237,7 @@ pub fn run() {
             commands::create_route,
             commands::refresh_quota,
             commands::discover_endpoint_models,
+            commands::refresh_opencode_model_catalogs,
             commands::probe_endpoint,
             commands::probe_endpoint_model,
             commands::reprobe_route_capabilities,
