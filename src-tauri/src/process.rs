@@ -25,18 +25,26 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Construct a non-interactive helper command without flashing a console on
 /// Windows. Other platforms keep the ordinary `std::process::Command` policy.
 pub fn background_command(program: impl AsRef<OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(program);
+    let command = std::process::Command::new(program);
     #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
+    let command = {
+        let mut command = command;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    };
     command
 }
 
 /// Same policy, for callers that need `tokio::process::Command` (async
 /// subprocess spawns).
 pub fn background_tokio_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(program);
+    let command = tokio::process::Command::new(program);
     #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
+    let command = {
+        let mut command = command;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    };
     command
 }
 

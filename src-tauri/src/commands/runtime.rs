@@ -442,11 +442,13 @@ pub(crate) async fn restart_codex_managed(
         state.set_draining(false);
         return Ok(ManagedRestart::refused(notice));
     }
-    let mut target = process.expect("precondition verified process");
+    let target = process.expect("precondition verified process");
     #[cfg(target_os = "windows")]
-    {
+    let target = {
+        let mut target = target;
         target.app_id = discover_codex_app_id();
-    }
+        target
+    };
     let previous_identity = launch_target_identity(&target);
 
     // The launch lease is a Proxy transaction, not a restart side-effect.
@@ -904,12 +906,8 @@ async fn stop_codex_and_wait(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         match next_stop_action(force, true) {
-            StopAction::Done => {
-                return Ok(stop_observation_from_output(&output, false, false));
-            }
-            StopAction::Refuse => {
-                return Ok(stop_observation_from_output(&output, true, false));
-            }
+            StopAction::Done => Ok(stop_observation_from_output(&output, false, false)),
+            StopAction::Refuse => Ok(stop_observation_from_output(&output, true, false)),
             StopAction::ForceKill => {
                 let mut command = crate::process::background_command("kill");
                 command.args(["-KILL", &target.pid.to_string()]);
@@ -920,11 +918,11 @@ async fn stop_codex_and_wait(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                return Ok(stop_observation_from_output(
+                Ok(stop_observation_from_output(
                     &forced,
                     process_is_alive(target.pid),
                     true,
-                ));
+                ))
             }
         }
     }

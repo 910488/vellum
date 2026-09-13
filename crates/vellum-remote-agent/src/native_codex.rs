@@ -1176,7 +1176,7 @@ fn process_identity(pid: u32) -> Option<String> {
         let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .ok()
             .map(|value| value.trim().to_owned())?;
-        return Some(format!("pid-{pid}-start-{start_time}-boot-{boot_id}"));
+        Some(format!("pid-{pid}-start-{start_time}-boot-{boot_id}"))
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -503,9 +503,7 @@ pub fn child_request(agent: &AgentRecord, stream: bool) -> Value {
     }
     let mut body = json!({
         "model": agent.identity.upstream_model,
-        "instructions": format!(
-            "You are a delegated sub-agent. Complete exactly the task described and reply with the result only. You have no tools: report what you conclude, and say plainly if the task cannot be done without running something."
-        ),
+        "instructions": "You are a delegated sub-agent. Complete exactly the task described and reply with the result only. You have no tools: report what you conclude, and say plainly if the task cannot be done without running something.",
         "input": input,
         "stream": stream
     });

@@ -351,7 +351,10 @@ fn keyscan_diagnostic(program: &Path, output: &Output) -> String {
 }
 
 fn keyscan_programs() -> Vec<PathBuf> {
+    #[cfg(windows)]
     let mut programs = Vec::new();
+    #[cfg(not(windows))]
+    let programs = vec![PathBuf::from("ssh-keyscan")];
     #[cfg(windows)]
     {
         // OpenSSH_for_Windows 9.5's ssh-keyscan aborts against otherwise
@@ -376,8 +379,8 @@ fn keyscan_programs() -> Vec<PathBuf> {
                 programs.push(candidate);
             }
         }
+        programs.push(PathBuf::from("ssh-keyscan"));
     }
-    programs.push(PathBuf::from("ssh-keyscan"));
     programs
 }
 

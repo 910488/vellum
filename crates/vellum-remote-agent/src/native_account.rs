@@ -434,7 +434,7 @@ pub(crate) fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), Stri
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| error.to_string())?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {
