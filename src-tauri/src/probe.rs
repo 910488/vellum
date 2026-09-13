@@ -1719,6 +1719,7 @@ async fn get_models(
     let mut req = client
         .get(format!("{v1}/models"))
         .timeout(models_catalog_timeout(v1));
+    req = apply_opencode_probe_identity(req, v1, &Value::Null);
     if let Some(k) = api_key {
         req = req.bearer_auth(k);
     }
@@ -2113,6 +2114,30 @@ struct RawProbeResponse {
     error: Option<String>,
 }
 
+fn opencode_probe_identity_headers(url: &str, body: &Value) -> Vec<(String, String)> {
+    let Some(profile) = vellum_proxy_runtime::infer_provider_profile(url) else {
+        return Vec::new();
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("catalog");
+    let conversation_key = format!("vellum:model-probe:{}:{model}", profile.as_str());
+    let encoded_body = serde_json::to_vec(body).unwrap_or_default();
+    vellum_proxy_runtime::opencode::identity_headers(&Value::Null, &conversation_key, &encoded_body)
+}
+
+fn apply_opencode_probe_identity(
+    mut request: reqwest::RequestBuilder,
+    url: &str,
+    body: &Value,
+) -> reqwest::RequestBuilder {
+    for (name, value) in opencode_probe_identity_headers(url, body) {
+        request = request.header(name, value);
+    }
+    request
+}
+
 async fn execute_probe_request(
     client: &reqwest::Client,
     url: &str,
@@ -2122,6 +2147,7 @@ async fn execute_probe_request(
 ) -> RawProbeResponse {
     let started = std::time::Instant::now();
     let mut req = client.post(url).json(&body);
+    req = apply_opencode_probe_identity(req, url, &body);
     if let Some(k) = api_key {
         req = req.bearer_auth(k);
     }
@@ -3680,6 +3706,7 @@ async fn probe_streaming_with_timeout(
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .timeout(timeout)
         .json(&body);
+    request = apply_opencode_probe_identity(request, v1, &body);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -3743,6 +3770,7 @@ async fn post_json_with_timeout(
     timeout: Option<std::time::Duration>,
 ) -> AppResult<(u16, Value, Option<String>)> {
     let mut req = client.post(url).json(&body);
+    req = apply_opencode_probe_identity(req, url, &body);
     if let Some(k) = api_key {
         req = req.bearer_auth(k);
     }
@@ -3797,6 +3825,46 @@ mod tests {
     #![allow(clippy::assertions_on_constants)]
 
     use super::*;
+
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn opencode_probes_carry_stable_hashed_session_identity() {
+        let first_body = json!({"model": "deepseek-v4-flash", "input": "ping"});
+        let second_body = json!({"model": "deepseek-v4-flash", "input": "tool probe"});
+        let first = opencode_probe_identity_headers(OPENCODE_GO_BASE_URL, &first_body);
+        let second = opencode_probe_identity_headers(
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            &second_body,
+        );
+
+        let first_session = header_value(&first, "x-opencode-session").unwrap();
+        assert_eq!(
+            first_session,
+            header_value(&second, "x-opencode-session").unwrap()
+        );
+        assert_ne!(
+            header_value(&first, "x-opencode-request"),
+            header_value(&second, "x-opencode-request")
+        );
+        assert_eq!(header_value(&first, "x-opencode-client"), Some("vellum"));
+        assert!(!first_session.contains("deepseek"));
+        assert_eq!(first_session.len(), 64);
+    }
+
+    #[test]
+    fn generic_provider_probes_do_not_receive_opencode_identity() {
+        assert!(opencode_probe_identity_headers(
+            "https://api.example.test/v1/chat/completions",
+            &json!({"model": "example"}),
+        )
+        .is_empty());
+    }
 
     #[test]
     fn initial_completion_budget_covers_observed_qwen_cold_start() {
