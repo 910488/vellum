@@ -2218,15 +2218,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn observed_control_socket_accepts_a_unix_domain_socket_that_is_file_rejects() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex");
+        // macOS sockaddr_un is ~104 bytes; a tempfile under /var/folders
+        // plus app-server-control.sock overflows and bind() fails.
+        let temp = tempfile::Builder::new()
+            .prefix("v")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = temp.path().join("c");
         let socket = control_socket_path(&home);
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
         assert!(
             observed_control_socket(&home).is_none(),
             "missing socket must not be invented"
         );
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _ = fs::remove_file(&socket);
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)
+            .unwrap_or_else(|error| panic!("bind {} ({} bytes): {error}", socket.display(), socket.as_os_str().len()));
         assert!(
             !socket.is_file(),
             "a real app-server-control.sock is S_IFSOCK, not a regular file"
