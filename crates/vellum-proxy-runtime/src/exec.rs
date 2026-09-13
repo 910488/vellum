@@ -4227,7 +4227,13 @@ impl ProxyRuntime {
                 UpstreamRequest {
                     method: "POST".into(),
                     url: upstream_endpoint(&route.base_url, route.wire),
-                    headers: json_upstream_headers(&auth, route, &request.body, &encoded_body),
+                    headers: json_upstream_headers(
+                        &auth,
+                        route,
+                        &request.body,
+                        &conversation_key,
+                        &encoded_body,
+                    ),
                     body: encoded_body.clone(),
                     timeout: non_streaming_timeout(route),
                     max_response_bytes: third_party_response_cap(route),
@@ -4295,6 +4301,7 @@ impl ProxyRuntime {
                                         &auth,
                                         route,
                                         &request.body,
+                                        &conversation_key,
                                         &encoded_body,
                                     ),
                                     body: encoded_body.clone(),
@@ -4337,6 +4344,7 @@ impl ProxyRuntime {
                                 &auth,
                                 route,
                                 &request.body,
+                                &conversation_key,
                                 &encoded_body,
                             ),
                             body: encoded_body.clone(),
@@ -4636,6 +4644,7 @@ impl ProxyRuntime {
         request: &RuntimeRequest,
         input: &[Value],
     ) -> Result<String, CodexLocalAttemptError> {
+        let conversation_key = self.resolve_request_conversation_key(request).key;
         let mut responses_body = json!({
             "model": route.upstream_model,
             "input": input,
@@ -4718,7 +4727,13 @@ impl ProxyRuntime {
                 UpstreamRequest {
                     method: "POST".into(),
                     url: upstream_endpoint(&route.base_url, route.wire),
-                    headers: json_upstream_headers(&auth, route, &request.body, &encoded_body),
+                    headers: json_upstream_headers(
+                        &auth,
+                        route,
+                        &request.body,
+                        &conversation_key,
+                        &encoded_body,
+                    ),
                     body: encoded_body,
                     timeout: non_streaming_timeout(route),
                     max_response_bytes: third_party_response_cap(route),
@@ -5221,6 +5236,7 @@ impl ProxyRuntime {
         .await?;
         let encoded_body = serde_json::to_vec(&request.body)
             .map_err(|error| RuntimeError::Internal(format!("encode compact body: {error}")))?;
+        let conversation_key = self.resolve_request_conversation_key(request).key;
         let endpoint = format!("{}/responses/compact", route.base_url.trim_end_matches('/'));
         let mut last_error = String::new();
         for attempt in 0..3 {
@@ -5229,7 +5245,13 @@ impl ProxyRuntime {
                 .execute(&UpstreamRequest {
                     method: "POST".into(),
                     url: endpoint.clone(),
-                    headers: json_upstream_headers(&auth, route, &request.body, &encoded_body),
+                    headers: json_upstream_headers(
+                        &auth,
+                        route,
+                        &request.body,
+                        &conversation_key,
+                        &encoded_body,
+                    ),
                     body: encoded_body.clone(),
                     timeout: None,
                     max_response_bytes: None,
@@ -5314,11 +5336,18 @@ impl ProxyRuntime {
         .await?;
         let encoded_body = serde_json::to_vec(&request.body)
             .map_err(|error| RuntimeError::Internal(format!("encode search body: {error}")))?;
+        let conversation_key = self.resolve_request_conversation_key(request).key;
         let endpoint = alpha_search_endpoint(&route.base_url);
         let upstream_request = |auth: &ResolvedAuth| UpstreamRequest {
             method: "POST".into(),
             url: endpoint.clone(),
-            headers: json_upstream_headers(auth, route, &request.body, &encoded_body),
+            headers: json_upstream_headers(
+                auth,
+                route,
+                &request.body,
+                &conversation_key,
+                &encoded_body,
+            ),
             body: encoded_body.clone(),
             timeout: None,
             max_response_bytes: None,
@@ -5401,7 +5430,13 @@ impl ProxyRuntime {
         let upstream_request = UpstreamRequest {
             method: "POST".into(),
             url: upstream_endpoint(&route.base_url, route.wire),
-            headers: json_upstream_headers(&auth, route, &request.body, &encoded_body),
+            headers: json_upstream_headers(
+                &auth,
+                route,
+                &request.body,
+                &conversation_key,
+                &encoded_body,
+            ),
             body: encoded_body.clone(),
             // Streaming has no overall deadline; the caller enforces
             // per-chunk idle timeouts.
@@ -5484,6 +5519,7 @@ impl ProxyRuntime {
                                     &auth,
                                     route,
                                     &request.body,
+                                    &conversation_key,
                                     &encoded_body,
                                 ),
                                 body: encoded_body.clone(),
@@ -5541,6 +5577,7 @@ impl ProxyRuntime {
                                 &auth,
                                 route,
                                 &request.body,
+                                &conversation_key,
                                 &encoded_body,
                             ),
                             body: encoded_body,
@@ -5977,6 +6014,7 @@ impl ProxyRuntime {
                             &route,
                             &auth,
                             &dispatch_body,
+                            &conversation_key,
                             &environment,
                             harness_options,
                             delegation_runtime_wired,
@@ -6472,6 +6510,7 @@ impl ProxyRuntime {
                     &route,
                     &auth,
                     &dispatch_body,
+                    &conversation_key,
                     &environment,
                     harness_options,
                     delegation_runtime_wired,
@@ -6520,6 +6559,7 @@ impl ProxyRuntime {
                             &route,
                             &auth,
                             &dispatch_body,
+                            &conversation_key,
                             &environment,
                             harness_options,
                             delegation_runtime_wired,
@@ -7730,6 +7770,7 @@ async fn open_chat_continuation_stream(
     route: &RuntimeModelRoute,
     auth: &ResolvedAuth,
     request_body: &Value,
+    conversation_key: &str,
     environment: &crate::environment::ExecutionEnvironment,
     harness_options: HarnessOptions,
     delegation_runtime_wired: bool,
@@ -7776,7 +7817,13 @@ async fn open_chat_continuation_stream(
         .execute_streaming(&UpstreamRequest {
             method: "POST".into(),
             url: upstream_endpoint(&route.base_url, route.wire),
-            headers: json_upstream_headers(auth, route, request_body, &encoded_body),
+            headers: json_upstream_headers(
+                auth,
+                route,
+                request_body,
+                conversation_key,
+                &encoded_body,
+            ),
             body: encoded_body,
             timeout: None,
             max_response_bytes: None,
@@ -7809,6 +7856,7 @@ fn json_upstream_headers(
     auth: &ResolvedAuth,
     route: &RuntimeModelRoute,
     inbound_body: &Value,
+    conversation_key: &str,
     upstream_body: &[u8],
 ) -> Vec<(String, String)> {
     let mut headers = auth.upstream_headers(&route.upstream_model);
@@ -7816,6 +7864,7 @@ fn json_upstream_headers(
     if route.effective_provider_profile().is_some() {
         headers.extend(crate::opencode::identity_headers(
             inbound_body,
+            conversation_key,
             upstream_body,
         ));
     }
@@ -8635,11 +8684,34 @@ mod tests {
             &ResolvedAuth::None,
             &sample_route(None),
             &serde_json::json!({}),
+            "conversation-test",
             b"{}",
         );
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-type") && value == "application/json"
         }));
+    }
+
+    #[test]
+    fn opencode_headers_use_resolved_metadata_identity_when_body_has_none() {
+        let mut route = sample_route(None);
+        route.base_url = crate::opencode::OPENCODE_GO_BASE_URL.into();
+        route.provider_profile = Some(crate::route::RuntimeProviderProfile::OpenCodeGo);
+        let raw_conversation_key = "codex:session-secret:review-thread-secret";
+        let headers = json_upstream_headers(
+            &ResolvedAuth::None,
+            &route,
+            &serde_json::json!({"model": "deepseek-v4.1-flash"}),
+            raw_conversation_key,
+            br#"{"model":"deepseek-v4.1-flash"}"#,
+        );
+        let session = headers
+            .iter()
+            .find(|(name, _)| name == "x-opencode-session")
+            .map(|(_, value)| value)
+            .expect("OpenCode session header");
+        assert_eq!(session.len(), 64);
+        assert!(!session.contains(raw_conversation_key));
     }
 
     #[test]

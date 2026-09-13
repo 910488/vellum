@@ -219,9 +219,12 @@ pub fn authorization_token(
 }
 
 /// SHA-256 conversation identity from the existing conversation-key/history
-/// mechanism. Never the raw Codex thread id or prompt cache key.
-pub fn session_identity(request: &Value) -> Option<String> {
+/// mechanism. Never the raw Codex thread id or prompt cache key. The resolved
+/// key covers requests whose identity lives in proxy metadata rather than the
+/// provider-facing JSON body, including Auto Review and continuation hops.
+pub fn session_identity(request: &Value, resolved_conversation_key: &str) -> String {
     conversation_key_from_request(request)
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(resolved_conversation_key.as_bytes())))
 }
 
 /// Stable per-Codex-request identity: session + exact upstream body. A retry
@@ -238,21 +241,19 @@ pub fn user_agent() -> String {
     format!("opencode/vellum-{}", crate::PROXY_RUNTIME_VERSION)
 }
 
-pub fn identity_headers(request: &Value, upstream_body: &[u8]) -> Vec<(String, String)> {
-    let session = session_identity(request);
-    let request_id = request_identity(
-        session.as_deref().unwrap_or("vellum-opencode"),
-        upstream_body,
-    );
-    let mut headers = vec![
+pub fn identity_headers(
+    request: &Value,
+    resolved_conversation_key: &str,
+    upstream_body: &[u8],
+) -> Vec<(String, String)> {
+    let session = session_identity(request, resolved_conversation_key);
+    let request_id = request_identity(&session, upstream_body);
+    vec![
         ("user-agent".into(), user_agent()),
         ("x-opencode-client".into(), OPENCODE_CLIENT.into()),
         ("x-opencode-request".into(), request_id),
-    ];
-    if let Some(session) = session {
-        headers.push(("x-opencode-session".into(), session));
-    }
-    headers
+        ("x-opencode-session".into(), session),
+    ]
 }
 
 /// Remove OpenAI Responses-only and conversation-identity fields from an
@@ -527,9 +528,9 @@ mod tests {
             "prompt_cache_key": "thread-xyz",
             "input": "one"
         });
-        let session = session_identity(&turn_one).unwrap();
-        assert_eq!(Some(session.clone()), session_identity(&turn_two));
-        assert_ne!(Some(session.clone()), session_identity(&other));
+        let session = session_identity(&turn_one, "unused");
+        assert_eq!(session, session_identity(&turn_two, "unused"));
+        assert_ne!(session, session_identity(&other, "unused"));
         assert!(!session.contains("thread-abc"));
         assert_eq!(session.len(), 64);
 
@@ -541,10 +542,28 @@ mod tests {
     }
 
     #[test]
-    fn requests_without_conversation_identity_do_not_share_a_fixed_session() {
-        let headers = identity_headers(&json!({"model": "mimo-v2.5-free"}), b"{}");
-        assert!(!headers.iter().any(|(name, _)| name == "x-opencode-session"));
-        assert!(headers.iter().any(|(name, _)| name == "x-opencode-request"));
+    fn requests_without_body_identity_use_the_resolved_conversation_key() {
+        let body = json!({"model": "mimo-v2.5-free"});
+        let first = identity_headers(&body, "codex:session-a:thread-a", b"{}");
+        let retry = identity_headers(&body, "codex:session-a:thread-a", b"{}");
+        let other = identity_headers(&body, "codex:session-a:thread-b", b"{}");
+        let header = |headers: &[(String, String)], name: &str| {
+            headers
+                .iter()
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.clone())
+                .expect("identity header")
+        };
+        assert_eq!(
+            header(&first, "x-opencode-session"),
+            header(&retry, "x-opencode-session")
+        );
+        assert_ne!(
+            header(&first, "x-opencode-session"),
+            header(&other, "x-opencode-session")
+        );
+        assert_eq!(header(&first, "x-opencode-session").len(), 64);
+        assert!(first.iter().any(|(name, _)| name == "x-opencode-request"));
     }
 
     #[test]
@@ -565,7 +584,7 @@ mod tests {
             "prompt_cache_key": "codex-thread-secret",
             "metadata": {"thread_id": "thread_raw"}
         });
-        let headers = identity_headers(&request, b"{}");
+        let headers = identity_headers(&request, "unused", b"{}");
         let map: HashMap<_, _> = headers.into_iter().collect();
         assert_eq!(
             map.get("user-agent").map(String::as_str),

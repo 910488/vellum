@@ -290,6 +290,12 @@ Its model and endpoint resolution must be explicit. OpenCode responses,
 streaming events, tool calls, usage, and failures are normalized through the
 shared runtime just like other third-party routes.
 
+Every OpenCode request carries a stable `x-opencode-session`, including Auto
+Review, compaction, search, retry, and continuation requests whose conversation
+identity is held in proxy metadata rather than the translated JSON body. Vellum
+hashes the resolved conversation key before sending it and never exposes the
+raw Codex session or thread identifier.
+
 ## Tools and search
 
 Tool definitions cross a provider boundary only when the destination supports
