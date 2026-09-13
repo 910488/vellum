@@ -19,6 +19,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -86,18 +88,167 @@ console.log(`sidecar staged: ${staged}`);
 console.log(`sidecar profile: ${profile}`);
 console.log(`sidecar sha256: ${digest}`);
 
-// Enhanced Codex is a separately signed `core-v*` update. Desktop packages
-// deliberately ship no core or helpers; the updater creates the first managed
-// core slot after download. A debug pointer may still reference a local fork,
-// but it is never copied into a Desktop artifact.
-const enhancedPointer = join(
-  root,
-  "src-tauri",
-  "binaries",
-  "vellum-enhanced-codex.dev-path",
-);
-if (profile === "debug" && existsSync(enhancedPointer)) {
-  console.log(`enhanced core (dev pointer only): ${readFileSync(enhancedPointer, "utf8").trim()}`);
-} else {
-  console.log("enhanced core: not bundled; install through the signed core update channel");
+await stageEnhancedRuntime();
+
+// Stages the Enhanced Codex core and the helper executables Codex looks for
+// beside it.
+//
+// The core is not a user-chosen path — `verify_settings` matches it byte for
+// byte against `artifactSha256` in `enhanced-runtime.lock.json`, so exactly one
+// file can pass and a release has to be the thing that puts it there.
+//
+// The helpers are not optional extras. Codex resolves them as siblings of its
+// own binary (`<dir>/<name>.exe`, then `<dir>/resources/<name>.exe`); when that
+// misses it falls back to the bare name, Windows searches PATH, and the user
+// gets a "file not found" dialog in the middle of a turn. Shipping the core
+// without them produces a build that verifies, injects, chats — and then fails
+// at the first sandboxed shell command.
+//
+// A debug build stages nothing: the core is a ~300 MB build output and copying
+// it on every `pnpm dev` is not worth it. `binaries/vellum-enhanced-codex.dev-path`
+// names the fork's output instead, and `build.rs` reads that pointer.
+async function stageEnhancedRuntime() {
+  const pointer = join(root, "src-tauri", "binaries", "vellum-enhanced-codex.dev-path");
+  const pointerValue = existsSync(pointer) ? readFileSync(pointer, "utf8").trim() : "";
+  const fromPointer = pointerValue ? dirname(pointerValue) : null;
+  const localOverride = process.env.VELLUM_ENHANCED_CODEX_DIR;
+  let source = localOverride;
+
+  if (profile === "debug") {
+    source ??= fromPointer;
+    const core = source ? join(source, `codex${suffix}`) : null;
+    console.log(
+      core && existsSync(core)
+        ? `enhanced core (dev, not copied): ${core}`
+        : "enhanced core: not configured; set binaries/vellum-enhanced-codex.dev-path to enable Enhanced locally",
+    );
+    return;
+  }
+
+  const lock = JSON.parse(
+    readFileSync(join(root, "enhanced-runtime.lock.json"), "utf8"),
+  );
+  const platform = lock.artifacts?.[targetTriple];
+  const expected = platform?.artifactSha256
+    ?? (lock.targetTriple === targetTriple ? lock.artifactSha256 : null);
+  if (!expected) {
+    throw new Error(
+      `enhanced-runtime.lock.json has no Enhanced core artifact pin for ${targetTriple}`,
+    );
+  }
+  if (!source) {
+    source = await downloadPinnedRuntime(lock, platform, expected);
+  }
+
+  const core = join(source, `codex${suffix}`);
+  if (!existsSync(core)) {
+    throw new Error(`Enhanced core not found at ${core}`);
+  }
+  const digest = `sha256:${createHash("sha256").update(readFileSync(core)).digest("hex")}`;
+  if (digest !== expected) {
+    // Failing here is the whole point: the same mismatch found at run time is
+    // a user staring at a settings screen they cannot fix.
+    throw new Error(
+      `Enhanced core does not match the pinned artifact
+  expected ${expected}
+  got      ${digest}
+  from     ${core}`,
+    );
+  }
+  stageUnchangedSkip(core, join(root, "src-tauri", "binaries", `vellum-enhanced-codex${suffix}`));
+  console.log(`enhanced core staged: ${core}`);
+  console.log(`enhanced core sha256: ${digest}`);
+
+  const missing = [];
+  const helpers = targetTriple.includes("windows")
+    ? ["codex-windows-sandbox-setup", "codex-command-runner", "codex-code-mode-host"]
+    : ["codex-code-mode-host"];
+  for (const helper of helpers) {
+    const from = join(source, `${helper}${suffix}`);
+    if (!existsSync(from)) {
+      missing.push(helper);
+      continue;
+    }
+    stageUnchangedSkip(from, join(root, "src-tauri", "binaries", `${helper}${suffix}`));
+    console.log(`enhanced helper staged: ${helper}${suffix}`);
+  }
+  if (missing.length) {
+    throw new Error(`Enhanced helpers missing from ${source}: ${missing.join(", ")}`);
+  }
+}
+
+// The Windows archive is a zip, which only bsdtar reads, and a Git for Windows
+// shell puts GNU tar on PATH ahead of the copy Windows ships. GNU tar also
+// reads the leading `C:` of an absolute path as a remote host. Name the system
+// binary rather than trusting whatever PATH order the build happens to run
+// under.
+function bsdtar() {
+  if (process.platform !== "win32") {
+    return "tar";
+  }
+  const system = join(process.env.SystemRoot ?? "C:\Windows", "System32", "tar.exe");
+  return existsSync(system) ? system : "tar";
+}
+
+async function downloadPinnedRuntime(lock, platform, expectedCore) {
+  const repository = lock.sourceRepository;
+  const commit = lock.enhancedCodexCommit;
+  const archiveName = platform?.archiveName;
+  const expectedArchive = platform?.archiveSha256;
+  if (!repository || !commit || !archiveName || !expectedArchive) {
+    throw new Error(
+      `release build has no local Enhanced core and the ${targetTriple} download pin is incomplete`,
+    );
+  }
+
+  const cache = join(root, "target", "enhanced-runtime", commit, targetTriple);
+  const cachedCore = join(cache, `codex${suffix}`);
+  if (existsSync(cachedCore)) {
+    const cachedDigest = `sha256:${createHash("sha256").update(readFileSync(cachedCore)).digest("hex")}`;
+    if (cachedDigest === expectedCore) {
+      console.log(`enhanced core cache hit: ${cache}`);
+      return cache;
+    }
+  }
+
+  const temporary = `${cache}.tmp-${process.pid}`;
+  rmSync(temporary, { recursive: true, force: true });
+  mkdirSync(temporary, { recursive: true });
+  const archive = join(temporary, archiveName);
+  const tag = `vellum-core-${commit}`;
+  const url = `${repository}/releases/download/${tag}/${archiveName}`;
+  console.log(`downloading Enhanced core: ${url}`);
+  const response = await fetch(url, { redirect: "follow" });
+  if (!response.ok) {
+    throw new Error(`download Enhanced core failed: HTTP ${response.status} ${response.statusText}`);
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const archiveDigest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  if (archiveDigest !== expectedArchive) {
+    throw new Error(
+      `Enhanced core archive does not match the pinned artifact\n  expected ${expectedArchive}\n  got      ${archiveDigest}\n  from     ${url}`,
+    );
+  }
+  writeFileSync(archive, bytes);
+  // Both paths are passed as the working directory and a bare file name: a
+  // repository checked out under a path the active ANSI code page cannot
+  // encode reaches a non-Unicode `tar.exe` as mojibake if it arrives in argv.
+  execFileSync(bsdtar(), ["-xf", archiveName], { cwd: temporary, stdio: "inherit" });
+  rmSync(archive, { force: true });
+
+  const core = join(temporary, `codex${suffix}`);
+  if (!existsSync(core)) {
+    throw new Error(`Enhanced core archive ${archiveName} did not contain codex${suffix}`);
+  }
+  const coreDigest = `sha256:${createHash("sha256").update(readFileSync(core)).digest("hex")}`;
+  if (coreDigest !== expectedCore) {
+    throw new Error(
+      `downloaded Enhanced core does not match the pinned artifact\n  expected ${expectedCore}\n  got      ${coreDigest}`,
+    );
+  }
+
+  rmSync(cache, { recursive: true, force: true });
+  mkdirSync(dirname(cache), { recursive: true });
+  renameSync(temporary, cache);
+  return cache;
 }

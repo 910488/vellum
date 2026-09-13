@@ -1,2 +1,0 @@
-This non-executable marker keeps Tauri's Desktop bridge resource glob valid
-before build-sidecar.mjs stages the platform executable.

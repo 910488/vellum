@@ -58,15 +58,14 @@ discovered that way, but the fix is here: build the helpers.
 
 ### Pointing a development build at the core
 
-The core is not part of the Desktop installer. `verify_settings` matches it
-byte for byte against the current Rust target's entry in `artifacts` in
+The core is not something the user chooses. `verify_settings` matches it byte
+for byte against the current Rust target's entry in `artifacts` in
 `enhanced-runtime.lock.json`, so exactly one file can pass per platform;
 Vellum resolves it instead of asking. It looks, in order, at
 
 1. the managed store, `<data root>/enhanced-runtime/core/sha256_<hex>/codex.exe`,
 2. whatever `binaries/vellum-enhanced-codex.dev-path` names (dev builds only),
-3. a legacy bundled baseline beside the installed executable, when upgrading
-   an older Vellum installation.
+3. `binaries/vellum-enhanced-codex.exe` beside the installed executable.
 
 A dev build therefore needs one line, written once, naming the fork's output:
 
@@ -75,32 +74,58 @@ echo C:/path/to/codex-rs/target/release/codex.exe > src-tauri/binaries/vellum-en
 ```
 
 The pointer exists because the core is a ~300 MB build output; copying it into
-`binaries/` on every rebuild is not worth it locally. A clean Desktop install
-has no core until the user installs a signed `core-v*` update. The managed slot
-then becomes the normal runtime; the legacy bundled path is compatibility only.
+`binaries/` on every rebuild is not worth it locally. When neither is present,
+Settings says this build does not carry a core — which is a broken install, not
+an unfinished setup, and it says so in those words.
 
-### Desktop, Remote, and Core package boundaries
+### A build without Remote Control
 
-The three update streams are intentionally independent:
+`tauri build` never builds the Remote payload — `scripts/build-local-release.ps1`
+does that, and `src-tauri/resources/remote/` is whatever a previous run staged.
+But an ordinary build still *ships* it: 535 MB of Linux agent images that a
+release not ready to support Remote Control should not be handing to users.
 
-- `desktop-v*` contains the local Tauri proxy application and the small
-  `vellum-codex-app-server` bridge used to launch an independently installed
-  Core. It contains no Linux image, Remote Agent/Broker/Codex payload, Enhanced
-  Core binary, sandbox helper, or code-mode helper.
-- `remote-v*` contains the Linux Remote Agent, Broker, pinned Codex CLI,
-  `proxy-image.tar`, and the metadata needed to install them on an SSH host.
-- `core-v*` contains the Enhanced Codex Core and the platform helpers it needs.
+`src-tauri/tauri.no-remote.conf.json` is a config overlay that drops that
+resource and keeps `binaries/*`:
 
-`tauri.conf.json` enforces the Desktop boundary by allowing only the bridge
-resource glob. Staging files under `src-tauri/resources/remote/` or additional
-binaries under `src-tauri/binaries/` therefore cannot silently add them to a
-Desktop installer.
+```
+pnpm tauri build --bundles nsis --config src-tauri/tauri.no-remote.conf.json
+```
+
+Arrays are replaced rather than merged, so this leaves the tracked config
+honest about what a full release contains instead of editing it per build.
+
+The Remote screen is still present in the UI. Asked to do anything, it reports
+`ReleaseManifestUnavailable` — an honest failure, not a crash, but not a hidden
+feature either. One caveat when checking this locally: `release_resource_roots()`
+also looks at the compile-time `CARGO_MANIFEST_DIR`, so on the machine that
+built it the app still finds the manifest in the source tree and behaves as if
+the payload shipped. Only a clean machine shows the real behaviour.
 
 ### Releases
 
-`pnpm run build:sidecar` builds and stages only the Desktop bridge. It does not
-download or copy an Enhanced Core or any Core helpers. Desktop release jobs do
-not build or download the Remote payload either.
+A release ships the core, so `pnpm run build:sidecar` stages the real file. By
+default it downloads the commit-addressed archive for the current Rust host
+target from `910488/enhanced-codex-core`, verifies both the archive and core
+SHA-256 values from `enhanced-runtime.lock.json`, and caches the verified
+extraction under `target/enhanced-runtime/`. A local source directory remains
+available as an explicit offline/development override:
+
+```
+VELLUM_ENHANCED_CODEX_DIR=C:/path/to/codex-rs/target/release pnpm run build:sidecar
+```
+
+It copies the platform core and its applicable helpers, then refuses to
+continue unless their pinned archive and core identities match. Failing at
+this point is deliberate: the identical
+mismatch discovered at run time is a user looking at a settings screen with no
+control on it that can fix the problem.
+
+A missing applicable helper fails a release build. The Windows sandbox pair
+decides whether shell commands work at all; `codex-code-mode-host` supplies
+code mode on every supported Desktop platform. All of them end up in
+`src-tauri/binaries/`, which `tauri.conf.json` already bundles as
+`binaries/*`, and which is where Codex looks for siblings of its own binary.
 
 Independent Core updates use `core-vX.Y.Z` or `core-vX.Y.Z-rc.N` tags in this
 repository. The release workflow downloads every commit-pinned archive from
@@ -123,11 +148,11 @@ automatically scheduling it again.
 
 ### Automated nightly and manual releases
 
-`Nightly and manual layered releases` is the end-to-end GitHub Actions entry
+`Nightly and manual bundled releases` is the end-to-end GitHub Actions entry
 point. Its daily schedule builds the long-lived `codex/dev` branch, resolves
 the latest published commit-addressed Enhanced Core release once, and
-publishes matching preview releases for the independently updatable Core and
-Desktop layers. Nightly versions use
+publishes matching preview releases for both the independently updatable core
+and a Desktop installer that embeds the same bytes. Nightly versions use
 `<next-patch>-nightly.<UTC-date>.<run-number>.<run-attempt>`, so Stable clients
 ignore them, Preview clients can select them, and a rerun remains immutable.
 
@@ -147,8 +172,9 @@ may omit the version, in which case the workflow generates a unique next-patch
 `preview` version. Keep `publish` enabled for an installed Desktop to discover
 the result—draft releases are intentionally invisible to update checks.
 
-The Core release completes before the Desktop build starts, so its signed lock
-identity can be recorded by Desktop without embedding the Core bytes.
+The core release completes before the Desktop build starts. This ordering and
+the immutable Enhanced Core tag ensure that update assets and bundled assets
+cannot drift to different Enhanced Core commits during one release run.
 
 `codex-code-mode-host` links `rusty_v8` and downloads a prebuilt archive from
 GitHub. If that download fails, the rest of the build still succeeds and only
@@ -287,8 +313,11 @@ pnpm install --frozen-lockfile
 pnpm run build:mac
 ```
 
-This builds the Desktop DMG only. It includes the local proxy and bridge, and
-does not build or embed the Remote payload or Enhanced Core.
+This builds and embeds the complete Remote Manager deployment payload for
+Linux amd64 and arm64, downloads and verifies the Enhanced Core matching the
+Mac's Rust host target (`aarch64-apple-darwin` or
+`x86_64-apple-darwin`), and then creates the DMG. A small DMG without these
+generated resources or the pinned Core is not a release build.
 
 The DMG is written to:
 
@@ -313,23 +342,28 @@ clean, the requested source ref is exactly `origin/main`, and `HEAD` equals
 `-SourceRef`, fails immediately instead of embedding local edits. Custom refs
 can only produce a development artifact when `-AllowDevelopment` is passed.
 
-`build:main` builds the Desktop layer only. It never invokes
-`scripts/build-local-release.ps1`, so Docker, the Linux Agent/Broker/Codex
-payload, and `proxy-image.tar` are not prerequisites for an NSIS installer.
+Before the Tauri NSIS step, `build:main` always runs
+`scripts/build-local-release.ps1 -Mode stage-only`. That rebuilds Linux
+amd64 and arm64 Agent, Broker, Codex, and the proxy image from the current
+source fingerprint. `-Resume` is refused. Missing `manifest.json`, a missing
+architecture artifact, a `releaseVersion` other than `package.json`, or a
+proxy image that does not match this source fail the installer build. A
+checkout that only contains `resources/remote/README.md` cannot ship.
 
 A named clean repair worktree may be passed with `-SourceWorktree` and
 `-AllowDevelopment` for validation. That artifact is recorded as
 `development` under an isolated directory and must not be labeled a main
 release.
 
-The Tauri step stages the Desktop bridge but does not download an Enhanced
-Core. Install and test the signed Core layer separately.
+The Tauri step also downloads and verifies the pinned
+`x86_64-pc-windows-msvc` Enhanced Core archive. A manual dev pointer is not
+required for a release build.
 
 ### Do not use this loop to develop Remote Manager
 
-The separate Remote package builder rebuilds both
+Everything above exists to produce a release, and it rebuilds both
 architectures, both proxy images, and re-downloads the pinned Codex every
-time because a Remote release must be buildable from nothing. Iterating on the
+time because a release must be buildable from nothing. Iterating on the
 Agent, the Broker, or the Desktop's remote code through it wastes most of
 that work on artifacts that did not change.
 
@@ -346,8 +380,7 @@ pnpm run remote:e2e:full  # plus manifest verification and pinned Codex
 
 A payload staged that way carries a `+dev.<fingerprint>` releaseVersion, so
 `Assert-VellumStagedRemotePayload` rejects it and it can never reach an
-official Remote package. Re-run `build-local-release.ps1 -Mode stage-only`
-before publishing a Remote release.
+installer. Re-run `build-local-release.ps1` before building a release.
 
 ```powershell
 pnpm run build:main
@@ -378,20 +411,19 @@ artifacts/development/<commit>/target/release/vellum-proxy-desktop.exe
 ```
 
 `build-info.json` records the source ref, full commit, `origin/main` commit,
-clean status, release kind, build time, version, executable SHA-256, and
-installer SHA-256. Remote package identity belongs to the separate
-`remote-v*` release manifest.
+clean status, release kind, build time, version, executable SHA-256,
+installer SHA-256, and the Remote Manager payload identity described above.
 A development build never writes under `artifacts/main/`.
 
 `build:local-release -Resume` is refused unless the cached proxy image
-fingerprint already matches the current source tree. The default
-`build:local-release` script uses `-Mode stage-only` and never passes
-`-Resume`. Fresh Remote release builds do not pass `-Resume`.
+fingerprint already matches the current source tree. `build:main` and
+`build:local-release -Mode stage-only` never pass `-Resume`. Fresh release
+builds do not pass `-Resume`.
 
 ```powershell
 pnpm run test:build-remote
 ```
 
-That script is the fail-closed gate for missing, stale, and mismatched Remote
-payloads. It also asserts `build:main` never stages those payloads into the
-Desktop package.
+That script is the fail-closed gate for missing, stale, and mismatched
+remote payloads. It also asserts `build:main` stages the payload before
+`pnpm run build`.

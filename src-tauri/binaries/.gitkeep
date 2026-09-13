@@ -1,0 +1,3 @@
+# scripts/build-sidecar.mjs stages the App Server bridge here before a release
+# build. The directory is tracked so the bundler's resource glob always has a
+# match, including on a plain `cargo build` that stages nothing.

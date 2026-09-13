@@ -244,6 +244,29 @@ function Assert-VellumStagedRemotePayload {
     }
 }
 
+function Assert-VellumEmbeddedRemotePayload {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Staged,
+        [Parameter(Mandatory = $true)]
+        [string] $EmbeddedRoot
+    )
+
+    $embedded = Assert-VellumStagedRemotePayload `
+        -ResourceRoot $EmbeddedRoot `
+        -ExpectedVersion $Staged.ReleaseVersion `
+        -ExpectedProxyImage $Staged.ProxyImage
+    if ($embedded.ManifestSha256 -ne $Staged.ManifestSha256) {
+        throw "Embedded remote manifest sha256 $($embedded.ManifestSha256) does not match staged $($Staged.ManifestSha256)"
+    }
+    foreach ($relative in $Staged.ArtifactSha256.Keys) {
+        if ($embedded.ArtifactSha256[$relative] -ne $Staged.ArtifactSha256[$relative]) {
+            throw "Embedded remote artifact $relative does not match the staged payload"
+        }
+    }
+    $embedded
+}
+
 function New-VellumBuildInfo {
     param(
         [Parameter(Mandatory = $true)]
@@ -255,7 +278,8 @@ function New-VellumBuildInfo {
         [string[]] $Bundles,
         [string] $Target,
         [string] $Renderer,
-        [string] $BuiltAt
+        [string] $BuiltAt,
+        $Remote
     )
 
     if (-not $BuiltAt) {
@@ -282,6 +306,26 @@ function New-VellumBuildInfo {
         installer = $Installer
         installerSha256 = if ($Installer) { Get-VellumFileSha256 $Installer } else { $null }
         bundles = @($Bundles)
+    }
+    if ($Remote) {
+        $info.remoteManifestSha256 = $Remote.ManifestSha256
+        $info.remoteReleaseVersion = $Remote.ReleaseVersion
+        $info.remoteProtocolVersion = $Remote.ProtocolVersion
+        $info.proxyImage = $Remote.ProxyImage
+        $info.remoteArtifacts = [ordered]@{
+            "linux-amd64" = [ordered]@{
+                agent = $Remote.ArtifactSha256["linux-amd64/vellum-remote-agent"]
+                broker = $Remote.ArtifactSha256["linux-amd64/vellum-remote-broker"]
+                codex = $Remote.ArtifactSha256["linux-amd64/codex"]
+                proxyArchive = $Remote.ArtifactSha256["linux-amd64/proxy-image.tar"]
+            }
+            "linux-arm64" = [ordered]@{
+                agent = $Remote.ArtifactSha256["linux-arm64/vellum-remote-agent"]
+                broker = $Remote.ArtifactSha256["linux-arm64/vellum-remote-broker"]
+                codex = $Remote.ArtifactSha256["linux-arm64/codex"]
+                proxyArchive = $Remote.ArtifactSha256["linux-arm64/proxy-image.tar"]
+            }
+        }
     }
     return $info
 }

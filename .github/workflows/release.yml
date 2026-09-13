@@ -63,7 +63,7 @@ on:
         required: false
         type: string
       enhanced_core_release:
-        description: "Enhanced Core tag whose signed identity Desktop records; empty keeps the lockfile"
+        description: "Enhanced Core tag to embed, e.g. vellum-core-<40-hex>; empty keeps the lockfile"
         required: false
         type: string
       publish:
@@ -185,9 +185,32 @@ jobs:
           LOCK_BASE64="$(node -e 'process.stdout.write(require("node:fs").readFileSync("enhanced-runtime.lock.json").toString("base64"))')"
           echo "enhanced_core_lock=$LOCK_BASE64" >> "$GITHUB_OUTPUT"
 
+  desktop-remote-payload:
+    name: Embedded Remote Manager payload
+    needs: resolve
+    if: needs.resolve.outputs.component == 'desktop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bash scripts/build-local-release.sh stage-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-only-remote-payload
+          path: src-tauri/resources/remote
+          if-no-files-found: error
+
   windows-updater:
     name: Windows NSIS updater asset
-    needs: resolve
+    needs: [resolve, desktop-remote-payload]
     if: needs.resolve.outputs.component == 'desktop'
     runs-on: windows-latest
     environment: release-signing
@@ -208,6 +231,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-only-remote-payload
+          path: src-tauri/resources/remote
       - name: Require embedded update trust
         shell: pwsh
         run: |
@@ -223,7 +250,7 @@ jobs:
 
   macos-updater:
     name: macOS updater archives
-    needs: resolve
+    needs: [resolve, desktop-remote-payload]
     if: needs.resolve.outputs.component == 'desktop'
     runs-on: macos-latest
     environment: release-signing
@@ -245,6 +272,10 @@ jobs:
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-only-remote-payload
+          path: src-tauri/resources/remote
       - name: Require embedded update trust
         run: |
           test -n "$VELLUM_UPDATE_PUBLIC_KEY"
@@ -268,10 +299,18 @@ jobs:
           if-no-files-found: error
 
   remote-linux:
-    name: Remote Linux packages
+    name: Remote Linux ${{ matrix.arch }} package
     needs: resolve
     if: needs.resolve.outputs.component == 'remote'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            docker: amd64
+          - arch: arm64
+            docker: arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -288,12 +327,11 @@ jobs:
       - name: Pack architecture set
         run: |
           mkdir -p updater
-          tar -C src-tauri/resources/remote -czf updater/vellum-remote-linux-x64.tar.gz linux-amd64
-          tar -C src-tauri/resources/remote -czf updater/vellum-remote-linux-arm64.tar.gz linux-arm64
+          tar -C src-tauri/resources/remote -czf "updater/vellum-remote-linux-${{ matrix.arch }}.tar.gz" "linux-${{ matrix.docker }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: updater-remote
-          path: updater/vellum-remote-linux-*.tar.gz
+          name: updater-remote-${{ matrix.arch }}
+          path: updater/vellum-remote-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   core-from-lockfile:
@@ -403,6 +441,7 @@ jobs:
     name: Hash, sign, and create GitHub Release
     needs:
       - resolve
+      - desktop-remote-payload
       - windows-updater
       - macos-updater
       - remote-linux
@@ -467,7 +506,6 @@ jobs:
       - name: Create signed release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMPONENT: ${{ needs.resolve.outputs.component }}
           TAG: ${{ needs.resolve.outputs.tag }}
           PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
           PUBLISH: ${{ needs.resolve.outputs.publish }}
@@ -485,6 +523,6 @@ jobs:
           fi
           gh release create "$TAG" \
             --title "$TAG" \
-            --notes "Signed $COMPONENT update $TAG. Assets are bound by update-manifest.json." \
+            --notes "Signed update $TAG built with the pinned Enhanced Codex Core. Assets are bound by update-manifest.json." \
             "${extra[@]}" \
             update-manifest.json update-manifest.json.sig release-assets/*
