@@ -418,6 +418,16 @@ with one explicit assessment turn, and leave tokenizer/output headroom. Chat
 reviewers must receive a semantic user turn and an explicit single-outcome JSON
 instruction; a malformed or missing outcome remains a protocol failure.
 
+Regardless of an advertised route window, one Guardian projection is capped at
+64K estimated input tokens. A 500K parent conversation is reduced while keeping
+the authorization policy and planned-action boundaries; it is never forwarded
+verbatim merely because the parent model accepts it. OpenAI-compatible routes
+whose upstream model identifies as Qwen receive a 50-second attempt
+deadline. When such a route is the fallback, its 50 seconds are reserved by
+limiting the non-Qwen primary to 20 seconds; the whole review remains bounded
+to 70 seconds so Codex still receives a terminal result before its own client
+deadline.
+
 ## Streaming and error semantics
 
 Trajectory loop detection is diagnostic only. Repeated tool calls, identical

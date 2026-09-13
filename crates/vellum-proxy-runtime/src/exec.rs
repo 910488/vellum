@@ -138,25 +138,62 @@ const STREAM_OPEN_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Used when draining a small upstream error envelope.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = OFFICIAL_STREAM_IDLE_TIMEOUT;
 
-/// Bounds how long one Guardian attempt (primary or fallback) may run before
-/// this dispatch gives up on it. Deliberately much shorter than
+/// Default bound for one Guardian attempt before this dispatch gives up on
+/// it. Deliberately much shorter than
 /// `NON_STREAMING_TIMEOUT`/`STREAM_OPEN_HEADER_TIMEOUT`: those bound a
 /// user-facing chat turn, where a slow-but-legitimate cold start must not be
 /// cut short. Guardian is a background approval gate riding in front of that
 /// same turn — a stalled primary here must free the fallback with enough
 /// runway to still beat Codex's own client-side timeout for the whole
-/// review request (~75s, observed live). The deadline covers the *entire*
-/// attempt, not just the header phase: headers opening, a keepalive, or a
-/// partial delta are not "done" for Guardian's purposes, only a complete,
-/// valid assessment is (see `collect_guardian_attempt`).
+/// review request (~75s, observed live). Qwen routes use the separately
+/// qualified 50s bound below. Every deadline covers the *entire* attempt, not
+/// just the header phase: headers opening, a keepalive, or a partial delta are
+/// not "done" for Guardian's purposes, only a complete, valid assessment is
+/// (see `collect_guardian_attempt`).
 const GUARDIAN_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 806/Qwen's live-qualified Guardian deadline. Its ordinary successful tail
+/// frequently exceeds 30s; 50s covers that tail while retaining headroom
+/// below Codex's observed client-side deadline.
+const GUARDIAN_QWEN_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// When a Qwen fallback is configured, release it earlier so it can receive
+/// its full qualified 50s without extending the entire review beyond 70s.
+const GUARDIAN_PRIMARY_BEFORE_QWEN_FALLBACK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
 
 /// Total wall-clock budget for one Failover review dispatch (the primary
 /// attempt plus, if needed, one fallback attempt). Leaves headroom under
 /// Codex's own ~75s client timeout so a fallback that starts right at the
 /// primary deadline still has time to answer before Codex gives up and the
 /// review is lost regardless of what Vellum decides.
-const GUARDIAN_REVIEW_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(65);
+const GUARDIAN_REVIEW_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(70);
+
+fn is_qwen_guardian_route(route: Option<&RuntimeModelRoute>) -> bool {
+    route.is_some_and(|route| {
+        route.provider_kind == RuntimeProviderKind::OpenAiCompatible
+            && route.upstream_model.to_ascii_lowercase().contains("qwen")
+    })
+}
+
+fn guardian_attempt_timeout(route: Option<&RuntimeModelRoute>) -> std::time::Duration {
+    if is_qwen_guardian_route(route) {
+        GUARDIAN_QWEN_ATTEMPT_TIMEOUT
+    } else {
+        GUARDIAN_ATTEMPT_TIMEOUT
+    }
+}
+
+fn guardian_primary_attempt_timeout(
+    primary: Option<&RuntimeModelRoute>,
+    fallback: Option<&RuntimeModelRoute>,
+) -> std::time::Duration {
+    if !is_qwen_guardian_route(primary) && is_qwen_guardian_route(fallback) {
+        GUARDIAN_PRIMARY_BEFORE_QWEN_FALLBACK_TIMEOUT
+    } else {
+        guardian_attempt_timeout(primary)
+    }
+}
 
 /// Third-party non-stream buffered response cap.
 const THIRD_PARTY_NON_STREAM_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -2647,9 +2684,9 @@ impl ProxyRuntime {
 
     /// Auto Review / Guardian dispatch (M9; Failover timeout fix). Tries the
     /// primary reviewer, and — if it fails in a fallback-eligible way
-    /// (including not producing a valid assessment within
-    /// `GUARDIAN_ATTEMPT_TIMEOUT`, see `review_failure_allows_fallback`) —
-    /// retries against the configured fallback with whatever remains of
+    /// (including not producing a valid assessment within its route-qualified
+    /// attempt deadline, see `review_failure_allows_fallback`) — retries
+    /// against the configured fallback with whatever remains of
     /// `GUARDIAN_REVIEW_TOTAL_BUDGET`. Each leg is buffered and validated in
     /// full before either winning (its content reaches the client) or being
     /// discarded in favor of the other leg — see `collect_guardian_attempt`
@@ -2722,6 +2759,10 @@ impl ProxyRuntime {
         let review_run_id = format!("review-{}", ulid::Ulid::new());
         let dispatch_snapshot = snapshot.clone();
         let primary_route = dispatch_snapshot.resolve_route_snapshot(&plan.primary_catalog_id);
+        let planned_fallback_route = plan
+            .fallback_catalog_id
+            .as_deref()
+            .and_then(|catalog_id| dispatch_snapshot.resolve_route_snapshot(catalog_id));
         let primary_route_id = primary_route
             .map(|snap| snap.route.route_id.clone())
             .unwrap_or_default();
@@ -2777,7 +2818,10 @@ impl ProxyRuntime {
                 &primary_request,
                 execution_id,
                 "primary",
-                GUARDIAN_ATTEMPT_TIMEOUT,
+                guardian_primary_attempt_timeout(
+                    primary_route.map(|snapshot| &snapshot.route),
+                    planned_fallback_route.map(|snapshot| &snapshot.route),
+                ),
             )
             .await;
         let first_error = match primary_outcome {
@@ -2921,22 +2965,17 @@ impl ProxyRuntime {
             },
         };
         let fallback_started = std::time::Instant::now();
-        // Never more than `GUARDIAN_ATTEMPT_TIMEOUT` — the same ceiling
-        // primary gets — even when the primary leg failed fast and left most
-        // of `GUARDIAN_REVIEW_TOTAL_BUDGET` unspent: a fallback attempt is
-        // not owed a longer window just because primary gave up quickly, and
-        // an unbounded "whatever remains" budget would make one leg's actual
-        // deadline depend on the other leg's failure speed instead of being
-        // a fixed, predictable 30s. Never less than a token amount either,
-        // so a pathologically-late fallback dispatch still gets *a* real
-        // attempt rather than an instant, guaranteed timeout. The combined
-        // primary + fallback ceiling this yields (30s + 30s = 60s) never
-        // exceeds `GUARDIAN_REVIEW_TOTAL_BUDGET` (65s).
-        let fallback_deadline = GUARDIAN_ATTEMPT_TIMEOUT.min(
-            GUARDIAN_REVIEW_TOTAL_BUDGET
-                .saturating_sub(review_deadline_start.elapsed())
-                .max(std::time::Duration::from_secs(1)),
-        );
+        // Each fallback receives its route-qualified ceiling, bounded by the
+        // remaining total budget. A configured Qwen fallback reserves 50s by
+        // limiting a non-Qwen primary to 20s above; other pairs retain their
+        // existing 30s-per-leg behavior. Never give a pathologically-late
+        // fallback an instant, guaranteed timeout.
+        let fallback_deadline = guardian_attempt_timeout(fallback_route.map(|snap| &snap.route))
+            .min(
+                GUARDIAN_REVIEW_TOTAL_BUDGET
+                    .saturating_sub(review_deadline_start.elapsed())
+                    .max(std::time::Duration::from_secs(1)),
+            );
         let fallback_outcome = self
             .collect_guardian_attempt(
                 snapshot,
@@ -13546,6 +13585,56 @@ mod tests {
         backup.catalog_id = "backup-catalog".into();
         backup.upstream_model = "backup-reviewer".into();
         (primary, backup)
+    }
+
+    #[test]
+    fn qwen_guardian_timeout_reserves_a_fifty_second_fallback_window() {
+        let (primary, mut qwen) = guardian_failover_routes();
+        qwen.upstream_model = "qwen".into();
+        assert_eq!(
+            guardian_primary_attempt_timeout(Some(&primary), Some(&qwen)),
+            GUARDIAN_PRIMARY_BEFORE_QWEN_FALLBACK_TIMEOUT
+        );
+        assert_eq!(
+            guardian_attempt_timeout(Some(&qwen)),
+            GUARDIAN_QWEN_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            GUARDIAN_PRIMARY_BEFORE_QWEN_FALLBACK_TIMEOUT + GUARDIAN_QWEN_ATTEMPT_TIMEOUT,
+            GUARDIAN_REVIEW_TOTAL_BUDGET
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn qwen_fallback_can_complete_after_the_old_thirty_second_cutoff() {
+        let (primary, mut qwen) = guardian_failover_routes();
+        qwen.upstream_model = "qwen".into();
+        let transport = Arc::new(SequencedTransport::new(
+            Arc::new(PendingForeverTransport),
+            Arc::new(DelayedBodyTransport {
+                delay: std::time::Duration::from_secs(40),
+                body: guardian_assessment_sse("qwen"),
+            }),
+        ));
+        let usage = Arc::new(MemoryUsageStore::new());
+        let runtime = guardian_failover_runtime(primary, qwen, transport, Arc::clone(&usage));
+        let response = runtime
+            .execute(guardian_request(), "test_slow_qwen_fallback")
+            .await
+            .expect("Qwen fallback should keep running past the old 30s cutoff");
+        let RuntimeResponse::Sse(mut stream) = response else {
+            panic!("Qwen fallback must replay the buffered SSE stream");
+        };
+        while stream.next().await.is_some() {}
+
+        let records = usage.records();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(
+            records[0].error_category.as_deref(),
+            Some("review_attempt_timeout")
+        );
+        assert_eq!(records[1].route_id, "backup");
+        assert_eq!(records[1].outcome.as_deref(), Some("success"));
     }
 
     fn guardian_failover_runtime(

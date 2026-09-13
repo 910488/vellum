@@ -197,6 +197,13 @@ pub fn is_guardian_request_with_upstream_model(body: &Value, upstream_model: Opt
 
 const GUARDIAN_OUTPUT_DIRECTIVE: &str = "Assess the planned action above. Return exactly one JSON object and no Markdown: {\"outcome\":\"allow\"}, or a deny object with outcome, risk_level, user_authorization, and rationale.";
 
+/// Maximum estimated size of one reviewer request, independent of the
+/// reviewer's advertised context window. Live 806/Qwen qualification with a
+/// 1,024-token output allowance stayed valid through 64K input tokens, while
+/// forwarding most of a 500K parent context only increased tail latency and
+/// previously exposed stale/optimistic provider window declarations.
+const GUARDIAN_MAX_INPUT_TOKENS: u64 = 65_536;
+
 /// Prepare one reviewer leg for the route that will actually receive it.
 /// Guardian prompts can contain the parent task's large context, while a
 /// fallback reviewer may have a much smaller window. The reviewer projection
@@ -257,16 +264,21 @@ fn append_guardian_output_directive(body: &mut Value) {
 }
 
 fn bound_guardian_request(body: &mut Value, context_window: Option<u64>) {
-    let Some(window) = context_window.filter(|window| *window > 0) else {
-        return;
-    };
-    // Leave both a fixed output/adapter reserve and 20% tokenizer headroom.
-    // The local estimator is intentionally approximate and providers do not
-    // all tokenize CJK, JSON escaping, and code identically.
-    let target = window
-        .saturating_sub(8_192)
-        .min(window.saturating_mul(4) / 5)
-        .max(1_024);
+    // Leave both a fixed output/adapter reserve and 20% tokenizer headroom
+    // when the route publishes a window. Also enforce the live-qualified 64K
+    // Guardian ceiling when the route has a much larger (or unknown) window:
+    // Auto Review needs the authorization and planned-action boundaries, not
+    // a verbatim replay of a 500K parent transcript.
+    let route_target = context_window
+        .filter(|window| *window > 0)
+        .map(|window| {
+            window
+                .saturating_sub(8_192)
+                .min(window.saturating_mul(4) / 5)
+                .max(1_024)
+        })
+        .unwrap_or(GUARDIAN_MAX_INPUT_TOKENS);
+    let target = route_target.min(GUARDIAN_MAX_INPUT_TOKENS);
     if crate::compaction::estimate_json_tokens(body) <= target {
         return;
     }
@@ -643,6 +655,27 @@ mod tests {
         });
         prepare_guardian_request(&mut body, "qwen-reviewer", Some(88_064));
         assert!(crate::compaction::estimate_json_tokens(&body) <= 88_064 * 4 / 5);
+        let projected = body["instructions"].as_str().unwrap();
+        assert!(projected.starts_with("You are judging one planned coding-agent action."));
+        assert!(projected.ends_with("PLANNED_ACTION_AT_THE_END"));
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn guardian_projection_reduces_a_500k_parent_context_to_the_qualified_cap() {
+        let mut body = json!({
+            "model": AUTO_REVIEW_MODEL,
+            "instructions": format!(
+                "You are judging one planned coding-agent action.\n# User Authorization Scoring\n{}\n# Outcome Policy\nPLANNED_ACTION_AT_THE_END",
+                "four token inherited context ".repeat(500_000)
+            ),
+            "input": [{"role":"user", "content":"old parent history".repeat(500_000)}]
+        });
+        prepare_guardian_request(&mut body, "qwen-reviewer", Some(500_000));
+        assert!(
+            crate::compaction::estimate_json_tokens(&body) <= GUARDIAN_MAX_INPUT_TOKENS,
+            "500K parent context was not reduced to the qualified Guardian cap"
+        );
         let projected = body["instructions"].as_str().unwrap();
         assert!(projected.starts_with("You are judging one planned coding-agent action."));
         assert!(projected.ends_with("PLANNED_ACTION_AT_THE_END"));
