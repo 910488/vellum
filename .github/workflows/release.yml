@@ -1,4 +1,4 @@
-name: Signed update releases
+name: Publish signed hot update
 
 # Tag-driven or reusable signed releases. `main` CI stays a build, not a
 # published channel.
@@ -37,9 +37,26 @@ on:
       - "core-v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag (desktop-vX.Y.Z, remote-vX.Y.Z, or core-vX.Y.Z)"
+      component:
+        description: "Hot-update component (desktop = Vellum app, remote = Remote package, core = Enhanced Codex Core)"
         required: true
+        default: desktop
+        type: choice
+        options:
+          - desktop
+          - remote
+          - core
+      channel:
+        description: "GitHub Release channel"
+        required: true
+        default: pre-release
+        type: choice
+        options:
+          - pre-release
+          - release
+      version:
+        description: "SemVer; required for release, optional for pre-release (auto-generates the next patch preview)"
+        required: false
         type: string
       source_ref:
         description: "Git ref to build (defaults to the selected branch)"
@@ -50,16 +67,16 @@ on:
         required: false
         type: string
       publish:
-        description: "Publish after signing (otherwise create a draft)"
+        description: "Publish after signing so Desktop can discover it (otherwise create a draft)"
         required: true
-        default: false
+        default: true
         type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.component || inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -79,28 +96,81 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.sha }}
       - id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_COMPONENT: ${{ inputs.component }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SOURCE_REF: ${{ inputs.source_ref }}
+          REQUESTED_CORE_RELEASE: ${{ inputs.enhanced_core_release }}
+          REQUESTED_PUBLISH: ${{ inputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          case "$TAG" in
-            desktop-v*) COMPONENT=desktop ;;
-            remote-v*) COMPONENT=remote ;;
-            core-v*) COMPONENT=core ;;
-            *) echo "unsupported tag $TAG" >&2; exit 1 ;;
-          esac
-          VERSION="${TAG#*-v}"
-          if [[ "$VERSION" == *-* ]]; then
-            PRERELEASE=true
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            COMPONENT="$REQUESTED_COMPONENT"
+            case "$COMPONENT" in
+              desktop|remote|core) ;;
+              *) echo "unsupported component $COMPONENT" >&2; exit 1 ;;
+            esac
+            CHANNEL="$REQUESTED_CHANNEL"
+            VERSION="$REQUESTED_VERSION"
+            BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
+            IFS=. read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+            case "$CHANNEL" in
+              release)
+                if [ -z "$VERSION" ]; then
+                  echo "A release requires an explicit version" >&2
+                  exit 1
+                fi
+                if [[ "$VERSION" == *-* ]]; then
+                  echo "Release channel requires a non-prerelease SemVer: $VERSION" >&2
+                  exit 1
+                fi
+                PRERELEASE=false
+                ;;
+              pre-release)
+                if [ -z "$VERSION" ]; then
+                  VERSION="$MAJOR.$MINOR.$((PATCH + 1))-preview.$RUN_NUMBER.$RUN_ATTEMPT"
+                elif [[ "$VERSION" != *-* ]]; then
+                  VERSION="$VERSION-preview.$RUN_NUMBER.$RUN_ATTEMPT"
+                fi
+                PRERELEASE=true
+                ;;
+              *) echo "unsupported channel $CHANNEL" >&2; exit 1 ;;
+            esac
+            node scripts/set-release-version.mjs "$VERSION"
+            TAG="$COMPONENT-v$VERSION"
           else
-            PRERELEASE=false
+            TAG="${REQUESTED_TAG:-$REF_NAME}"
+            case "$TAG" in
+              desktop-v*) COMPONENT=desktop ;;
+              remote-v*) COMPONENT=remote ;;
+              core-v*) COMPONENT=core ;;
+              *) echo "unsupported tag $TAG" >&2; exit 1 ;;
+            esac
+            VERSION="${TAG#*-v}"
+            node scripts/set-release-version.mjs "$VERSION"
+            if [[ "$VERSION" == *-* ]]; then
+              PRERELEASE=true
+            else
+              PRERELEASE=false
+            fi
           fi
           {
             echo "tag=$TAG"
             echo "component=$COMPONENT"
             echo "prerelease=$PRERELEASE"
-            echo "source_ref=${{ inputs.source_ref }}"
-            echo "enhanced_core_release=${{ inputs.enhanced_core_release }}"
-            echo "publish=${{ inputs.publish || false }}"
+            echo "source_ref=$REQUESTED_SOURCE_REF"
+            echo "enhanced_core_release=$REQUESTED_CORE_RELEASE"
+            echo "publish=${REQUESTED_PUBLISH:-false}"
           } >> "$GITHUB_OUTPUT"
+          printf 'component: %s\nchannel: %s\ntag: %s\nsource: %s\npublish: %s\n' \
+            "$COMPONENT" "$(if [ "$PRERELEASE" = true ]; then echo pre-release; else echo release; fi)" \
+            "$TAG" "${REQUESTED_SOURCE_REF:-$REF_NAME}" "${REQUESTED_PUBLISH:-false}" >> "$GITHUB_STEP_SUMMARY"
       - id: core
         env:
           GITHUB_TOKEN: ${{ github.token }}

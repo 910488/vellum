@@ -162,6 +162,16 @@ version. `source_ref` selects the Vellum source, and `enhanced_core_release`
 can pin an explicit `vellum-core-<40-hex>` release instead of resolving the
 latest one. Turning off `publish` leaves both signed releases as drafts.
 
+For testing one hot-update surface independently, run the
+`Publish signed hot update` Action. Its `component` selector maps directly to
+the three updater streams: `desktop` builds the Vellum app, `remote` builds the
+Remote package, and `core` builds the Enhanced Codex Core package. Choose
+`pre-release` for a Desktop Preview-channel test or `release` for the Stable
+channel. A release requires an explicit non-prerelease SemVer; a prerelease
+may omit the version, in which case the workflow generates a unique next-patch
+`preview` version. Keep `publish` enabled for an installed Desktop to discover
+the result—draft releases are intentionally invisible to update checks.
+
 The core release completes before the Desktop build starts. This ordering and
 the immutable Enhanced Core tag ensure that update assets and bundled assets
 cannot drift to different Enhanced Core commits during one release run.
