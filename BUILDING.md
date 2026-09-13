@@ -23,6 +23,16 @@ the next development build. Do not replace that with a bare
 does not stage the bytes whose digest `build.rs` embeds in the Vellum host,
 leaving Settings with a correct fail-closed bridge hash mismatch.
 
+The multi-client Remote Control relay is also a **Desktop component**. It
+belongs beside the App Server bridge in `src-tauri/binaries/` and follows the
+Desktop update stream; it is not part of the Linux Remote payload or the
+independently updated Enhanced Core. When a Desktop build has no verified
+`vellum-codex-relay` binary, the bridge deliberately falls back to a single
+Remote Control owner on Official Codex and disables Remote Control in the
+Enhanced child. This fallback prevents the two children from racing for the
+same installation id, but it cannot make Enhanced-owned live threads remotely
+resumable; full cross-plane mobile control requires the relay resource.
+
 The sidecar matters because Codex Desktop launches `CODEX_CLI_PATH` directly:
 Enhanced needs a real standalone executable that ships with Vellum, not a mode
 flag on the Vellum binary. `build.rs` records its SHA-256 into the build

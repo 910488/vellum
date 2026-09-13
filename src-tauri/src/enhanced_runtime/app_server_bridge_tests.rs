@@ -149,6 +149,20 @@ fn a_build_without_the_relay_keeps_mobile_control_on_official() {
     // an Official process's active writer. The no-sidecar runtime therefore
     // has to keep the one available Remote Control owner on Official.
     assert_eq!(FALLBACK_REMOTE_CONTROL_PLANE, ExecutionPlane::OfficialCodex);
+    assert!(owns_fallback_remote_control(ExecutionPlane::OfficialCodex));
+    assert!(!owns_fallback_remote_control(ExecutionPlane::EnhancedCodex));
+
+    let mut official = std::process::Command::new("official");
+    configure_fallback_remote_control(&mut official, ExecutionPlane::OfficialCodex);
+    assert!(official
+        .get_envs()
+        .all(|(name, _)| name != REMOTE_CONTROL_DISABLED_ENV));
+
+    let mut enhanced = std::process::Command::new("enhanced");
+    configure_fallback_remote_control(&mut enhanced, ExecutionPlane::EnhancedCodex);
+    assert!(enhanced.get_envs().any(|(name, value)| {
+        name == REMOTE_CONTROL_DISABLED_ENV && value == Some(std::ffi::OsStr::new("1"))
+    }));
 }
 
 /// The phone failure this branch exists for: `thread/resume` reached the

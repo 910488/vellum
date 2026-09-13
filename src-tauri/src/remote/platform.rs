@@ -214,6 +214,17 @@ pub fn managed_codex_home(user_home: &Path, os: &str) -> PathBuf {
     }
 }
 
+/// Build a path for the remote Unix host without applying the Desktop host's
+/// path separator rules. `PathBuf::join` on Windows turns `/home/user` into a
+/// mixed `/home/user\\...` path, which is not a valid SSH forced command.
+pub fn managed_codex_home_posix(user_home: &str, os: &str) -> String {
+    let user_home = user_home.trim_end_matches('/');
+    match normalize_os(os) {
+        Some("darwin") => format!("{user_home}/.vellum-remote/codex"),
+        _ => format!("{user_home}/.codex"),
+    }
+}
+
 /// Remote agent/proxy state root. On macOS this is Application Support.
 pub fn managed_state_root(data_local_dir: &Path) -> PathBuf {
     data_local_dir.join("vellum-remote")
@@ -256,10 +267,7 @@ mod tests {
             RemotePlatform::from_os_arch("macos", "aarch64").unwrap(),
             RemotePlatform::DarwinArm64
         );
-        assert_eq!(
-            RemotePlatform::DarwinArm64.artifact_key(),
-            "darwin-arm64"
-        );
+        assert_eq!(RemotePlatform::DarwinArm64.artifact_key(), "darwin-arm64");
         assert_eq!(
             RemotePlatform::DarwinArm64.rust_target(),
             "aarch64-apple-darwin"
@@ -309,6 +317,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_codex_home_always_uses_posix_separators() {
+        assert_eq!(
+            managed_codex_home_posix("/home/josh", "Linux"),
+            "/home/josh/.codex"
+        );
+        assert_eq!(
+            managed_codex_home_posix("/Users/josh/", "Darwin"),
+            "/Users/josh/.vellum-remote/codex"
+        );
+    }
+
+    #[test]
     fn macos_is_not_deployable_until_the_isolation_gate_passes() {
         assert!(RemotePlatform::LinuxAmd64.deployable());
         assert!(RemotePlatform::LinuxArm64.deployable());
@@ -319,10 +339,19 @@ mod tests {
 
     #[test]
     fn protocol_4_is_required_for_macos_while_linux_1_to_3_still_parse() {
-        assert!(desktop_accepts_agent_protocol(1, Some(RemotePlatform::LinuxAmd64)));
-        assert!(desktop_accepts_agent_protocol(2, Some(RemotePlatform::LinuxArm64)));
+        assert!(desktop_accepts_agent_protocol(
+            1,
+            Some(RemotePlatform::LinuxAmd64)
+        ));
+        assert!(desktop_accepts_agent_protocol(
+            2,
+            Some(RemotePlatform::LinuxArm64)
+        ));
         assert!(desktop_accepts_agent_protocol(3, None));
-        assert!(desktop_accepts_agent_protocol(4, Some(RemotePlatform::LinuxAmd64)));
+        assert!(desktop_accepts_agent_protocol(
+            4,
+            Some(RemotePlatform::LinuxAmd64)
+        ));
         assert!(desktop_accepts_agent_protocol(
             4,
             Some(RemotePlatform::DarwinArm64)
@@ -355,9 +384,7 @@ mod tests {
             Path::new("/home/operator/.codex")
         );
         assert_eq!(
-            managed_state_root(Path::new(
-                "/Users/joshhuang/Library/Application Support"
-            )),
+            managed_state_root(Path::new("/Users/joshhuang/Library/Application Support")),
             Path::new("/Users/joshhuang/Library/Application Support/vellum-remote")
         );
     }

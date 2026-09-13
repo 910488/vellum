@@ -54,6 +54,17 @@ const LAUNCH_ID_ENV: &str = "VELLUM_LAUNCH_ID";
 /// phone list the shared on-disk thread and then fail to read or resume its
 /// live Official writer.
 const FALLBACK_REMOTE_CONTROL_PLANE: ExecutionPlane = ExecutionPlane::OfficialCodex;
+const REMOTE_CONTROL_DISABLED_ENV: &str = "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED";
+
+fn owns_fallback_remote_control(plane: ExecutionPlane) -> bool {
+    plane == FALLBACK_REMOTE_CONTROL_PLANE
+}
+
+fn configure_fallback_remote_control(command: &mut Command, plane: ExecutionPlane) {
+    if !owns_fallback_remote_control(plane) {
+        command.env(REMOTE_CONTROL_DISABLED_ENV, "1");
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -345,6 +356,13 @@ impl ChildProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Both cores share one installation id, and the Remote Control service
+        // accepts exactly one online app server for it. Without the optional
+        // multi-client relay, allowing both children to connect creates a
+        // startup race: whichever child wins can only serve threads owned by
+        // that plane, while the other retries forever with HTTP 409. Keep the
+        // documented fallback owner deterministic.
+        configure_fallback_remote_control(&mut command, plane);
         if plane == ExecutionPlane::EnhancedCodex {
             let features: EnhancedRuntimeFeatures = manifest.feature_profile.clone().into();
             command

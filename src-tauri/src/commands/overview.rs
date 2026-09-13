@@ -536,7 +536,7 @@ fn usage_streaks(days: &[UsageActivityDay]) -> (u32, u32) {
 pub(crate) fn refresh_catalog_if_running(state: &AppState) -> AppResult<()> {
     if state.proxy_status().running {
         let paths = crate::codex::CodexPaths::discover(&state.data_root());
-        crate::runtime::snapshot_catalog(&state.data_root(), &paths.catalog)?;
+        let previous = crate::runtime::snapshot_catalog(&state.data_root(), &paths.catalog)?;
         // Provider add/remove/enable changes are deliberately deferred until
         // the proxy restarts. Publish the same immutable route snapshot the
         // listener is actually serving; publishing `state.routes()` here can
@@ -561,8 +561,16 @@ pub(crate) fn refresh_catalog_if_running(state: &AppState) -> AppResult<()> {
                 .advertised(),
             None,
         )?;
-        state.mark_restart_required(crate::model::RuntimeNotice::new("routesAndCatalogUpdated"));
-        state.set_restart_process_identity(crate::commands::runtime::codex_process_identity());
+        let current = std::fs::read(&paths.catalog)
+            .map_err(|error| AppError::Message(format!("無法讀取更新後的模型型錄：{error}")))?;
+        let catalog_changed = previous
+            .as_ref()
+            .is_none_or(|version| version.id != crate::runtime::catalog_id(&current));
+        if catalog_changed {
+            state
+                .mark_restart_required(crate::model::RuntimeNotice::new("routesAndCatalogUpdated"));
+            state.set_restart_process_identity(crate::commands::runtime::codex_process_identity());
+        }
     }
     Ok(())
 }
@@ -1190,6 +1198,22 @@ mod tests {
         );
         assert_eq!(entry["context_window"], expected_context_window);
         assert_eq!(entry["max_context_window"], expected_context_window);
+    }
+
+    #[test]
+    fn unchanged_catalog_refresh_does_not_require_another_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_test_fixtures(temp.path().to_path_buf());
+        state.activate_proxy_routes();
+        state.set_proxy_running(true, None, true, None);
+
+        refresh_catalog_if_running(&state).unwrap();
+        assert!(state.runtime_status().restart_required);
+
+        state.clear_restart_required();
+        refresh_catalog_if_running(&state).unwrap();
+
+        assert!(!state.runtime_status().restart_required);
     }
 
     /* 用量列裡的供應商名稱是寫入當下的快照。線路還在就用現在的名字 ——

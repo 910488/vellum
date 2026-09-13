@@ -7,6 +7,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::remote::process::background_command;
+
 pub const WRAPPER_MARKER: &str = "# Managed by Vellum Remote Manager";
 pub const AUTH_KEYS_MARKER_PREFIX: &str = "vellum-remote-managed:";
 
@@ -32,9 +34,11 @@ pub struct IsolationApplyRequest<'a> {
     pub user: &'a str,
     pub port: u16,
     pub public_key: &'a str,
-    pub managed_codex_home: &'a Path,
-    pub install_dir: &'a Path,
-    pub extra_path: &'a Path,
+    /// Paths interpreted by the remote Unix shell. Keep these as strings so a
+    /// Windows Desktop cannot silently rewrite their separators.
+    pub managed_codex_home: &'a str,
+    pub install_dir: &'a str,
+    pub extra_path: &'a str,
     pub existing_authorized_keys: &'a str,
 }
 
@@ -112,9 +116,9 @@ pub fn managed_alias(host_id: &str) -> String {
 }
 
 pub fn managed_ssh_wrapper_contents(
-    codex_home: &Path,
-    install_dir: &Path,
-    extra_path: &Path,
+    codex_home: &str,
+    install_dir: &str,
+    extra_path: &str,
 ) -> String {
     format!(
         "#!/bin/sh\n{WRAPPER_MARKER}\n\
@@ -125,9 +129,9 @@ case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
   \"\") exec \"${{SHELL:-/bin/bash}}\" -l ;;\n\
   scp\\ *|scp|sftp*|rsync\\ *|/usr/libexec/sftp-server*) exec \"${{SHELL:-/bin/bash}}\" -c \"$SSH_ORIGINAL_COMMAND\" ;;\n\
   *) exec \"${{SHELL:-/bin/bash}}\" -lc \"$SSH_ORIGINAL_COMMAND\" ;;\nesac\n",
-        home = shell_single_quote(&codex_home.to_string_lossy()),
-        install = shell_single_quote(&install_dir.to_string_lossy()),
-        extra = shell_single_quote(&extra_path.to_string_lossy()),
+        home = shell_single_quote(codex_home),
+        install = shell_single_quote(install_dir),
+        extra = shell_single_quote(extra_path),
     )
 }
 
@@ -140,15 +144,8 @@ pub fn is_managed_wrapper(contents: &str) -> bool {
     contents.starts_with(&format!("#!/bin/sh\n{WRAPPER_MARKER}\n"))
 }
 
-pub fn marked_authorized_keys_line(
-    host_id: &str,
-    wrapper_path: &Path,
-    public_key: &str,
-) -> String {
-    let quoted_wrapper = format!(
-        "\"{}\"",
-        wrapper_path.to_string_lossy().replace('"', "\\\"")
-    );
+pub fn marked_authorized_keys_line(host_id: &str, wrapper_path: &str, public_key: &str) -> String {
+    let quoted_wrapper = format!("\"{}\"", wrapper_path.replace('"', "\\\""));
     let command = format!(
         "command={quoted_wrapper},no-agent-forwarding,no-X11-forwarding {}",
         public_key.trim()
@@ -158,6 +155,27 @@ pub fn marked_authorized_keys_line(
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_posix_join(base: &str, child: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        child.trim_start_matches('/')
+    )
+}
+
+fn remote_posix_parent(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() { "/" } else { parent })
+}
+
+fn validate_remote_posix_path(label: &str, path: &str) -> Result<(), String> {
+    if !path.starts_with('/') || path.contains('\\') || path.contains('\0') {
+        return Err(format!("RemotePosixPathInvalid:{label}:{path}"));
+    }
+    Ok(())
 }
 
 pub fn upsert_authorized_keys(existing: &str, host_id: &str, line_block: &str) -> String {
@@ -225,6 +243,48 @@ pub fn parse_user_host_port(destination: &str) -> Result<(String, String, u16), 
     Ok((user.to_string(), host.to_string(), port))
 }
 
+/// Resolve aliases through the same OpenSSH configuration used by the real
+/// connection. A cached target such as `jetson-orin` does not carry its
+/// configured `User`, `HostName`, or `Port`; inventing `User user` here makes
+/// the dedicated alias unusable even though the original alias works.
+pub fn resolve_user_host_port(destination: &str) -> Result<(String, String, u16), String> {
+    let output = background_command("ssh")
+        .args(["-G", "--", destination])
+        .output()
+        .map_err(|error| format!("ssh -G unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to resolve SSH destination {destination}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_resolved_ssh_config(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_resolved_ssh_config(raw: &str) -> Result<(String, String, u16), String> {
+    let mut user = None;
+    let mut host = None;
+    let mut port = None;
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        match key {
+            "user" => user = Some(value.trim().to_string()),
+            "hostname" => host = Some(value.trim().to_string()),
+            "port" => port = value.trim().parse::<u16>().ok(),
+            _ => {}
+        }
+    }
+    let user = user
+        .filter(|value| !value.is_empty())
+        .ok_or("ssh -G returned no user")?;
+    let host = host
+        .filter(|value| !value.is_empty())
+        .ok_or("ssh -G returned no hostname")?;
+    Ok((user, host, port.unwrap_or(22)))
+}
+
 /// Writes a marked SSH config block and returns the wrapper + authorized_keys
 /// payload the remote install path must apply. Tests drive this function on
 /// temp files; bootstrap calls it before copying the agent.
@@ -234,6 +294,9 @@ pub fn apply_managed_ssh_isolation(
     if request.identity_file.as_os_str().is_empty() {
         return Err("SshIdentityMissing".into());
     }
+    validate_remote_posix_path("managedCodexHome", request.managed_codex_home)?;
+    validate_remote_posix_path("installDir", request.install_dir)?;
+    validate_remote_posix_path("extraPath", request.extra_path)?;
     let config = ManagedSshConfig {
         host_id: request.host_id.into(),
         alias: managed_alias(request.host_id),
@@ -249,11 +312,9 @@ pub fn apply_managed_ssh_isolation(
     }
     fs::write(request.ssh_config_path, next.as_bytes())
         .map_err(|error| format!("SshConfigWriteFailed: {error}"))?;
-    let wrapper_path = request
-        .managed_codex_home
-        .parent()
-        .unwrap_or(request.managed_codex_home)
-        .join("ssh-wrapper");
+    let wrapper_root =
+        remote_posix_parent(request.managed_codex_home).unwrap_or(request.managed_codex_home);
+    let wrapper_path = remote_posix_join(wrapper_root, "ssh-wrapper");
     let wrapper_contents = managed_ssh_wrapper_contents(
         request.managed_codex_home,
         request.install_dir,
@@ -273,16 +334,13 @@ pub fn apply_managed_ssh_isolation(
         return Err("SshWrapperMustNotRewriteLocalCodexHome".into());
     }
     let block = marked_authorized_keys_line(request.host_id, &wrapper_path, request.public_key);
-    let authorized_keys = upsert_remote_authorized_keys(
-        request.existing_authorized_keys,
-        request.host_id,
-        &block,
-    );
+    let authorized_keys =
+        upsert_remote_authorized_keys(request.existing_authorized_keys, request.host_id, &block);
     Ok(AppliedIsolation {
         alias: config.alias,
         ssh_config_path: request.ssh_config_path.to_path_buf(),
         identity_file: request.identity_file.to_path_buf(),
-        wrapper_path: wrapper_path.to_string_lossy().into_owned(),
+        wrapper_path,
         wrapper_contents,
         authorized_keys,
     })
@@ -299,7 +357,6 @@ pub fn remove_remote_authorized_keys(existing: &str, host_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn ssh_config_add_and_remove_only_touch_marked_blocks() {
@@ -325,11 +382,11 @@ mod tests {
 
     #[test]
     fn launcher_env_does_not_rewrite_local_codex_home() {
-        let home = Path::new("/Users/joshhuang/.vellum-remote/codex");
+        let home = "/Users/joshhuang/.vellum-remote/codex";
         let contents = managed_ssh_wrapper_contents(
             home,
-            &home.join("packages/standalone/current"),
-            Path::new("/Users/joshhuang/.local/bin"),
+            "/Users/joshhuang/.vellum-remote/codex/packages/standalone/current",
+            "/Users/joshhuang/.local/bin",
         );
         assert!(!wrapper_rewrites_local_codex_home(
             &contents,
@@ -340,7 +397,7 @@ mod tests {
         let keys = "ssh-ed25519 AAAAUSER mine\n";
         let block = marked_authorized_keys_line(
             "mac-mini",
-            Path::new("/Users/joshhuang/.vellum-remote/ssh-wrapper"),
+            "/Users/joshhuang/.vellum-remote/ssh-wrapper",
             "ssh-ed25519 AAAAMANAGED vellum",
         );
         let added = upsert_remote_authorized_keys(keys, "mac-mini", &block);
@@ -355,7 +412,7 @@ mod tests {
         let ssh_config = temp.path().join("config");
         fs::write(&ssh_config, "Host gpu-dev\n    HostName 192.0.2.10\n").unwrap();
         let identity = temp.path().join("id_ed25519");
-        let home = Path::new("/Users/joshhuang/.vellum-remote/codex");
+        let home = "/Users/joshhuang/.vellum-remote/codex";
         let applied = apply_managed_ssh_isolation(IsolationApplyRequest {
             ssh_config_path: &ssh_config,
             identity_file: &identity,
@@ -365,8 +422,8 @@ mod tests {
             port: 22,
             public_key: "ssh-ed25519 AAAAMANAGED vellum",
             managed_codex_home: home,
-            install_dir: &home.join("packages/standalone/current"),
-            extra_path: Path::new("/Users/joshhuang/.local/bin"),
+            install_dir: "/Users/joshhuang/.vellum-remote/codex/packages/standalone/current",
+            extra_path: "/Users/joshhuang/.local/bin",
             existing_authorized_keys: "ssh-ed25519 AAAAUSER mine\n",
         })
         .unwrap();
@@ -375,13 +432,91 @@ mod tests {
         assert!(config.contains("Host vellum-remote-mac-mini"));
         assert!(config.contains("IdentityFile"));
         assert_eq!(applied.alias, "vellum-remote-mac-mini");
-        assert!(applied.wrapper_contents.contains("CODEX_HOME='/Users/joshhuang/.vellum-remote/codex'"));
-        assert!(!applied.wrapper_contents.contains("CODEX_HOME='/Users/joshhuang/.codex'"));
-        assert!(applied.authorized_keys.contains("ssh-ed25519 AAAAUSER mine"));
-        assert!(applied.authorized_keys.contains("vellum-remote-managed:mac-mini"));
+        assert!(applied
+            .wrapper_contents
+            .contains("CODEX_HOME='/Users/joshhuang/.vellum-remote/codex'"));
+        assert!(!applied
+            .wrapper_contents
+            .contains("CODEX_HOME='/Users/joshhuang/.codex'"));
+        assert!(applied
+            .authorized_keys
+            .contains("ssh-ed25519 AAAAUSER mine"));
+        assert!(applied
+            .authorized_keys
+            .contains("vellum-remote-managed:mac-mini"));
         assert_eq!(
             parse_user_host_port("joshhuang@100.78.101.55").unwrap(),
             ("joshhuang".into(), "100.78.101.55".into(), 22)
+        );
+    }
+
+    #[test]
+    fn linux_remote_paths_never_use_windows_separators() {
+        let temp = tempfile::tempdir().unwrap();
+        let applied = apply_managed_ssh_isolation(IsolationApplyRequest {
+            ssh_config_path: &temp.path().join("config"),
+            identity_file: &temp.path().join("id_ed25519"),
+            host_id: "linux-host",
+            hostname: "example.test",
+            user: "josh",
+            port: 22,
+            public_key: "ssh-ed25519 AAAAMANAGED vellum",
+            managed_codex_home: "/home/josh/.codex",
+            install_dir: "/home/josh/.codex/packages/standalone/current",
+            extra_path: "/home/josh/.local/bin",
+            existing_authorized_keys: "",
+        })
+        .unwrap();
+
+        assert_eq!(applied.wrapper_path, "/home/josh/ssh-wrapper");
+        assert!(applied
+            .authorized_keys
+            .contains("command=\"/home/josh/ssh-wrapper\""));
+        assert!(applied
+            .wrapper_contents
+            .contains("export PATH='/home/josh/.codex/packages/standalone/current':'/home/josh/.local/bin':\"$PATH\""));
+        assert!(!applied.authorized_keys.contains('\\'));
+        for line in applied
+            .wrapper_contents
+            .lines()
+            .filter(|line| line.starts_with("export "))
+        {
+            assert!(
+                !line.contains('\\'),
+                "remote path export was not POSIX: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_paths_with_windows_separators_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = apply_managed_ssh_isolation(IsolationApplyRequest {
+            ssh_config_path: &temp.path().join("config"),
+            identity_file: &temp.path().join("id_ed25519"),
+            host_id: "linux-host",
+            hostname: "example.test",
+            user: "josh",
+            port: 22,
+            public_key: "ssh-ed25519 AAAAMANAGED vellum",
+            managed_codex_home: "/home/josh\\.codex",
+            install_dir: "/home/josh/.codex/packages/standalone/current",
+            extra_path: "/home/josh/.local/bin",
+            existing_authorized_keys: "",
+        })
+        .unwrap_err();
+
+        assert!(error.starts_with("RemotePosixPathInvalid:managedCodexHome:"));
+    }
+
+    #[test]
+    fn resolved_ssh_config_preserves_alias_user_host_and_port() {
+        assert_eq!(
+            parse_resolved_ssh_config(
+                "host jetson-orin\nuser josh\nhostname 100.107.71.86\nport 2202\n"
+            )
+            .unwrap(),
+            ("josh".into(), "100.107.71.86".into(), 2202)
         );
     }
 }

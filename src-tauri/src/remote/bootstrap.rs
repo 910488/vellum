@@ -238,11 +238,9 @@ where
         .ssh_destination
         .ok_or_else(|| AppError::Message("clean-host bootstrap requires SSH".into()))?;
     let baseline = probe(&state.data_root(), &alias)?;
-    let platform = crate::remote::platform::RemotePlatform::from_os_arch(
-        &baseline.os,
-        &baseline.arch,
-    )
-    .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
+    let platform =
+        crate::remote::platform::RemotePlatform::from_os_arch(&baseline.os, &baseline.arch)
+            .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
     let bundle_dir = platform.bundle_dir();
     let binaries = if platform.broker_required() {
         vec!["vellum-remote-agent", "vellum-remote-broker"]
@@ -285,20 +283,13 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
     let operation_id = format!("bootstrap-{}", ulid::Ulid::new());
     let data_root = state.data_root();
     let probe = probe(&data_root, &alias)?;
-    let platform = match crate::remote::platform::RemotePlatform::from_os_arch(
-        &probe.os,
-        &probe.arch,
-    ) {
-        Ok(platform) => platform,
-        Err(error) => {
-            return Ok(blocked(
-                operation_id,
-                probe,
-                error.code,
-                &error.message,
-            ));
-        }
-    };
+    let platform =
+        match crate::remote::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch) {
+            Ok(platform) => platform,
+            Err(error) => {
+                return Ok(blocked(operation_id, probe, error.code, &error.message));
+            }
+        };
     let normalized_arch = platform.bundle_dir();
     let remote_agent_sha256 = probe.agent_sha256.clone();
     let remote_broker_sha256 = probe.broker_sha256.clone();
@@ -330,7 +321,9 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
                 .push(format!("ssh.isolationInstalled:{alias_name}"));
         }
         Err(error) => {
-            result.blocked_reasons.push(format!("sshIsolationFailed:{error}"));
+            result
+                .blocked_reasons
+                .push(format!("sshIsolationFailed:{error}"));
             result.repair_commands.push(
                 "Create the dedicated Remote SSH key and marked authorized_keys entry, then Bootstrap again."
                     .into(),
@@ -409,9 +402,7 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
             "依 Linux 發行版安裝 Docker，並將目前使用者加入可執行 docker 的群組後重新登入。".into(),
         );
     }
-    if platform.service_manager()
-        == crate::remote::platform::SERVICE_MANAGER_SYSTEMD_USER
-    {
+    if platform.service_manager() == crate::remote::platform::SERVICE_MANAGER_SYSTEMD_USER {
         if !result.systemd_user_available {
             result.blocked_reasons.push("systemdUserUnavailable".into());
             result.repair_commands.push(
@@ -436,9 +427,7 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
             }
         }
     } else if !probe.gui_session_available {
-        result
-            .blocked_reasons
-            .push("guiSessionUnavailable".into());
+        result.blocked_reasons.push("guiSessionUnavailable".into());
         result.repair_commands.push(
             "登入 macOS 圖形工作階段後再部署。Remote Proxy 是登入後常駐，不會改電源或自動登入。"
                 .into(),
@@ -509,6 +498,7 @@ struct BootstrapProbe {
     agent_sha256: Option<String>,
     broker_sha256: Option<String>,
     gui_session_available: bool,
+    user_home: Option<String>,
     managed_codex_home: Option<String>,
     disk_free_bytes: Option<u64>,
 }
@@ -564,19 +554,16 @@ fi
         agent_sha256: Some(value("agentSha")).filter(|value| !value.is_empty()),
         broker_sha256: Some(value("brokerSha")).filter(|value| !value.is_empty()),
         gui_session_available: value("gui") == "1",
+        user_home: Some(value("home")).filter(|value| !value.is_empty()),
         managed_codex_home: {
-            let home = value("home");
-            if home.is_empty() {
+            let user_home = value("home");
+            if user_home.is_empty() {
                 None
             } else {
-                Some(
-                    crate::remote::platform::managed_codex_home(
-                        Path::new(&home),
-                        &value("os"),
-                    )
-                    .display()
-                    .to_string(),
-                )
+                Some(crate::remote::platform::managed_codex_home_posix(
+                    &user_home,
+                    &value("os"),
+                ))
             }
         },
         disk_free_bytes: value("diskFree").parse().ok(),
@@ -589,8 +576,8 @@ fn install_managed_ssh_isolation(
     alias: &str,
     probe: &BootstrapProbe,
 ) -> AppResult<String> {
-    let (user, hostname, port) = crate::remote::ssh_isolation::parse_user_host_port(alias)
-        .map_err(AppError::Message)?;
+    let (user, hostname, port) =
+        crate::remote::ssh_isolation::resolve_user_host_port(alias).map_err(AppError::Message)?;
     let identity_dir = data_root.join("remote-ssh").join(host_id);
     let identity = identity_dir.join("id_ed25519");
     let public_key = ensure_isolation_identity(&identity)?;
@@ -604,17 +591,13 @@ fn install_managed_ssh_isolation(
         "cat \"$HOME/.ssh/authorized_keys\" 2>/dev/null || true",
     )?;
     let existing_text = String::from_utf8_lossy(&existing_keys.stdout);
+    let user_home = probe.user_home.as_deref().unwrap_or("/tmp/vellum-remote");
     let home = probe
         .managed_codex_home
         .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/vellum-remote/codex"));
-    let install_dir = home.join("packages/standalone/current");
-    let extra = home
-        .parent()
-        .and_then(|path| path.parent())
-        .unwrap_or(home.as_path())
-        .join(".local/bin");
+        .unwrap_or("/tmp/vellum-remote/codex");
+    let install_dir = format!("{}/packages/standalone/current", home.trim_end_matches('/'));
+    let extra = format!("{}/.local/bin", user_home.trim_end_matches('/'));
     let applied = crate::remote::ssh_isolation::apply_managed_ssh_isolation(
         crate::remote::ssh_isolation::IsolationApplyRequest {
             ssh_config_path: &ssh_config,
@@ -624,7 +607,7 @@ fn install_managed_ssh_isolation(
             user: &user,
             port,
             public_key: public_key.trim(),
-            managed_codex_home: &home,
+            managed_codex_home: home,
             install_dir: &install_dir,
             extra_path: &extra,
             existing_authorized_keys: existing_text.as_ref(),
@@ -747,7 +730,8 @@ fn install_artifact(
     }
     crate::remote::space::gate_replace(disk_free_bytes, bytes.len() as u64)
         .map_err(AppError::Message)?;
-    let remote = crate::remote::digest::install_artifact_remote_script(binary_name, digest.as_str());
+    let remote =
+        crate::remote::digest::install_artifact_remote_script(binary_name, digest.as_str());
     ssh_script(data_root, alias, &bytes, &remote)?;
     Ok(())
 }
@@ -906,12 +890,9 @@ fn blocked(
         completed_steps: vec!["host.probed".into()],
         blocked_reasons: vec![reason.into()],
         repair_commands: vec![repair.into()],
-        platform: crate::remote::platform::RemotePlatform::from_os_arch(
-            &probe.os,
-            &probe.arch,
-        )
-        .ok()
-        .map(|item| item.artifact_key().into()),
+        platform: crate::remote::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch)
+            .ok()
+            .map(|item| item.artifact_key().into()),
         proxy_backend: None,
         service_manager: None,
         persistence_scope: None,
@@ -936,7 +917,10 @@ mod tests {
             .find("install_artifact(\n            &data_root")
             .expect("agent artifact install_artifact call");
         assert!(iso < agent, "SSH isolation must run before agent copy");
-        assert!(apply > iso, "apply_managed_ssh_isolation is the install helper");
+        assert!(
+            apply > iso,
+            "apply_managed_ssh_isolation is the install helper"
+        );
     }
 
     #[test]
@@ -954,10 +938,7 @@ mod tests {
             Some(10),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("insufficientDiskSpace"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("insufficientDiskSpace"), "{err}");
     }
 
     #[test]
@@ -965,8 +946,8 @@ mod tests {
         assert_eq!(normalize_arch("x86_64"), Some("amd64"));
         assert_eq!(normalize_arch("aarch64"), Some("arm64"));
         assert_eq!(normalize_arch("riscv64"), None);
-        let darwin = crate::remote::platform::RemotePlatform::from_os_arch("Darwin", "arm64")
-            .unwrap();
+        let darwin =
+            crate::remote::platform::RemotePlatform::from_os_arch("Darwin", "arm64").unwrap();
         assert_eq!(darwin.bundle_dir(), "darwin-arm64");
         assert!(
             crate::remote::platform::RemotePlatform::from_os_arch("Darwin", "x86_64")
@@ -974,7 +955,10 @@ mod tests {
                 .ui_unsupported
         );
         assert_eq!(
-            crate::remote::digest::parse_digest_output(&format!("{}  file with spaces\n", "a".repeat(64))),
+            crate::remote::digest::parse_digest_output(&format!(
+                "{}  file with spaces\n",
+                "a".repeat(64)
+            )),
             Some("a".repeat(64))
         );
         assert!(crate::remote::digest::remote_file_digest_snippet().contains("shasum -a 256"));
