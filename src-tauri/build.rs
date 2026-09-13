@@ -5,12 +5,6 @@ fn main() {
         "cargo:rustc-env=VELLUM_BUILD_TARGET={}",
         std::env::var("TARGET").unwrap_or_default()
     );
-    let manifest = std::path::PathBuf::from("resources/remote/manifest.json");
-    println!("cargo:rerun-if-changed={}", manifest.display());
-    if let Ok(bytes) = std::fs::read(&manifest) {
-        let digest = Sha256::digest(bytes);
-        println!("cargo:rustc-env=VELLUM_BUNDLED_MANIFEST_SHA256={digest:x}");
-    }
     record_bridge_sidecar();
     record_enhanced_runtime();
     let relay = format!(
@@ -77,11 +71,11 @@ fn record_bridge_sidecar() {
 /// — a second digest baked in at build time could only ever agree or contradict
 /// the lockfile, and the lockfile is the one the qualification journal cites.
 ///
-/// A release stages the core into `binaries/`; a dev build writes a pointer at
-/// `binaries/vellum-enhanced-codex.dev-path` instead, because the core is a
-/// ~300 MB build output that nobody wants copied on every rebuild. When neither
-/// exists the value is empty rather than wrong, and
-/// `packaged_enhanced_executable()` reports the gap at runtime.
+/// A dev build may write a pointer at
+/// `binaries/vellum-enhanced-codex.dev-path`, because the core is a ~300 MB
+/// build output that nobody wants copied on every rebuild. A release records
+/// the legacy bundled location for upgrade compatibility, but new Desktop
+/// packages do not include that file; signed managed slots are authoritative.
 fn record_enhanced_runtime() {
     let suffix = if std::env::var("TARGET")
         .unwrap_or_default()

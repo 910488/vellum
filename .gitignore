@@ -52,4 +52,4 @@ qa/reports/**/*.html
 
 # Staged App Server bridge sidecar (scripts/build-sidecar.mjs); built per release.
 src-tauri/binaries/*
-!src-tauri/binaries/.gitkeep
+!src-tauri/binaries/vellum-codex-app-server.placeholder

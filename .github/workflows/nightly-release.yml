@@ -1,4 +1,4 @@
-name: Nightly and manual bundled releases
+name: Nightly and manual layered releases
 
 on:
   schedule:
@@ -127,7 +127,7 @@ jobs:
     secrets: inherit
 
   desktop:
-    name: Publish Desktop with the same core embedded
+    name: Publish Desktop after Core
     needs: [resolve, core-update]
     uses: ./.github/workflows/release.yml
     permissions:

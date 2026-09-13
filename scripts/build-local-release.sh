@@ -2,16 +2,16 @@
 set -euo pipefail
 
 codex_version="${CODEX_VERSION:-0.147.0-alpha.6.6}"
-bundle="${1:-dmg}"
+mode="${1:-stage-only}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 resource_root="$repo/src-tauri/resources/remote"
 scratch_root="$repo/target/local-release"
 version="$(node -p "require('$repo/package.json').version")"
 resume="${VELLUM_RELEASE_RESUME:-0}"
 
-case "$bundle" in
-  dmg|nsis|stage-only) ;;
-  *) echo "usage: $0 [dmg|nsis|stage-only]" >&2; exit 2 ;;
+case "$mode" in
+  stage-only) ;;
+  *) echo "usage: $0 [stage-only]" >&2; exit 2 ;;
 esac
 
 command -v docker >/dev/null || { echo "Docker with buildx is required" >&2; exit 1; }
@@ -191,7 +191,7 @@ const manifest = {
 fs.writeFileSync(path.join(root, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 
-echo "==> Embedded remote payload"
+echo "==> Remote package payload"
 du -sh "$resource_root"
 for arch in amd64 arm64; do
   for name in vellum-remote-agent vellum-remote-broker codex proxy-image.tar; do
@@ -199,9 +199,3 @@ for arch in amd64 arm64; do
   done
 done
 test -s "$resource_root/manifest.json"
-
-if [[ "$bundle" != stage-only ]]; then
-  command -v pnpm >/dev/null || { echo "pnpm is required to bundle the desktop app" >&2; exit 1; }
-  pnpm --dir "$repo" install --frozen-lockfile
-  pnpm --dir "$repo" exec tauri build --bundles "$bundle"
-fi

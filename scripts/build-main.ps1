@@ -91,23 +91,6 @@ if ($ValidateOnly) {
 
 New-Item -ItemType Directory -Force -Path $layout.CommitRoot | Out-Null
 
-$stageScript = Join-Path $source.SourceWorktree "scripts\build-local-release.ps1"
-if (-not (Test-Path -LiteralPath $stageScript -PathType Leaf)) {
-    throw "build:main requires scripts/build-local-release.ps1 in the source worktree"
-}
-Write-Host "Staging Remote Manager payload from current source (fresh, no Resume)"
-& $stageScript -Mode stage-only
-if ($LASTEXITCODE -ne 0) {
-    throw "remote payload staging failed with exit code $LASTEXITCODE"
-}
-
-$expectedProxyImage = Get-VellumExpectedProxyImage $source.SourceWorktree $version
-$resourceRoot = Get-VellumRemoteResourceRoot $source.SourceWorktree
-$stagedRemote = Assert-VellumStagedRemotePayload `
-    -ResourceRoot $resourceRoot `
-    -ExpectedVersion $version `
-    -ExpectedProxyImage $expectedProxyImage
-
 $previousTargetDir = $env:CARGO_TARGET_DIR
 $previousCommit = $env:VELLUM_GIT_COMMIT
 $previousVersion = $env:VELLUM_BUILD_VERSION
@@ -134,12 +117,6 @@ $bundles = @(
 $desktopExecutable = Join-Path $targetDir "release\vellum-proxy-desktop.exe"
 $installer = $bundles | Where-Object { $_ -like "*-setup.exe" } | Select-Object -First 1
 
-$embeddedRoot = Join-Path $targetDir "release\resources\remote"
-if (-not (Test-Path -LiteralPath $embeddedRoot -PathType Container)) {
-    throw "Tauri output is missing embedded resources/remote at $embeddedRoot"
-}
-$embeddedRemote = Assert-VellumEmbeddedRemotePayload -Staged $stagedRemote -EmbeddedRoot $embeddedRoot
-
 $info = New-VellumBuildInfo `
     -Source $source `
     -Version $version `
@@ -147,8 +124,7 @@ $info = New-VellumBuildInfo `
     -Installer $installer `
     -Bundles $bundles `
     -Target $targetDir `
-    -Renderer (Join-Path $source.SourceWorktree "dist") `
-    -Remote $embeddedRemote
+    -Renderer (Join-Path $source.SourceWorktree "dist")
 
 $info["artifactDir"] = $layout.CommitRoot
 $manifestJson = $info | ConvertTo-Json -Depth 6

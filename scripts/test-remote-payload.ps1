@@ -150,29 +150,18 @@ try {
     if (-not $staged.ManifestSha256) { throw "valid payload missing manifest hash" }
     Write-Host "PASS valid payload"
 
-    $embedded = Join-Path $temp "embedded-mismatch"
-    New-FakePayload -Root $embedded
-    [IO.File]::WriteAllText((Join-Path $embedded "linux-amd64\codex"), "mutated", $utf8)
-    Assert-Throws "embedded artifact drift" {
-        Assert-VellumEmbeddedRemotePayload -Staged $staged -EmbeddedRoot $embedded
-    } "does not match"
-
     $buildMain = [IO.File]::ReadAllText((Join-Path $repo "scripts\build-main.ps1"), $utf8)
-    if ($buildMain -notmatch 'build-local-release\.ps1') {
-        throw "build-main.ps1 must invoke build-local-release.ps1"
+    if ($buildMain -match 'build-local-release\.ps1') {
+        throw "build-main.ps1 must not build or stage the separate Remote package"
     }
-    if ($buildMain -notmatch '-Mode stage-only') {
-        throw "build-main.ps1 must stage remote payload with -Mode stage-only"
+    if ($buildMain -match 'Assert-VellumEmbeddedRemotePayload') {
+        throw "build-main.ps1 must not require Remote payloads in Desktop output"
     }
-    if ($buildMain -match 'build-local-release\.ps1[^\r\n]*Resume') {
-        throw "build:main must not pass -Resume to remote staging"
-    }
-    $stageAt = $buildMain.IndexOf('-Mode stage-only')
     $buildAt = $buildMain.IndexOf('pnpm --dir $source.SourceWorktree run build')
-    if ($stageAt -lt 0 -or $buildAt -lt 0 -or $stageAt -gt $buildAt) {
-        throw "build:main must stage the remote payload before pnpm run build"
+    if ($buildAt -lt 0) {
+        throw "build-main.ps1 must still build the Desktop package"
     }
-    Write-Host "PASS build-main stages remote payload before Tauri"
+    Write-Host "PASS build-main keeps Remote out of Desktop"
 
     $localRelease = [IO.File]::ReadAllText((Join-Path $repo "scripts\build-local-release.ps1"), $utf8)
     if ($localRelease -notmatch 'stage-only refuses -Resume') {

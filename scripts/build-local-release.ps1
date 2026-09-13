@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
     [string] $CodexVersion = "0.147.0-alpha.6.6",
-    [ValidateSet("stage-only", "nsis")]
-    [string] $Mode = "nsis",
+    [ValidateSet("stage-only")]
+    [string] $Mode = "stage-only",
     [switch] $Resume
 )
 
@@ -63,10 +63,6 @@ function Test-CompleteArch([string] $ArchRoot, [string] $ExpectedImage) {
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "Docker Desktop with buildx is required"
 }
-if ($Mode -ne "stage-only" -and -not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
-    throw "pnpm is required"
-}
-
 New-Item -ItemType Directory -Force -Path $scratchRoot | Out-Null
 $staged = @{}
 foreach ($arch in @("amd64", "arm64")) {
@@ -193,20 +189,4 @@ $staged = Assert-VellumStagedRemotePayload `
 Write-Host "Staged remote payload $($staged.ReleaseVersion) image $($staged.ProxyImage)"
 Write-Host "Manifest SHA-256: $($staged.ManifestSha256)"
 
-if ($Mode -eq "stage-only") {
-    Write-Host "stage-only complete; installer was not built"
-    return
-}
-
-Invoke-Checked "Install JavaScript dependencies" { pnpm --dir $repo install --frozen-lockfile }
-Invoke-Checked "Build Vellum $version NSIS with embedded remote bundle" {
-    pnpm --dir $repo exec tauri build --bundles nsis
-}
-
-$installerPath = Join-Path $repo "target\release\bundle\nsis\Vellum_${version}_x64-setup.exe"
-if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
-    throw "NSIS installer was not produced"
-}
-Write-Host ""
-Write-Host "Local release ready: $installerPath"
-Write-Host "SHA-256: $(Sha256 $installerPath)"
+Write-Host "stage-only complete; Remote payload is ready for separate packaging"
