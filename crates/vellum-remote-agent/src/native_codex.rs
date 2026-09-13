@@ -1329,18 +1329,47 @@ fn observe_process_facts(
 ) -> Option<crate::process_identity::ProcessFacts> {
     let uid = process_uid(pid)?;
     let binary = process_binary(pid).or_else(|| standalone_binary(expected_home).map(|launch| launch.program))?;
-    let socket = control_socket_path(expected_home);
-    let socket_owner_uid = socket_owner_uid(&socket);
+    let socket = observed_control_socket(expected_home);
+    let socket_owner_uid = socket.as_deref().and_then(socket_owner_uid);
     Some(crate::process_identity::ProcessFacts {
         pid,
         uid,
         binary,
         start_time: start_time.to_string(),
         codex_home: process_codex_home(pid).or_else(|| Some(expected_home.to_path_buf())),
-        socket_path: socket.is_file().then_some(socket),
+        socket_path: socket,
         socket_owner_uid,
         comm: None,
     })
+}
+
+/// Codex's app-server control socket is `S_IFSOCK`, not a regular file.
+/// `Path::is_file()` is false for that inode, so presence must accept a
+/// socket (or a regular file in tests) via metadata, not `is_file()`.
+pub(crate) fn control_socket_present(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_file() {
+        return true;
+    }
+    if meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        meta.file_type().is_socket()
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
+pub(crate) fn observed_control_socket(expected_home: &Path) -> Option<PathBuf> {
+    let socket = control_socket_path(expected_home);
+    control_socket_present(&socket).then_some(socket)
 }
 
 fn process_uid(pid: u32) -> Option<u32> {
@@ -2177,6 +2206,53 @@ mod tests {
             .find("find_daemon_process_for_home")
             .expect("discover_native must use find_daemon_process_for_home");
         assert!(match_at > 0 && find > 0);
+        let observe = source.find("fn observe_process_facts").unwrap();
+        assert!(
+            source[observe..]
+                .find("observed_control_socket")
+                .is_some(),
+            "observe_process_facts must use observed_control_socket, not Path::is_file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_control_socket_accepts_a_unix_domain_socket_that_is_file_rejects() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let socket = control_socket_path(&home);
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        assert!(
+            observed_control_socket(&home).is_none(),
+            "missing socket must not be invented"
+        );
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(
+            !socket.is_file(),
+            "a real app-server-control.sock is S_IFSOCK, not a regular file"
+        );
+        assert!(
+            control_socket_present(&socket),
+            "shipped predicate must accept the unix socket"
+        );
+        assert_eq!(
+            observed_control_socket(&home).as_deref(),
+            Some(socket.as_path())
+        );
+        assert!(
+            socket_owner_uid(&socket).is_some(),
+            "socket ownership must be readable on a real control socket"
+        );
+    }
+
+    #[test]
+    fn control_socket_present_rejects_directories_and_accepts_regular_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("app-server-control.sock");
+        fs::write(&file, b"").unwrap();
+        assert!(control_socket_present(&file));
+        assert!(!control_socket_present(temp.path()));
+        assert!(!control_socket_present(&temp.path().join("missing.sock")));
     }
 
     #[test]
