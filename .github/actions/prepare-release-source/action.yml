@@ -1,0 +1,22 @@
+name: Prepare release source
+description: Pin one Enhanced Core release and align the ephemeral checkout version with the update tag.
+inputs:
+  tag:
+    description: Component update tag
+    required: true
+  enhanced-core-lock:
+    description: Base64-encoded enhanced-runtime.lock.json resolved once by the workflow
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Set release version
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ inputs.tag }}
+      run: node scripts/set-release-version.mjs "${RELEASE_TAG#*-v}"
+    - name: Restore resolved Enhanced Core lock
+      shell: bash
+      env:
+        ENHANCED_CORE_LOCK: ${{ inputs.enhanced-core-lock }}
+      run: node -e "require('node:fs').writeFileSync('enhanced-runtime.lock.json', Buffer.from(process.env.ENHANCED_CORE_LOCK, 'base64'))"

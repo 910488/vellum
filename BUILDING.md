@@ -146,6 +146,26 @@ and the bridge attestation confirms the launch. A failed launch drops the
 pending slot; an explicit rollback keeps the reverted build as history without
 automatically scheduling it again.
 
+### Automated nightly and manual releases
+
+`Nightly and manual bundled releases` is the end-to-end GitHub Actions entry
+point. Its daily schedule builds `main`, resolves the latest published
+commit-addressed Enhanced Core release once, and publishes matching preview
+releases for both the independently updatable core and a Desktop installer
+that embeds the same bytes. Nightly versions use
+`<next-patch>-nightly.<UTC-date>.<run-number>.<run-attempt>`, so Stable clients
+ignore them, Preview clients can select them, and a rerun remains immutable.
+
+The workflow can also be run manually. A Stable run requires an explicit
+non-prerelease SemVer; a Preview run accepts one or generates the nightly
+version. `source_ref` selects the Vellum source, and `enhanced_core_release`
+can pin an explicit `vellum-core-<40-hex>` release instead of resolving the
+latest one. Turning off `publish` leaves both signed releases as drafts.
+
+The core release completes before the Desktop build starts. This ordering and
+the immutable Enhanced Core tag ensure that update assets and bundled assets
+cannot drift to different Enhanced Core commits during one release run.
+
 `codex-code-mode-host` links `rusty_v8` and downloads a prebuilt archive from
 GitHub. If that download fails, the rest of the build still succeeds and only
 code mode is affected; retry, or set `V8_FROM_SOURCE=1` to compile V8 locally.

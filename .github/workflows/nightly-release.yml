@@ -1,0 +1,141 @@
+name: Nightly and manual bundled releases
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - stable
+      version:
+        description: "SemVer for a manual release; required for stable, optional for preview"
+        required: false
+        type: string
+      source_ref:
+        description: Git ref to build
+        required: true
+        default: main
+        type: string
+      enhanced_core_release:
+        description: "Enhanced Core tag; empty selects its latest published release"
+        required: false
+        type: string
+      publish:
+        description: Publish signed releases immediately
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-and-manual-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve immutable release inputs
+    runs-on: ubuntu-latest
+    outputs:
+      core_release: ${{ steps.resolve.outputs.core_release }}
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      core_tag: ${{ steps.resolve.outputs.core_tag }}
+      desktop_tag: ${{ steps.resolve.outputs.desktop_tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || 'main' }}
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SOURCE_REF: ${{ inputs.source_ref }}
+          REQUESTED_CORE_RELEASE: ${{ inputs.enhanced_core_release }}
+          REQUESTED_PUBLISH: ${{ inputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          SOURCE_REF="${REQUESTED_SOURCE_REF:-main}"
+          CORE_RELEASE="$REQUESTED_CORE_RELEASE"
+          if [ -z "$CORE_RELEASE" ]; then
+            CORE_RELEASE="$(gh api repos/910488/enhanced-codex-core/releases/latest --jq .tag_name)"
+          fi
+          if ! [[ "$CORE_RELEASE" =~ ^vellum-core-[0-9a-f]{40}$ ]]; then
+            echo "Enhanced Core release is not commit-addressed: $CORE_RELEASE" >&2
+            exit 1
+          fi
+
+          BASE_VERSION="$(node -p "require('./package.json').version.split('-')[0]")"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            CHANNEL=preview
+            VERSION="$MAJOR.$MINOR.$((PATCH + 1))-nightly.$(date -u +%Y%m%d).$RUN_NUMBER.$RUN_ATTEMPT"
+            PUBLISH=true
+          else
+            CHANNEL="${REQUESTED_CHANNEL:-preview}"
+            VERSION="$REQUESTED_VERSION"
+            PUBLISH="${REQUESTED_PUBLISH:-true}"
+            if [ "$CHANNEL" = stable ] && [ -z "$VERSION" ]; then
+              echo "A stable manual release requires an explicit version" >&2
+              exit 1
+            fi
+            if [ -z "$VERSION" ]; then
+              VERSION="$MAJOR.$MINOR.$((PATCH + 1))-nightly.$(date -u +%Y%m%d).$RUN_NUMBER.$RUN_ATTEMPT"
+            fi
+          fi
+          node scripts/set-release-version.mjs "$VERSION"
+          if [ "$CHANNEL" = stable ] && [[ "$VERSION" == *-* ]]; then
+            echo "Stable releases require a non-prerelease SemVer: $VERSION" >&2
+            exit 1
+          fi
+          if [ "$CHANNEL" = preview ] && [[ "$VERSION" != *-* ]]; then
+            echo "Preview releases require a prerelease SemVer: $VERSION" >&2
+            exit 1
+          fi
+          {
+            echo "core_release=$CORE_RELEASE"
+            echo "source_ref=$SOURCE_REF"
+            echo "core_tag=core-v$VERSION"
+            echo "desktop_tag=desktop-v$VERSION"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+          printf 'source: %s\ncore: %s\ncore update: %s\ndesktop: %s\npublish: %s\n' \
+            "$SOURCE_REF" "$CORE_RELEASE" "core-v$VERSION" "desktop-v$VERSION" "$PUBLISH" >> "$GITHUB_STEP_SUMMARY"
+
+  core-update:
+    name: Publish Enhanced Core hot update
+    needs: resolve
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.resolve.outputs.core_tag }}
+      source_ref: ${{ needs.resolve.outputs.source_ref }}
+      enhanced_core_release: ${{ needs.resolve.outputs.core_release }}
+      publish: ${{ needs.resolve.outputs.publish == 'true' }}
+    secrets: inherit
+
+  desktop:
+    name: Publish Desktop with the same core embedded
+    needs: [resolve, core-update]
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.resolve.outputs.desktop_tag }}
+      source_ref: ${{ needs.resolve.outputs.source_ref }}
+      enhanced_core_release: ${{ needs.resolve.outputs.core_release }}
+      enhanced_core_lock: ${{ needs.core-update.outputs.enhanced_core_lock }}
+      publish: ${{ needs.resolve.outputs.publish == 'true' }}
+    secrets: inherit

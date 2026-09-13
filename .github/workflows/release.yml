@@ -1,9 +1,35 @@
 name: Signed update releases
 
-# Tag-driven drafts. `main` CI stays a build, not a published channel.
+# Tag-driven or reusable signed releases. `main` CI stays a build, not a
+# published channel.
 # Assets are built first, hashed into the manifest, then signed. Signing
 # `assets: []` and uploading binaries later would not bind those binaries.
 on:
+  workflow_call:
+    outputs:
+      enhanced_core_lock:
+        description: The immutable resolved lock, for a following component release in the same run
+        value: ${{ jobs.resolve.outputs.enhanced_core_lock }}
+    inputs:
+      tag:
+        required: true
+        type: string
+      source_ref:
+        required: false
+        type: string
+        default: ""
+      enhanced_core_release:
+        required: false
+        type: string
+        default: ""
+      enhanced_core_lock:
+        required: false
+        type: string
+        default: ""
+      publish:
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - "desktop-v*"
@@ -15,6 +41,19 @@ on:
         description: "Release tag (desktop-vX.Y.Z, remote-vX.Y.Z, or core-vX.Y.Z)"
         required: true
         type: string
+      source_ref:
+        description: "Git ref to build (defaults to the selected branch)"
+        required: false
+        type: string
+      enhanced_core_release:
+        description: "Enhanced Core tag to embed, e.g. vellum-core-<40-hex>; empty keeps the lockfile"
+        required: false
+        type: string
+      publish:
+        description: "Publish after signing (otherwise create a draft)"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -31,22 +70,50 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       component: ${{ steps.tag.outputs.component }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      source_ref: ${{ steps.tag.outputs.source_ref }}
+      enhanced_core_release: ${{ steps.tag.outputs.enhanced_core_release }}
+      enhanced_core_lock: ${{ steps.core.outputs.enhanced_core_lock }}
+      publish: ${{ steps.tag.outputs.publish }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - id: tag
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          TAG="${{ inputs.tag || github.ref_name }}"
           case "$TAG" in
-            desktop-v*) echo "component=desktop" >> "$GITHUB_OUTPUT" ;;
-            remote-v*) echo "component=remote" >> "$GITHUB_OUTPUT" ;;
-            core-v*) echo "component=core" >> "$GITHUB_OUTPUT" ;;
+            desktop-v*) COMPONENT=desktop ;;
+            remote-v*) COMPONENT=remote ;;
+            core-v*) COMPONENT=core ;;
             *) echo "unsupported tag $TAG" >&2; exit 1 ;;
           esac
-          if [[ "$TAG" == *-rc.* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          VERSION="${TAG#*-v}"
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
           else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            PRERELEASE=false
           fi
+          {
+            echo "tag=$TAG"
+            echo "component=$COMPONENT"
+            echo "prerelease=$PRERELEASE"
+            echo "source_ref=${{ inputs.source_ref }}"
+            echo "enhanced_core_release=${{ inputs.enhanced_core_release }}"
+            echo "publish=${{ inputs.publish || false }}"
+          } >> "$GITHUB_OUTPUT"
+      - id: core
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REQUESTED_CORE_RELEASE: ${{ inputs.enhanced_core_release }}
+          PROVIDED_CORE_LOCK: ${{ inputs.enhanced_core_lock }}
+        run: |
+          if [ -n "$PROVIDED_CORE_LOCK" ]; then
+            node -e "require('node:fs').writeFileSync('enhanced-runtime.lock.json', Buffer.from(process.env.PROVIDED_CORE_LOCK, 'base64'))"
+          elif [ -n "$REQUESTED_CORE_RELEASE" ]; then
+            node scripts/sync-enhanced-runtime-lock.mjs --release "$REQUESTED_CORE_RELEASE"
+          fi
+          LOCK_BASE64="$(node -e 'process.stdout.write(require("node:fs").readFileSync("enhanced-runtime.lock.json").toString("base64"))')"
+          echo "enhanced_core_lock=$LOCK_BASE64" >> "$GITHUB_OUTPUT"
 
   desktop-remote-payload:
     name: Embedded Remote Manager payload
@@ -55,6 +122,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -76,6 +149,12 @@ jobs:
       VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -110,6 +189,12 @@ jobs:
       VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -158,6 +243,12 @@ jobs:
             docker: arm64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -193,6 +284,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -270,8 +367,8 @@ jobs:
           path: updater/*
           if-no-files-found: error
 
-  sign-and-draft:
-    name: Hash, sign, and draft GitHub Release
+  sign-and-release:
+    name: Hash, sign, and create GitHub Release
     needs:
       - resolve
       - desktop-remote-payload
@@ -290,6 +387,12 @@ jobs:
     environment: release-signing
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -330,11 +433,12 @@ jobs:
           VELLUM_UPDATE_SIGNING_KEY: ${{ secrets.VELLUM_UPDATE_SIGNING_KEY }}
           VELLUM_UPDATE_PUBLIC_KEY: ${{ vars.VELLUM_UPDATE_PUBLIC_KEY }}
         run: node scripts/sign-update-manifest.mjs update-manifest.json update-manifest.json.sig
-      - name: Create draft with assets and signed manifest
+      - name: Create signed release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.resolve.outputs.tag }}
           PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          PUBLISH: ${{ needs.resolve.outputs.publish }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists; refusing to overwrite published assets."
@@ -344,9 +448,11 @@ jobs:
           if [ "$PRERELEASE" = "true" ]; then
             extra+=(--prerelease)
           fi
+          if [ "$PUBLISH" != "true" ]; then
+            extra+=(--draft)
+          fi
           gh release create "$TAG" \
-            --draft \
             --title "$TAG" \
-            --notes "Signed update $TAG. Publish only after reviewing hashed assets in update-manifest.json." \
+            --notes "Signed update $TAG built with the pinned Enhanced Codex Core. Assets are bound by update-manifest.json." \
             "${extra[@]}" \
             update-manifest.json update-manifest.json.sig release-assets/*
