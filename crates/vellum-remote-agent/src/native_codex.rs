@@ -1186,7 +1186,7 @@ fn compatibility(version: Option<&str>) -> (bool, Option<String>) {
 }
 
 #[derive(Debug)]
-struct DaemonProcess {
+pub(crate) struct DaemonProcess {
     pid: u32,
     codex_home: Option<PathBuf>,
     launch: Option<CodexLaunch>,
@@ -1294,11 +1294,135 @@ fn daemon_from_pid_record(expected_home: &Path) -> Option<DaemonProcess> {
     if observed_start != recorded_start {
         return None;
     }
-    Some(DaemonProcess {
-        pid,
-        codex_home: Some(expected_home.to_path_buf()),
-        launch: standalone_binary(expected_home),
+    let facts = observe_process_facts(pid, expected_home, &observed_start)?;
+    let expected = expected_identity(expected_home, &recorded_start)?;
+    claim_daemon_if_managed(pid, expected_home, &facts, &expected)
+}
+
+fn control_socket_path(home: &Path) -> PathBuf {
+    home.join("app-server-control")
+        .join("app-server-control.sock")
+}
+
+fn expected_identity(expected_home: &Path, start_time: &str) -> Option<crate::process_identity::ExpectedIdentity> {
+    Some(crate::process_identity::ExpectedIdentity {
+        uid: current_uid()?,
+        binary: standalone_binary(expected_home)?.program,
+        start_time: start_time.to_string(),
+        codex_home: expected_home.to_path_buf(),
+        socket_path: control_socket_path(expected_home),
     })
+}
+
+fn current_uid() -> Option<u32> {
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn observe_process_facts(
+    pid: u32,
+    expected_home: &Path,
+    start_time: &str,
+) -> Option<crate::process_identity::ProcessFacts> {
+    let uid = process_uid(pid)?;
+    let binary = process_binary(pid).or_else(|| standalone_binary(expected_home).map(|launch| launch.program))?;
+    let socket = control_socket_path(expected_home);
+    let socket_owner_uid = socket_owner_uid(&socket);
+    Some(crate::process_identity::ProcessFacts {
+        pid,
+        uid,
+        binary,
+        start_time: start_time.to_string(),
+        codex_home: process_codex_home(pid).or_else(|| Some(expected_home.to_path_buf())),
+        socket_path: socket.is_file().then_some(socket),
+        socket_owner_uid,
+        comm: None,
+    })
+}
+
+fn process_uid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        linux_effective_uid(&status)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "uid="])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())?
+    }
+}
+
+fn process_binary(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let args = String::from_utf8_lossy(&output.stdout);
+        let first = args.split_whitespace().next()?;
+        Some(PathBuf::from(first))
+    }
+}
+
+fn process_codex_home(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
+        return raw.split(|byte| *byte == 0).find_map(|part| {
+            part.strip_prefix(b"CODEX_HOME=")
+                .map(|value| PathBuf::from(String::from_utf8_lossy(value).to_string()))
+        });
+    }
+    let _ = pid;
+    None
+}
+
+fn socket_owner_uid(path: &Path) -> Option<u32> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Some(meta.uid());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+pub(crate) fn claim_daemon_if_managed(
+    pid: u32,
+    expected_home: &Path,
+    facts: &crate::process_identity::ProcessFacts,
+    expected: &crate::process_identity::ExpectedIdentity,
+) -> Option<DaemonProcess> {
+    match crate::process_identity::match_managed_process(facts, expected) {
+        crate::process_identity::IdentityVerdict::Match => Some(DaemonProcess {
+            pid,
+            codex_home: Some(expected_home.to_path_buf()),
+            launch: standalone_binary(expected_home),
+        }),
+        crate::process_identity::IdentityVerdict::Reject { .. } => None,
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2007,6 +2131,49 @@ mod tests {
             contents.contains(&target.to_string_lossy().to_string())
                 || contents.contains("exec")
         );
+    }
+
+    #[test]
+    fn daemon_from_pid_record_requires_match_managed_process_not_pid_and_start_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let binary = home.join("packages/standalone/current/codex");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"codex").unwrap();
+        let socket = home.join("app-server-control/app-server-control.sock");
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        fs::write(&socket, b"").unwrap();
+        let start = "Fri Aug 14 16:21:43 2026";
+        let expected = crate::process_identity::ExpectedIdentity {
+            uid: 501,
+            binary: binary.clone(),
+            start_time: start.into(),
+            codex_home: home.clone(),
+            socket_path: socket.clone(),
+        };
+        let mut facts = crate::process_identity::ProcessFacts {
+            pid: 4242,
+            uid: 501,
+            binary: binary.clone(),
+            start_time: start.into(),
+            codex_home: Some(home.clone()),
+            socket_path: Some(socket.clone()),
+            socket_owner_uid: Some(501),
+            comm: Some("codex".into()),
+        };
+        assert!(claim_daemon_if_managed(4242, &home, &facts, &expected).is_some());
+        facts.uid = 0;
+        assert!(claim_daemon_if_managed(4242, &home, &facts, &expected).is_none());
+        let source = include_str!("native_codex.rs");
+        let from_pid = source.find("fn daemon_from_pid_record").unwrap();
+        let match_at = source[from_pid..]
+            .find("claim_daemon_if_managed")
+            .expect("daemon_from_pid_record must call claim_daemon_if_managed");
+        let discover = source.find("fn discover_native").unwrap();
+        let find = source[discover..]
+            .find("find_daemon_process_for_home")
+            .expect("discover_native must use find_daemon_process_for_home");
+        assert!(match_at > 0 && find > 0);
     }
 
     #[test]

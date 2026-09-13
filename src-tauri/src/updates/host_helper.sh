@@ -44,6 +44,22 @@ verify_package() {
   }
 }
 
+require_replace_space() {
+  pkg_bytes=$(wc -c < "$PKG" | tr -d ' ')
+  required=$((pkg_bytes * 3))
+  if command -v df >/dev/null 2>&1; then
+    avail_k=$(df -kP "$ROOT" | awk 'NR==2 {print $4}')
+    avail=$((avail_k * 1024))
+    if [ "$avail" -lt "$required" ]; then
+      echo "insufficientDiskSpace: need $required bytes, have $avail" >&2
+      exit 1
+    fi
+  else
+    echo "insufficientDiskSpace: disk free unknown; refusing replace" >&2
+    exit 1
+  fi
+}
+
 guard_tar_members() {
   # Do not pipe into while: exit 1 in a pipeline subshell would not
   # stop tar -xzf. List members to a file, then fail this process.
@@ -166,6 +182,7 @@ apply_locked() {
 
   if ! already stage; then
     verify_package
+    require_replace_space
     guard_tar_members
     tar -xzf "$PKG" -C "$STAGE"
     record stage

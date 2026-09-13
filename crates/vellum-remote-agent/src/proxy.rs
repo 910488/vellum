@@ -543,6 +543,10 @@ impl ProxyManager {
                 binary.display()
             ));
         }
+        let payload = std::fs::metadata(&binary)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        crate::space::gate_replace(crate::space::free_bytes_for_path(&paths.root), payload)?;
         let actual_digest = crate::native_proxy::digest_native_binary(&binary)?;
         if let Some(expected) = native_executable_digest.as_deref() {
             if !actual_digest.eq_ignore_ascii_case(expected) {
@@ -843,6 +847,13 @@ impl ProxyManager {
                 Some(digest) if !digest.is_empty() => digest.to_string(),
                 _ => crate::native_proxy::digest_native_binary(Path::new(staged))?,
             };
+            let payload = std::fs::metadata(staged)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            crate::space::gate_replace(
+                crate::space::free_bytes_for_path(self.store.paths().root.as_path()),
+                payload,
+            )?;
             crate::update::install_binary(Path::new(staged), &target, &expected)?;
         }
         let digest = image_digest
@@ -1829,6 +1840,39 @@ mod tests {
         assert_eq!(
             docker.last_run_user.lock().unwrap().as_deref(),
             Some(expected_user.as_str())
+        );
+    }
+
+    #[test]
+    fn native_install_and_update_gate_space_before_plist_or_binary_swap() {
+        let source = include_str!("proxy.rs");
+        let install_fn = source
+            .find("fn install_native_inner")
+            .expect("install_native_inner");
+        let install_body = &source[install_fn..];
+        let install_gate = install_body
+            .find("space::gate_replace")
+            .expect("install_native_inner must call gate_replace");
+        let plist = install_body
+            .find("write_launch_agent_plist")
+            .expect("install writes plist");
+        assert!(
+            install_gate < plist,
+            "space gate must run before writing the LaunchAgent plist"
+        );
+        let update_fn = source
+            .find("fn update_native_inner")
+            .expect("update_native_inner");
+        let update_body = &source[update_fn..];
+        let update_gate = update_body
+            .find("space::gate_replace")
+            .expect("update_native_inner must call gate_replace");
+        let binary = update_body
+            .find("install_binary")
+            .expect("update replaces the binary");
+        assert!(
+            update_gate < binary,
+            "space gate must run before binary swap"
         );
     }
 

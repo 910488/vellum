@@ -40,6 +40,13 @@ pub(crate) fn install_binary(
             staged.display()
         ));
     }
+    let payload = std::fs::metadata(staged)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    crate::space::gate_replace(
+        crate::space::free_bytes_for_path(target.parent().unwrap_or(target)),
+        payload,
+    )?;
     let digest = sha256_file(staged)?;
     let expected = expected_sha256
         .trim()

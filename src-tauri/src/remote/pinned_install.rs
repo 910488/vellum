@@ -433,6 +433,13 @@ pub fn update_remote_components(
     let manifest = load_verified_manifest()?;
     let target = crate::remote::RemoteHostManager::resolve_target(state, host_id)?;
     let client = RemoteAgentClient::new(target.clone());
+    let status = client.host_status().ok();
+    let session = client.codex_session_status(None).ok();
+    crate::remote::observation::require_idle_for_destructive_op(
+        session.as_ref(),
+        status.as_ref().and_then(|value| value.get("nativeCodex")),
+    )
+    .map_err(|code| AppError::Message(format!("ComponentUpdateBlocked: {code}")))?;
     let inventory = client.host_inventory_v2()?;
     let arch = inventory
         .pointer("/system/arch")
@@ -727,6 +734,28 @@ mod tests {
         assert_eq!(
             sha256_file(&path).unwrap(),
             hex::encode(Sha256::digest(b"payload"))
+        );
+    }
+
+    #[test]
+    fn update_remote_components_gates_incomplete_observation_before_replace() {
+        let source = include_str!("pinned_install.rs");
+        let fn_at = source
+            .find("pub fn update_remote_components(")
+            .expect("update_remote_components");
+        let body = &source[fn_at..];
+        let gate_at = body
+            .find("require_idle_for_destructive_op(")
+            .expect("update must call require_idle_for_destructive_op");
+        let agent_at = body.find("client.agent_update(");
+        let proxy_at = body.find("client.proxy_update(");
+        assert!(
+            agent_at.is_none_or(|at| gate_at < at),
+            "observation gate must precede agent.update"
+        );
+        assert!(
+            proxy_at.is_none_or(|at| gate_at < at),
+            "observation gate must precede proxy.update"
         );
     }
 

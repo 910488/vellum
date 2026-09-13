@@ -33,6 +33,16 @@ pub fn destructive_op_decision(obs: &DestructiveObservation) -> DestructiveDecis
     DestructiveDecision::Allow
 }
 
+pub fn require_idle_for_destructive_op(
+    session: Option<&serde_json::Value>,
+    native: Option<&serde_json::Value>,
+) -> Result<(), &'static str> {
+    match destructive_op_decision(&observation_from_session(session, native)) {
+        DestructiveDecision::Allow => Ok(()),
+        DestructiveDecision::Block { code } => Err(code),
+    }
+}
+
 pub fn observation_from_session(
     session: Option<&serde_json::Value>,
     native: Option<&serde_json::Value>,
@@ -134,5 +144,10 @@ mod tests {
                 code: "incompleteObservation"
             }
         );
+        assert_eq!(
+            require_idle_for_destructive_op(None, None).unwrap_err(),
+            "incompleteObservation"
+        );
+        assert!(require_idle_for_destructive_op(Some(&session), None).is_ok());
     }
 }

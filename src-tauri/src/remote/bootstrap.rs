@@ -323,6 +323,21 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
         managed_codex_home: probe.managed_codex_home.clone(),
     };
 
+    match install_managed_ssh_isolation(&data_root, host_id, &alias, &probe) {
+        Ok(alias_name) => {
+            result
+                .completed_steps
+                .push(format!("ssh.isolationInstalled:{alias_name}"));
+        }
+        Err(error) => {
+            result.blocked_reasons.push(format!("sshIsolationFailed:{error}"));
+            result.repair_commands.push(
+                "Create the dedicated Remote SSH key and marked authorized_keys entry, then Bootstrap again."
+                    .into(),
+            );
+        }
+    }
+
     let agent_artifact = find_artifact("vellum-remote-agent", normalized_arch);
     let agent_needs_install = !result.agent_installed
         || agent_artifact
@@ -342,6 +357,7 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
             &artifact.path,
             "vellum-remote-agent",
             &artifact.digest,
+            probe.disk_free_bytes,
         )?;
         result.agent_installed = true;
         result.completed_steps.push("agent.installed".into());
@@ -366,6 +382,7 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
                     &artifact.path,
                     "vellum-remote-broker",
                     &artifact.digest,
+                    probe.disk_free_bytes,
                 )?;
                 result.broker_installed = true;
                 result
@@ -493,6 +510,7 @@ struct BootstrapProbe {
     broker_sha256: Option<String>,
     gui_session_available: bool,
     managed_codex_home: Option<String>,
+    disk_free_bytes: Option<u64>,
 }
 
 fn probe(data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
@@ -520,6 +538,10 @@ if [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" = yes
 uid=$(id -u)
 if launchctl print "gui/$uid" >/dev/null 2>&1; then echo gui=1; else echo gui=0; fi
 if [ -e "$HOME/.local/state/vellum" ] || [ -e "$HOME/.local/share/vellum" ] || [ -e "$HOME/Library/Application Support/vellum-remote" ] || ls "$HOME/.config/systemd/user"/vellum-* >/dev/null 2>&1; then echo managed=1; else echo managed=0; fi
+if command -v df >/dev/null 2>&1; then
+  avail=$(df -kP "$HOME" | awk 'NR==2 {print $4}')
+  echo "diskFree=$((avail * 1024))"
+fi
 "#;
     let output = ssh_script(data_root, alias, script.as_bytes(), "sh -s --")?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -557,7 +579,100 @@ if [ -e "$HOME/.local/state/vellum" ] || [ -e "$HOME/.local/share/vellum" ] || [
                 )
             }
         },
+        disk_free_bytes: value("diskFree").parse().ok(),
     })
+}
+
+fn install_managed_ssh_isolation(
+    data_root: &Path,
+    host_id: &str,
+    alias: &str,
+    probe: &BootstrapProbe,
+) -> AppResult<String> {
+    let (user, hostname, port) = crate::remote::ssh_isolation::parse_user_host_port(alias)
+        .map_err(AppError::Message)?;
+    let identity_dir = data_root.join("remote-ssh").join(host_id);
+    let identity = identity_dir.join("id_ed25519");
+    let public_key = ensure_isolation_identity(&identity)?;
+    let ssh_config = dirs::home_dir()
+        .map(|home| home.join(".ssh").join("config"))
+        .ok_or_else(|| AppError::Message("SshConfigHomeMissing".into()))?;
+    let existing_keys = ssh_script(
+        data_root,
+        alias,
+        b"",
+        "cat \"$HOME/.ssh/authorized_keys\" 2>/dev/null || true",
+    )?;
+    let existing_text = String::from_utf8_lossy(&existing_keys.stdout);
+    let home = probe
+        .managed_codex_home
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/vellum-remote/codex"));
+    let install_dir = home.join("packages/standalone/current");
+    let extra = home
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or(home.as_path())
+        .join(".local/bin");
+    let applied = crate::remote::ssh_isolation::apply_managed_ssh_isolation(
+        crate::remote::ssh_isolation::IsolationApplyRequest {
+            ssh_config_path: &ssh_config,
+            identity_file: &identity,
+            host_id,
+            hostname: &hostname,
+            user: &user,
+            port,
+            public_key: public_key.trim(),
+            managed_codex_home: &home,
+            install_dir: &install_dir,
+            extra_path: &extra,
+            existing_authorized_keys: existing_text.as_ref(),
+        },
+    )
+    .map_err(AppError::Message)?;
+    let wrapper_quoted = crate::remote::digest::shell_single_quote(&applied.wrapper_path);
+    ssh_script(
+        data_root,
+        alias,
+        applied.wrapper_contents.as_bytes(),
+        &format!(
+            "umask 077; mkdir -p \"$(dirname {wrapper_quoted})\" && cat > {wrapper_quoted} && chmod 0700 {wrapper_quoted}"
+        ),
+    )?;
+    ssh_script(
+        data_root,
+        alias,
+        applied.authorized_keys.as_bytes(),
+        "umask 077; mkdir -p \"$HOME/.ssh\" && cat > \"$HOME/.ssh/authorized_keys\"",
+    )?;
+    Ok(applied.alias)
+}
+
+fn ensure_isolation_identity(path: &Path) -> AppResult<String> {
+    let pub_path = path.with_extension("pub");
+    if path.is_file() && pub_path.is_file() {
+        return fs::read_to_string(&pub_path).map_err(|error| AppError::Message(error.to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| AppError::Message(error.to_string()))?;
+    }
+    let status = std::process::Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            &path.to_string_lossy(),
+            "-N",
+            "",
+            "-q",
+        ])
+        .status()
+        .map_err(|error| AppError::Message(format!("SshKeygenFailed: {error}")))?;
+    if !status.success() {
+        return Err(AppError::Message("SshKeygenFailed".into()));
+    }
+    fs::read_to_string(&pub_path).map_err(|error| AppError::Message(error.to_string()))
 }
 
 fn ensure_linger(data_root: &Path, alias: &str) -> AppResult<()> {
@@ -615,6 +730,7 @@ fn install_artifact(
     artifact: &Path,
     binary_name: &str,
     expected_digest: &str,
+    disk_free_bytes: Option<u64>,
 ) -> AppResult<()> {
     if !matches!(
         binary_name,
@@ -629,6 +745,8 @@ fn install_artifact(
             "RemoteArtifactDigestMismatch: expected {expected_digest}, got {digest}"
         )));
     }
+    crate::remote::space::gate_replace(disk_free_bytes, bytes.len() as u64)
+        .map_err(AppError::Message)?;
     let remote = crate::remote::digest::install_artifact_remote_script(binary_name, digest.as_str());
     ssh_script(data_root, alias, &bytes, &remote)?;
     Ok(())
@@ -806,6 +924,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bootstrap_installs_managed_ssh_isolation_before_agent_copy() {
+        let source = include_str!("bootstrap.rs").replace("\r\n", "\n");
+        let iso = source
+            .find("install_managed_ssh_isolation(")
+            .expect("bootstrap must call install_managed_ssh_isolation");
+        let apply = source
+            .find("apply_managed_ssh_isolation(")
+            .expect("bootstrap isolation must call apply_managed_ssh_isolation");
+        let agent = source
+            .find("install_artifact(\n            &data_root")
+            .expect("agent artifact install_artifact call");
+        assert!(iso < agent, "SSH isolation must run before agent copy");
+        assert!(apply > iso, "apply_managed_ssh_isolation is the install helper");
+    }
+
+    #[test]
+    fn install_artifact_stops_on_space_shortfall_before_ssh() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("vellum-remote-agent");
+        fs::write(&artifact, b"verified bytes").unwrap();
+        let digest = hex::encode(Sha256::digest(b"verified bytes"));
+        let err = install_artifact(
+            temp.path(),
+            "must-not-be-contacted",
+            &artifact,
+            "vellum-remote-agent",
+            &digest,
+            Some(10),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("insufficientDiskSpace"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn bootstrap_arch_matrix_is_explicit() {
         assert_eq!(normalize_arch("x86_64"), Some("amd64"));
         assert_eq!(normalize_arch("aarch64"), Some("arm64"));
@@ -843,6 +998,7 @@ mod tests {
             &artifact,
             "vellum-remote-agent",
             &"0".repeat(64),
+            Some(1024 * 1024 * 1024),
         )
         .unwrap_err();
 

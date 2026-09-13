@@ -878,6 +878,11 @@ mod tests {
             "native macOS helper path must use launchctl, not docker, for the LaunchAgent proxy"
         );
         assert!(
+            script.contains("require_replace_space")
+                && script.contains("insufficientDiskSpace"),
+            "helper must refuse extract when free space is below download+extract+rollback"
+        );
+        assert!(
             script.contains("running.json"),
             "helper must record the new running identity"
         );

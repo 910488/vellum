@@ -244,6 +244,15 @@ fn restart_remote_native_codex_inner(
 ) -> AppResult<serde_json::Value> {
     let target = crate::remote::RemoteHostManager::resolve_target(state, host_id)?;
     let client = crate::remote::RemoteAgentClient::new(target);
+    let status = client.host_status().ok();
+    let session = client.codex_session_status(None).ok();
+    crate::remote::observation::require_idle_for_destructive_op(
+        session.as_ref(),
+        status.as_ref().and_then(|value| value.get("nativeCodex")),
+    )
+    .map_err(|code| {
+        crate::error::AppError::Message(format!("NativeRestartBlocked: {code}"))
+    })?;
     let provisioned = crate::remote::provision_remote_boundary_key(
         &client,
         &state.data_root(),
@@ -725,6 +734,9 @@ mod tests {
     #[test]
     fn boundary_key_provisioning_precedes_the_manual_restart_rpc_in_source_order() {
         let source = include_str!("commands.rs");
+        let gate_at = source
+            .find("require_idle_for_destructive_op(")
+            .expect("restart_remote_native_codex_inner() must gate incomplete observation");
         let provision_at = source
             .find("provision_remote_boundary_key(")
             .expect("restart_remote_native_codex_inner() must call provision_remote_boundary_key");
@@ -734,6 +746,10 @@ mod tests {
         let confirm_at = source
             .find("confirm_remote_boundary_key_consumers(")
             .expect("manual restart must confirm the resulting native instance");
+        assert!(
+            gate_at < provision_at,
+            "observation gate must run before restart mutates the host"
+        );
         assert!(
             provision_at < rpc_at,
             "boundary-key provisioning must run before the manual codex.restartNative RPC"
