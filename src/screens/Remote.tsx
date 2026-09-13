@@ -1202,6 +1202,22 @@ export function Remote({
                   <Row label="SSH">{host?.validated ? t("remote.detail.sshResolved") : host?.validationError ?? t("remote.detail.sshUnresolved")}</Row>
                   <Row label="Agent">{status?.agent ? `${status.agent.agentVersion} · protocol ${status.agent.agentProtocol}` : probeErrors[selectedHostId ?? ""] ?? status?.agentError ?? t("remote.detail.agentAbsent")}</Row>
                   <Row label="OS">{status?.agent ? `${status.agent.capabilities.os} · ${status.agent.capabilities.arch}` : unknown}</Row>
+                  <Row label={t("remote.detail.platform")}>{inventory?.platform ?? status?.agent?.capabilities.platform ?? unknown}</Row>
+                  <Row label={t("remote.detail.proxyBackend")}>{inventory?.proxyBackend ?? status?.agent?.capabilities.proxyBackend ?? unknown}</Row>
+                  <Row label={t("remote.detail.persistence")}>{
+                    (inventory?.persistenceScope ?? status?.agent?.capabilities.persistenceScope) === "login"
+                      ? t("remote.detail.loginResident")
+                      : (inventory?.persistenceScope ?? status?.agent?.capabilities.persistenceScope) === "linger"
+                        ? t("remote.detail.lingerResident")
+                        : unknown
+                  }</Row>
+                  <Row label={t("remote.detail.managedHome")}>{inventory?.managedCodexHome ?? status?.agent?.capabilities.managedCodexHome ?? native?.codexHome ?? unknown}</Row>
+                  {(inventory?.platform === "darwin-arm64" || status?.agent?.capabilities.platform === "darwin-arm64") && (
+                    <Row label={t("remote.detail.isolationLabel")}>{t("remote.detail.isolation")}</Row>
+                  )}
+                  {(status?.agent?.capabilities.os === "darwin" || status?.agent?.capabilities.os === "macos") && status?.agent?.capabilities.arch === "x86_64" && (
+                    <Row label={t("remote.detail.platform")}>{t("remote.blocker.intelMacUnsupported")}</Row>
+                  )}
                   <Row label="CPU">{inventory?.system.cpuCores != null ? t("remote.detail.cores", { count: inventory.system.cpuCores }) : unknown}</Row>
                   <Row label="Memory">{formatBytes(inventory?.system.memoryBytes, unknown)}</Row>
                   <Row label="Disk">{inventory?.system.diskTotalBytes != null ? t("remote.detail.diskFree", { free: formatBytes(inventory.system.diskFreeBytes, unknown), total: formatBytes(inventory.system.diskTotalBytes, unknown) }) : unknown}</Row>

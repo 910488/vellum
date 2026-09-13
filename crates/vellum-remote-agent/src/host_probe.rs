@@ -5,9 +5,13 @@ use crate::protocol::{CodexInventory, DockerInventory, HostCapabilities, SystemI
 pub fn probe_host() -> HostCapabilities {
     let docker = probe_docker();
     let codex = probe_codex();
+    let os = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+    let platform = crate::platform::RemotePlatform::from_os_arch(&os, &arch).ok();
+    let user_home = dirs::home_dir();
     HostCapabilities {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
+        os: os.clone(),
+        arch,
         docker_available: docker.available,
         docker_mode: docker.mode,
         rootless_docker: docker.rootless,
@@ -15,6 +19,14 @@ pub fn probe_host() -> HostCapabilities {
         linger_enabled: linger_enabled(),
         codex_binary: codex.binary,
         codex_version: codex.version,
+        platform: platform.map(|item| item.artifact_key().to_string()),
+        proxy_backend: platform.map(|item| item.proxy_backend_name().to_string()),
+        service_manager: platform.map(|item| item.service_manager().to_string()),
+        persistence_scope: platform.map(|item| item.persistence_scope().to_string()),
+        managed_codex_home: user_home
+            .as_ref()
+            .map(|home| crate::platform::managed_codex_home(home, &os).display().to_string()),
+        gui_session_available: Some(gui_session_available()),
     }
 }
 
@@ -202,6 +214,9 @@ pub fn probe_codex_inventory_with_native(
 }
 
 fn probe_cpu_cores() -> Option<u64> {
+    if let Some(cores) = sysctl_u64(&["hw.ncpu"]) {
+        return Some(cores);
+    }
     if let Ok(output) = Command::new("nproc").output() {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -216,17 +231,40 @@ fn probe_cpu_cores() -> Option<u64> {
 }
 
 fn probe_memory_bytes() -> Option<u64> {
+    if let Some(bytes) = sysctl_u64(&["hw.memsize"]) {
+        return Some(bytes);
+    }
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|input| parse_meminfo_total(&input))
 }
 
 fn probe_disk_bytes() -> Option<(u64, u64)> {
+    if let Some(bytes) = probe_disk_posix() {
+        return Some(bytes);
+    }
     let output = Command::new("df").args(["-P", "-B1", "/"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
     parse_df_bytes(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn probe_disk_posix() -> Option<(u64, u64)> {
+    let output = Command::new("df").args(["-kP", "/"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let (total_k, avail_k) = parse_df_kilobytes(&String::from_utf8_lossy(&output.stdout))?;
+    Some((total_k.saturating_mul(1024), avail_k.saturating_mul(1024)))
+}
+
+fn sysctl_u64(args: &[&str]) -> Option<u64> {
+    let output = Command::new("sysctl").args(["-n"]).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn read_hostname() -> Option<String> {
@@ -324,6 +362,27 @@ fn linger_enabled() -> bool {
         .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "yes")
 }
 
+fn gui_session_available() -> bool {
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let Some(uid) = uid else {
+        return false;
+    };
+    Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}")])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Parse `df -kP /` (POSIX, BSD and GNU) into (total KiB, available KiB).
+fn parse_df_kilobytes(input: &str) -> Option<(u64, u64)> {
+    parse_df_bytes(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +420,15 @@ Filesystem 1B-blocks Used Available Capacity Mounted on
         assert_eq!(parse_df_bytes(""), None);
         let bad = "Filesystem 1B-blocks Used Available Capacity Mounted on\n/dev/root x y z 0% /\n";
         assert_eq!(parse_df_bytes(bad), None);
+    }
+
+    #[test]
+    fn bsd_df_kp_output_is_parsed_as_kilobytes() {
+        let sample = "\
+Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/disk3s1 488245288 484000000 3500000 99% /System/Volumes/Data
+";
+        assert_eq!(parse_df_kilobytes(sample), Some((488_245_288, 3_500_000)));
     }
 
     #[test]

@@ -232,6 +232,13 @@ fn dispatch(
             image,
             image_digest,
         } => operation_to_value(manager.update(&operation_id, &image, image_digest)?),
+        AgentRequest::ProxyLogs { max_bytes } => {
+            Ok(serde_json::to_value(manager.logs(max_bytes)?)
+                .map_err(|error| error.to_string())?)
+        }
+        AgentRequest::ProxyRollback { operation_id } => {
+            operation_to_value(manager.rollback(&operation_id)?)
+        }
         AgentRequest::CredentialPut {
             operation_id,
             credential_id,
@@ -860,16 +867,32 @@ fn host_inventory_with_native(
     native: Option<&vellum_remote_agent::native_codex::NativeCodexRuntimeStatus>,
 ) -> Result<HostInventoryV2, String> {
     let state = store.load()?;
+    let system = vellum_remote_agent::host_probe::probe_system_inventory();
+    let platform = vellum_remote_agent::platform::RemotePlatform::from_os_arch(
+        &system.os,
+        &system.arch,
+    )
+    .ok();
+    let managed_home = dirs::home_dir().map(|home| {
+        vellum_remote_agent::platform::managed_codex_home(&home, &system.os)
+            .display()
+            .to_string()
+    });
     let mut inventory = HostInventoryV2 {
         host_id: state.host_id,
         agent_version: AGENT_VERSION.to_string(),
         agent_protocol: AGENT_PROTOCOL_VERSION,
-        system: vellum_remote_agent::host_probe::probe_system_inventory(),
+        system,
         docker: vellum_remote_agent::host_probe::probe_docker_inventory(),
         codex: vellum_remote_agent::host_probe::probe_codex_inventory_with_native(native),
         proxy: manager.status()?,
         blockers: Vec::new(),
         available_actions: Vec::new(),
+        platform: platform.map(|item| item.artifact_key().to_string()),
+        proxy_backend: platform.map(|item| item.proxy_backend_name().to_string()),
+        service_manager: platform.map(|item| item.service_manager().to_string()),
+        persistence_scope: platform.map(|item| item.persistence_scope().to_string()),
+        managed_codex_home: managed_home,
     };
     inventory.blockers = host_blockers(&inventory);
     inventory.available_actions = host_actions(&inventory);
@@ -952,7 +975,22 @@ fn host_manager_snapshot(
 /// list is only what the agent can observe about the host itself.
 fn host_blockers(inventory: &HostInventoryV2) -> Vec<HostBlocker> {
     let mut blockers = Vec::new();
-    if !inventory.docker.available {
+    let platform = vellum_remote_agent::platform::RemotePlatform::from_os_arch(
+        &inventory.system.os,
+        &inventory.system.arch,
+    );
+    if let Err(unsupported) = &platform {
+        blockers.push(HostBlocker::new(
+            unsupported.code,
+            unsupported.message.clone(),
+            false,
+        ));
+    }
+    let docker_is_blocker = platform
+        .as_ref()
+        .map(|item| item.docker_is_blocker())
+        .unwrap_or(true);
+    if docker_is_blocker && !inventory.docker.available {
         blockers.push(HostBlocker::new(
             "dockerUnavailable",
             "Docker daemon is not available on this host",
@@ -992,7 +1030,13 @@ fn host_actions(inventory: &HostInventoryV2) -> Vec<String> {
     if inventory.codex.standalone_installed && !inventory.codex.app_cli_discoverable {
         actions.push("repair".into());
     }
-    if !inventory.docker.available {
+    let docker_is_blocker = vellum_remote_agent::platform::RemotePlatform::from_os_arch(
+        &inventory.system.os,
+        &inventory.system.arch,
+    )
+    .map(|item| item.docker_is_blocker())
+    .unwrap_or(true);
+    if docker_is_blocker && !inventory.docker.available {
         actions.push("repair".into());
     }
     actions.push("exportSupportBundle".into());
@@ -1031,7 +1075,13 @@ fn reconcile_native_profile_runtime(profiles: &mut [Value], native: Option<&Valu
 
 fn doctor_notes(status: &HostStatus) -> Vec<String> {
     let mut notes = Vec::new();
-    if !status.capabilities.docker_available {
+    let docker_is_blocker = vellum_remote_agent::platform::RemotePlatform::from_os_arch(
+        &status.capabilities.os,
+        &status.capabilities.arch,
+    )
+    .map(|item| item.docker_is_blocker())
+    .unwrap_or(true);
+    if docker_is_blocker && !status.capabilities.docker_available {
         notes.push("docker unavailable".into());
     }
     if status.proxy.present && status.proxy.running && !status.proxy.ready {
@@ -1163,5 +1213,31 @@ mod tests {
             .iter()
             .any(|blocker| blocker.code == "codexAppCliUnavailable" && blocker.repairable));
         assert!(host_actions(&inventory).contains(&"repair".to_string()));
+    }
+
+    #[test]
+    fn macos_without_docker_is_not_a_blocker() {
+        let mut inventory = inventory_fixture();
+        inventory.system.os = "macos".into();
+        inventory.system.arch = "aarch64".into();
+        inventory.docker.available = false;
+        inventory.docker.mode = "unavailable".into();
+        inventory.platform = Some("darwin-arm64".into());
+        inventory.proxy_backend = Some("native".into());
+        let blockers = host_blockers(&inventory);
+        let codes: Vec<&str> = blockers
+            .iter()
+            .map(|blocker| blocker.code.as_str())
+            .collect();
+        assert!(!codes.contains(&"dockerUnavailable"));
+        assert!(!host_actions(&inventory).contains(&"repair".to_string()) || inventory.codex.standalone_installed);
+        let intel = {
+            let mut item = inventory.clone();
+            item.system.arch = "x86_64".into();
+            item
+        };
+        assert!(host_blockers(&intel)
+            .iter()
+            .any(|blocker| blocker.code == "intelMacUnsupported"));
     }
 }

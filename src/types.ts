@@ -1157,6 +1157,12 @@ export interface RemoteHostStatus {
       lingerEnabled: boolean;
       codexBinary: string | null;
       codexVersion: string | null;
+      platform?: string | null;
+      proxyBackend?: string | null;
+      serviceManager?: string | null;
+      persistenceScope?: string | null;
+      managedCodexHome?: string | null;
+      guiSessionAvailable?: boolean | null;
     };
     proxy: {
       present: boolean;
@@ -1230,6 +1236,11 @@ export interface RemoteHostInventory {
   codex: RemoteCodexInventory;
   blockers: { code: string; message: string; repairable: boolean }[];
   availableActions: string[];
+  platform?: string | null;
+  proxyBackend?: string | null;
+  serviceManager?: string | null;
+  persistenceScope?: string | null;
+  managedCodexHome?: string | null;
 }
 
 export interface RemoteGrokStatus {

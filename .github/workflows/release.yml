@@ -305,6 +305,35 @@ jobs:
           path: updater/vellum-remote-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
+  remote-darwin:
+    name: Remote macOS ARM64 package
+    needs: resolve
+    if: needs.resolve.outputs.component == 'remote'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build Darwin remote payload
+        run: |
+          cargo build -p vellum-remote-agent -p vellum-proxy-daemon --release --target aarch64-apple-darwin
+          mkdir -p src-tauri/resources/remote/darwin-arm64 updater
+          cp target/aarch64-apple-darwin/release/vellum-remote-agent src-tauri/resources/remote/darwin-arm64/vellum-remote-agent
+          cp target/aarch64-apple-darwin/release/vellum-proxy-daemon src-tauri/resources/remote/darwin-arm64/vellum-proxy-daemon
+          tar -C src-tauri/resources/remote -czf updater/vellum-remote-darwin-arm64.tar.gz darwin-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updater-remote-darwin-arm64
+          path: updater/vellum-remote-darwin-arm64.tar.gz
+          if-no-files-found: error
+
   core-from-lockfile:
     name: Enhanced core from lockfile (${{ matrix.triple }})
     needs: resolve

@@ -72,22 +72,40 @@ fn manager_snapshot_method_not_found(error: &AppError) -> bool {
 }
 
 fn native_detached_ready(agent: &Value) -> bool {
-    agent
+    let daemon = agent
         .pointer("/nativeCodex/daemonRunning")
         .and_then(Value::as_bool)
         .unwrap_or(false)
         && agent
             .pointer("/nativeCodex/cliLauncher/ready")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        && agent
+            .unwrap_or(false);
+    if !daemon {
+        return false;
+    }
+    let os = agent
+        .pointer("/capabilities/os")
+        .and_then(Value::as_str)
+        .unwrap_or("linux");
+    if crate::remote::platform::normalize_os(os) == Some("darwin") {
+        agent
+            .pointer("/capabilities/guiSessionAvailable")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+            && agent
+                .pointer("/capabilities/persistenceScope")
+                .and_then(Value::as_str)
+                == Some(crate::remote::platform::PERSISTENCE_LOGIN)
+    } else {
+        agent
             .pointer("/capabilities/lingerEnabled")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-        && agent
-            .pointer("/capabilities/userSystemdAvailable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+            && agent
+                .pointer("/capabilities/userSystemdAvailable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }
 }
 
 impl RemoteHostManager {

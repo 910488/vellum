@@ -65,6 +65,30 @@ proxy_image_from_expected() {
   sed -n 's/.*"proxyImage"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p; s/.*"proxy_image"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$EXPECTED" | head -1
 }
 
+proxy_backend_from_expected() {
+  [ -f "$EXPECTED" ] || return 0
+  sed -n 's/.*"proxyBackend"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p; s/.*"proxy_backend"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$EXPECTED" | head -1
+}
+
+is_native_proxy() {
+  backend=$(proxy_backend_from_expected)
+  [ "${backend:-}" = "native" ]
+}
+
+NATIVE_LABEL="com.vellum.remote.proxy"
+NATIVE_PLIST="$HOME/Library/LaunchAgents/${NATIVE_LABEL}.plist"
+NATIVE_PROXY_DIR="$HOME/Library/Application Support/vellum-remote/bin"
+
+install_native_proxy_bin() {
+  src_root="${1:?}"
+  mkdir -p "$NATIVE_PROXY_DIR" "$HOME/.local/bin"
+  found=$(find "$src_root" -name 'vellum-proxy-daemon' -type f 2>/dev/null | head -1)
+  [ -n "$found" ] || return 0
+  cp "$found" "$NATIVE_PROXY_DIR/vellum-proxy-daemon"
+  cp "$found" "$HOME/.local/bin/vellum-proxy-daemon"
+  chmod 0700 "$NATIVE_PROXY_DIR/vellum-proxy-daemon" "$HOME/.local/bin/vellum-proxy-daemon" || true
+}
+
 stop_running_set() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --user stop vellum-remote-agent vellum-remote-broker 2>/dev/null || true
@@ -73,7 +97,10 @@ stop_running_set() {
     pkill -x vellum-remote-agent 2>/dev/null || true
     pkill -x vellum-remote-broker 2>/dev/null || true
   fi
-  if command -v docker >/dev/null 2>&1; then
+  if is_native_proxy && command -v launchctl >/dev/null 2>&1; then
+    uid=$(id -u)
+    launchctl bootout "gui/${uid}/${NATIVE_LABEL}" 2>/dev/null || true
+  elif command -v docker >/dev/null 2>&1; then
     ids=$(docker ps -aq --filter name=vellum-proxy 2>/dev/null || true)
     if [ -n "$ids" ]; then
       echo "$ids" | xargs docker stop >/dev/null 2>&1 || true
@@ -83,9 +110,18 @@ stop_running_set() {
 }
 
 start_running_set() {
-  image=$(proxy_image_from_expected)
-  if command -v docker >/dev/null 2>&1 && [ -n "${image:-}" ]; then
-    docker run -d --name vellum-proxy --restart unless-stopped "$image" >/dev/null
+  if is_native_proxy && command -v launchctl >/dev/null 2>&1; then
+    uid=$(id -u)
+    if [ -f "$NATIVE_PLIST" ]; then
+      launchctl bootstrap "gui/${uid}" "$NATIVE_PLIST" 2>/dev/null || \
+        launchctl load -w "$NATIVE_PLIST" 2>/dev/null || true
+      launchctl kickstart -k "gui/${uid}/${NATIVE_LABEL}" 2>/dev/null || true
+    fi
+  else
+    image=$(proxy_image_from_expected)
+    if command -v docker >/dev/null 2>&1 && [ -n "${image:-}" ]; then
+      docker run -d --name vellum-proxy --restart unless-stopped "$image" >/dev/null
+    fi
   fi
   if [ -x "$HOME/.local/bin/vellum-remote-agent" ]; then
     nohup "$HOME/.local/bin/vellum-remote-agent" >>"$ROOT/agent.log" 2>&1 &
@@ -111,7 +147,11 @@ apply_locked() {
     if [ -d "$PREV" ]; then
       find "$PREV" -name 'vellum-remote-agent' -exec cp {} "$HOME/.local/bin/vellum-remote-agent" \;
       find "$PREV" -name 'vellum-remote-broker' -exec cp {} "$HOME/.local/bin/vellum-remote-broker" \;
-      find "$PREV" -name 'proxy-image.tar' -exec docker load -i {} \; || true
+      if is_native_proxy; then
+        install_native_proxy_bin "$PREV"
+      else
+        find "$PREV" -name 'proxy-image.tar' -exec docker load -i {} \; || true
+      fi
       if [ -f "$PREV/expected.json" ]; then
         cp "$PREV/expected.json" "$EXPECTED"
       fi
@@ -142,7 +182,11 @@ apply_locked() {
     fi
     find "$STAGE" -name 'vellum-remote-agent' -exec cp {} "$HOME/.local/bin/vellum-remote-agent" \;
     find "$STAGE" -name 'vellum-remote-broker' -exec cp {} "$HOME/.local/bin/vellum-remote-broker" \;
-    find "$STAGE" -name 'proxy-image.tar' -exec docker load -i {} \;
+    if is_native_proxy; then
+      install_native_proxy_bin "$STAGE"
+    else
+      find "$STAGE" -name 'proxy-image.tar' -exec docker load -i {} \;
+    fi
     restart_running_set
     write_running_json
     record replaceSet

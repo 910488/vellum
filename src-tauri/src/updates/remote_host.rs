@@ -38,6 +38,8 @@ pub struct ValidationReport {
     pub task_list: bool,
     pub events_ok: bool,
     pub health_only: bool,
+    pub proxy_backend: Option<String>,
+    pub native_proxy_digest: Option<String>,
 }
 
 /// Identity of the running agent+broker+proxy set. Apply succeeds only when
@@ -48,6 +50,10 @@ pub struct RunningSetIdentity {
     pub agent_version: String,
     pub broker_version: String,
     pub proxy_image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_proxy_digest: Option<String>,
 }
 
 impl RunningSetIdentity {
@@ -56,15 +62,32 @@ impl RunningSetIdentity {
             agent_version: version.to_string(),
             broker_version: version.to_string(),
             proxy_image: format!("vellum-proxy:{version}"),
+            proxy_backend: None,
+            native_proxy_digest: None,
         }
     }
 
     pub fn from_report(report: &ValidationReport) -> Option<Self> {
+        let agent_version = report
+            .agent_version
+            .clone()
+            .filter(|value| !value.is_empty())?;
+        if report.proxy_backend.as_deref() == Some("native")
+            || report.native_proxy_digest.as_deref().is_some_and(|d| !d.is_empty())
+        {
+            return Some(Self {
+                agent_version,
+                broker_version: String::new(),
+                proxy_image: String::new(),
+                proxy_backend: Some("native".into()),
+                native_proxy_digest: report
+                    .native_proxy_digest
+                    .clone()
+                    .filter(|value| !value.is_empty()),
+            });
+        }
         Some(Self {
-            agent_version: report
-                .agent_version
-                .clone()
-                .filter(|value| !value.is_empty())?,
+            agent_version,
             broker_version: report
                 .broker_version
                 .clone()
@@ -73,6 +96,8 @@ impl RunningSetIdentity {
                 .proxy_image
                 .clone()
                 .filter(|value| !value.is_empty())?,
+            proxy_backend: None,
+            native_proxy_digest: None,
         })
     }
 }
@@ -116,6 +141,20 @@ fn identity_from_json(bytes: &[u8]) -> Option<RunningSetIdentity> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
     let agent = pointer_string(&value, "/agent/version")
         .or_else(|| pointer_string(&value, "/agentVersion"))?;
+    let backend = pointer_string(&value, "/proxy/backend")
+        .or_else(|| pointer_string(&value, "/proxyBackend"));
+    let native_digest = pointer_string(&value, "/proxy/nativeExecutableDigest")
+        .or_else(|| pointer_string(&value, "/nativeProxyDigest"));
+    if backend.as_deref() == Some("native") || native_digest.as_deref().is_some_and(|d| !d.is_empty())
+    {
+        return Some(RunningSetIdentity {
+            agent_version: agent,
+            broker_version: String::new(),
+            proxy_image: String::new(),
+            proxy_backend: Some("native".into()),
+            native_proxy_digest: native_digest,
+        });
+    }
     let broker = pointer_string(&value, "/broker/version")
         .or_else(|| pointer_string(&value, "/brokerVersion"))?;
     let proxy =
@@ -127,6 +166,8 @@ fn identity_from_json(bytes: &[u8]) -> Option<RunningSetIdentity> {
         agent_version: agent,
         broker_version: broker,
         proxy_image: proxy,
+        proxy_backend: None,
+        native_proxy_digest: None,
     })
 }
 
@@ -268,6 +309,10 @@ pub fn validation_from_json(
             .or_else(|| pointer_string(inventory, "/broker/version")),
         proxy_image: pointer_string(inventory, "/proxy/image")
             .or_else(|| pointer_string(inventory, "/proxyImage")),
+        proxy_backend: pointer_string(inventory, "/proxyBackend")
+            .or_else(|| pointer_string(inventory, "/proxy/proxyBackend")),
+        native_proxy_digest: pointer_string(inventory, "/proxy/nativeExecutableDigest")
+            .or_else(|| pointer_string(inventory, "/nativeProxyDigest")),
         agent_protocol: handshake
             .get("agentProtocol")
             .and_then(Value::as_u64)
@@ -653,6 +698,8 @@ mod tests {
             task_list: true,
             events_ok: true,
             health_only: false,
+            proxy_backend: None,
+            native_proxy_digest: None,
         }
     }
 
@@ -804,8 +851,10 @@ mod tests {
     fn host_helper_script_verifies_hash_guards_tar_and_restarts_the_set() {
         let script = HOST_HELPER_SH;
         assert!(
-            script.contains("package sha256 mismatch") && script.contains("sha256sum"),
-            "helper must verify package.tar.gz against $ROOT/sha256"
+            script.contains("package sha256 mismatch")
+                && script.contains("sha256sum")
+                && script.contains("shasum -a 256"),
+            "helper must verify package.tar.gz with sha256sum or shasum -a 256"
         );
         assert!(
             script.contains("illegal tar member") && script.contains("*..*"),
@@ -818,6 +867,15 @@ mod tests {
                 && script.contains("docker run")
                 && (script.contains("pkill") || script.contains("systemctl")),
             "helper must stop/restart agent, broker, and proxy; docker load is not a switch"
+        );
+        assert!(
+            script.contains("is_native_proxy")
+                && script.contains("launchctl bootout")
+                && script.contains("launchctl bootstrap")
+                && script.contains("launchctl kickstart")
+                && script.contains("com.vellum.remote.proxy")
+                && script.contains("vellum-proxy-daemon"),
+            "native macOS helper path must use launchctl, not docker, for the LaunchAgent proxy"
         );
         assert!(
             script.contains("running.json"),
@@ -937,12 +995,37 @@ mod tests {
             task_list: true,
             events_ok: true,
             health_only: false,
+            proxy_backend: None,
+            native_proxy_digest: None,
         };
         let err = require_full_validation(&old, &expected).unwrap_err();
         assert!(
             err.contains("does not match staged remote-v*"),
             "presence of inventory fields is not success: {err}"
         );
+        let native = ValidationReport {
+            agent_version: Some("0.4.0".into()),
+            broker_version: None,
+            proxy_image: None,
+            agent_protocol: Some(4),
+            task_list: true,
+            events_ok: true,
+            health_only: false,
+            proxy_backend: Some("native".into()),
+            native_proxy_digest: Some("a".repeat(64)),
+        };
+        let expected_native = RunningSetIdentity {
+            agent_version: "0.4.0".into(),
+            broker_version: String::new(),
+            proxy_image: String::new(),
+            proxy_backend: Some("native".into()),
+            native_proxy_digest: Some("a".repeat(64)),
+        };
+        require_full_validation(&native, &expected_native).expect("macos native identity");
+        assert!(RunningSetIdentity::from_report(&native)
+            .unwrap()
+            .broker_version
+            .is_empty());
 
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("pkg.tar.gz");

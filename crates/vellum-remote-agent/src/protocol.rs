@@ -15,6 +15,18 @@ pub struct HostCapabilities {
     pub linger_enabled: bool,
     pub codex_binary: Option<String>,
     pub codex_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_manager: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_codex_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_session_available: Option<bool>,
 }
 
 /// Versioned host inventory (M30). A single-call superset of
@@ -33,6 +45,16 @@ pub struct HostInventoryV2 {
     pub blockers: Vec<HostBlocker>,
     #[serde(default)]
     pub available_actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_manager: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_codex_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -135,6 +157,19 @@ pub struct ProxyStatusView {
     pub install_id: Option<String>,
     pub config_hash: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_executable_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyLogsView {
+    pub source: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
 }
 
 /// M35: one-SSH-round-trip superset of `host.status` + `host.inventoryV2` +
@@ -247,6 +282,13 @@ pub enum AgentRequest {
         image: String,
         image_digest: Option<String>,
     },
+    #[serde(rename = "proxy.logs")]
+    ProxyLogs {
+        #[serde(default)]
+        max_bytes: Option<u64>,
+    },
+    #[serde(rename = "proxy.rollback")]
+    ProxyRollback { operation_id: String },
     #[serde(rename = "credential.put")]
     CredentialPut {
         operation_id: String,
@@ -534,6 +576,28 @@ mod tests {
     }
 
     #[test]
+    fn proxy_logs_and_rollback_wire_contract_is_camel_case() {
+        let logs = serde_json::to_value(AgentRequest::ProxyLogs {
+            max_bytes: Some(4096),
+        })
+        .unwrap();
+        assert_eq!(logs["method"], "proxy.logs");
+        assert_eq!(logs["maxBytes"], 4096);
+        assert!(logs.get("max_bytes").is_none());
+        let bare: AgentRequest =
+            serde_json::from_value(serde_json::json!({"method": "proxy.logs"})).unwrap();
+        assert_eq!(bare, AgentRequest::ProxyLogs { max_bytes: None });
+
+        let rollback = serde_json::to_value(AgentRequest::ProxyRollback {
+            operation_id: "op-rb".into(),
+        })
+        .unwrap();
+        assert_eq!(rollback["method"], "proxy.rollback");
+        assert_eq!(rollback["operationId"], "op-rb");
+        assert!(rollback.get("operation_id").is_none());
+    }
+
+    #[test]
     fn host_manager_snapshot_wire_contract_is_camel_case() {
         let value = serde_json::to_value(AgentRequest::HostManagerSnapshot {
             expected_account_id: Some("acct-1".into()),
@@ -587,6 +651,12 @@ mod tests {
                     linger_enabled: true,
                     codex_binary: None,
                     codex_version: None,
+                    platform: None,
+                    proxy_backend: None,
+                    service_manager: None,
+                    persistence_scope: None,
+                    managed_codex_home: None,
+                    gui_session_available: None,
                 },
                 proxy: ProxyStatusView::default(),
                 install: None,
@@ -720,6 +790,12 @@ mod tests {
             linger_enabled: true,
             codex_binary: Some("codex".into()),
             codex_version: Some("0.147.0".into()),
+            platform: None,
+            proxy_backend: None,
+            service_manager: None,
+            persistence_scope: None,
+            managed_codex_home: None,
+            gui_session_available: None,
         })
         .unwrap();
         let object = value.as_object().unwrap();
@@ -784,6 +860,39 @@ mod tests {
         assert!(encoded.get("cpuCores").is_none());
         assert!(encoded.get("cpu_cores").is_none());
         assert_eq!(encoded["codex"]["source"], "missing");
+        assert_eq!(parsed.platform, None);
+        assert_eq!(parsed.proxy_backend, None);
+        assert_eq!(parsed.managed_codex_home, None);
+    }
+
+    #[test]
+    fn protocol_4_inventory_fields_are_optional_on_linux_shaped_payloads() {
+        let value = serde_json::json!({
+            "hostId": "mac",
+            "agentVersion": "0.3.0",
+            "agentProtocol": 4,
+            "system": {"os": "macos", "arch": "aarch64"},
+            "docker": {"available": false, "mode": "unavailable"},
+            "codex": {"source": "native", "codexHome": "/Users/joshhuang/.vellum-remote/codex"},
+            "proxy": {"present": true, "running": true, "ready": true, "hostPort": 15722, "proxyBackend": "native", "nativeExecutableDigest": "a".repeat(64)},
+            "platform": "darwin-arm64",
+            "proxyBackend": "native",
+            "serviceManager": "launchd",
+            "persistenceScope": "login",
+            "managedCodexHome": "/Users/joshhuang/.vellum-remote/codex"
+        });
+        let parsed: HostInventoryV2 = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.platform.as_deref(), Some("darwin-arm64"));
+        assert_eq!(parsed.proxy_backend.as_deref(), Some("native"));
+        assert_eq!(parsed.service_manager.as_deref(), Some("launchd"));
+        assert_eq!(parsed.persistence_scope.as_deref(), Some("login"));
+        assert_eq!(
+            parsed.managed_codex_home.as_deref(),
+            Some("/Users/joshhuang/.vellum-remote/codex")
+        );
+        assert_eq!(parsed.proxy.host_port, Some(15722));
+        assert_eq!(parsed.proxy.proxy_backend.as_deref(), Some("native"));
+        assert!(parsed.proxy.image.is_none());
     }
 
     #[test]

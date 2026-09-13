@@ -21,9 +21,11 @@ curl -fsS http://127.0.0.1:15721/v1/models
 
 通過條件：
 
-- `dockerAvailable=true`、`userSystemdAvailable=true`、`lingerEnabled=true`；
+- Linux：`dockerAvailable=true`、`userSystemdAvailable=true`、`lingerEnabled=true`，proxy host port 15721；
+- Apple Silicon：`platform=darwin-arm64`、`proxyBackend=native`、`serviceManager=launchd`、`persistenceScope=login`（登入後常駐），Docker 不是 blocker；proxy 預設 `127.0.0.1:15722`；受管 `CODEX_HOME` 為 `~/.vellum-remote/codex`，不得改寫本機 `~/.codex`。Intel Mac 必須顯示尚未支援且不可部署。
+- Linux 通過條件仍包含：
 - `nativeCodex.daemonOwner=codexCliDaemon`、`durable=true`、`restartSafe=true`；
-- proxy `running=true`、`ready=true`，host port 15721；
+- proxy `running=true`、`ready=true`；
 - managed lease `active`，native runtime ready，broker 不成為 session authority；
 - model/credential set 不含 `weikuwu`；
 - `readyz.model_count` 與 `/v1/models` 相同。

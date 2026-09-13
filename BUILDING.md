@@ -322,10 +322,12 @@ pnpm run build:mac
 ```
 
 This builds and embeds the complete Remote Manager deployment payload for
-Linux amd64 and arm64, downloads and verifies the Enhanced Core matching the
+Linux amd64 and arm64 plus the Darwin ARM64 Agent and native proxy daemon,
+downloads and verifies the Enhanced Core matching the
 Mac's Rust host target (`aarch64-apple-darwin` or
 `x86_64-apple-darwin`), and then creates the DMG. A small DMG without these
-generated resources or the pinned Core is not a release build.
+generated resources or the pinned Core is not a release build. Intel Mac is
+not a Remote Manager deploy target.
 
 The DMG is written to:
 

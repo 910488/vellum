@@ -234,3 +234,43 @@ jobs:
           cargo run -p vellum-eval --bin vellum-eval -- protocol-replay
           cargo run -p vellum-eval --bin vellum-eval -- app-replay --suite desktop-protocol-replay
           cargo run -p vellum-eval --bin vellum-eval -- app-replay --suite canonical-compaction-12
+
+  remote-macos:
+    name: macOS ARM64 remote artifact
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test remote agent and native proxy
+        run: |
+          cargo test -p vellum-remote-agent --all-targets
+          cargo test -p vellum-proxy-daemon --all-targets
+          cargo clippy -p vellum-remote-agent -p vellum-proxy-daemon --all-targets -- -D warnings
+
+      - name: Build Darwin remote binaries
+        run: |
+          cargo build -p vellum-remote-agent -p vellum-proxy-daemon --release --target aarch64-apple-darwin
+          mkdir -p dist/remote/darwin-arm64
+          cp "target/aarch64-apple-darwin/release/vellum-remote-agent" dist/remote/darwin-arm64/vellum-remote-agent
+          cp "target/aarch64-apple-darwin/release/vellum-proxy-daemon" dist/remote/darwin-arm64/vellum-proxy-daemon
+          test -x dist/remote/darwin-arm64/vellum-remote-agent
+          test -x dist/remote/darwin-arm64/vellum-proxy-daemon
+          ! test -e dist/remote/darwin-arm64/vellum-remote-broker
+
+      - name: Upload macOS remote artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-remote-darwin-arm64-${{ github.sha }}
+          path: dist/remote/darwin-arm64
+          if-no-files-found: error
+          retention-days: 7

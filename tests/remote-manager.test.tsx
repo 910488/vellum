@@ -325,7 +325,64 @@ describe("Remote Manager operations UI", () => {
     expect(runtime?.open).toBe(false);
     openTray("執行環境");
     expect(runtime?.open).toBe(true);
-    expect(screen.getByText("/home/vellum-test/.codex")).toBeTruthy();
+    expect(screen.getAllByText("/home/vellum-test/.codex").length).toBeGreaterThan(0);
+  });
+
+  it("shows Apple Silicon login persistence, isolation, and Intel as 尚未支援", async () => {
+    apiMocks.inspectRemoteHost.mockResolvedValue({
+      ...status,
+      agent: status.agent && {
+        ...status.agent,
+        agentProtocol: 4,
+        capabilities: {
+          ...status.agent.capabilities,
+          os: "macos",
+          arch: "aarch64",
+          dockerAvailable: false,
+          platform: "darwin-arm64",
+          proxyBackend: "native",
+          serviceManager: "launchd",
+          persistenceScope: "login",
+          managedCodexHome: "/Users/joshhuang/.vellum-remote/codex",
+        },
+        nativeCodex: status.agent.nativeCodex && {
+          ...status.agent.nativeCodex,
+          codexHome: "/Users/joshhuang/.vellum-remote/codex",
+        },
+      },
+      inventory: status.inventory && {
+        ...status.inventory,
+        agentProtocol: 4,
+        platform: "darwin-arm64",
+        proxyBackend: "native",
+        serviceManager: "launchd",
+        persistenceScope: "login",
+        managedCodexHome: "/Users/joshhuang/.vellum-remote/codex",
+        system: { ...status.inventory.system, os: "macos", arch: "aarch64" },
+        docker: { ...status.inventory.docker, available: false, mode: "unavailable" },
+      },
+    });
+    renderRemote();
+    expect(await screen.findByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    openTray("主機");
+    expect(screen.getByText("登入後常駐")).toBeTruthy();
+    expect(screen.getAllByText("/Users/joshhuang/.vellum-remote/codex").length).toBeGreaterThan(0);
+    expect(screen.getByText(/本機 Vellum／Enhanced／~\/.codex 隔離/)).toBeTruthy();
+
+    apiMocks.inspectRemoteHost.mockResolvedValue({
+      ...status,
+      agent: status.agent && {
+        ...status.agent,
+        capabilities: {
+          ...status.agent.capabilities,
+          os: "macos",
+          arch: "x86_64",
+        },
+      },
+    });
+    cleanup();
+    renderRemote();
+    expect(await screen.findByText(/尚未支援/)).toBeTruthy();
   });
 
   it("shows a plain-language upgrade notice for a schema-1 configuration instead of a raw code", async () => {

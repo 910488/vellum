@@ -48,6 +48,16 @@ pub struct BootstrapResult {
     pub completed_steps: Vec<String>,
     pub blocked_reasons: Vec<String>,
     pub repair_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_manager: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_codex_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,20 +191,7 @@ where
         .and_then(|agent| agent.pointer("/nativeCodex/daemonRunning"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let detached_ready = verified.manager_state == "detachedReady"
-        && native_daemon_running
-        && verified
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.pointer("/capabilities/lingerEnabled"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        && verified
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.pointer("/capabilities/userSystemdAvailable"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+    let detached_ready = verified.manager_state == "detachedReady" && native_daemon_running;
     if !proxy_ready || !native_daemon_running || !detached_ready {
         return Err(AppError::Message(format!(
             "OneClickBootstrapVerificationFailed: managerState={}, proxyReady={proxy_ready}, nativeDaemonRunning={native_daemon_running}, detachedReady={detached_ready}",
@@ -241,11 +238,19 @@ where
         .ssh_destination
         .ok_or_else(|| AppError::Message("clean-host bootstrap requires SSH".into()))?;
     let baseline = probe(&state.data_root(), &alias)?;
-    let normalized_arch = normalize_arch(&baseline.arch).ok_or_else(|| {
-        AppError::Message(format!("UnsupportedRemoteArchitecture: {}", baseline.arch))
-    })?;
-    for binary_name in ["vellum-remote-agent", "vellum-remote-broker"] {
-        if let Some(path) = find_artifact(binary_name, normalized_arch) {
+    let platform = crate::remote::platform::RemotePlatform::from_os_arch(
+        &baseline.os,
+        &baseline.arch,
+    )
+    .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
+    let bundle_dir = platform.bundle_dir();
+    let binaries = if platform.broker_required() {
+        vec!["vellum-remote-agent", "vellum-remote-broker"]
+    } else {
+        vec!["vellum-remote-agent", "vellum-proxy-daemon"]
+    };
+    for binary_name in binaries {
+        if let Some(path) = find_artifact(binary_name, bundle_dir) {
             let digest = file_sha256(&path).ok_or_else(|| {
                 AppError::Message(format!("cannot hash bootstrap artifact {}", path.display()))
             })?;
@@ -280,24 +285,28 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
     let operation_id = format!("bootstrap-{}", ulid::Ulid::new());
     let data_root = state.data_root();
     let probe = probe(&data_root, &alias)?;
-    if probe.os != "Linux" {
-        return Ok(blocked(
-            operation_id,
-            probe,
-            "unsupportedOperatingSystem",
-            "首版 Remote Manager 僅支援 Linux systemd host。",
-        ));
-    }
-    let normalized_arch = normalize_arch(&probe.arch).ok_or_else(|| {
-        AppError::Message(format!("unsupported remote architecture: {}", probe.arch))
-    })?;
+    let platform = match crate::remote::platform::RemotePlatform::from_os_arch(
+        &probe.os,
+        &probe.arch,
+    ) {
+        Ok(platform) => platform,
+        Err(error) => {
+            return Ok(blocked(
+                operation_id,
+                probe,
+                error.code,
+                &error.message,
+            ));
+        }
+    };
+    let normalized_arch = platform.bundle_dir();
     let remote_agent_sha256 = probe.agent_sha256.clone();
     let remote_broker_sha256 = probe.broker_sha256.clone();
     let mut result = BootstrapResult {
         operation_id: operation_id.clone(),
         state: "bootstrapping".into(),
-        os: probe.os,
-        arch: normalized_arch.into(),
+        os: probe.os.clone(),
+        arch: probe.arch.clone(),
         agent_installed: probe.agent_installed,
         broker_installed: probe.broker_installed,
         docker_available: probe.docker_available,
@@ -307,6 +316,11 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
         completed_steps: vec!["host.probed".into()],
         blocked_reasons: Vec::new(),
         repair_commands: Vec::new(),
+        platform: Some(platform.artifact_key().into()),
+        proxy_backend: Some(platform.proxy_backend_name().into()),
+        service_manager: Some(platform.service_manager().into()),
+        persistence_scope: Some(platform.persistence_scope().into()),
+        managed_codex_home: probe.managed_codex_home.clone(),
     };
 
     let agent_artifact = find_artifact("vellum-remote-agent", normalized_arch);
@@ -316,8 +330,12 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
             .and_then(file_sha256)
             .is_some_and(|digest| Some(digest) != remote_agent_sha256);
     if agent_needs_install {
-        let artifact =
-            resolve_bootstrap_artifact(agent_artifact, "vellum-remote-agent", normalized_arch)?;
+        let artifact = resolve_bootstrap_artifact(
+            agent_artifact,
+            "vellum-remote-agent",
+            &probe.os,
+            &probe.arch,
+        )?;
         install_artifact(
             &data_root,
             &alias,
@@ -328,16 +346,18 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
         result.agent_installed = true;
         result.completed_steps.push("agent.installed".into());
     }
-    if !result.broker_installed
-        || find_artifact("vellum-remote-broker", normalized_arch)
-            .as_deref()
-            .and_then(file_sha256)
-            .is_some_and(|digest| Some(digest) != remote_broker_sha256)
+    if platform.broker_required()
+        && (!result.broker_installed
+            || find_artifact("vellum-remote-broker", normalized_arch)
+                .as_deref()
+                .and_then(file_sha256)
+                .is_some_and(|digest| Some(digest) != remote_broker_sha256))
     {
         match resolve_bootstrap_artifact(
             find_artifact("vellum-remote-broker", normalized_arch),
             "vellum-remote-broker",
-            normalized_arch,
+            &probe.os,
+            &probe.arch,
         ) {
             Ok(artifact) => {
                 install_artifact(
@@ -366,34 +386,46 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
     let client = RemoteAgentClient::new(target);
     client.agent_version()?;
     result.completed_steps.push("agent.compatible".into());
-    if !result.docker_available {
+    if platform.docker_is_blocker() && !result.docker_available {
         result.blocked_reasons.push("dockerUnavailable".into());
         result.repair_commands.push(
             "依 Linux 發行版安裝 Docker，並將目前使用者加入可執行 docker 的群組後重新登入。".into(),
         );
     }
-    if !result.systemd_user_available {
-        result.blocked_reasons.push("systemdUserUnavailable".into());
-        result.repair_commands.push(
-            "確認 systemd user manager 可用，並由系統管理員執行：loginctl enable-linger $USER"
-                .into(),
-        );
-    } else if !result.linger_enabled {
-        match ensure_linger(&data_root, &alias) {
-            Ok(()) => {
-                result.linger_enabled = true;
-                result.completed_steps.push("host.lingerEnabled".into());
-            }
-            Err(error) => {
-                result
-                    .blocked_reasons
-                    .push(format!("lingerEnableFailed:{error}"));
-                result.repair_commands.push(
-                    "Enable lingering for the SSH user (loginctl enable-linger $USER), then retry Bootstrap"
-                        .into(),
-                );
+    if platform.service_manager()
+        == crate::remote::platform::SERVICE_MANAGER_SYSTEMD_USER
+    {
+        if !result.systemd_user_available {
+            result.blocked_reasons.push("systemdUserUnavailable".into());
+            result.repair_commands.push(
+                "確認 systemd user manager 可用，並由系統管理員執行：loginctl enable-linger $USER"
+                    .into(),
+            );
+        } else if !result.linger_enabled {
+            match ensure_linger(&data_root, &alias) {
+                Ok(()) => {
+                    result.linger_enabled = true;
+                    result.completed_steps.push("host.lingerEnabled".into());
+                }
+                Err(error) => {
+                    result
+                        .blocked_reasons
+                        .push(format!("lingerEnableFailed:{error}"));
+                    result.repair_commands.push(
+                        "Enable lingering for the SSH user (loginctl enable-linger $USER), then retry Bootstrap"
+                            .into(),
+                    );
+                }
             }
         }
+    } else if !probe.gui_session_available {
+        result
+            .blocked_reasons
+            .push("guiSessionUnavailable".into());
+        result.repair_commands.push(
+            "登入 macOS 圖形工作階段後再部署。Remote Proxy 是登入後常駐，不會改電源或自動登入。"
+                .into(),
+        );
     }
     crate::remote::provision_remote_boundary_key(&client, &data_root, host_id, &operation_id)?;
     result
@@ -459,21 +491,35 @@ struct BootstrapProbe {
     managed_footprint_present: bool,
     agent_sha256: Option<String>,
     broker_sha256: Option<String>,
+    gui_session_available: bool,
+    managed_codex_home: Option<String>,
 }
 
 fn probe(data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
     let script = r#"set -eu
 printf 'os=%s\n' "$(uname -s)"
 printf 'arch=%s\n' "$(uname -m)"
+printf 'home=%s\n' "$HOME"
+digest_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
 if command -v vellum-remote-agent >/dev/null 2>&1 || [ -x "$HOME/.local/bin/vellum-remote-agent" ]; then echo agent=1; else echo agent=0; fi
 if command -v vellum-remote-broker >/dev/null 2>&1 || [ -x "$HOME/.local/bin/vellum-remote-broker" ]; then echo broker=1; else echo broker=0; fi
-if [ -x "$HOME/.local/bin/vellum-remote-agent" ]; then printf 'agentSha=%s\n' "$(sha256sum "$HOME/.local/bin/vellum-remote-agent" | awk '{print $1}')"; fi
-if [ -x "$HOME/.local/bin/vellum-remote-broker" ]; then printf 'brokerSha=%s\n' "$(sha256sum "$HOME/.local/bin/vellum-remote-broker" | awk '{print $1}')"; fi
+if [ -x "$HOME/.local/bin/vellum-remote-agent" ]; then printf 'agentSha=%s\n' "$(digest_file "$HOME/.local/bin/vellum-remote-agent")"; fi
+if [ -x "$HOME/.local/bin/vellum-remote-broker" ]; then printf 'brokerSha=%s\n' "$(digest_file "$HOME/.local/bin/vellum-remote-broker")"; fi
 if docker version --format '{{.Server.Os}}' >/dev/null 2>&1; then echo docker=1; else echo docker=0; fi
 if systemctl --user show-environment >/dev/null 2>&1; then echo systemd=1; else echo systemd=0; fi
 user=$(id -un)
 if [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" = yes ]; then echo linger=1; else echo linger=0; fi
-if [ -e "$HOME/.local/state/vellum" ] || [ -e "$HOME/.local/share/vellum" ] || ls "$HOME/.config/systemd/user"/vellum-* >/dev/null 2>&1; then echo managed=1; else echo managed=0; fi
+uid=$(id -u)
+if launchctl print "gui/$uid" >/dev/null 2>&1; then echo gui=1; else echo gui=0; fi
+if [ -e "$HOME/.local/state/vellum" ] || [ -e "$HOME/.local/share/vellum" ] || [ -e "$HOME/Library/Application Support/vellum-remote" ] || ls "$HOME/.config/systemd/user"/vellum-* >/dev/null 2>&1; then echo managed=1; else echo managed=0; fi
 "#;
     let output = ssh_script(data_root, alias, script.as_bytes(), "sh -s --")?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -495,6 +541,22 @@ if [ -e "$HOME/.local/state/vellum" ] || [ -e "$HOME/.local/share/vellum" ] || l
         managed_footprint_present: value("managed") == "1",
         agent_sha256: Some(value("agentSha")).filter(|value| !value.is_empty()),
         broker_sha256: Some(value("brokerSha")).filter(|value| !value.is_empty()),
+        gui_session_available: value("gui") == "1",
+        managed_codex_home: {
+            let home = value("home");
+            if home.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::remote::platform::managed_codex_home(
+                        Path::new(&home),
+                        &value("os"),
+                    )
+                    .display()
+                    .to_string(),
+                )
+            }
+        },
     })
 }
 
@@ -513,6 +575,7 @@ fi
 fn resolve_bootstrap_artifact(
     bundled: Option<PathBuf>,
     binary_name: &str,
+    os: &str,
     arch: &str,
 ) -> AppResult<ResolvedBootstrapArtifact> {
     if let Some(path) = bundled {
@@ -529,11 +592,15 @@ fn resolve_bootstrap_artifact(
 
     let manifest = crate::remote::pinned_install::load_verified_manifest().map_err(|error| {
         AppError::Message(format!(
-            "RemoteComponentArtifactMissing: expected bundled {binary_name} Linux {arch} release artifact; {error}"
+            "RemoteComponentArtifactMissing: expected bundled {binary_name} {os} {arch} release artifact; {error}"
         ))
     })?;
-    let artifact =
-        crate::remote::pinned_install::component_artifact_for_arch(&manifest, binary_name, arch)?;
+    let artifact = crate::remote::pinned_install::component_artifact_for_os_arch(
+        &manifest,
+        binary_name,
+        os,
+        arch,
+    )?;
     let path = crate::remote::pinned_install::download_artifact(&artifact)?;
     Ok(ResolvedBootstrapArtifact {
         path,
@@ -549,7 +616,10 @@ fn install_artifact(
     binary_name: &str,
     expected_digest: &str,
 ) -> AppResult<()> {
-    if !matches!(binary_name, "vellum-remote-agent" | "vellum-remote-broker") {
+    if !matches!(
+        binary_name,
+        "vellum-remote-agent" | "vellum-remote-broker" | "vellum-proxy-daemon"
+    ) {
         return Err(AppError::Message("invalid bootstrap artifact name".into()));
     }
     let bytes = fs::read(artifact).map_err(|error| AppError::Message(error.to_string()))?;
@@ -559,9 +629,7 @@ fn install_artifact(
             "RemoteArtifactDigestMismatch: expected {expected_digest}, got {digest}"
         )));
     }
-    let remote = format!(
-        "set -eu; umask 077; mkdir -p \"$HOME/.local/bin\" \"$HOME/.local/state/vellum/bootstrap\"; tmp=\"$HOME/.local/state/vellum/bootstrap/{binary_name}.tmp\"; cat >\"$tmp\"; actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); [ \"$actual\" = \"{digest}\" ] || {{ rm -f \"$tmp\"; exit 42; }}; chmod 0700 \"$tmp\"; mv -f \"$tmp\" \"$HOME/.local/bin/{binary_name}\""
-    );
+    let remote = crate::remote::digest::install_artifact_remote_script(binary_name, digest.as_str());
     ssh_script(data_root, alias, &bytes, &remote)?;
     Ok(())
 }
@@ -669,21 +737,18 @@ fn ssh_script(
     }
 }
 
+#[cfg(test)]
 fn normalize_arch(value: &str) -> Option<&'static str> {
-    match value.trim() {
-        "x86_64" | "amd64" => Some("amd64"),
-        "aarch64" | "arm64" => Some("arm64"),
-        _ => None,
-    }
+    crate::remote::platform::normalize_arch(value)
 }
 
-fn find_artifact(name: &str, arch: &str) -> Option<PathBuf> {
+fn find_artifact(name: &str, bundle_dir: &str) -> Option<PathBuf> {
     let env_key = format!(
         "VELLUM_REMOTE_{}_{}",
         name.trim_start_matches("vellum-remote-")
             .replace('-', "_")
             .to_ascii_uppercase(),
-        arch.to_ascii_uppercase()
+        bundle_dir.replace('-', "_").to_ascii_uppercase()
     );
     if let Some(path) = std::env::var_os(env_key)
         .map(PathBuf::from)
@@ -693,7 +758,7 @@ fn find_artifact(name: &str, arch: &str) -> Option<PathBuf> {
     }
     crate::install_paths::remote_resource_roots()
         .into_iter()
-        .map(|root| root.join(format!("linux-{arch}")).join(name))
+        .map(|root| root.join(bundle_dir).join(name))
         .find(|path| path.is_file())
 }
 
@@ -712,8 +777,8 @@ fn blocked(
     BootstrapResult {
         operation_id,
         state: "recoveryRequired".into(),
-        os: probe.os,
-        arch: probe.arch,
+        os: probe.os.clone(),
+        arch: probe.arch.clone(),
         agent_installed: probe.agent_installed,
         broker_installed: probe.broker_installed,
         docker_available: probe.docker_available,
@@ -723,6 +788,16 @@ fn blocked(
         completed_steps: vec!["host.probed".into()],
         blocked_reasons: vec![reason.into()],
         repair_commands: vec![repair.into()],
+        platform: crate::remote::platform::RemotePlatform::from_os_arch(
+            &probe.os,
+            &probe.arch,
+        )
+        .ok()
+        .map(|item| item.artifact_key().into()),
+        proxy_backend: None,
+        service_manager: None,
+        persistence_scope: None,
+        managed_codex_home: probe.managed_codex_home,
     }
 }
 
@@ -735,6 +810,19 @@ mod tests {
         assert_eq!(normalize_arch("x86_64"), Some("amd64"));
         assert_eq!(normalize_arch("aarch64"), Some("arm64"));
         assert_eq!(normalize_arch("riscv64"), None);
+        let darwin = crate::remote::platform::RemotePlatform::from_os_arch("Darwin", "arm64")
+            .unwrap();
+        assert_eq!(darwin.bundle_dir(), "darwin-arm64");
+        assert!(
+            crate::remote::platform::RemotePlatform::from_os_arch("Darwin", "x86_64")
+                .unwrap_err()
+                .ui_unsupported
+        );
+        assert_eq!(
+            crate::remote::digest::parse_digest_output(&format!("{}  file with spaces\n", "a".repeat(64))),
+            Some("a".repeat(64))
+        );
+        assert!(crate::remote::digest::remote_file_digest_snippet().contains("shasum -a 256"));
     }
 
     #[test]

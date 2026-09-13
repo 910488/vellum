@@ -17,6 +17,18 @@ pub struct InstallRecord {
     pub config_hash: String,
     pub host_port: u16,
     pub updated_at: DateTime<Utc>,
+    /// Absent on records written before protocol 4; those are Docker installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    /// SHA-256 of the native `vellum-proxy-daemon` binary. Never a fake image name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_executable_digest: Option<String>,
+}
+
+impl InstallRecord {
+    pub fn backend(&self) -> crate::platform::ProxyBackend {
+        crate::platform::ProxyBackend::parse(self.proxy_backend.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -178,4 +190,44 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
             path.display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmarked_install_records_default_to_docker_and_never_invent_a_native_image() {
+        let raw = r#"{
+            "installId": "install-1",
+            "hostId": "host-1",
+            "image": "vellum-proxy:0.2.2",
+            "imageDigest": "sha256:abc",
+            "configHash": "cfg",
+            "hostPort": 15721,
+            "updatedAt": "2026-01-01T00:00:00Z"
+        }"#;
+        let record: InstallRecord = serde_json::from_str(raw).unwrap();
+        assert_eq!(record.backend(), crate::platform::ProxyBackend::Docker);
+        assert!(record.native_executable_digest.is_none());
+        assert_eq!(record.image, "vellum-proxy:0.2.2");
+
+        let native = InstallRecord {
+            install_id: "install-2".into(),
+            host_id: "host-1".into(),
+            image: String::new(),
+            image_digest: None,
+            config_hash: "cfg".into(),
+            host_port: 15722,
+            updated_at: Utc::now(),
+            proxy_backend: Some("native".into()),
+            native_executable_digest: Some("a".repeat(64)),
+        };
+        let encoded = serde_json::to_value(&native).unwrap();
+        assert_eq!(encoded["proxyBackend"], "native");
+        assert_eq!(encoded["image"], "");
+        assert_eq!(encoded["nativeExecutableDigest"], "a".repeat(64));
+        assert_ne!(encoded["image"], "vellum-proxy:native");
+        assert_eq!(native.backend(), crate::platform::ProxyBackend::Native);
+    }
 }

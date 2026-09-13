@@ -19,8 +19,8 @@ Codex 原生 daemon 是 thread、turn、approval、workspace 與 session 的唯�
 ## Remote Manager 能做什麼
 
 1. 匯入 Codex App「連線」與 OpenSSH config 中已設定的 SSH host；同時支援 Codex 舊版 `alias` 與新版 `hostname: user@host` connection snapshot。
-2. 探測 Linux/CPU architecture、Docker mode、user systemd、linger、Codex CLI/standalone/native daemon ownership。
-3. 以 digest 驗證方式 bootstrap ARM64/AMD64 Agent、Codex standalone 與 proxy image。
+2. 探測 OS+architecture（Linux x64/ARM64 與 Apple Silicon `aarch64-apple-darwin`；Intel Mac 顯示尚未支援）、Docker mode 或 native proxy backend、user systemd/linger 或 LaunchAgent 登入後常駐、Codex CLI/standalone/native daemon ownership。
+3. 以 digest 驗證方式 bootstrap Linux ARM64/AMD64 Agent、Codex standalone 與 proxy image；macOS 則安裝 Agent、原生 `vellum-proxy-daemon` 與 pinned Darwin Codex，不要求 diagnostic Broker 或 Docker。
 4. 在 Desktop 端產生不含 secret 的 deployment plan，顯示 model、credential requirement、config/catalog hash、drift、restart requirement 與 blocker。
 5. Apply 時依序安裝並啟動 loopback-only proxy、注入 credential、套用 config/catalog、以 three-way lease adopt `~/.codex` 的受管欄位，再由 Codex CLI daemon 接管 durable app-server。
 6. 讓 Codex App 的原生遠端專案直接選用 Vellum catalog 中的模型；context、tool、compaction、Auto Review、usage 與 continuation 都經共享 proxy runtime。
@@ -30,7 +30,8 @@ Codex 原生 daemon 是 thread、turn、approval、workspace 與 session 的唯�
 
 ## 安全邊界
 
-- Proxy 只 publish `127.0.0.1:15721`，不對 LAN 公開。
+- Linux Proxy 只 publish `127.0.0.1:15721`；macOS 遠端 Proxy 預設 `127.0.0.1:15722` 以免與本機 Vellum 衝突，占用時回報明確衝突。不對 LAN 公開。
+- macOS 遠端 state 在 `~/Library/Application Support/vellum-remote`，獨立 Codex home 為 `~/.vellum-remote/codex`。不複製或改寫本機 `~/.codex`、Enhanced 或全域 shell。
 - Proxy container 不掛載 Docker socket、`~/.codex` 或任意 workspace。
 - Agent 不接受 renderer 傳來的任意 shell command。
 - SSH host key 必須先顯示指紋並由使用者明確確認，之後只寫入 Vellum 私有的 `known_hosts`。Windows 若偵測到標準位置的 Git for Windows，優先使用其相容版 `ssh-keyscan`，並以系統 OpenSSH 作後備；兩者都只讀取遠端公開 host key，不會匯入或自動信任使用者既有的 `known_hosts`。
@@ -51,8 +52,8 @@ Codex 原生 daemon 是 thread、turn、approval、workspace 與 session 的唯�
 
 ## 現行 inventory、pinned 安裝與 per-host desired state
 
-- `host.inventoryV2`（agent RPC）：單一呼叫回傳 system（os/arch/hostname/CPU/memory/disk）、docker（version/daemon/context/permission）、codex（binary/version/source/CODEX_HOME/app-server compatibility）、proxy 狀態、host-level blockers（`dockerUnavailable`／`codexBinaryMissing`／`proxyNotReady`）與 available actions（`installCodex`／`repair`／`exportSupportBundle`／`updateComponents`）。Desktop `inspect_remote_host` 合併進 `RemoteHostStatus.inventory`；舊 agent 不支援時靜默 fallback。
-- 本機建置腳本產生單一 schema v3 manifest，連同 Linux amd64/arm64 Agent、Broker、Codex 與 Proxy image archive 一起包入 NSIS。manifest SHA-256 在編譯時嵌入 executable；runtime manifest 不符即 fail-closed。Desktop 依遠端 arch 選擇 bundle artifact、驗證 SHA-256，再經 SSH stdin staging；agent 端二次驗證後原子安裝 Codex，Proxy archive 則以 allow-listed `proxy.loadImage` 執行 `docker load`。
+- `host.inventoryV2`（agent RPC）：單一呼叫回傳 system（os/arch/hostname/CPU/memory/disk）、docker（version/daemon/context/permission）、codex（binary/version/source/CODEX_HOME/app-server compatibility）、proxy 狀態、platform／proxyBackend／serviceManager／persistenceScope／managedCodexHome、host-level blockers（`dockerUnavailable` 僅 Linux／`codexBinaryMissing`／`proxyNotReady`／`intelMacUnsupported`）與 available actions（`installCodex`／`repair`／`exportSupportBundle`／`updateComponents`）。Desktop `inspect_remote_host` 合併進 `RemoteHostStatus.inventory`；舊 Linux agent（protocol 1–3）不支援時靜默 fallback。macOS 功能要求 Agent protocol 4。
+- 本機建置腳本產生平台索引 manifest（schema 4；schema 3 的 Linux 讀取仍可用），連同 Linux amd64/arm64 Agent、Broker、Codex 與 Proxy image archive，以及 Darwin ARM64 Agent／原生 Proxy daemon／pinned Codex 一起包入安裝包。manifest SHA-256 在編譯時嵌入 executable；runtime manifest 不符即 fail-closed。Desktop 依 OS+arch 選擇 bundle artifact、驗證 SHA-256（GNU `sha256sum` 或 BSD `shasum -a 256`），再經 SSH stdin staging；agent 端二次驗證後原子安裝 Codex。Linux Proxy archive 以 allow-listed `proxy.loadImage` 執行 `docker load`；macOS 以原生 executable digest 安裝，不用假 image 名稱。
 - RPC：`codex.installPinned`／`codex.updatePinned`（不自動降版、不覆寫 Codex App 擁有的 active daemon）／`codex.verifyInstallation`／`services.reconcile`。legacy bootstrap 不再使用未驗證 `curl | sh`：未配置 pinned artifact URL＋digest 時 fail-closed。
 - per-host desired state（`remote-desired-state/<hostId>.json`）：`desiredRevision`／`observedRevision`／`lastPlanId`／`selectedCatalogIds`／`configHash`／`catalogHash`；plan 時 revision 遞增，apply 成功後 `observedRevision` 更新；`planHash` 為 selection＋config/catalog hash 的 content fingerprint。UI 提供「Reapply desired state」（以 persisted selection 重新 plan）與 Revision／Rollback 展示。
 - UI 維運動作：Bootstrap、Plan/Apply、Restart native、Detach、Restore、Repair、Export support bundle、Install Codex、Update Agent，以及 Sync Desktop Codex runtime。Desktop 以內附 Codex core 的完整 prerelease 版本與 generated app-server schema hash 作為協議 identity；Remote Manager 只接受同版 `openai/codex` 官方 Linux artifact 與 GitHub publisher SHA-256，經新版 Agent staged probe 後原子替換並重啟。UI 顯示 bundled release readiness、Desktop/remote compatibility、host/inventory blockers 與 native app-server thread/active-turn 明細；任何 digest、架構、Agent protocol 或 probe 驗證未通過時都 fail-closed。

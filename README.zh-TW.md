@@ -35,7 +35,7 @@ Remote Manager 將桌面連線與遠端執行分開。離開時 detach，回來�
 
 ## 開始使用
 
-[下載最新版本](../../releases/latest)，支援 Windows x64 與 macOS Apple 晶片。需搭配相容的 Codex 安裝；Remote Manager 另需具備 Docker 與 systemd 使用者工作階段的 Linux SSH 主機。
+[下載最新版本](../../releases/latest)，支援 Windows x64 與 macOS Apple 晶片。需搭配相容的 Codex 安裝；Remote Manager 可管理具備 Docker 與 systemd 使用者工作階段的 Linux SSH 主機，或登入後常駐的 Apple Silicon Mac（Intel Mac 尚未支援）。
 
 環境需求請參閱[建置與設定說明](BUILDING.md)，配置方式與技術細節請從[文件索引](docs/README.md)開始。
 

@@ -181,6 +181,16 @@ pub struct RemoteDeploymentPlan {
     pub restart_required: bool,
     pub blocked_reasons: Vec<String>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_codex_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -807,11 +817,13 @@ pub fn plan(
             }
         })
         .collect::<Vec<_>>();
-    let plan_hash = plan_fingerprint(
+    let identity = deployment_identity_from_status(agent_status.as_ref().ok(), &proxy_image);
+    let plan_hash = plan_fingerprint_with_identity(
         &selected_ids,
         &desired_remote_config_hash,
         &catalog_hash,
         &proxy_image,
+        identity.as_ref(),
     );
     let rollback_summary = "restore Vellum-managed proxy config, model catalog and credentials; user-modified conflicts are preserved".to_string();
     let public_diff = vec![
@@ -876,6 +888,11 @@ pub fn plan(
         restart_required,
         blocked_reasons: blocked,
         expires_at,
+        platform: identity.as_ref().map(|item| item.platform.clone()),
+        proxy_backend: identity.as_ref().map(|item| item.proxy_backend.clone()),
+        host_port: identity.as_ref().map(|item| item.host_port),
+        managed_codex_home: identity.as_ref().map(|item| item.managed_codex_home.clone()),
+        artifact_id: identity.as_ref().map(|item| item.artifact_id.clone()),
     };
     super::desired_state::save(
         &state.data_root(),
@@ -923,19 +940,77 @@ fn hidden_official_model_ids(catalog: Option<&Value>) -> BTreeSet<String> {
 /// Content fingerprint of the desired configuration: stable across plans
 /// with identical selection and resolved hashes, so the UI can detect that a
 /// previously applied plan is still current without comparing secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentIdentity {
+    pub platform: String,
+    pub proxy_backend: String,
+    pub host_port: u16,
+    pub managed_codex_home: String,
+    pub artifact_id: String,
+}
+
+#[cfg(test)]
 fn plan_fingerprint(
     selected_ids: &BTreeSet<String>,
     config_hash: &str,
     catalog_hash: &str,
     image: &str,
 ) -> String {
+    plan_fingerprint_with_identity(selected_ids, config_hash, catalog_hash, image, None)
+}
+
+fn plan_fingerprint_with_identity(
+    selected_ids: &BTreeSet<String>,
+    config_hash: &str,
+    catalog_hash: &str,
+    image: &str,
+    identity: Option<&DeploymentIdentity>,
+) -> String {
     let payload = serde_json::json!({
         "selectedCatalogIds": selected_ids,
         "configHash": config_hash,
         "catalogHash": catalog_hash,
         "image": image,
+        "platform": identity.map(|item| item.platform.as_str()),
+        "proxyBackend": identity.map(|item| item.proxy_backend.as_str()),
+        "hostPort": identity.map(|item| item.host_port),
+        "managedCodexHome": identity.map(|item| item.managed_codex_home.as_str()),
+        "artifactId": identity.map(|item| item.artifact_id.as_str()),
     });
     hash(&serde_json::to_string(&payload).expect("fingerprint serialization cannot fail"))
+}
+
+pub fn apply_is_noop(previous_hash: &str, next_hash: &str) -> bool {
+    !previous_hash.is_empty() && previous_hash == next_hash
+}
+
+fn deployment_identity_from_status(
+    status: Option<&Value>,
+    artifact_id: &str,
+) -> Option<DeploymentIdentity> {
+    let status = status?;
+    let os = status
+        .pointer("/capabilities/os")
+        .and_then(Value::as_str)?;
+    let arch = status
+        .pointer("/capabilities/arch")
+        .and_then(Value::as_str)?;
+    let platform = crate::remote::platform::RemotePlatform::from_os_arch(os, arch).ok()?;
+    Some(DeploymentIdentity {
+        platform: platform.artifact_key().into(),
+        proxy_backend: platform.proxy_backend_name().into(),
+        host_port: status
+            .pointer("/proxy/hostPort")
+            .and_then(Value::as_u64)
+            .map(|port| port as u16)
+            .unwrap_or_else(|| platform.default_proxy_port()),
+        managed_codex_home: status
+            .pointer("/nativeCodex/codexHome")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        artifact_id: artifact_id.into(),
+    })
 }
 
 /// Re-plan from the persisted per-host desired state (M30/M32 "Reapply
@@ -1101,6 +1176,16 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
     steps.push("compatibility.verified".into());
 
     let agent_status = client.host_status()?;
+    let sessions = client.codex_session_status(None).ok();
+    let observation = crate::remote::observation::observation_from_session(
+        sessions.as_ref(),
+        agent_status.get("nativeCodex"),
+    );
+    if observation.active_turn || observation.active_tools || observation.pending_approvals {
+        return Err(AppError::Message(
+            "DeploymentApplyBlocked: activeWorkInProgress".into(),
+        ));
+    }
     let status = agent_status
         .get("proxy")
         .cloned()
@@ -1116,6 +1201,20 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
     // the new container will start with only `vellum-mock` configured.
     let needs_configure = stored.public.drift.config_changed || needs_install;
     let needs_proxy_mutation = needs_install || needs_configure;
+    let needs_native_apply_preview = needs_proxy_mutation
+        || stored.public.drift.catalog_changed
+        || stored.public.restart_required;
+    if !needs_install && !needs_configure && !needs_native_apply_preview {
+        steps.push("apply.noop".into());
+        return Ok(RemoteApplyResult {
+            operation_id,
+            completed_steps: steps,
+            proxy: status,
+            native_adopt: serde_json::json!({"status": "alreadyActive"}),
+            native_runtime: client.codex_discover_native()?,
+            state: "nativeActive".into(),
+        });
+    }
     let active_native_lease = agent_status
         .get("managedProfiles")
         .and_then(Value::as_array)
@@ -1149,27 +1248,39 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
             .pointer("/system/arch")
             .and_then(Value::as_str)
             .ok_or_else(|| AppError::Message("host inventory missing system.arch".into()))?;
-        let artifact = crate::remote::pinned_install::proxy_artifact_for_arch(&manifest, arch)?;
-        let staged = crate::remote::pinned_install::download_artifact(artifact)?;
-        let bytes = fs::read(&staged)
-            .map_err(|error| AppError::Message(format!("read proxy image archive: {error}")))?;
-        let remote_path = format!("/tmp/vellum-proxy-stage-{}.tar", ulid::Ulid::new());
-        let load_result = (|| -> AppResult<()> {
-            client.stage_artifact(&remote_path, &bytes)?;
-            client.proxy_load_image(
-                &format!("{operation_id}-load-image"),
-                &remote_path,
-                &artifact.sha256,
-                &stored.image,
-            )?;
-            Ok(())
-        })();
-        client.remove_remote_file(&remote_path);
-        let _ = fs::remove_file(&staged);
-        load_result?;
-        steps.push("proxy.imageLoaded".into());
-        client.proxy_install(&format!("{operation_id}-install"), &stored.image, None)?;
-        steps.push("proxy.installed".into());
+        let os = inventory
+            .pointer("/system/os")
+            .and_then(Value::as_str)
+            .unwrap_or("linux");
+        let native = crate::remote::platform::RemotePlatform::from_os_arch(os, arch)
+            .map(|platform| platform.proxy_backend() == crate::remote::platform::ProxyBackend::Native)
+            .unwrap_or(false);
+        if native {
+            client.proxy_install(&format!("{operation_id}-install"), "", None)?;
+            steps.push("proxy.installedNative".into());
+        } else {
+            let artifact = crate::remote::pinned_install::proxy_artifact_for_arch(&manifest, arch)?;
+            let staged = crate::remote::pinned_install::download_artifact(artifact)?;
+            let bytes = fs::read(&staged)
+                .map_err(|error| AppError::Message(format!("read proxy image archive: {error}")))?;
+            let remote_path = format!("/tmp/vellum-proxy-stage-{}.tar", ulid::Ulid::new());
+            let load_result = (|| -> AppResult<()> {
+                client.stage_artifact(&remote_path, &bytes)?;
+                client.proxy_load_image(
+                    &format!("{operation_id}-load-image"),
+                    &remote_path,
+                    &artifact.sha256,
+                    &stored.image,
+                )?;
+                Ok(())
+            })();
+            client.remove_remote_file(&remote_path);
+            let _ = fs::remove_file(&staged);
+            load_result?;
+            steps.push("proxy.imageLoaded".into());
+            client.proxy_install(&format!("{operation_id}-install"), &stored.image, None)?;
+            steps.push("proxy.installed".into());
+        }
     }
 
     // The remote proxy refuses to start without its boundary key, so this has
@@ -1227,7 +1338,8 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         steps.push("proxy.configured".into());
     }
     let proxy = if !running || needs_proxy_mutation {
-        let value = client.proxy_start(&format!("{operation_id}-start"), Some(15721), None)?;
+        let listen_port = stored.public.host_port.unwrap_or(15721);
+        let value = client.proxy_start(&format!("{operation_id}-start"), Some(listen_port), None)?;
         steps.push("proxy.ready".into());
         value
     } else {
@@ -1553,6 +1665,11 @@ mod tests {
             restart_required: false,
             blocked_reasons: vec![],
             expires_at: Utc::now(),
+            platform: None,
+            proxy_backend: None,
+            host_port: None,
+            managed_codex_home: None,
+            artifact_id: None,
         };
         let value = serde_json::to_value(&public).unwrap();
         assert!(value.get("configToml").is_none());
@@ -1579,6 +1696,41 @@ mod tests {
             first, different,
             "selection change must alter the fingerprint"
         );
+        let identity = DeploymentIdentity {
+            platform: "darwin-arm64".into(),
+            proxy_backend: "native".into(),
+            host_port: 15722,
+            managed_codex_home: "/Users/joshhuang/.vellum-remote/codex".into(),
+            artifact_id: "sha256:abc".into(),
+        };
+        let with_id = plan_fingerprint_with_identity(
+            &selected,
+            "cfg-a",
+            "cat-b",
+            "",
+            Some(&identity),
+        );
+        let again = plan_fingerprint_with_identity(
+            &selected,
+            "cfg-a",
+            "cat-b",
+            "",
+            Some(&identity),
+        );
+        assert_eq!(with_id, again);
+        assert!(apply_is_noop(&with_id, &again));
+        let other_port = DeploymentIdentity {
+            host_port: 15723,
+            ..identity.clone()
+        };
+        let changed = plan_fingerprint_with_identity(
+            &selected,
+            "cfg-a",
+            "cat-b",
+            "",
+            Some(&other_port),
+        );
+        assert!(!apply_is_noop(&with_id, &changed));
     }
 
     #[test]

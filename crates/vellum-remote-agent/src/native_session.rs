@@ -44,6 +44,10 @@ pub struct NativeThreadStatus {
     pub active_turn_id: Option<String>,
     pub turn_count: u64,
     pub last_turn_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approvals: Option<bool>,
 }
 
 /// Query the native app-server control API. `thread_id` narrows to a single
@@ -196,6 +200,38 @@ fn map_thread(thread: &Value) -> Result<NativeThreadStatus, String> {
             0,
         )
     };
+    let (active_tools, pending_approvals) = if let Some(turns) = thread.get("turns").and_then(Value::as_array)
+    {
+        let tools = turns.iter().any(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.contains("tool") || kind.contains("command"))
+                        && item.get("status").and_then(Value::as_str) == Some("inProgress")
+                })
+        });
+        let approvals = turns.iter().any(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.contains("approval"))
+                        && item.get("status").and_then(Value::as_str) != Some("completed")
+                })
+        });
+        (Some(tools), Some(approvals))
+    } else if !active {
+        (Some(false), Some(false))
+    } else {
+        (None, None)
+    };
     Ok(NativeThreadStatus {
         thread_id,
         status,
@@ -203,6 +239,8 @@ fn map_thread(thread: &Value) -> Result<NativeThreadStatus, String> {
         active_turn_id,
         turn_count,
         last_turn_status,
+        active_tools,
+        pending_approvals,
     })
 }
 

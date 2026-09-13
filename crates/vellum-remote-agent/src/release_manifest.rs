@@ -30,6 +30,8 @@ pub struct ArtifactSet {
     pub linux_x64: CodexArtifact,
     #[serde(rename = "linux-arm64")]
     pub linux_arm64: CodexArtifact,
+    #[serde(rename = "darwin-arm64", default, skip_serializing_if = "Option::is_none")]
+    pub darwin_arm64: Option<CodexArtifact>,
 }
 
 /// Component pin with per-arch artifacts (agent / broker self-update).
@@ -62,14 +64,30 @@ pub struct ReleaseManifest {
 
 /// Resolve the artifact for a host architecture. The agent reports
 /// `std::env::consts::ARCH` (`aarch64` / `x86_64`) in its inventory.
+/// Linux-only callers keep working; macOS must go through OS+arch.
 pub fn select_artifact<'a>(
     manifest: &'a ReleaseManifest,
     arch: &str,
 ) -> Result<&'a CodexArtifact, String> {
-    match arch {
-        "aarch64" | "arm64" => Ok(&manifest.codex.artifacts.linux_arm64),
-        "x86_64" | "amd64" => Ok(&manifest.codex.artifacts.linux_x64),
-        other => Err(format!("CodexArtifactUnsupportedArch: {other}")),
+    select_artifact_for_os_arch(manifest, "linux", arch)
+}
+
+pub fn select_artifact_for_os_arch<'a>(
+    manifest: &'a ReleaseManifest,
+    os: &str,
+    arch: &str,
+) -> Result<&'a CodexArtifact, String> {
+    let platform = crate::platform::RemotePlatform::from_os_arch(os, arch)
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    match platform {
+        crate::platform::RemotePlatform::LinuxAmd64 => Ok(&manifest.codex.artifacts.linux_x64),
+        crate::platform::RemotePlatform::LinuxArm64 => Ok(&manifest.codex.artifacts.linux_arm64),
+        crate::platform::RemotePlatform::DarwinArm64 => manifest
+            .codex
+            .artifacts
+            .darwin_arm64
+            .as_ref()
+            .ok_or_else(|| "CodexArtifactMissingDarwinArm64".into()),
     }
 }
 
@@ -184,7 +202,54 @@ mod tests {
             "https://example.invalid/x64"
         );
         assert!(select_artifact(&manifest, "riscv64").is_err());
+        assert!(select_artifact_for_os_arch(&manifest, "darwin", "arm64").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn schema_3_linux_payload_still_loads_without_darwin_artifacts() {
+        let value = json!({
+            "schemaVersion": 3,
+            "releaseVersion": "v0.1.2",
+            "codex": {
+                "pinnedVersion": "0.147.0",
+                "compatibleRange": "0.147.x",
+                "artifacts": {
+                    "linux-x64": {"url": "https://example.invalid/x64", "sha256": "a".repeat(64)},
+                    "linux-arm64": {"url": "https://example.invalid/arm64", "sha256": "b".repeat(64)}
+                }
+            },
+            "agent": {
+                "version": "0.1.0",
+                "artifacts": {
+                    "linux-x64": {"url": "https://example.invalid/agent-x64", "sha256": "c".repeat(64)},
+                    "linux-arm64": {"url": "https://example.invalid/agent-arm64", "sha256": "c".repeat(64)}
+                }
+            },
+            "broker": {
+                "version": "0.1.0",
+                "artifacts": {
+                    "linux-x64": {"url": "https://example.invalid/broker-x64", "sha256": "d".repeat(64)},
+                    "linux-arm64": {"url": "https://example.invalid/broker-arm64", "sha256": "d".repeat(64)}
+                }
+            },
+            "proxy": {
+                "image": "ghcr.io/910488/vellum/vellum-proxy:v0.1.2",
+                "digest": "sha256:".to_string() + &"e".repeat(64)
+            },
+            "protocolVersion": 1
+        });
+        let manifest: ReleaseManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(manifest.schema_version, 3);
+        assert!(manifest.codex.artifacts.darwin_arm64.is_none());
+        assert_eq!(
+            select_artifact_for_os_arch(&manifest, "linux", "aarch64")
+                .unwrap()
+                .sha256,
+            "b".repeat(64)
+        );
+        let intel = crate::platform::RemotePlatform::from_os_arch("darwin", "x86_64").unwrap_err();
+        assert_eq!(intel.message, "尚未支援");
     }
 
     #[test]

@@ -35,7 +35,7 @@ The remote Codex daemon keeps tasks running while the host and services remain o
 
 ## Get started
 
-[Download the latest release](../../releases/latest) for Windows x64 or macOS Apple silicon. A compatible Codex installation is required; Remote Manager also requires a Linux SSH host with Docker and a systemd user session.
+[Download the latest release](../../releases/latest) for Windows x64 or macOS Apple silicon. A compatible Codex installation is required; Remote Manager can manage a Linux SSH host with Docker and a systemd user session, or an Apple Silicon Mac with a login session (Intel Mac is not supported yet).
 
 See [build and setup instructions](BUILDING.md) for requirements, or the [documentation index](docs/README.md) for configuration and technical details.
 

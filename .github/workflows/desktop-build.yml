@@ -48,9 +48,36 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  remote-payload-darwin:
+    name: Embedded Remote Manager Darwin payload
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build Darwin remote binaries
+        run: |
+          cargo build -p vellum-remote-agent -p vellum-proxy-daemon --release --target aarch64-apple-darwin
+          mkdir -p src-tauri/resources/remote/darwin-arm64
+          cp target/aarch64-apple-darwin/release/vellum-remote-agent src-tauri/resources/remote/darwin-arm64/vellum-remote-agent
+          cp target/aarch64-apple-darwin/release/vellum-proxy-daemon src-tauri/resources/remote/darwin-arm64/vellum-proxy-daemon
+
+      - name: Upload Darwin payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-remote-payload-darwin-${{ github.sha }}
+          path: src-tauri/resources/remote/darwin-arm64
+          if-no-files-found: error
+          retention-days: 1
+
   macos-dmg:
     name: macOS DMG
-    needs: remote-payload
+    needs: [remote-payload, remote-payload-darwin]
     runs-on: macos-latest
     steps:
       - name: Check out source
@@ -81,6 +108,12 @@ jobs:
         with:
           name: vellum-remote-payload-${{ github.sha }}
           path: src-tauri/resources/remote
+
+      - name: Download Darwin remote payload
+        uses: actions/download-artifact@v4
+        with:
+          name: vellum-remote-payload-darwin-${{ github.sha }}
+          path: src-tauri/resources/remote/darwin-arm64
 
       - name: Build DMG and app archive
         env:
@@ -113,7 +146,7 @@ jobs:
 
   windows-installer:
     name: Windows installer
-    needs: remote-payload
+    needs: [remote-payload, remote-payload-darwin]
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -144,6 +177,12 @@ jobs:
         with:
           name: vellum-remote-payload-${{ github.sha }}
           path: src-tauri/resources/remote
+
+      - name: Download Darwin remote payload
+        uses: actions/download-artifact@v4
+        with:
+          name: vellum-remote-payload-darwin-${{ github.sha }}
+          path: src-tauri/resources/remote/darwin-arm64
 
       - name: Build NSIS installer
         env:

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -12,7 +12,7 @@ use crate::docker::{
 use crate::mutation_lock::HostMutationGuard;
 use crate::operations::{BeginOutcome, OperationRecord};
 use crate::permissions::prepare_proxy_mounts;
-use crate::protocol::{OperationResult, ProxyStatusView};
+use crate::protocol::{OperationResult, ProxyLogsView, ProxyStatusView};
 use crate::state::{AgentStateStore, InstallRecord};
 
 #[cfg(not(test))]
@@ -30,18 +30,55 @@ pub struct ProxyStartRequest {
 pub struct ProxyManager {
     store: AgentStateStore,
     docker: Arc<dyn DockerClient>,
+    launchd: Arc<dyn crate::native_proxy::LaunchdClient>,
+    launch_agents_dir: PathBuf,
+    launchd_domain: String,
+    prefer_native: bool,
 }
 
 impl ProxyManager {
     pub fn new(store: AgentStateStore) -> Self {
+        let launch_agents_dir =
+            crate::native_proxy::default_launch_agents_dir(store.paths());
+        let launchd_domain = crate::native_proxy::ProcessLaunchdClient::domain()
+            .unwrap_or_else(|_| "gui/0".into());
         Self {
             store,
             docker: Arc::new(ProcessDockerClient::new()),
+            launchd: Arc::new(crate::native_proxy::ProcessLaunchdClient),
+            launch_agents_dir,
+            launchd_domain,
+            prefer_native: false,
         }
     }
 
     pub fn with_docker(store: AgentStateStore, docker: Arc<dyn DockerClient>) -> Self {
-        Self { store, docker }
+        let launch_agents_dir =
+            crate::native_proxy::default_launch_agents_dir(store.paths());
+        Self {
+            store,
+            docker,
+            launchd: Arc::new(crate::native_proxy::ProcessLaunchdClient),
+            launch_agents_dir,
+            launchd_domain: "gui/0".into(),
+            prefer_native: false,
+        }
+    }
+
+    pub fn with_native(
+        store: AgentStateStore,
+        launchd: Arc<dyn crate::native_proxy::LaunchdClient>,
+        launch_agents_dir: PathBuf,
+        launchd_domain: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            docker: Arc::new(ProcessDockerClient::new()),
+            launchd,
+            launch_agents_dir,
+            launchd_domain: launchd_domain.into(),
+            prefer_native: true,
+        }
     }
 
     /// This host's proxy boundary key, or empty when none is provisioned yet.
@@ -56,6 +93,20 @@ impl ProxyManager {
     /// Read-only status may return diagnostics when Docker is unavailable.
     pub fn status(&self) -> Result<ProxyStatusView, String> {
         let state = self.store.load()?;
+        if self.native_backend_active()
+            || state
+                .install
+                .as_ref()
+                .is_some_and(|install| install.backend() == crate::platform::ProxyBackend::Native)
+        {
+            return crate::native_proxy::observe_native(
+                &self.store,
+                self.launchd.as_ref(),
+                &self.launch_agents_dir,
+                &self.launchd_domain,
+                &self.boundary_key(),
+            );
+        }
         let containers = match self.docker.list_proxy_containers() {
             Ok(containers) => containers,
             Err(error) => {
@@ -70,6 +121,8 @@ impl ProxyManager {
                     install_id: state.install.as_ref().map(|i| i.install_id.clone()),
                     config_hash: state.install.as_ref().map(|i| i.config_hash.clone()),
                     last_error: Some(format!("docker unavailable: {error}")),
+                    proxy_backend: Some(crate::platform::PROXY_BACKEND_DOCKER.into()),
+                    native_executable_digest: None,
                 });
             }
         };
@@ -87,6 +140,17 @@ impl ProxyManager {
         image: &str,
         image_digest: Option<String>,
     ) -> Result<OperationResult, String> {
+        if self.native_backend_active() && image.trim().is_empty() {
+            let request = json!({
+                "proxyBackend": crate::platform::PROXY_BACKEND_NATIVE,
+                "nativeExecutableDigest": image_digest,
+            });
+            return self.with_mutation_lock(|| {
+                self.run_operation_locked(operation_id, "proxy.install", &request, |record| {
+                    self.install_native_inner(record, image_digest.clone())
+                })
+            });
+        }
         let request = json!({
             "image": image,
             "imageDigest": image_digest,
@@ -148,6 +212,13 @@ impl ProxyManager {
             "hostPort": request.host_port,
             "image": request.image,
         });
+        if self.native_backend_active() {
+            return self.with_mutation_lock(|| {
+                self.run_operation_locked(&request.operation_id, "proxy.start", &payload, |record| {
+                    self.start_native_inner(record, &request)
+                })
+            });
+        }
         self.with_mutation_lock(|| {
             self.run_operation_locked(&request.operation_id, "proxy.start", &payload, |record| {
                 self.start_inner(record, &request)
@@ -157,6 +228,13 @@ impl ProxyManager {
 
     pub fn stop(&self, operation_id: &str) -> Result<OperationResult, String> {
         let payload = json!({});
+        if self.native_backend_active() {
+            return self.with_mutation_lock(|| {
+                self.run_operation_locked(operation_id, "proxy.stop", &payload, |record| {
+                    self.stop_native_inner(record, false)
+                })
+            });
+        }
         self.with_mutation_lock(|| {
             self.run_operation_locked(operation_id, "proxy.stop", &payload, |record| {
                 self.stop_inner(record, false)
@@ -171,6 +249,17 @@ impl ProxyManager {
         let payload = json!({});
         self.with_mutation_lock(|| {
             self.run_operation_locked(operation_id, "proxy.restart", &payload, |record| {
+                if self.native_backend_active() {
+                    self.stop_native_inner(record, true)?;
+                    return self.start_native_inner(
+                        record,
+                        &ProxyStartRequest {
+                            operation_id: operation_id.into(),
+                            host_port: None,
+                            image: None,
+                        },
+                    );
+                }
                 self.stop_inner(record, true)?;
                 self.start_inner(
                     record,
@@ -191,6 +280,27 @@ impl ProxyManager {
                 let state = self.store.load()?;
                 if state.install.is_none() {
                     return Err("RepairRequiresInstall: no managed proxy install exists".into());
+                }
+                if self.native_backend_active() {
+                    let status = crate::native_proxy::observe_native(
+                        &self.store,
+                        self.launchd.as_ref(),
+                        &self.launch_agents_dir,
+                        &self.launchd_domain,
+                        &self.boundary_key(),
+                    )?;
+                    if status.ready {
+                        return serde_json::to_value(status).map_err(|error| error.to_string());
+                    }
+                    self.stop_native_inner(record, true)?;
+                    return self.start_native_inner(
+                        record,
+                        &ProxyStartRequest {
+                            operation_id: operation_id.into(),
+                            host_port: None,
+                            image: None,
+                        },
+                    );
                 }
                 let inventory = self.require_docker_observable()?;
                 let status = status_from_inventory(
@@ -227,9 +337,39 @@ impl ProxyManager {
         });
         self.with_mutation_lock(|| {
             self.run_operation_locked(operation_id, "proxy.update", &payload, |record| {
-                self.update_inner(record, image, image_digest.clone())
+                if self.native_backend_active() {
+                    self.update_native_inner(record, image, image_digest.clone())
+                } else {
+                    self.update_inner(record, image, image_digest.clone())
+                }
             })
         })
+    }
+
+    pub fn rollback(&self, operation_id: &str) -> Result<OperationResult, String> {
+        let payload = json!({});
+        self.with_mutation_lock(|| {
+            self.run_operation_locked(operation_id, "proxy.rollback", &payload, |record| {
+                if self.native_backend_active() {
+                    self.rollback_native_inner(record)
+                } else {
+                    Err(
+                        "ProxyRollbackRequiresNativeBackend: docker rollback is stop plus a previous image install"
+                            .into(),
+                    )
+                }
+            })
+        })
+    }
+
+    pub fn logs(&self, max_bytes: Option<u64>) -> Result<ProxyLogsView, String> {
+        let max = max_bytes
+            .unwrap_or(64 * 1024)
+            .min(usize::MAX as u64) as usize;
+        if self.native_backend_active() {
+            return crate::native_proxy::logs_native(&self.store, self.launchd.as_ref(), max);
+        }
+        docker_file_logs(&self.store.paths().proxy_logs_dir, max)
     }
 
     fn with_mutation_lock<T>(&self, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -242,6 +382,20 @@ impl ProxyManager {
         self.docker
             .list_proxy_containers()
             .map_err(|error| format!("docker inventory unavailable; refusing mutation: {error}"))
+    }
+
+    fn native_backend_active(&self) -> bool {
+        if self.prefer_native {
+            return true;
+        }
+        if let Ok(state) = self.store.load() {
+            if let Some(install) = state.install {
+                return install.backend() == crate::platform::ProxyBackend::Native;
+            }
+        }
+        crate::platform::current_platform()
+            .map(|platform| platform.proxy_backend() == crate::platform::ProxyBackend::Native)
+            .unwrap_or(false)
     }
 
     fn run_operation_locked<F>(
@@ -264,8 +418,10 @@ impl ProxyManager {
                 detail: result,
             }),
             BeginOutcome::Fresh { mut record } | BeginOutcome::Resume { mut record } => {
-                // Fail closed before marking Executing when Docker cannot be observed.
-                let _ = self.require_docker_observable()?;
+                if !self.native_backend_active() {
+                    // Fail closed before marking Executing when Docker cannot be observed.
+                    let _ = self.require_docker_observable()?;
+                }
                 journal.mark_executing(&mut record)?;
                 match work(&mut record) {
                     Ok(detail) => {
@@ -328,7 +484,14 @@ impl ProxyManager {
             .map(|item| item.host_port)
             .unwrap_or(15721);
         let config_hash = config_hash_for(&resolved.source, host_port, &install_id);
-        write_default_proxy_config(paths, &host_id, &install_id, &config_hash, &resolved.source)?;
+        write_default_proxy_config(
+            paths,
+            &host_id,
+            &install_id,
+            &config_hash,
+            &resolved.source,
+            "0.0.0.0:15721",
+        )?;
         let install = InstallRecord {
             install_id,
             host_id,
@@ -337,10 +500,130 @@ impl ProxyManager {
             config_hash,
             host_port,
             updated_at: Utc::now(),
+            proxy_backend: Some(crate::platform::PROXY_BACKEND_DOCKER.into()),
+            native_executable_digest: None,
         };
         state.install = Some(install.clone());
         self.store.save(&state)?;
         serde_json::to_value(&install).map_err(|error| error.to_string())
+    }
+
+    fn install_native_inner(
+        &self,
+        _record: &mut OperationRecord,
+        native_executable_digest: Option<String>,
+    ) -> Result<Value, String> {
+        if native_executable_digest
+            .as_deref()
+            .is_some_and(|value| value.starts_with("vellum-proxy:") || value.contains("ghcr.io/"))
+        {
+            return Err(
+                "NativeProxyDigestInvalid: native executable digest must not be a container image name"
+                    .into(),
+            );
+        }
+        let paths = self.store.paths();
+        paths.ensure()?;
+        let mut state = self.store.load()?;
+        let host_id = state.host_id.clone();
+        let install_id = state
+            .install
+            .as_ref()
+            .map(|item| item.install_id.clone())
+            .unwrap_or_else(|| format!("install-{}", ulid::Ulid::new()));
+        let host_port = state
+            .install
+            .as_ref()
+            .map(|item| item.host_port)
+            .unwrap_or(crate::platform::DARWIN_PROXY_PORT);
+        let binary = crate::native_proxy::native_proxy_bin(paths);
+        if !binary.is_file() {
+            return Err(format!(
+                "NativeProxyBinaryMissing: {}",
+                binary.display()
+            ));
+        }
+        let actual_digest = crate::native_proxy::digest_native_binary(&binary)?;
+        if let Some(expected) = native_executable_digest.as_deref() {
+            if !actual_digest.eq_ignore_ascii_case(expected) {
+                return Err(format!(
+                    "NativeProxyDigestMismatch: expected {expected}, got {actual_digest}"
+                ));
+            }
+        }
+        let digest = native_executable_digest.unwrap_or(actual_digest);
+        let config_hash = config_hash_for(&digest, host_port, &install_id);
+        write_default_proxy_config(
+            paths,
+            &host_id,
+            &install_id,
+            &config_hash,
+            "vellum-proxy-daemon",
+            &crate::native_proxy::native_listen(host_port),
+        )?;
+        let spec = crate::native_proxy::LaunchAgentSpec::new(
+            binary,
+            paths.proxy_config_dir.join("proxy.toml"),
+            crate::native_proxy::native_listen(host_port),
+            &paths.logs_dir,
+            paths.root.clone(),
+        );
+        crate::native_proxy::write_launch_agent_plist(&spec, &self.launch_agents_dir)?;
+        let install = InstallRecord {
+            install_id,
+            host_id,
+            image: String::new(),
+            image_digest: None,
+            config_hash,
+            host_port,
+            updated_at: Utc::now(),
+            proxy_backend: Some(crate::platform::PROXY_BACKEND_NATIVE.into()),
+            native_executable_digest: Some(digest),
+        };
+        state.install = Some(install.clone());
+        self.store.save(&state)?;
+        serde_json::to_value(&install).map_err(|error| error.to_string())
+    }
+
+    fn start_native_inner(
+        &self,
+        _record: &mut OperationRecord,
+        request: &ProxyStartRequest,
+    ) -> Result<Value, String> {
+        if self.store.load()?.install.is_none() {
+            self.install_native_inner(_record, None)?;
+        }
+        let view = crate::native_proxy::start_native(
+            &self.store,
+            self.launchd.as_ref(),
+            &self.launch_agents_dir,
+            &self.launchd_domain,
+            request.host_port,
+            &self.boundary_key(),
+        )?;
+        serde_json::to_value(&view).map_err(|error| error.to_string())
+    }
+
+    fn stop_native_inner(
+        &self,
+        _record: &mut OperationRecord,
+        coordinated_restart: bool,
+    ) -> Result<Value, String> {
+        let references = active_profile_references(self.store.paths())?;
+        if !coordinated_restart && !references.is_empty() {
+            return Err(format!(
+                "ProxyInUse: managed profile leases still reference this proxy: {}",
+                references.join(", ")
+            ));
+        }
+        let view = crate::native_proxy::stop_native(
+            &self.store,
+            self.launchd.as_ref(),
+            &self.launch_agents_dir,
+            &self.launchd_domain,
+            &self.boundary_key(),
+        )?;
+        serde_json::to_value(&view).map_err(|error| error.to_string())
     }
 
     fn start_inner(
@@ -430,6 +713,7 @@ impl ProxyManager {
                 &install.install_id,
                 &install.config_hash,
                 &image,
+                "0.0.0.0:15721",
             )?;
         }
 
@@ -536,6 +820,78 @@ impl ProxyManager {
     ) -> Result<Value, String> {
         self.install_inner(record, image, image_digest)
     }
+
+    fn update_native_inner(
+        &self,
+        record: &mut OperationRecord,
+        image: &str,
+        image_digest: Option<String>,
+    ) -> Result<Value, String> {
+        if looks_like_container_image(image) {
+            return Err(
+                "NativeProxyDigestInvalid: native proxy.update must not receive a container image name"
+                    .into(),
+            );
+        }
+        if self.store.load()?.install.is_none() {
+            return Err("NativeProxyInstallMissing: install the native proxy first".into());
+        }
+        let target = crate::native_proxy::native_proxy_bin(self.store.paths());
+        let staged = image.trim();
+        if !staged.is_empty() {
+            let expected = match image_digest.as_deref() {
+                Some(digest) if !digest.is_empty() => digest.to_string(),
+                _ => crate::native_proxy::digest_native_binary(Path::new(staged))?,
+            };
+            crate::update::install_binary(Path::new(staged), &target, &expected)?;
+        }
+        let digest = image_digest
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| crate::native_proxy::digest_native_binary(&target).ok());
+        self.install_native_inner(record, digest)?;
+        let view = crate::native_proxy::reload_native_if_loaded(
+            &self.store,
+            self.launchd.as_ref(),
+            &self.launch_agents_dir,
+            &self.launchd_domain,
+            &self.boundary_key(),
+        )?;
+        serde_json::to_value(&view).map_err(|error| error.to_string())
+    }
+
+    fn rollback_native_inner(&self, record: &mut OperationRecord) -> Result<Value, String> {
+        if self.store.load()?.install.is_none() {
+            return Err("NativeProxyInstallMissing: install the native proxy first".into());
+        }
+        let target = crate::native_proxy::native_proxy_bin(self.store.paths());
+        crate::update::rollback_binary(&target)?;
+        let digest = crate::native_proxy::digest_native_binary(&target)?;
+        self.install_native_inner(record, Some(digest))?;
+        let view = crate::native_proxy::reload_native_if_loaded(
+            &self.store,
+            self.launchd.as_ref(),
+            &self.launch_agents_dir,
+            &self.launchd_domain,
+            &self.boundary_key(),
+        )?;
+        serde_json::to_value(&view).map_err(|error| error.to_string())
+    }
+}
+
+fn looks_like_container_image(image: &str) -> bool {
+    let trimmed = image.trim();
+    trimmed.starts_with("vellum-proxy:")
+        || trimmed.contains("ghcr.io/")
+        || trimmed.contains("@sha256:")
+}
+
+fn docker_file_logs(dir: &Path, max_bytes: usize) -> Result<ProxyLogsView, String> {
+    let stdout_path = dir.join("proxy.out.log");
+    let stderr_path = dir.join("proxy.err.log");
+    let mut view = crate::native_proxy::read_launchd_log_files(&stdout_path, &stderr_path, max_bytes)?;
+    view.source = "docker-files".into();
+    Ok(view)
 }
 
 fn wait_for_runtime_contract(
@@ -704,6 +1060,7 @@ fn status_from_inventory(
                 "stale managed container present with mismatched config hash; stop/update required"
                     .into(),
             ),
+            ..Default::default()
         });
     }
 
@@ -718,6 +1075,7 @@ fn status_from_inventory(
         install_id: Some(install.install_id.clone()),
         config_hash: Some(install.config_hash.clone()),
         last_error: None,
+        ..Default::default()
     })
 }
 
@@ -774,6 +1132,8 @@ fn status_from_container(
         install_id: Some(install.install_id.clone()),
         config_hash: Some(install.config_hash.clone()),
         last_error,
+        proxy_backend: Some(install.backend().as_str().into()),
+        native_executable_digest: install.native_executable_digest.clone(),
     })
 }
 
@@ -791,11 +1151,12 @@ fn write_default_proxy_config(
     install_id: &str,
     config_hash: &str,
     image: &str,
+    listen: &str,
 ) -> Result<(), String> {
     paths.ensure()?;
     let config = format!(
         "schema_version = 2\n\
-listen = \"0.0.0.0:15721\"\n\
+listen = \"{listen}\"\n\
 data_dir = \"/var/lib/vellum/data\"\n\
 history_dir = \"/var/lib/vellum/history\"\n\
 log_dir = \"/var/log/vellum\"\n\
@@ -1201,6 +1562,19 @@ mod tests {
     }
 
     #[test]
+    fn docker_rollback_is_refused_and_does_not_touch_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manager, _) = manager(&temp);
+        manager
+            .install("op-install", "vellum-proxy:local", None)
+            .unwrap();
+        let before = manager.store.load().unwrap();
+        let err = manager.rollback("op-rb").unwrap_err();
+        assert!(err.contains("ProxyRollbackRequiresNativeBackend"));
+        assert_eq!(manager.store.load().unwrap(), before);
+    }
+
+    #[test]
     fn update_does_not_mutate_state_when_docker_inventory_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         {
@@ -1456,6 +1830,175 @@ mod tests {
             docker.last_run_user.lock().unwrap().as_deref(),
             Some(expected_user.as_str())
         );
+    }
+
+    #[test]
+    fn native_install_start_stop_status_uses_launchd_not_a_fabricated_running_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStateStore::new(AgentPaths::from_root(temp.path().join("state")));
+        store.paths().ensure().unwrap();
+        let bin = crate::native_proxy::native_proxy_bin(store.paths());
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"vellum-proxy-daemon").unwrap();
+        let digest = crate::native_proxy::digest_native_binary(&bin).unwrap();
+        let agents = temp.path().join("Library").join("LaunchAgents");
+        let launchd = Arc::new(crate::native_proxy::MemoryLaunchd {
+            ready: Mutex::new(true),
+            ..crate::native_proxy::MemoryLaunchd::default()
+        });
+        let manager =
+            ProxyManager::with_native(store, launchd.clone(), agents.clone(), "gui/501");
+
+        let installed = manager
+            .install("op-n-install", "", Some(digest.clone()))
+            .unwrap();
+        let record: InstallRecord = serde_json::from_value(installed.detail).unwrap();
+        assert_eq!(record.host_port, 15722);
+        assert_eq!(record.backend(), crate::platform::ProxyBackend::Native);
+        assert!(record.image.is_empty());
+        assert_ne!(record.image, "vellum-proxy:native");
+        assert_eq!(
+            record.native_executable_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        let plist_path = crate::native_proxy::LaunchAgentSpec::plist_path(&agents);
+        assert!(plist_path.is_file());
+        assert!(
+            !manager.status().unwrap().running,
+            "install must not fabricate a running process"
+        );
+
+        manager
+            .start(ProxyStartRequest {
+                operation_id: "op-n-start".into(),
+                host_port: Some(15722),
+                image: None,
+            })
+            .unwrap();
+        let started = manager.status().unwrap();
+        assert!(started.running, "status must follow launchctl, not a constant");
+        assert!(started.ready);
+        assert_eq!(started.host_port, Some(15722));
+        let plist = std::fs::read_to_string(&plist_path).unwrap();
+        assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<string>127.0.0.1:15722</string>"));
+        assert!(plist.contains(&bin.to_string_lossy().to_string()));
+        assert_eq!(launchd.loads.lock().unwrap().len(), 1);
+        assert_eq!(launchd.loads.lock().unwrap()[0], plist_path);
+
+        manager.stop("op-n-stop").unwrap();
+        let stopped = manager.status().unwrap();
+        assert!(!stopped.running);
+        assert!(!stopped.ready);
+        assert!(plist_path.is_file(), "stop unloads launchd, it does not delete the plist");
+        assert_eq!(
+            launchd.unloads.lock().unwrap().as_slice(),
+            [crate::native_proxy::LAUNCH_AGENT_LABEL]
+        );
+        assert_eq!(
+            manager.store.load().unwrap().install.unwrap().host_port,
+            15722
+        );
+    }
+
+    #[test]
+    fn native_logs_repair_update_rollback_use_launchd_not_docker() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStateStore::new(AgentPaths::from_root(temp.path().join("state")));
+        store.paths().ensure().unwrap();
+        let bin = crate::native_proxy::native_proxy_bin(store.paths());
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"proxy-v1").unwrap();
+        let digest_v1 = crate::native_proxy::digest_native_binary(&bin).unwrap();
+        let agents = temp.path().join("Library").join("LaunchAgents");
+        let launchd = Arc::new(crate::native_proxy::MemoryLaunchd {
+            ready: Mutex::new(true),
+            stdout_log: Mutex::new("native stdout".into()),
+            stderr_log: Mutex::new("native stderr".into()),
+            ..crate::native_proxy::MemoryLaunchd::default()
+        });
+        let manager =
+            ProxyManager::with_native(store, launchd.clone(), agents.clone(), "gui/501");
+
+        manager
+            .install("op-n-install", "", Some(digest_v1.clone()))
+            .unwrap();
+        manager
+            .start(ProxyStartRequest {
+                operation_id: "op-n-start".into(),
+                host_port: Some(15722),
+                image: None,
+            })
+            .unwrap();
+        assert_eq!(launchd.loads.lock().unwrap().len(), 1);
+
+        let logs = manager.logs(Some(4096)).unwrap();
+        assert_eq!(logs.source, "launchd");
+        assert_eq!(logs.stdout, "native stdout");
+        assert_eq!(logs.stderr, "native stderr");
+        assert_eq!(*launchd.log_reads.lock().unwrap(), 1);
+
+        *launchd.ready.lock().unwrap() = false;
+        manager.repair("op-n-repair").unwrap();
+        assert_eq!(launchd.unloads.lock().unwrap().len(), 1);
+        assert_eq!(launchd.loads.lock().unwrap().len(), 2);
+        *launchd.ready.lock().unwrap() = true;
+        let ready = manager.repair("op-n-repair-noop").unwrap();
+        assert_eq!(ready.detail["ready"], true);
+        assert_eq!(launchd.loads.lock().unwrap().len(), 2);
+
+        let staged = temp.path().join("proxy-v2");
+        std::fs::write(&staged, b"proxy-v2").unwrap();
+        let digest_v2 = crate::native_proxy::digest_native_binary(&staged).unwrap();
+        manager
+            .update(
+                "op-n-update",
+                staged.to_str().unwrap(),
+                Some(digest_v2.clone()),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), b"proxy-v2");
+        assert_eq!(
+            manager
+                .store
+                .load()
+                .unwrap()
+                .install
+                .unwrap()
+                .native_executable_digest
+                .as_deref(),
+            Some(digest_v2.as_str())
+        );
+        assert_eq!(launchd.unloads.lock().unwrap().len(), 2);
+        assert_eq!(launchd.loads.lock().unwrap().len(), 3);
+        assert!(
+            manager
+                .update(
+                    "op-n-update-image",
+                    "vellum-proxy:local",
+                    None,
+                )
+                .unwrap_err()
+                .contains("NativeProxyDigestInvalid")
+        );
+
+        manager.rollback("op-n-rollback").unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), b"proxy-v1");
+        assert_eq!(
+            manager
+                .store
+                .load()
+                .unwrap()
+                .install
+                .unwrap()
+                .native_executable_digest
+                .as_deref(),
+            Some(digest_v1.as_str())
+        );
+        assert_eq!(launchd.unloads.lock().unwrap().len(), 3);
+        assert_eq!(launchd.loads.lock().unwrap().len(), 4);
+        assert_eq!(manager.status().unwrap().host_port, Some(15722));
+        assert_eq!(manager.status().unwrap().proxy_backend.as_deref(), Some("native"));
     }
 
     #[derive(Debug, Default)]

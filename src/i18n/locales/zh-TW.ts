@@ -590,6 +590,11 @@ const zhTW: ResourceTree = {
       "credentialsMissing": "主機缺少本次部署所需的憑證。",
       "desktopOfficialAccountMissing": "桌面端尚未選定 ChatGPT 帳號，無法與遠端配對。",
       "dockerUnavailable": "主機上沒有可用的 Docker，Proxy 無法啟動。",
+      "intelMacUnsupported": "Intel Mac 尚未支援。第一版 Remote Manager 只支援 Apple Silicon。",
+      "guiSessionUnavailable": "沒有可用的 macOS 登入工作階段。Proxy 是登入後常駐，不會改電源或自動登入。",
+      "proxyPortConflict": "遠端 Proxy 預設埠被占用。請在部署計畫指定其他埠，或釋放 127.0.0.1:15722。",
+      "insufficientDiskSpace": "可用空間不足以完成下載、解壓與回滾保留，已在替換前停止。不會自動刪除使用者資料。",
+      "incompleteObservation": "無法完整觀測受管 runtime 的 turn、工具或核准，已阻擋破壞性操作。",
       "hostNotConfigured": "此主機尚未寫入 Vellum 的設定。",
       "injectionRequiresReadyProxy": "需待 Proxy 就緒後，才能將模型注入 Codex 的選單。",
       "invalidCompactionThreshold": "壓縮門檻的設定值不在合法範圍。",
@@ -673,7 +678,15 @@ const zhTW: ResourceTree = {
       "releaseUnverified": "未通過驗證 · {{trust}}",
       "verified": "已驗證",
       "pinned": "pinned 版本",
-      "inventoryBlockers": "盤點阻礙項"
+      "inventoryBlockers": "盤點阻礙項",
+      "platform": "平台",
+      "proxyBackend": "Proxy 後端",
+      "persistence": "常駐範圍",
+      "loginResident": "登入後常駐",
+      "lingerResident": "systemd linger 常駐",
+      "managedHome": "受管 CODEX_HOME",
+      "isolationLabel": "隔離",
+      "isolation": "遠端設定與本機 Vellum／Enhanced／~/.codex 隔離。"
     },
     "desktopCodex": {
       "desktop": "Desktop Codex",

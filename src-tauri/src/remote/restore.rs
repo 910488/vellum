@@ -35,6 +35,16 @@ where
     );
     let before = client.host_status()?;
     let sessions = client.codex_session_status(None)?;
+    let observation = crate::remote::observation::observation_from_session(
+        Some(&sessions),
+        before.get("nativeCodex"),
+    );
+    match crate::remote::observation::destructive_op_decision(&observation) {
+        crate::remote::observation::DestructiveDecision::Block { code } => {
+            return Err(AppError::Message(format!("OneClickRestoreBlocked: {code}")));
+        }
+        crate::remote::observation::DestructiveDecision::Allow => {}
+    }
     if active_turn_present(&before, &sessions) {
         return Err(AppError::Message(
             "OneClickRestoreBlocked: activeTurnInProgress; wait for the current Codex turn to finish"
@@ -161,6 +171,17 @@ pub(crate) fn active_turn_present(host: &Value, sessions: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn incomplete_observation_blocks_restore() {
+        let obs = crate::remote::observation::observation_from_session(None, None);
+        assert_eq!(
+            crate::remote::observation::destructive_op_decision(&obs),
+            crate::remote::observation::DestructiveDecision::Block {
+                code: "incompleteObservation"
+            }
+        );
+    }
 
     #[test]
     fn restore_preflight_detects_only_structured_active_turns() {

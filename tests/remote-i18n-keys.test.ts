@@ -20,7 +20,9 @@ const LOCALES: Record<string, ResourceTree> = { "zh-TW": zhTW, "zh-CN": zhCN, en
 /** 後端會送出來的 blocker 代號。跟 remoteVocabulary 的 BLOCKERS 一致。 */
 const BLOCKER_CODES = [
   "agentUnavailable", "codexRestartRequired", "credentialsMissing",
-  "desktopOfficialAccountMissing", "dockerUnavailable", "hostNotConfigured",
+  "desktopOfficialAccountMissing", "dockerUnavailable", "intelMacUnsupported",
+  "guiSessionUnavailable", "proxyPortConflict", "insufficientDiskSpace",
+  "incompleteObservation", "hostNotConfigured",
   "injectionRequiresReadyProxy", "invalidCompactionThreshold",
   "managedRuntimeRecoveryRequired", "nativeCodexVersionMismatch",
   "nativeDaemonAppOwned", "noModelsSelected", "officialAccountActivationRequired",

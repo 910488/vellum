@@ -535,6 +535,11 @@ const ja: ResourceTree = {
       "credentialsMissing": "この配備に必要な資格情報がホストにありません。",
       "desktopOfficialAccountMissing": "デスクトップ側で ChatGPT アカウントが選択されていないため、リモートとペアリングできません。",
       "dockerUnavailable": "ホストに使える Docker がなく、Proxy を起動できません。",
+      "intelMacUnsupported": "Intel Mac は未対応です。Remote Manager の初版は Apple Silicon のみです。",
+      "guiSessionUnavailable": "macOS のログインセッションがありません。Proxy はログイン後常駐であり、電源や自動ログイン設定は変更しません。",
+      "proxyPortConflict": "リモート Proxy の既定ポートが使用中です。デプロイ計画で別ポートを指定するか、127.0.0.1:15722 を空けてください。",
+      "insufficientDiskSpace": "ダウンロード・展開・ロールバック予約に必要な空き容量が足りないため、置換前に停止しました。ユーザーデータは自動削除しません。",
+      "incompleteObservation": "管理対象 runtime の turn / ツール / 承認を完全に観測できないため、破壊的操作を遮断しました。",
       "hostNotConfigured": "このホストにはまだ Vellum の設定が書き込まれていません。",
       "injectionRequiresReadyProxy": "モデルを Codex の一覧へ注入できるのは、Proxy が準備完了になってからです。",
       "invalidCompactionThreshold": "圧縮しきい値の設定が許容範囲外です。",
@@ -618,7 +623,15 @@ const ja: ResourceTree = {
       "releaseUnverified": "未検証 · {{trust}}",
       "verified": "検証済み",
       "pinned": "pinned バージョン",
-      "inventoryBlockers": "点検で見つかった阻害要因"
+      "inventoryBlockers": "点検で見つかった阻害要因",
+      "platform": "プラットフォーム",
+      "proxyBackend": "Proxy バックエンド",
+      "persistence": "常駐範囲",
+      "loginResident": "ログイン後常駐",
+      "lingerResident": "systemd linger で常駐",
+      "managedHome": "管理対象 CODEX_HOME",
+      "isolationLabel": "分離",
+      "isolation": "リモート設定はローカルの Vellum / Enhanced / ~/.codex から分離されます。"
     },
     "desktopCodex": {
       "desktop": "Desktop Codex",

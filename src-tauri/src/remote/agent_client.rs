@@ -19,7 +19,7 @@ use crate::remote::ssh_trust;
 
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
 const RPC_TIMEOUT_SECS: u64 = 60;
-const SUPPORTED_AGENT_PROTOCOLS: &[u64] = &[1, 2, 3];
+const SUPPORTED_AGENT_PROTOCOLS: &[u64] = &[1, 2, 3, 4];
 
 /// Trusted process target resolved from CachedHost metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -431,6 +431,34 @@ impl RemoteAgentClient {
         }))
     }
 
+    pub fn proxy_update(
+        &self,
+        operation_id: &str,
+        image: &str,
+        image_digest: Option<&str>,
+    ) -> AppResult<Value> {
+        self.rpc(json!({
+            "method": "proxy.update",
+            "operationId": operation_id,
+            "image": image,
+            "imageDigest": image_digest,
+        }))
+    }
+
+    pub fn proxy_logs(&self, max_bytes: Option<u64>) -> AppResult<Value> {
+        self.rpc(json!({
+            "method": "proxy.logs",
+            "maxBytes": max_bytes,
+        }))
+    }
+
+    pub fn proxy_rollback(&self, operation_id: &str) -> AppResult<Value> {
+        self.rpc(json!({
+            "method": "proxy.rollback",
+            "operationId": operation_id,
+        }))
+    }
+
     pub fn credential_put(
         &self,
         operation_id: &str,
@@ -658,6 +686,25 @@ impl RemoteAgentClient {
 }
 
 fn ensure_agent_compatible(value: &Value) -> AppResult<()> {
+    ensure_agent_compatible_for_platform(value, None)
+}
+
+fn platform_from_agent_value(value: &Value) -> Option<crate::remote::platform::RemotePlatform> {
+    let os = value
+        .pointer("/system/os")
+        .or_else(|| value.pointer("/capabilities/os"))
+        .and_then(Value::as_str)?;
+    let arch = value
+        .pointer("/system/arch")
+        .or_else(|| value.pointer("/capabilities/arch"))
+        .and_then(Value::as_str)?;
+    crate::remote::platform::RemotePlatform::from_os_arch(os, arch).ok()
+}
+
+fn ensure_agent_compatible_for_platform(
+    value: &Value,
+    platform: Option<crate::remote::platform::RemotePlatform>,
+) -> AppResult<()> {
     let protocol = value
         .get("agentProtocol")
         .and_then(Value::as_u64)
@@ -665,6 +712,12 @@ fn ensure_agent_compatible(value: &Value) -> AppResult<()> {
     if !SUPPORTED_AGENT_PROTOCOLS.contains(&protocol) {
         return Err(AppError::Message(format!(
             "IncompatibleAgentProtocol: remote={protocol}, supported={SUPPORTED_AGENT_PROTOCOLS:?}"
+        )));
+    }
+    let platform = platform.or_else(|| platform_from_agent_value(value));
+    if !crate::remote::platform::desktop_accepts_agent_protocol(protocol, platform) {
+        return Err(AppError::Message(format!(
+            "IncompatibleAgentProtocol: macOS features require agent protocol 4, remote={protocol}"
         )));
     }
     Ok(())
@@ -861,8 +914,27 @@ mod tests {
     fn compatibility_matrix_fails_closed_for_unknown_protocols() {
         assert!(ensure_agent_compatible(&json!({"agentProtocol": 1})).is_ok());
         assert!(ensure_agent_compatible(&json!({"agentProtocol": 3})).is_ok());
+        assert!(ensure_agent_compatible(&json!({"agentProtocol": 4})).is_ok());
         let error = ensure_agent_compatible(&json!({"agentProtocol": 99})).unwrap_err();
         assert!(error.to_string().contains("IncompatibleAgentProtocol"));
         assert!(ensure_agent_compatible(&json!({})).is_err());
+        let linux = json!({
+            "agentProtocol": 3,
+            "capabilities": {"os": "linux", "arch": "aarch64"}
+        });
+        assert!(ensure_agent_compatible(&linux).is_ok());
+        let macos_old = json!({
+            "agentProtocol": 3,
+            "capabilities": {"os": "macos", "arch": "aarch64"}
+        });
+        assert!(ensure_agent_compatible(&macos_old)
+            .unwrap_err()
+            .to_string()
+            .contains("protocol 4"));
+        let macos_new = json!({
+            "agentProtocol": 4,
+            "capabilities": {"os": "macos", "arch": "aarch64"}
+        });
+        assert!(ensure_agent_compatible(&macos_new).is_ok());
     }
 }

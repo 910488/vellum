@@ -28,7 +28,7 @@ pub fn rollback_current() -> Result<AgentUpdateResult, String> {
     rollback_binary(&target)
 }
 
-fn install_binary(
+pub(crate) fn install_binary(
     staged: &Path,
     target: &Path,
     expected_sha256: &str,
@@ -77,7 +77,7 @@ fn install_binary(
     })
 }
 
-fn rollback_binary(target: &Path) -> Result<AgentUpdateResult, String> {
+pub(crate) fn rollback_binary(target: &Path) -> Result<AgentUpdateResult, String> {
     let rollback = rollback_path(target);
     reject_symlink(&rollback)?;
     if !rollback.is_file() {

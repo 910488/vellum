@@ -16,7 +16,8 @@ use crate::remote::agent_client::RemoteAgentClient;
 use crate::remote::process::background_command;
 use crate::state::AppState;
 
-const RELEASE_SCHEMA_VERSION: u32 = 3;
+const RELEASE_SCHEMA_VERSION: u32 = 4;
+const LEGACY_RELEASE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +33,8 @@ pub struct ArtifactSet {
     pub linux_x64: CodexArtifact,
     #[serde(rename = "linux-arm64")]
     pub linux_arm64: CodexArtifact,
+    #[serde(rename = "darwin-arm64", default, skip_serializing_if = "Option::is_none")]
+    pub darwin_arm64: Option<CodexArtifact>,
 }
 
 /// Component pin with per-arch artifacts (agent / broker self-update).
@@ -89,9 +92,11 @@ pub struct RemoteReleaseStatus {
 
 impl ReleaseManifest {
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != RELEASE_SCHEMA_VERSION {
+        if self.schema_version != RELEASE_SCHEMA_VERSION
+            && self.schema_version != LEGACY_RELEASE_SCHEMA_VERSION
+        {
             return Err(format!(
-                "ReleaseManifestSchemaUnsupported: expected {RELEASE_SCHEMA_VERSION}, got {}",
+                "ReleaseManifestSchemaUnsupported: expected {LEGACY_RELEASE_SCHEMA_VERSION} or {RELEASE_SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
@@ -128,8 +133,17 @@ impl ReleaseManifest {
         match relative.replace('\\', "/").as_str() {
             "linux-amd64/vellum-remote-agent" => Some(&self.agent.artifacts.linux_x64.sha256),
             "linux-arm64/vellum-remote-agent" => Some(&self.agent.artifacts.linux_arm64.sha256),
+            "darwin-arm64/vellum-remote-agent" => {
+                self.agent.artifacts.darwin_arm64.as_ref().map(|item| item.sha256.as_str())
+            }
             "linux-amd64/vellum-remote-broker" => Some(&self.broker.artifacts.linux_x64.sha256),
             "linux-arm64/vellum-remote-broker" => Some(&self.broker.artifacts.linux_arm64.sha256),
+            "darwin-arm64/vellum-proxy-daemon" => self
+                .proxy
+                .artifacts
+                .darwin_arm64
+                .as_ref()
+                .map(|item| item.sha256.as_str()),
             _ => None,
         }
     }
@@ -214,32 +228,54 @@ pub fn release_status() -> RemoteReleaseStatus {
 }
 
 fn artifact_for_arch<'a>(artifacts: &'a ArtifactSet, arch: &str) -> AppResult<&'a CodexArtifact> {
-    match arch {
-        "aarch64" | "arm64" => Ok(&artifacts.linux_arm64),
-        "x86_64" | "amd64" => Ok(&artifacts.linux_x64),
-        other => Err(AppError::Message(format!(
-            "ReleaseArtifactUnsupportedArch: {other}"
-        ))),
+    artifact_for_os_arch(artifacts, "linux", arch)
+}
+
+fn artifact_for_os_arch<'a>(
+    artifacts: &'a ArtifactSet,
+    os: &str,
+    arch: &str,
+) -> AppResult<&'a CodexArtifact> {
+    let platform = crate::remote::platform::RemotePlatform::from_os_arch(os, arch)
+        .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
+    match platform {
+        crate::remote::platform::RemotePlatform::LinuxAmd64 => Ok(&artifacts.linux_x64),
+        crate::remote::platform::RemotePlatform::LinuxArm64 => Ok(&artifacts.linux_arm64),
+        crate::remote::platform::RemotePlatform::DarwinArm64 => artifacts
+            .darwin_arm64
+            .as_ref()
+            .ok_or_else(|| AppError::Message("ReleaseArtifactMissingDarwinArm64".into())),
     }
 }
 
 /// Resolve a compile-time-verified bundled component artifact before the Agent exists.
 /// The component name is owned by Desktop code, never renderer input.
+#[cfg(test)]
 pub(crate) fn component_artifact_for_arch(
     manifest: &ReleaseManifest,
     component: &str,
     arch: &str,
 ) -> AppResult<CodexArtifact> {
+    component_artifact_for_os_arch(manifest, component, "linux", arch)
+}
+
+pub(crate) fn component_artifact_for_os_arch(
+    manifest: &ReleaseManifest,
+    component: &str,
+    os: &str,
+    arch: &str,
+) -> AppResult<CodexArtifact> {
     let artifacts = match component {
         "vellum-remote-agent" => &manifest.agent.artifacts,
         "vellum-remote-broker" => &manifest.broker.artifacts,
+        "vellum-proxy-daemon" => &manifest.proxy.artifacts,
         _ => {
             return Err(AppError::Message(format!(
                 "ReleaseArtifactUnknownComponent: {component}"
             )))
         }
     };
-    artifact_for_arch(artifacts, arch).cloned()
+    artifact_for_os_arch(artifacts, os, arch).cloned()
 }
 
 fn select_artifact<'a>(manifest: &'a ReleaseManifest, arch: &str) -> AppResult<&'a CodexArtifact> {
@@ -409,6 +445,35 @@ pub fn update_remote_components(
     let running_proxy_image = inventory
         .pointer("/proxy/image")
         .and_then(serde_json::Value::as_str);
+    let os = inventory
+        .pointer("/system/os")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("linux");
+    let proxy_backend = inventory
+        .pointer("/proxyBackend")
+        .or_else(|| inventory.pointer("/proxy/proxyBackend"))
+        .and_then(serde_json::Value::as_str);
+    let running_native_digest = inventory
+        .pointer("/proxy/nativeExecutableDigest")
+        .and_then(serde_json::Value::as_str);
+    let native = proxy_backend == Some("native");
+    let native_proxy_artifact = if native {
+        Some(component_artifact_for_os_arch(
+            &manifest,
+            "vellum-proxy-daemon",
+            os,
+            arch,
+        )?)
+    } else {
+        None
+    };
+    let native_proxy_stale = native_proxy_artifact.as_ref().is_some_and(|artifact| {
+        native_proxy_component_update_needed(
+            proxy_backend,
+            running_native_digest,
+            &artifact.sha256,
+        )
+    });
 
     let mut report = serde_json::json!({
         "hostId": host_id,
@@ -425,40 +490,107 @@ pub fn update_remote_components(
         "proxy": {
             "desiredImage": manifest.proxy.image,
             "runningImage": running_proxy_image,
-            "current": running_proxy_image == Some(manifest.proxy.image.as_str()),
-            "note": "proxy image switches on the next deployment apply"
+            "proxyBackend": proxy_backend,
+            "runningNativeDigest": running_native_digest,
+            "current": if native {
+                !native_proxy_stale
+            } else {
+                running_proxy_image == Some(manifest.proxy.image.as_str())
+            },
+            "note": if native {
+                "native proxy updates through proxy.update and LaunchAgent reload"
+            } else {
+                "proxy image switches on the next deployment apply"
+            },
         },
         "steps": [],
     });
-    let steps = report
-        .get_mut("steps")
-        .and_then(serde_json::Value::as_array_mut)
-        .expect("steps array");
-
-    if running_agent == manifest.agent.version {
+    let agent_current = running_agent == manifest.agent.version;
+    if agent_current && !native_proxy_stale {
+        let steps = report
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array");
         steps.push("agent.alreadyCurrent".into());
         steps.push("broker.notUpdated".into());
-        steps.push("proxy.updatedOnNextApply".into());
+        steps.push(
+            if native {
+                "proxy.alreadyCurrent"
+            } else {
+                "proxy.updatedOnNextApply"
+            }
+            .into(),
+        );
         return Ok(report);
     }
-    let artifact = artifact_for_arch(&manifest.agent.artifacts, arch)?;
-    let local_staged = download_artifact(artifact)?;
-    let update_result = (|| -> AppResult<serde_json::Value> {
-        let bytes = std::fs::read(&local_staged)
-            .map_err(|error| AppError::Message(format!("read agent artifact: {error}")))?;
-        let remote_path = format!("/tmp/vellum-agent-stage-{}.bin", ulid::Ulid::new());
-        client.stage_artifact(&remote_path, &bytes)?;
-        let update = client.agent_update(operation_id, &remote_path, &artifact.sha256);
-        client.remove_remote_file(&remote_path);
-        update
-    })();
-    let _ = std::fs::remove_file(&local_staged);
-    let update = update_result?;
-    steps.push("agent.updated".into());
+    let mut agent_update = None;
+    let mut proxy_update = None;
+    {
+        let steps = report
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array");
+    if !agent_current {
+        let artifact = artifact_for_os_arch(&manifest.agent.artifacts, os, arch)?;
+        let local_staged = download_artifact(artifact)?;
+        let update_result = (|| -> AppResult<serde_json::Value> {
+            let bytes = std::fs::read(&local_staged)
+                .map_err(|error| AppError::Message(format!("read agent artifact: {error}")))?;
+            let remote_path = format!("/tmp/vellum-agent-stage-{}.bin", ulid::Ulid::new());
+            client.stage_artifact(&remote_path, &bytes)?;
+            let update = client.agent_update(operation_id, &remote_path, &artifact.sha256);
+            client.remove_remote_file(&remote_path);
+            update
+        })();
+        let _ = std::fs::remove_file(&local_staged);
+        agent_update = Some(update_result?);
+        steps.push("agent.updated".into());
+    } else {
+        steps.push("agent.alreadyCurrent".into());
+    }
     steps.push("broker.notUpdated".into());
-    steps.push("proxy.updatedOnNextApply".into());
-    report["update"] = update;
+    if native_proxy_stale {
+        let artifact = native_proxy_artifact.expect("native proxy artifact");
+        let local_staged = download_artifact(&artifact)?;
+        let update_result = (|| -> AppResult<serde_json::Value> {
+            let bytes = std::fs::read(&local_staged)
+                .map_err(|error| AppError::Message(format!("read native proxy artifact: {error}")))?;
+            let remote_path = format!("/tmp/vellum-proxy-stage-{}.bin", ulid::Ulid::new());
+            client.stage_artifact(&remote_path, &bytes)?;
+            let update = client.proxy_update(
+                &format!("{operation_id}-proxy"),
+                &remote_path,
+                Some(&artifact.sha256),
+            );
+            client.remove_remote_file(&remote_path);
+            update
+        })();
+        let _ = std::fs::remove_file(&local_staged);
+        proxy_update = Some(update_result?);
+        steps.push("proxy.updatedNative".into());
+    } else if native {
+        steps.push("proxy.alreadyCurrent".into());
+    } else {
+        steps.push("proxy.updatedOnNextApply".into());
+    }
+    }
+    if let Some(update) = agent_update {
+        report["update"] = update;
+    }
+    if let Some(update) = proxy_update {
+        report["proxyUpdate"] = update;
+    }
     Ok(report)
+}
+
+pub(crate) fn native_proxy_component_update_needed(
+    proxy_backend: Option<&str>,
+    running_digest: Option<&str>,
+    desired_digest: &str,
+) -> bool {
+    proxy_backend == Some("native")
+        && !desired_digest.is_empty()
+        && !running_digest.is_some_and(|digest| digest.eq_ignore_ascii_case(desired_digest))
 }
 
 #[cfg(test)]
@@ -481,6 +613,7 @@ mod tests {
                         url: "https://example.invalid/arm64".into(),
                         sha256: "b".repeat(64),
                     },
+                    darwin_arm64: None,
                 },
             },
             agent: ComponentManifestEntry {
@@ -494,6 +627,7 @@ mod tests {
                         url: "https://example.invalid/agent-arm64".into(),
                         sha256: "c".repeat(64),
                     },
+                    darwin_arm64: None,
                 },
             },
             broker: ComponentManifestEntry {
@@ -507,6 +641,7 @@ mod tests {
                         url: "https://example.invalid/broker-arm64".into(),
                         sha256: "d".repeat(64),
                     },
+                    darwin_arm64: None,
                 },
             },
             proxy: ProxyManifestEntry {
@@ -520,6 +655,7 @@ mod tests {
                         url: "bundle://linux-arm64/proxy-image.tar".into(),
                         sha256: "f".repeat(64),
                     },
+                    darwin_arm64: None,
                 },
             },
             protocol_version: 1,
@@ -538,8 +674,28 @@ mod tests {
         malformed.schema_version = 1;
         assert_eq!(
             malformed.validate(),
-            Err("ReleaseManifestSchemaUnsupported: expected 3, got 1".into())
+            Err("ReleaseManifestSchemaUnsupported: expected 3 or 4, got 1".into())
         );
+        let mut schema3 = manifest_fixture();
+        schema3.schema_version = 3;
+        assert!(schema3.validate().is_ok());
+    }
+
+    #[test]
+    fn os_plus_arch_picks_darwin_arm64_and_rejects_intel_mac() {
+        let mut manifest = manifest_fixture();
+        manifest.codex.artifacts.darwin_arm64 = Some(CodexArtifact {
+            url: "bundle://darwin-arm64/codex".into(),
+            sha256: "1".repeat(64),
+        });
+        assert_eq!(
+            artifact_for_os_arch(&manifest.codex.artifacts, "darwin", "arm64")
+                .unwrap()
+                .url,
+            "bundle://darwin-arm64/codex"
+        );
+        assert!(artifact_for_os_arch(&manifest.codex.artifacts, "darwin", "x86_64").is_err());
+        assert!(artifact_for_os_arch(&manifest.codex.artifacts, "linux", "amd64").is_ok());
     }
 
     #[test]
@@ -594,5 +750,36 @@ mod tests {
             rpc_at < confirm_at,
             "native confirmation must follow install"
         );
+    }
+
+    #[test]
+    fn native_proxy_component_update_is_digest_gated_and_linux_stays_next_apply() {
+        let digest = "a".repeat(64);
+        let other = "b".repeat(64);
+        assert!(native_proxy_component_update_needed(
+            Some("native"),
+            None,
+            &digest
+        ));
+        assert!(native_proxy_component_update_needed(
+            Some("native"),
+            Some(other.as_str()),
+            &digest
+        ));
+        assert!(!native_proxy_component_update_needed(
+            Some("native"),
+            Some(&digest),
+            &digest
+        ));
+        assert!(!native_proxy_component_update_needed(
+            Some("docker"),
+            None,
+            &digest
+        ));
+        assert!(!native_proxy_component_update_needed(
+            Some("native"),
+            None,
+            ""
+        ));
     }
 }

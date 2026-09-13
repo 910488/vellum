@@ -91,15 +91,23 @@ pub(crate) struct CodexLaunch {
     pub(crate) display: String,
 }
 
+pub fn expected_managed_codex_home() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        "NativeCodexHomeMissing: cannot determine the current user's home".to_string()
+    })?;
+    Ok(crate::platform::managed_codex_home(
+        &home,
+        std::env::consts::OS,
+    ))
+}
+
 pub fn discover_native() -> Result<NativeCodexRuntimeStatus, String> {
-    let process = find_daemon_process();
+    let expected_home = expected_managed_codex_home()?;
+    let process = find_daemon_process_for_home(&expected_home);
     let codex_home = process
         .as_ref()
         .and_then(|item| item.codex_home.clone())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| {
-            "NativeCodexHomeMissing: cannot determine the current user's home".to_string()
-        })?;
+        .unwrap_or(expected_home);
     let launch = launcher_from_process(&process);
     let version = launch.as_ref().and_then(codex_version);
     let daemon = launch.as_ref().and_then(daemon_version);
@@ -366,14 +374,13 @@ pub fn bootstrap_native(
     paths: &crate::state::AgentPaths,
 ) -> Result<NativeCodexRuntimeStatus, String> {
     let boundary_key = resolve_boundary_key_for_daemon_lifecycle(paths, "bootstrap_native")?;
-    let process = find_daemon_process();
+    let expected_home = expected_managed_codex_home()?;
+    let process = find_daemon_process_for_home(&expected_home);
     let daemon_running = process.is_some();
     let process_codex_home = process
         .as_ref()
         .and_then(|process| process.codex_home.clone());
-    let codex_home = process_codex_home
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| "NativeCodexHomeMissing".to_string())?;
+    let codex_home = process_codex_home.unwrap_or(expected_home);
     let launch = process
         .and_then(|process| process.launch)
         .or_else(|| standalone_binary(&codex_home))
@@ -526,6 +533,9 @@ fn launcher_home(codex_home: &Path) -> Option<PathBuf> {
 }
 
 fn launcher_path(codex_home: &Path) -> Option<PathBuf> {
+    if crate::platform::normalize_os(std::env::consts::OS) == Some("darwin") {
+        return dirs::home_dir().map(|home| home.join(".vellum-remote").join("ssh-wrapper"));
+    }
     launcher_home(codex_home).map(|home| home.join(".local/bin/codex"))
 }
 
@@ -559,10 +569,25 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 fn managed_codex_launcher_contents(target: &Path) -> String {
-    format!(
-        "#!/bin/sh\n{VELLUM_CODEX_LAUNCHER_MARKER}\nexec {} \"$@\"\n",
-        shell_single_quote(&target.to_string_lossy())
-    )
+    let home = expected_managed_codex_home().ok();
+    managed_codex_launcher_contents_for_home(target, home.as_deref())
+}
+
+fn managed_codex_launcher_contents_for_home(target: &Path, codex_home: Option<&Path>) -> String {
+    match codex_home {
+        Some(home) if crate::platform::normalize_os(std::env::consts::OS) == Some("darwin") => {
+            format!(
+                "#!/bin/sh\n{VELLUM_CODEX_LAUNCHER_MARKER}\nexport CODEX_HOME={home}\nexport CODEX_INSTALL_DIR={install}\nexec {} \"$@\"\n",
+                shell_single_quote(&target.to_string_lossy()),
+                home = shell_single_quote(&home.to_string_lossy()),
+                install = shell_single_quote(&home.join("packages/standalone/current").to_string_lossy()),
+            )
+        }
+        _ => format!(
+            "#!/bin/sh\n{VELLUM_CODEX_LAUNCHER_MARKER}\nexec {} \"$@\"\n",
+            shell_single_quote(&target.to_string_lossy())
+        ),
+    }
 }
 
 /// Maintain the stable command that Codex App resolves through the remote
@@ -1180,11 +1205,21 @@ fn process_identity(pid: u32) -> Option<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Some(format!("pid-{pid}"))
+        process_start_time(pid).map(|start| format!("pid-{pid}-start-{start}"))
     }
 }
 
 fn find_daemon_process() -> Option<DaemonProcess> {
+    find_daemon_process_for_home(&expected_managed_codex_home().ok()?)
+}
+
+fn find_daemon_process_for_home(expected_home: &Path) -> Option<DaemonProcess> {
+    if crate::process_identity::first_app_server_scan_is_authority() {
+        return None;
+    }
+    if let Some(from_pid_file) = daemon_from_pid_record(expected_home) {
+        return Some(from_pid_file);
+    }
     #[cfg(target_os = "linux")]
     {
         // `/proc` is host-wide. On shared machines, Codex app-servers owned by
@@ -1193,6 +1228,7 @@ fn find_daemon_process() -> Option<DaemonProcess> {
         // session for a lifecycle mutation. Fail closed if our own effective
         // UID cannot be established.
         let effective_uid = linux_effective_uid(&fs::read_to_string("/proc/self/status").ok()?)?;
+        let expected = fs::canonicalize(expected_home).unwrap_or_else(|_| expected_home.to_path_buf());
         let entries = fs::read_dir("/proc").ok()?;
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -1232,6 +1268,13 @@ fn find_daemon_process() -> Option<DaemonProcess> {
                         .map(|value| PathBuf::from(String::from_utf8_lossy(value).to_string()))
                 })
             });
+            let Some(home) = codex_home.as_ref() else {
+                continue;
+            };
+            let observed = fs::canonicalize(home).unwrap_or_else(|_| home.clone());
+            if observed != expected {
+                continue;
+            }
             let launch = launcher_from_cmdline(&args);
             return Some(DaemonProcess {
                 pid,
@@ -1240,7 +1283,22 @@ fn find_daemon_process() -> Option<DaemonProcess> {
             });
         }
     }
+    let _ = expected_home;
     None
+}
+
+fn daemon_from_pid_record(expected_home: &Path) -> Option<DaemonProcess> {
+    let record = expected_home.join("app-server-daemon/app-server.pid");
+    let (pid, recorded_start) = updater_pid_record(&record)?;
+    let observed_start = process_start_time(pid)?;
+    if observed_start != recorded_start {
+        return None;
+    }
+    Some(DaemonProcess {
+        pid,
+        codex_home: Some(expected_home.to_path_buf()),
+        launch: standalone_binary(expected_home),
+    })
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1462,6 +1520,13 @@ fn run_codex_command(launch: &CodexLaunch, args: &[&str]) -> Result<(), String> 
 fn command(launch: &CodexLaunch, args: &[&str]) -> Command {
     let mut command = Command::new(&launch.program);
     command.args(&launch.prefix).args(args);
+    if let Ok(home) = expected_managed_codex_home() {
+        command.env("CODEX_HOME", &home);
+        command.env(
+            "CODEX_INSTALL_DIR",
+            home.join("packages/standalone/current"),
+        );
+    }
     command
 }
 
@@ -1930,6 +1995,27 @@ mod tests {
         assert_eq!(fs::read_to_string(&official).unwrap(), "legacy payload");
         assert!(!legacy.exists());
         assert!(!migrate_legacy_standalone_layout(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn managed_launcher_never_exports_the_local_codex_home() {
+        let target = PathBuf::from("/Users/joshhuang/.vellum-remote/codex/packages/standalone/current/codex");
+        let managed = PathBuf::from("/Users/joshhuang/.vellum-remote/codex");
+        let contents = managed_codex_launcher_contents_for_home(&target, Some(&managed));
+        assert!(!contents.contains("CODEX_HOME='/Users/joshhuang/.codex'"));
+        assert!(
+            contents.contains(&target.to_string_lossy().to_string())
+                || contents.contains("exec")
+        );
+    }
+
+    #[test]
+    fn process_identity_never_accepts_pid_only_or_first_app_server() {
+        assert!(!crate::process_identity::pid_only_identity_is_sufficient(1));
+        assert!(!crate::process_identity::first_app_server_scan_is_authority());
+        assert!(!crate::process_identity::process_name_scan_may_takeover(
+            "app-server"
+        ));
     }
 
     #[test]
