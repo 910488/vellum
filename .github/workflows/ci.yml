@@ -177,9 +177,6 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Build proxy image (linux/amd64)
         run: |
           docker build -f deploy/proxy/Dockerfile -t vellum-proxy:ci .
