@@ -1386,13 +1386,16 @@ fn process_codex_home(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
-        return raw.split(|byte| *byte == 0).find_map(|part| {
+        raw.split(|byte| *byte == 0).find_map(|part| {
             part.strip_prefix(b"CODEX_HOME=")
                 .map(|value| PathBuf::from(String::from_utf8_lossy(value).to_string()))
-        });
+        })
     }
-    let _ = pid;
-    None
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn socket_owner_uid(path: &Path) -> Option<u32> {
@@ -1400,7 +1403,7 @@ fn socket_owner_uid(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return Some(meta.uid());
+        Some(meta.uid())
     }
     #[cfg(not(unix))]
     {
