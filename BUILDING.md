@@ -149,10 +149,10 @@ automatically scheduling it again.
 ### Automated nightly and manual releases
 
 `Nightly and manual bundled releases` is the end-to-end GitHub Actions entry
-point. Its daily schedule builds `main`, resolves the latest published
-commit-addressed Enhanced Core release once, and publishes matching preview
-releases for both the independently updatable core and a Desktop installer
-that embeds the same bytes. Nightly versions use
+point. Its daily schedule builds the long-lived `codex/dev` branch, resolves
+the latest published commit-addressed Enhanced Core release once, and
+publishes matching preview releases for both the independently updatable core
+and a Desktop installer that embeds the same bytes. Nightly versions use
 `<next-patch>-nightly.<UTC-date>.<run-number>.<run-attempt>`, so Stable clients
 ignore them, Preview clients can select them, and a rerun remains immutable.
 

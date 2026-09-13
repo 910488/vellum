@@ -20,7 +20,7 @@ on:
       source_ref:
         description: Git ref to build
         required: true
-        default: main
+        default: codex/dev
         type: string
       enhanced_core_release:
         description: "Enhanced Core tag; empty selects its latest published release"
@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: ${{ inputs.source_ref || 'codex/dev' }}
       - id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -66,7 +66,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          SOURCE_REF="${REQUESTED_SOURCE_REF:-main}"
+          SOURCE_REF="${REQUESTED_SOURCE_REF:-codex/dev}"
           CORE_RELEASE="$REQUESTED_CORE_RELEASE"
           if [ -z "$CORE_RELEASE" ]; then
             CORE_RELEASE="$(gh api repos/910488/enhanced-codex-core/releases/latest --jq .tag_name)"
