@@ -317,6 +317,7 @@ async fn mimo_streaming_tool_call_round_trip_does_not_leak_thread_identity() {
     let sse = concat!(
         "data: {\"id\":\"chatcmpl-mimo-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_mimo\",\"type\":\"function\",\"function\":{\"name\":\"vellum_probe_tool\",\"arguments\":\"{\\\"value\\\":\\\"ok\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"chatcmpl-mimo-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-mimo-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":90929,\"completion_tokens\":25,\"total_tokens\":90954}}\n\n",
         "data: [DONE]\n\n",
     );
     let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
@@ -370,6 +371,13 @@ async fn mimo_streaming_tool_call_round_trip_does_not_leak_thread_identity() {
         .unwrap()
         .contains("codex-thread-secret"));
     let records = runtime.usage_records().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "one terminal row per request: {records:?}"
+    );
+    assert_eq!(records[0].input_tokens, 90_929);
+    assert_eq!(records[0].output_tokens, 25);
     assert!(records.iter().any(|record| {
         record.outcome.as_deref() == Some("success")
             && record.auth_mode.as_deref() == Some("anonymousFree")
@@ -470,12 +478,17 @@ async fn live_zen_free_mimo_accepts_a_codex_streaming_request() {
         "expected a terminal response: {transcript}"
     );
     let records = runtime.usage_records().expect("live usage row");
-    assert!(records.iter().any(|record| {
-        record.outcome.as_deref() == Some("success")
-            && record.auth_mode.as_deref() == Some("anonymousFree")
-            && record.provider_profile.as_deref() == Some("openCodeZen")
-            && record.upstream_attempted == Some(true)
-    }));
+    let record = records
+        .iter()
+        .find(|record| {
+            record.outcome.as_deref() == Some("success")
+                && record.auth_mode.as_deref() == Some("anonymousFree")
+                && record.provider_profile.as_deref() == Some("openCodeZen")
+                && record.upstream_attempted == Some(true)
+        })
+        .expect("live OpenCode request must have one successful usage row");
+    assert!(record.input_tokens > 0, "upstream input usage was lost");
+    assert!(record.output_tokens > 0, "upstream output usage was lost");
 }
 
 /// Provider-routing live gate: proves the shared runtime's tool-call

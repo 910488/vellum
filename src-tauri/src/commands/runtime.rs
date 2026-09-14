@@ -490,7 +490,15 @@ pub(crate) async fn restart_codex_managed(
         return Ok(ManagedRestart::refused(stopped.notice()));
     }
 
-    if let Err(error) = launch_codex(&target) {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = quiesce_macos_codex_relaunches(target.pid).await {
+        state.set_draining(false);
+        return Err(AppError::Message(format!(
+            "無法穩定關閉自動重新啟動的 Codex 程序：{error}"
+        )));
+    }
+
+    if let Err(error) = launch_codex(&target, launch.as_ref()) {
         state.set_draining(false);
         return Err(AppError::Message(format!("無法重新啟動 Codex：{error}")));
     }
@@ -722,7 +730,10 @@ fn discover_codex_process() -> AppResult<Option<CodexLaunchTarget>> {
     #[cfg(target_os = "macos")]
     {
         let mut pgrep = crate::process::background_command("pgrep");
-        pgrep.args(["-f", "ChatGPT\\.app/Contents/MacOS/ChatGPT"]);
+        pgrep.args([
+            "-f",
+            "(ChatGPT\\.app/Contents/MacOS/ChatGPT|Codex\\.app/Contents/MacOS/Codex)",
+        ]);
         let output = pgrep
             .output()
             .map_err(|error| AppError::Message(format!("cannot inspect Codex: {error}")))?;
@@ -781,34 +792,88 @@ fn discover_codex_app_id() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-// Enhanced no longer changes how Codex Desktop is started. `CODEX_CLI_PATH`
-// arrives through the per-user environment lease, which a packaged app picks up
-// on its own — so the app is launched exactly the way the user would launch it,
-// rather than through a side door that only works when Vellum is the parent.
+// The durable user environment lease lets later user launches keep Enhanced,
+// but the managed restart also binds the verified bridge directly. GUI launch
+// environments can lag or drop a broadcast on both supported desktop systems;
+// a restart must not claim success based on that ambient state alone.
 #[cfg(target_os = "windows")]
-fn launch_codex(target: &CodexLaunchTarget) -> std::io::Result<()> {
-    let (program, args) =
-        crate::runtime::codex_launch_spec(target.app_id.as_deref(), &target.executable);
-    std::process::Command::new(program).args(args).spawn()?;
+fn launch_codex(
+    target: &CodexLaunchTarget,
+    launch: Option<&DesktopRuntimeLaunch>,
+) -> std::io::Result<()> {
+    let (program, args, bridge) = windows_launch_spec(target, launch);
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    if let Some(bridge) = bridge {
+        command.env(crate::enhanced_runtime::env_lease::CODEX_CLI_PATH, bridge);
+    }
+    command.spawn()?;
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_launch_spec(
+    target: &CodexLaunchTarget,
+    launch: Option<&DesktopRuntimeLaunch>,
+) -> (PathBuf, Vec<String>, Option<PathBuf>) {
+    if let Some(launch) = launch {
+        return (
+            target.executable.clone(),
+            Vec::new(),
+            Some(launch.bridge_executable.clone()),
+        );
+    }
+    let (program, args) =
+        crate::runtime::codex_launch_spec(target.app_id.as_deref(), &target.executable);
+    (program, args, None)
+}
+
 #[cfg(target_os = "macos")]
-fn launch_codex(target: &CodexLaunchTarget) -> std::io::Result<()> {
+fn launch_codex(
+    target: &CodexLaunchTarget,
+    launch: Option<&DesktopRuntimeLaunch>,
+) -> std::io::Result<()> {
     if let Some(app_id) = target.app_id.as_deref() {
         std::process::Command::new("open")
-            .args(["-b", app_id])
+            .args(macos_open_args(app_id, launch))
             .spawn()?;
     } else {
-        std::process::Command::new(&target.executable).spawn()?;
+        let mut command = std::process::Command::new(&target.executable);
+        if let Some(launch) = launch {
+            command.env(
+                crate::enhanced_runtime::env_lease::CODEX_CLI_PATH,
+                &launch.bridge_executable,
+            );
+        }
+        command.spawn()?;
     }
     Ok(())
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn launch_codex(target: &CodexLaunchTarget) -> std::io::Result<()> {
+fn launch_codex(
+    target: &CodexLaunchTarget,
+    _launch: Option<&DesktopRuntimeLaunch>,
+) -> std::io::Result<()> {
     std::process::Command::new(&target.executable).spawn()?;
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_open_args(app_id: &str, launch: Option<&DesktopRuntimeLaunch>) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["-b".into(), app_id.into()];
+    if let Some(launch) = launch {
+        args.push("--env".into());
+        args.push(
+            format!(
+                "{}={}",
+                crate::enhanced_runtime::env_lease::CODEX_CLI_PATH,
+                launch.bridge_executable.display()
+            )
+            .into(),
+        );
+    }
+    args
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -957,6 +1022,45 @@ async fn stop_codex_and_wait(
             return Ok(stop_observation_from_output(&output, false, false));
         }
         Ok(stop_observation_from_output(&output, true, false))
+    }
+}
+
+/// LaunchServices may recreate an Electron app between the PID we stopped and
+/// our explicit `open`. `open --env` only applies to a process it launches, so
+/// accepting that replacement would repeat the exact stale-bridge failure the
+/// managed restart is meant to repair. Require a short quiet window, bounded
+/// by a hard deadline, before issuing the authoritative launch.
+#[cfg(target_os = "macos")]
+async fn quiesce_macos_codex_relaunches(original_pid: u32) -> std::io::Result<()> {
+    const QUIET_WINDOW: Duration = Duration::from_millis(500);
+    const HARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let deadline = std::time::Instant::now() + HARD_TIMEOUT;
+    let mut quiet_since = std::time::Instant::now();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Codex kept relaunching during the managed restart",
+            ));
+        }
+        let replacement = discover_codex_process()
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .filter(|target| target.pid != original_pid);
+        if let Some(replacement) = replacement {
+            let stopped = stop_codex_and_wait(&replacement, true).await?;
+            if !stopped.exited {
+                return Err(std::io::Error::other(
+                    "replacement Codex process did not exit",
+                ));
+            }
+            quiet_since = std::time::Instant::now();
+            continue;
+        }
+        if quiet_since.elapsed() >= QUIET_WINDOW {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1137,6 +1241,54 @@ mod restart_guard_tests {
     #[test]
     fn the_user_can_overrule_the_guard() {
         assert!(codex_turn_refusal(Some(&attestation(3)), true).is_none());
+    }
+
+    #[test]
+    fn macos_managed_launch_binds_the_verified_bridge_explicitly() {
+        let launch = DesktopRuntimeLaunch {
+            bridge_executable: PathBuf::from("/Applications/Vellum.app/Contents/Resources/bridge"),
+            launch_id: "launch-1".into(),
+            manifest_path: PathBuf::from("/tmp/launch.json"),
+            attestation_path: PathBuf::from("/tmp/attestation.json"),
+        };
+        let args = macos_open_args("com.openai.codex", Some(&launch));
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("-b"),
+                std::ffi::OsString::from("com.openai.codex"),
+                std::ffi::OsString::from("--env"),
+                std::ffi::OsString::from(
+                    "CODEX_CLI_PATH=/Applications/Vellum.app/Contents/Resources/bridge"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_managed_launch_binds_the_verified_bridge_explicitly() {
+        let target = CodexLaunchTarget {
+            pid: 42,
+            #[cfg(target_os = "macos")]
+            started_at: Some("1".into()),
+            executable: PathBuf::from(r"C:\Program Files\WindowsApps\ChatGPT.exe"),
+            app_id: Some("OpenAI.Codex_123!Codex".into()),
+        };
+        let launch = DesktopRuntimeLaunch {
+            bridge_executable: PathBuf::from(r"E:\Vellum\binaries\bridge.exe"),
+            launch_id: "launch-1".into(),
+            manifest_path: PathBuf::from(r"E:\Vellum\launch.json"),
+            attestation_path: PathBuf::from(r"E:\Vellum\attestation.json"),
+        };
+        let (program, args, bridge) = windows_launch_spec(&target, Some(&launch));
+        assert_eq!(program, target.executable);
+        assert!(args.is_empty());
+        assert_eq!(bridge.as_deref(), Some(launch.bridge_executable.as_path()));
+
+        let (program, args, bridge) = windows_launch_spec(&target, None);
+        assert_eq!(program, PathBuf::from("explorer.exe"));
+        assert_eq!(args, vec![r"shell:AppsFolder\OpenAI.Codex_123!Codex"]);
+        assert_eq!(bridge, None);
     }
 
     #[test]
