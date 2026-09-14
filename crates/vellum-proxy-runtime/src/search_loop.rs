@@ -437,6 +437,28 @@ pub fn append_search_outputs(
     }
 }
 
+/// Preserve readable reasoning from the assistant hop that requested search.
+/// Chat providers that bind reasoning to tool calls require this item to be
+/// replayed with the call on the continuation request.
+pub fn append_search_reasoning(request_body: &mut Value, response: &Value) {
+    let Some(reasoning) = response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .cloned()
+    else {
+        return;
+    };
+    let input = request_body
+        .as_object_mut()
+        .map(|object| object.entry("input").or_insert_with(|| json!([])));
+    if let Some(Value::Array(input)) = input {
+        input.push(reasoning);
+    }
+}
+
 pub async fn execute_pending_searches(
     engine: &dyn SearchEngine,
     pending: &[PendingSearch],
@@ -593,6 +615,34 @@ mod tests {
         assert_eq!(input[1]["name"], "web_search");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn search_reasoning_is_kept_immediately_before_the_tool_call() {
+        let mut body = json!({"input":[{"type":"message","role":"user","content":"q"}]});
+        let response = json!({
+            "output": [{
+                "type": "reasoning",
+                "id": "reasoning_1",
+                "summary": [{"type":"summary_text","text":"I should search first"}]
+            }]
+        });
+        let pending = PendingSearch {
+            call_id: "call_1".into(),
+            output_index: 1,
+            item_id: "ws_call_1".into(),
+            arguments: r#"{"query":"today"}"#.into(),
+            query: "today".into(),
+            function_item: json!({"type":"function_call","name":"web_search","call_id":"call_1"}),
+        };
+
+        append_search_reasoning(&mut body, &response);
+        append_search_outputs(&mut body, &[pending], &["result".into()]);
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
     }
 
     #[test]

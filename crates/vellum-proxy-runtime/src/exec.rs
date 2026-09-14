@@ -81,8 +81,8 @@ use crate::review::{
 use crate::route::{RouteCatalog, RuntimeModelRoute, RuntimeProviderKind, RuntimeWireFormat};
 use crate::search::{DisabledSearchEngine, SearchEngine};
 use crate::search_loop::{
-    append_search_outputs, completed_search_events, execute_pending_searches, SearchLoopSession,
-    SseAction,
+    append_search_outputs, append_search_reasoning, completed_search_events,
+    execute_pending_searches, SearchLoopSession, SseAction,
 };
 use crate::snapshot::RuntimeSnapshot;
 use crate::sse::{append_utf8_safe, strip_sse_field, take_limited_sse_block};
@@ -6586,6 +6586,15 @@ impl ProxyRuntime {
                                 yield ok(Bytes::from(event));
                             }
                         }
+                        // Console Go and similar thinking-mode Chat providers
+                        // reject a tool continuation unless the assistant's
+                        // reasoning_content is replayed with that tool call.
+                        // The adapter retains the full readable reasoning;
+                        // append it before the function call so the Chat
+                        // projector binds both to one assistant message.
+                        let search_hop = adapter.history_response();
+                        append_search_reasoning(&mut dispatch_body, &search_hop);
+                        append_search_reasoning(&mut request_body, &search_hop);
                         // Both bodies take the search items: the dispatched
                         // one so the model sees the result it asked for, the
                         // recorded one so the next turn's hydration replays it.
@@ -11219,6 +11228,30 @@ mod tests {
         )
     }
 
+    fn chat_web_search_completion_sse() -> String {
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "I need current sources before answering.",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_search_reasoning",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\":\"today news\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+        )
+    }
+
     fn auto_continue_chat_runtime(transport: Arc<RecordingTransport>) -> ProxyRuntime {
         let mut route = sample_route(None);
         route.auth_kind = RuntimeAuthKind::None;
@@ -11439,6 +11472,91 @@ mod tests {
         .with_search_engine(engine)
         .with_web_search_wrapper_enabled(true)
         .with_search_tool_loop_limit(loop_limit)
+    }
+
+    fn chat_web_search_runtime(
+        transport: Arc<RecordingTransport>,
+        engine: Arc<dyn SearchEngine>,
+    ) -> ProxyRuntime {
+        let mut route = sample_route(None);
+        route.auth_kind = RuntimeAuthKind::None;
+        route.wire = RuntimeWireFormat::Chat;
+        route.reasoning = true;
+        route.chat_capabilities =
+            crate::route::RuntimeChatCapabilities::tool_call_bound_reasoning();
+        ProxyRuntime::new(
+            Arc::new(FixedCatalog {
+                routes: vec![route],
+            }),
+            Arc::new(MemoryCredentialProvider::new()),
+            Arc::new(UnconfiguredOfficialAuthProvider),
+            Arc::new(CountingRequestLifecycle::new()),
+            transport,
+        )
+        .with_search_engine(engine)
+        .with_web_search_wrapper_enabled(true)
+    }
+
+    /// Regression for Console Go's `invalid_request_error`: thinking-mode
+    /// continuations must send the assistant reasoning back alongside the
+    /// `web_search` tool call that produced the local search result.
+    #[tokio::test]
+    async fn chat_web_search_continuation_replays_tool_bound_reasoning_content() {
+        let transport = Arc::new(RecordingTransport::new(vec![
+            UpstreamResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: chat_web_search_completion_sse().into_bytes(),
+            },
+            UpstreamResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: chat_text_completion_sse("Search complete.").into_bytes(),
+            },
+        ]));
+        let runtime = chat_web_search_runtime(transport.clone(), Arc::new(FixedNewsEngine));
+
+        let response = runtime
+            .execute(
+                request(json!({
+                    "model": "vlm-test",
+                    "input": [{"type":"message","role":"user","content":"search today's news"}],
+                    "stream": true
+                })),
+                "chat-search-reasoning-replay",
+            )
+            .await
+            .unwrap();
+        let RuntimeResponse::Sse(mut stream) = response else {
+            panic!("streaming Chat request must return SSE");
+        };
+        let mut transcript = String::new();
+        while let Some(chunk) = stream.next().await {
+            transcript.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        assert!(transcript.contains("Search complete."), "{transcript}");
+
+        let continuation = parsed_request_body(&transport, 1);
+        let messages = continuation["messages"]
+            .as_array()
+            .expect("Chat continuation messages");
+        let assistant = messages
+            .iter()
+            .find(|message| {
+                message.get("role").and_then(Value::as_str) == Some("assistant")
+                    && message.get("tool_calls").is_some()
+            })
+            .expect("assistant tool-call message");
+        assert_eq!(
+            assistant["reasoning_content"], "I need current sources before answering.",
+            "provider-required reasoning must stay bound to the search call: {continuation}"
+        );
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "web_search");
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str)
+                    == Some("call_search_reasoning")
+        }));
     }
 
     /// End-to-end coverage for the gap the branch shipped without: a real
