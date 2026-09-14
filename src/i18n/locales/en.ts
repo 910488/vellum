@@ -149,6 +149,7 @@ const en: ResourceTree = {
     "title": "Today",
     "loading": "Loading status…",
     "noProvider": "No provider yet",
+    "noSuccessfulRequest": "No successful requests yet",
     "addProvider": "Add provider",
     "providerTokens": "Current Provider token total",
     "requests_one": "{{count}} request",

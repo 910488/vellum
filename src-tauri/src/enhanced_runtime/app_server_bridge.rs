@@ -21,7 +21,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use vellum_enhanced_codex::{AblationProfile, EnhancedEventKind, EnhancedRuntimeFeatures};
 
-use super::attestation::{AttestationWriter, ChildAttestation};
+use super::attestation::{AttestationWriter, BridgeAttestationV1, ChildAttestation};
 use super::launch_manifest::{LaunchManifestError, LaunchManifestV1};
 use super::observations::RuntimeObservations;
 use super::qualification::{
@@ -60,10 +60,62 @@ fn owns_fallback_remote_control(plane: ExecutionPlane) -> bool {
     plane == FALLBACK_REMOTE_CONTROL_PLANE
 }
 
-fn configure_fallback_remote_control(command: &mut Command, plane: ExecutionPlane) {
-    if !owns_fallback_remote_control(plane) {
+fn configure_fallback_remote_control(
+    command: &mut Command,
+    plane: ExecutionPlane,
+    adopted_by_desktop: bool,
+) {
+    if !adopted_by_desktop || !owns_fallback_remote_control(plane) {
         command.env(REMOTE_CONTROL_DISABLED_ENV, "1");
     }
+}
+
+struct BridgeStatePaths {
+    attestation: PathBuf,
+    observations: PathBuf,
+    _isolation: Option<tempfile::TempDir>,
+}
+
+fn bridge_is_started_by_codex_desktop() -> bool {
+    let Some(parent_pid) = super::process_info::parent_pid(std::process::id()) else {
+        return false;
+    };
+    super::process_info::executable_of(parent_pid)
+        .as_deref()
+        .is_some_and(super::desktop_manager::is_known_codex_desktop_executable)
+}
+
+fn should_isolate_bridge_state(adopted_by_desktop: bool, canonical_is_live: bool) -> bool {
+    !adopted_by_desktop && canonical_is_live
+}
+
+fn bridge_state_paths(
+    canonical: &Path,
+    adopted_by_desktop: bool,
+) -> Result<BridgeStatePaths, std::io::Error> {
+    let canonical_is_live = BridgeAttestationV1::read(canonical)
+        .ok()
+        .is_some_and(|attestation| {
+            attestation.is_live() && super::desktop_manager::adopted_by_codex_desktop(&attestation)
+        });
+    if should_isolate_bridge_state(adopted_by_desktop, canonical_is_live) {
+        // CODEX_CLI_PATH is user-scoped, so helpers such as Computer Use can
+        // invoke this bridge too. Their short-lived App Servers must not
+        // overwrite the Desktop bridge's sole live status files.
+        let isolation = tempfile::Builder::new()
+            .prefix("vellum-transient-bridge-")
+            .tempdir()?;
+        return Ok(BridgeStatePaths {
+            attestation: isolation.path().join("bridge-attestation.json"),
+            observations: isolation.path().join("observations.json"),
+            _isolation: Some(isolation),
+        });
+    }
+    Ok(BridgeStatePaths {
+        attestation: canonical.to_path_buf(),
+        observations: canonical.with_file_name("observations.json"),
+        _isolation: None,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -134,8 +186,10 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         return multiplex::run(config);
     }
     let manifest = config.manifest.clone();
+    let adopted_by_desktop = bridge_is_started_by_codex_desktop();
+    let state_paths = bridge_state_paths(&manifest.attestation_path, adopted_by_desktop)?;
     let mut attestation = AttestationWriter::new(
-        manifest.attestation_path.clone(),
+        state_paths.attestation.clone(),
         manifest.launch_id.clone(),
         manifest.model_provider_map_sha256.clone(),
         manifest.binding_db.clone(),
@@ -170,6 +224,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         &manifest,
         &config.child_args,
         events_tx.clone(),
+        adopted_by_desktop,
     ) {
         Ok(child) => child,
         Err(error) => return Err(fail_attestation(&mut attestation, error)),
@@ -180,6 +235,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         &manifest,
         &config.child_args,
         events_tx.clone(),
+        adopted_by_desktop,
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -210,9 +266,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
     // this is the production bridge path. Keep the same launch-scoped
     // observation file the relay path writes; otherwise the Enhanced Core tab
     // can report "no observations" while this bridge is actively serving.
-    let observation_path = manifest
-        .attestation_path
-        .with_file_name("observations.json");
+    let observation_path = state_paths.observations.clone();
     let mut observations = RuntimeObservations::new(manifest.launch_id.clone());
     observations.seed_bindings(&bindings);
     let _ = observations.write(&observation_path);
@@ -331,6 +385,7 @@ impl ChildProcess {
         manifest: &LaunchManifestV1,
         args: &[String],
         events: mpsc::Sender<BridgeEvent>,
+        adopted_by_desktop: bool,
     ) -> Result<Self, BridgeError> {
         let identity = match plane {
             ExecutionPlane::OfficialCodex => &manifest.official,
@@ -362,7 +417,7 @@ impl ChildProcess {
         // startup race: whichever child wins can only serve threads owned by
         // that plane, while the other retries forever with HTTP 409. Keep the
         // documented fallback owner deterministic.
-        configure_fallback_remote_control(&mut command, plane);
+        configure_fallback_remote_control(&mut command, plane, adopted_by_desktop);
         if plane == ExecutionPlane::EnhancedCodex {
             let features: EnhancedRuntimeFeatures = manifest.feature_profile.clone().into();
             command

@@ -50,6 +50,14 @@ function hostTriple() {
 const targetTriple = hostTriple();
 const suffix = targetTriple.includes("windows") ? ".exe" : "";
 const isolatedTarget = join(root, "target", "sidecar-build");
+// The Tauri CLI exports its merged bundle configuration while running
+// `beforeBuildCommand`. This Cargo invocation compiles the bridge, which
+// depends on the Vellum library and therefore runs Vellum's build script too.
+// Letting that nested build inherit TAURI_CONFIG makes tauri-build validate
+// the Desktop-only resource glob before this script has staged the bridge it
+// points at, creating a clean-checkout bootstrap cycle.
+const cargoEnvironment = { ...process.env, CARGO_TARGET_DIR: isolatedTarget };
+delete cargoEnvironment.TAURI_CONFIG;
 
 execFileSync(
   "cargo",
@@ -64,7 +72,7 @@ execFileSync(
   {
     stdio: "inherit",
     cwd: root,
-    env: { ...process.env, CARGO_TARGET_DIR: isolatedTarget },
+    env: cargoEnvironment,
   },
 );
 

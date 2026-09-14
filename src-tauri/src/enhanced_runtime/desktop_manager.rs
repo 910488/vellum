@@ -822,7 +822,7 @@ pub fn adopted_by_codex_desktop(attestation: &BridgeAttestationV1) -> bool {
         && is_known_codex_desktop_executable(&live_parent)
 }
 
-fn is_known_codex_desktop_executable(path: &Path) -> bool {
+pub(crate) fn is_known_codex_desktop_executable(path: &Path) -> bool {
     is_known_codex_desktop_executable_for(path, dirs::home_dir().as_deref())
 }
 

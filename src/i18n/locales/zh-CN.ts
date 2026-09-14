@@ -149,6 +149,7 @@ const zhCN: ResourceTree = {
     "title": "现状",
     "loading": "正在读取状态…",
     "noProvider": "还没有供应商",
+    "noSuccessfulRequest": "尚无成功请求",
     "addProvider": "加入供应商",
     "providerTokens": "当前 Provider 累计 Token",
     "requests_one": "{{count}} 次请求",

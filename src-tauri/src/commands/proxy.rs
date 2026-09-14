@@ -45,9 +45,11 @@ pub(crate) fn clear_test_start_override(root: &std::path::Path) {
 }
 
 fn update_codex_restart_requirement(state: &AppState, process_identity: Option<String>) {
-    if process_identity.is_some() {
-        state.mark_restart_required(crate::model::RuntimeNotice::new("codexRunning"));
-        state.set_restart_process_identity(process_identity);
+    if let Some(process_identity) = process_identity {
+        state.mark_restart_required_for_process(
+            crate::model::RuntimeNotice::new("codexRunning"),
+            process_identity,
+        );
     } else {
         state.clear_restart_required();
     }
@@ -389,11 +391,11 @@ async fn start_proxy_transaction_on(
 }
 
 fn update_codex_restart_after_stop(state: &AppState, process_identity: Option<String>) {
-    if process_identity.is_some() {
-        state.mark_restart_required(crate::model::RuntimeNotice::new(
-            "proxyStoppedCodexRestartRequired",
-        ));
-        state.set_restart_process_identity(process_identity);
+    if let Some(process_identity) = process_identity {
+        state.mark_restart_required_for_process(
+            crate::model::RuntimeNotice::new("proxyStoppedCodexRestartRequired"),
+            process_identity,
+        );
     } else {
         state.clear_restart_required();
     }
@@ -445,10 +447,15 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     };
     match armed {
         Ok(launch) => {
-            if launch.is_some() && crate::commands::runtime::codex_process_identity().is_some() {
-                state.mark_restart_required(crate::model::RuntimeNotice::new(
-                    "enhancedDesktopRuntimeChanged",
-                ));
+            if let Some(process_identity) = launch
+                .is_some()
+                .then(crate::commands::runtime::codex_process_identity)
+                .flatten()
+            {
+                state.mark_restart_required_for_process(
+                    crate::model::RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+                    process_identity,
+                );
             }
         }
         Err(error) => {

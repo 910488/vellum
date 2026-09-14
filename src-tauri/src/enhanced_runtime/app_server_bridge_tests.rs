@@ -153,16 +153,33 @@ fn a_build_without_the_relay_keeps_mobile_control_on_official() {
     assert!(!owns_fallback_remote_control(ExecutionPlane::EnhancedCodex));
 
     let mut official = std::process::Command::new("official");
-    configure_fallback_remote_control(&mut official, ExecutionPlane::OfficialCodex);
+    configure_fallback_remote_control(&mut official, ExecutionPlane::OfficialCodex, true);
     assert!(official
         .get_envs()
         .all(|(name, _)| name != REMOTE_CONTROL_DISABLED_ENV));
 
     let mut enhanced = std::process::Command::new("enhanced");
-    configure_fallback_remote_control(&mut enhanced, ExecutionPlane::EnhancedCodex);
+    configure_fallback_remote_control(&mut enhanced, ExecutionPlane::EnhancedCodex, true);
     assert!(enhanced.get_envs().any(|(name, value)| {
         name == REMOTE_CONTROL_DISABLED_ENV && value == Some(std::ffi::OsStr::new("1"))
     }));
+
+    // User-scoped CODEX_CLI_PATH also reaches short-lived helpers. They are
+    // not the Desktop Remote Control owner and must never open a competing
+    // connection with the same installation id.
+    let mut transient_official = std::process::Command::new("official");
+    configure_fallback_remote_control(
+        &mut transient_official,
+        ExecutionPlane::OfficialCodex,
+        false,
+    );
+    assert!(transient_official.get_envs().any(|(name, value)| {
+        name == REMOTE_CONTROL_DISABLED_ENV && value == Some(std::ffi::OsStr::new("1"))
+    }));
+
+    assert!(should_isolate_bridge_state(false, true));
+    assert!(!should_isolate_bridge_state(true, true));
+    assert!(!should_isolate_bridge_state(false, false));
 }
 
 /// The phone failure this branch exists for: `thread/resume` reached the
