@@ -95,8 +95,23 @@ pub fn acquire(
     )
     .map_err(EnvironmentLeaseError::Io)?;
     write_user_environment(CODEX_CLI_PATH, Some(value))?;
+    let observed = read_user_environment(CODEX_CLI_PATH)?;
+    if !environment_write_was_observed(value, observed.as_deref()) {
+        // A successful command exit is not proof that the GUI launch domain
+        // accepted the value. Leaving the durable lease behind would make the
+        // next attempt look owned while Desktop still launches natively.
+        let _ = release(data_root);
+        return Err(EnvironmentLeaseError::WriteNotObserved {
+            expected: value.to_string(),
+            observed,
+        });
+    }
     broadcast_environment_change();
     Ok(lease)
+}
+
+fn environment_write_was_observed(expected: &str, observed: Option<&str>) -> bool {
+    observed == Some(expected)
 }
 
 /// Whether a `CODEX_CLI_PATH` value names a Vellum App Server bridge.
@@ -340,6 +355,13 @@ pub enum EnvironmentLeaseError {
     Unsupported,
     #[error("cannot read or write the per-user environment: {0}")]
     Command(String),
+    #[error(
+        "CODEX_CLI_PATH write was not observed in the user launch environment (expected={expected}, observed={observed:?})"
+    )]
+    WriteNotObserved {
+        expected: String,
+        observed: Option<String>,
+    },
     #[error(transparent)]
     Io(std::io::Error),
     #[error("environment lease JSON is invalid: {0}")]
@@ -458,6 +480,22 @@ mod tests {
             Some("C:/other/codex.exe".to_string())
         );
         assert_eq!(plan_previous_value(None, None), None);
+    }
+
+    #[test]
+    fn an_unobserved_user_environment_write_is_not_success() {
+        assert!(environment_write_was_observed(
+            "/Applications/Vellum.app/bridge",
+            Some("/Applications/Vellum.app/bridge")
+        ));
+        assert!(!environment_write_was_observed(
+            "/Applications/Vellum.app/bridge",
+            None
+        ));
+        assert!(!environment_write_was_observed(
+            "/Applications/Vellum.app/bridge",
+            Some("/Applications/Other.app/codex")
+        ));
     }
     #[test]
     fn acquiring_an_orphaned_exact_bridge_does_not_make_a_self_referential_lease() {

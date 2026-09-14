@@ -6670,7 +6670,7 @@ impl ProxyRuntime {
                 yield ok(Bytes::from(failed_sse_event_with_category(category, &message)));
             }
             let completed = adapter.history_response();
-            if completed_seen && !terminal_response_recorded {
+            if completed_seen && !usage_recorded {
                 let status = if stream_error.is_none() { 200 } else { 502 };
                 record_subagent_spawn_requests_in_sink(
                     Arc::clone(&diagnostics),
@@ -6733,6 +6733,8 @@ impl ProxyRuntime {
                     },
                 );
                 usage_recorded = true;
+            }
+            if completed_seen && !terminal_response_recorded {
                 if let Err(error) = history.record_exchange_with_conversation_key(
                     &request_body,
                     &completed,
@@ -6884,24 +6886,23 @@ impl ProxyRuntime {
                 yield ok(Bytes::from(failed_sse_event(&message)));
             }
             if let Some(response) = completed {
-                if !terminal_response_recorded {
-                    let status = if stream_error.is_none() { 200 } else { 502 };
-                    record_subagent_spawn_requests_in_sink(
-                        Arc::clone(&diagnostics),
-                        Arc::clone(&pending_subagent_spawns),
-                        &parent_request_id,
-                        &execution_id,
-                        &response,
-                    );
-                    let details = usage_details_from_response(&response);
-                    let outcome_str = if stream_error.is_none() { "success" } else { "provider_failure" };
-                    finish_terminal_once_with_record_raw(
-                        &parent_cancel,
-                        &diagnostics,
-                        &usage,
-                        &execution_id,
-                        outcome_str,
-                        UsageRecord {
+                let status = if stream_error.is_none() { 200 } else { 502 };
+                record_subagent_spawn_requests_in_sink(
+                    Arc::clone(&diagnostics),
+                    Arc::clone(&pending_subagent_spawns),
+                    &parent_request_id,
+                    &execution_id,
+                    &response,
+                );
+                let details = usage_details_from_response(&response);
+                let outcome_str = if stream_error.is_none() { "success" } else { "provider_failure" };
+                finish_terminal_once_with_record_raw(
+                    &parent_cancel,
+                    &diagnostics,
+                    &usage,
+                    &execution_id,
+                    outcome_str,
+                    UsageRecord {
                         route_id: route_id.clone(),
                         provider: provider.clone(),
                         model: model.clone(),
@@ -6928,8 +6929,9 @@ impl ProxyRuntime {
                         review_reason: guardian.reason.clone(),
                         agent_attribution: agent_attribution.clone(),
                         ..Default::default()
-                        },
-                    );
+                    },
+                );
+                if !terminal_response_recorded {
                     if let Err(error) = record_exchange_with_official_compactions(
                         history.as_ref(),
                         &request_body,
@@ -10624,7 +10626,7 @@ mod tests {
     async fn official_streaming_request_retries_without_rejected_tool_choice() {
         let completed = concat!(
             "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":31,\"output_tokens\":4,\"total_tokens\":35}}}\n\n"
         );
         let transport = Arc::new(RecordingTransport::new(vec![
             UpstreamResponse {
@@ -10652,7 +10654,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(response, RuntimeResponse::Sse(_)));
+        let RuntimeResponse::Sse(mut stream) = response else {
+            panic!("official streaming request must produce SSE");
+        };
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
 
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -10661,6 +10668,16 @@ mod tests {
         assert_eq!(first["tool_choice"], "auto");
         assert!(second.get("tool_choice").is_none());
         assert_eq!(first["stream"], second["stream"]);
+        drop(requests);
+        let records = runtime.usage_records().expect("official usage ledger");
+        assert_eq!(
+            records.len(),
+            1,
+            "one terminal row per request: {records:?}"
+        );
+        assert_eq!(records[0].input_tokens, 31);
+        assert_eq!(records[0].output_tokens, 4);
+        assert_eq!(records[0].outcome.as_deref(), Some("success"));
     }
 
     #[tokio::test]

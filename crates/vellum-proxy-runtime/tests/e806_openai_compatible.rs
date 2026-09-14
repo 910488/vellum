@@ -276,6 +276,7 @@ async fn e806_chat_sse_stream_ends_with_completed_and_never_fails() {
         "data: {\"id\":\"chatcmpl-e806-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"chatcmpl-e806-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"chatcmpl-e806-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-e806-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":7,\"total_tokens\":127}}\n\n",
         "data: [DONE]\n\n",
     );
     let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
@@ -315,6 +316,15 @@ async fn e806_chat_sse_stream_ends_with_completed_and_never_fails() {
     assert!(!text.contains("response.failed"), "stream failed: {text}");
     assert!(text.contains("reasoning"), "reasoning delta lost: {text}");
     assert!(text.contains("Hello"), "content delta lost: {text}");
+    let records = runtime.usage_records().expect("usage ledger");
+    assert_eq!(
+        records.len(),
+        1,
+        "one terminal row per request: {records:?}"
+    );
+    assert_eq!(records[0].input_tokens, 120);
+    assert_eq!(records[0].output_tokens, 7);
+    assert_eq!(records[0].outcome.as_deref(), Some("success"));
 }
 
 #[tokio::test]
