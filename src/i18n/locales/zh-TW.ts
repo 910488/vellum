@@ -149,6 +149,7 @@ const zhTW: ResourceTree = {
     "title": "現況",
     "loading": "正在讀取狀態…",
     "noProvider": "還沒有供應商",
+    "noSuccessfulRequest": "尚無成功請求",
     "addProvider": "加入供應商",
     "providerTokens": "當前 Provider 累計 Token",
     "requests_one": "{{count}} 次請求",

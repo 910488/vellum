@@ -172,7 +172,7 @@ export function Today({
     );
   }
 
-  const { route, quota, usage, health, findings } = overview;
+  const { route, lastSuccessfulRoute, quota, usage, health, findings } = overview;
   const ctxPercent = percent(usage.usedTokens, usage.windowTokens);
 
   async function refreshProviderQuota(routeId: string) {
@@ -284,7 +284,9 @@ export function Today({
         <div>
           <p className="eyebrow">{t("today.title")}</p>
           <h2 className="canvas__title">
-            {route ? `${route.model} · ${route.name}` : t("today.noProvider")}
+            {lastSuccessfulRoute
+              ? `${lastSuccessfulRoute.model} · ${lastSuccessfulRoute.provider}`
+              : t("today.noSuccessfulRequest")}
           </h2>
         </div>
         <div className="rowline">

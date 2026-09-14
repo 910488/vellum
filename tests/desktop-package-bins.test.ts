@@ -40,6 +40,7 @@ describe("daily Desktop package", () => {
       "binaries/vellum-codex-app-server*",
     ]);
     expect(buildSidecar).toMatch(/VELLUM_DESKTOP_HOT_UPDATE/);
+    expect(buildSidecar).toMatch(/delete cargoEnvironment\.TAURI_CONFIG/);
 
     const windowsHotUpdate = releaseWorkflow.slice(
       releaseWorkflow.indexOf("  windows-updater:"),

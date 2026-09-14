@@ -172,6 +172,69 @@ describe("proxy lifecycle button state", () => {
     expect(await screen.findByText(/failed to refresh/i)).toBeTruthy();
   });
 
+  it("does not present the selected default model as one the user has used", async () => {
+    render(
+      <Today
+        proxy={running}
+        overview={{
+          ...overview,
+          route: {
+            id: "opencode-zen",
+            name: "OpenCode Zen",
+            baseUrl: "https://opencode.ai/zen/v1",
+            model: "muse-spark-1.3-contributor-free",
+            wire: "responses",
+            isCurrent: true,
+            serverSideResume: false,
+            streaming: true,
+            reasoning: false,
+            providerKind: "openAiCompatible",
+            authKind: "bearer",
+            enabled: true,
+            models: ["muse-spark-1.3-contributor-free"],
+            selectedModels: ["muse-spark-1.3-contributor-free"],
+            contextWindow: null,
+            modelCapabilities: [],
+          },
+        }}
+        onNavigate={() => {}}
+        onChanged={() => {}}
+        onProxyChanged={() => {}}
+        refreshVersion={0}
+        onRefreshComplete={() => {}}
+        active
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "No successful requests yet" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: /muse-spark/i })).toBeNull();
+  });
+
+  it("presents the provider and model from the latest successful request", async () => {
+    render(
+      <Today
+        proxy={running}
+        overview={{
+          ...overview,
+          lastSuccessfulRoute: {
+            routeId: "used-route",
+            provider: "Actually used",
+            model: "used-model",
+            createdAt: 1_722_222_222,
+          },
+        }}
+        onNavigate={() => {}}
+        onChanged={() => {}}
+        onProxyChanged={() => {}}
+        refreshVersion={0}
+        onRefreshComplete={() => {}}
+        active
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "used-model · Actually used" })).toBeTruthy();
+  });
+
   it("keeps the running boolean next to the phase enum", () => {
     expect(running.running).toBe(true);
     expect(running.phase).toBe("running");

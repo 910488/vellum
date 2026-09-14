@@ -149,6 +149,7 @@ const ja: ResourceTree = {
     "title": "現況",
     "loading": "ステータスを読み込み中…",
     "noProvider": "プロバイダーがありません",
+    "noSuccessfulRequest": "成功したリクエストはまだありません",
     "addProvider": "プロバイダーを追加",
     "providerTokens": "現在の Provider 累計 Token",
     "requests_one": "{{count}} 件のリクエスト",
