@@ -1846,6 +1846,22 @@ impl AppState {
         }
     }
 
+    /// Records a restart reason together with the Codex instance that still
+    /// has the previous configuration loaded. Keeping both writes under one
+    /// lock prevents a status poll from observing an unreconcilable reason
+    /// with no process identity.
+    pub fn mark_restart_required_for_process(
+        &self,
+        reason: RuntimeNotice,
+        process_identity: String,
+    ) {
+        let mut proxy = self.proxy.lock().expect("proxy state poisoned");
+        if !proxy.restart_reasons.contains(&reason) {
+            proxy.restart_reasons.push(reason);
+        }
+        proxy.restart_process_identity = Some(process_identity);
+    }
+
     pub fn set_restart_process_identity(&self, identity: Option<String>) {
         self.proxy
             .lock()
@@ -3108,8 +3124,10 @@ mod tests {
     fn restart_requirement_clears_only_after_a_new_codex_process_instance() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir(temp.path().to_path_buf());
-        state.mark_restart_required(RuntimeNotice::new("catalogUpdated"));
-        state.set_restart_process_identity(Some("100:1000".into()));
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("catalogUpdated"),
+            "100:1000".into(),
+        );
 
         state.reconcile_codex_restart(Some("100:1000".into()));
         assert!(state.runtime_status().restart_required);

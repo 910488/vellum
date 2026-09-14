@@ -111,8 +111,12 @@ fn repair_superseded_launch(
     if !state.claim_launch_repair(&launch_id) {
         return;
     }
-    state.mark_restart_required(RuntimeNotice::new("enhancedDesktopRuntimeChanged"));
-    state.set_restart_process_identity(codex_process_identity());
+    if let Some(process_identity) = codex_process_identity() {
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+            process_identity,
+        );
+    }
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
         // Close admission before checking for idle, otherwise a request can
@@ -222,9 +226,12 @@ pub async fn disable_enhanced_desktop_runtime(
         Ok::<_, AppError>(crate::enhanced_runtime::desktop_runtime_status(&data_root))
     })
     .await??;
-    state.mark_restart_required(crate::model::RuntimeNotice::new(
-        "enhancedDesktopRuntimeChanged",
-    ));
+    if let Some(process_identity) = codex_process_identity() {
+        state.mark_restart_required_for_process(
+            crate::model::RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+            process_identity,
+        );
+    }
     Ok(status)
 }
 
@@ -259,10 +266,11 @@ pub async fn configure_enhanced_desktop_runtime(
         Ok::<_, AppError>(crate::enhanced_runtime::desktop_runtime_status(&data_root))
     })
     .await??;
-    if codex_process_identity().is_some() {
-        state.mark_restart_required(crate::model::RuntimeNotice::new(
-            "enhancedDesktopRuntimeChanged",
-        ));
+    if let Some(process_identity) = codex_process_identity() {
+        state.mark_restart_required_for_process(
+            crate::model::RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+            process_identity,
+        );
     }
     Ok(status)
 }
