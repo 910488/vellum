@@ -119,6 +119,16 @@ Remote Control on Official Codex so a phone can read and resume Desktop's
 native conversations. A build with the sidecar must route each remote request
 through the thread's immutable execution-plane binding.
 
+### Tool continuations
+
+When Vellum executes a provider-requested tool locally, the continuation must
+retain every provider-required assistant field from the requesting hop. In
+particular, Chat thinking providers that bind readable `reasoning_content` to
+tool calls must receive that reasoning on the same assistant message as the
+original call before its tool result. Reconstructing only the function call and
+result is not a valid continuation, even when the client-visible Responses
+stream is otherwise complete.
+
 ### Artifact and protocol verification
 
 Enhanced Runtime activation verifies the actual artifacts being launched:
