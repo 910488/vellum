@@ -208,6 +208,14 @@ pub struct HarnessTranscriptDiagnostics {
     pub first_role: Option<String>,
     pub last_role: Option<String>,
     pub body_bytes: Option<u64>,
+    /// Serialized bytes occupied by the final Chat `messages` array.
+    pub message_bytes: Option<u64>,
+    /// Serialized bytes occupied by system messages inside `messages`.
+    pub system_message_bytes: Option<u64>,
+    /// Number of function declarations in the final Chat `tools` array.
+    pub tool_count: u64,
+    /// Serialized bytes occupied by the final Chat `tools` array.
+    pub tool_bytes: Option<u64>,
     pub model: Option<String>,
     pub upstream_status: Option<u16>,
     pub replay_prefix_items: u64,

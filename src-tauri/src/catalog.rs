@@ -80,7 +80,10 @@ fn apply_codex_catalog_schema_defaults(
     );
     object.insert("supports_image_detail_original".into(), json!(false));
     object.insert("experimental_supported_tools".into(), json!([]));
-    object.insert("supports_search_tool".into(), json!(false));
+    // This is Codex's client-side deferred tool-discovery capability, not the
+    // optional Vellum/Brave web-search setting. The shared adapters preserve
+    // `tool_search` calls on every translated route.
+    object.insert("supports_search_tool".into(), json!(true));
     object.remove("comp_hash");
     object.remove("tool_mode");
     // Native multi-agent V2 is executed by the qualified Enhanced Codex host;
@@ -243,6 +246,36 @@ fn ordered_reasoning_efforts(efforts: &[String]) -> Vec<String> {
     ordered
 }
 
+/// Choose a useful default when a successful capability probe did not name
+/// one. Falling back to the first display-ordered item selected `none` for
+/// the common `[none, minimal, low, medium, ...]` surface, which made two
+/// otherwise identical routes behave differently depending on whether Codex
+/// happened to retain an older per-thread effort selection.
+fn default_reasoning_effort(model: &ModelRoute) -> &str {
+    if let Some(explicit) = model.default_reasoning_effort.as_deref() {
+        return explicit;
+    }
+
+    model
+        .reasoning_efforts
+        .iter()
+        .find(|effort| effort.eq_ignore_ascii_case("medium"))
+        .or_else(|| {
+            ordered_reasoning_efforts(&model.reasoning_efforts)
+                .into_iter()
+                .find(|effort| !effort.eq_ignore_ascii_case("none"))
+                .and_then(|selected| {
+                    model
+                        .reasoning_efforts
+                        .iter()
+                        .find(|effort| effort.eq_ignore_ascii_case(&selected))
+                })
+        })
+        .or_else(|| model.reasoning_efforts.first())
+        .map(String::as_str)
+        .unwrap_or("none")
+}
+
 fn third_party_catalog_entry(
     model: &ModelRoute,
     priority: usize,
@@ -281,11 +314,7 @@ fn third_party_catalog_entry(
         "supported_reasoning_levels": ordered_reasoning_efforts(&model.reasoning_efforts).iter().map(|effort| {
             json!({"effort": effort, "description": effort})
         }).collect::<Vec<_>>(),
-        "default_reasoning_level": model
-            .default_reasoning_effort
-            .as_deref()
-            .or_else(|| model.reasoning_efforts.first().map(String::as_str))
-            .unwrap_or("none"),
+        "default_reasoning_level": default_reasoning_effort(model),
         "prefer_websockets": false,
         "additional_speed_tiers": [],
         "service_tiers": [],
@@ -754,23 +783,6 @@ pub(crate) fn ensure_catalog_ready_for_codex(catalog: &mut Value) -> AppResult<(
     Ok(())
 }
 
-/// Third-party catalog rows advertise native Codex search only when Vellum
-/// can actually run the Brave loop. Official cache rows keep their own flag.
-fn apply_search_tool_capability(catalog: &mut Value, available: bool) {
-    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for model in models {
-        let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
-        if !slug.starts_with("vlm-") {
-            continue;
-        }
-        if let Some(object) = model.as_object_mut() {
-            object.insert("supports_search_tool".into(), json!(available));
-        }
-    }
-}
-
 pub fn read_official_catalog(path: &Path) -> Option<Value> {
     let bytes = std::fs::read(path).ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
@@ -790,7 +802,7 @@ fn write_catalog_with_search(
     path: &Path,
     routes: &[Route],
     official_cache_path: Option<&Path>,
-    search_tool_available: bool,
+    _search_tool_available: bool,
 ) -> AppResult<()> {
     let parent = path
         .parent()
@@ -800,7 +812,6 @@ fn write_catalog_with_search(
     let tmp = path.with_extension("json.tmp");
     let official = official_cache_path.and_then(read_official_catalog);
     let mut catalog = catalog_json_with_official(routes, official.as_ref());
-    apply_search_tool_capability(&mut catalog, search_tool_available);
     ensure_catalog_ready_for_codex(&mut catalog)?;
     let bytes = serde_json::to_vec_pretty(&catalog)
         .map_err(|error| AppError::Message(format!("模型型錄序列化失敗：{error}")))?;
@@ -851,7 +862,7 @@ pub fn write_catalog_with_model_routes_and_search_and_compaction(
     routes: &[Route],
     model_routes: &[ModelRoute],
     official_cache_path: Option<&Path>,
-    search_tool_available: bool,
+    _search_tool_available: bool,
     compaction_policies: Option<&CompactionPolicyBySlug>,
 ) -> AppResult<()> {
     let official = official_cache_path.and_then(read_official_catalog);
@@ -902,7 +913,6 @@ pub fn write_catalog_with_model_routes_and_search_and_compaction(
         let entry = third_party_catalog_entry(model, 2000 + priority, &profile, projection);
         models.push(entry);
     }
-    apply_search_tool_capability(&mut value, search_tool_available);
     ensure_catalog_ready_for_codex(&mut value)?;
     let parent = path
         .parent()
@@ -978,6 +988,46 @@ mod tests {
 
         assert_eq!(advertised, vec!["low", "medium", "high", "xhigh"]);
         assert_eq!(entry["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn missing_reasoning_default_prefers_medium_over_none() {
+        let mut provider = route(ProviderKind::OpenAiCompatible, "third", "thinking-model");
+        provider.model_capabilities = vec![ModelCapability {
+            model: "thinking-model".into(),
+            reasoning_efforts: vec![
+                "none".into(),
+                "minimal".into(),
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+            ],
+            default_reasoning_effort: None,
+            reasoning_effort_transport: ReasoningEffortTransport::ChatField,
+            probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
+            effort_probe_version: Some(crate::probe::EFFORT_PROBE_VERSION),
+            ..Default::default()
+        }];
+
+        let value = catalog_json(&[provider]);
+        assert_eq!(value["models"][0]["default_reasoning_level"], "medium");
+    }
+
+    #[test]
+    fn missing_reasoning_default_uses_lightest_non_none_level() {
+        let mut provider = route(ProviderKind::OpenAiCompatible, "third", "thinking-model");
+        provider.model_capabilities = vec![ModelCapability {
+            model: "thinking-model".into(),
+            reasoning_efforts: vec!["none".into(), "high".into(), "minimal".into()],
+            default_reasoning_effort: None,
+            reasoning_effort_transport: ReasoningEffortTransport::ChatField,
+            probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
+            effort_probe_version: Some(crate::probe::EFFORT_PROBE_VERSION),
+            ..Default::default()
+        }];
+
+        let value = catalog_json(&[provider]);
+        assert_eq!(value["models"][0]["default_reasoning_level"], "minimal");
     }
 
     #[test]
@@ -1243,6 +1293,10 @@ mod tests {
             .unwrap();
         assert_eq!(entry["context_window"], 300_000);
         assert_eq!(entry["max_context_window"], 300_000);
+        assert_eq!(
+            entry["supports_search_tool"], true,
+            "disabling Brave search must not disable deferred tool discovery"
+        );
     }
 
     /// Grok is manual-`/compact`-only (see docs/protocol-source-of-truth.md):
@@ -1681,19 +1735,15 @@ mod tests {
         assert_eq!(entry["truncation_policy"]["mode"], "tokens");
         assert_eq!(entry["input_modalities"], json!(["text"]));
         assert_eq!(entry["supports_image_detail_original"], false);
-        assert_eq!(entry["supports_search_tool"], false);
+        assert_eq!(entry["supports_search_tool"], true);
         assert_eq!(entry["multi_agent_version"], "v2");
     }
 
     #[test]
-    fn third_party_search_capability_follows_brave_availability() {
+    fn third_party_deferred_tool_search_does_not_follow_brave_availability() {
         let grok = route(ProviderKind::GrokCli, "grok-cli", "grok-4.6");
-        let mut catalog = catalog_json(&[grok]);
-        assert_eq!(catalog["models"][0]["supports_search_tool"], false);
-        apply_search_tool_capability(&mut catalog, true);
+        let catalog = catalog_json(&[grok]);
         assert_eq!(catalog["models"][0]["supports_search_tool"], true);
-        apply_search_tool_capability(&mut catalog, false);
-        assert_eq!(catalog["models"][0]["supports_search_tool"], false);
     }
 
     /// Issue #6 §B: the third-party prompt used to be `models.first()`, so it
@@ -1798,10 +1848,8 @@ mod tests {
         assert_eq!(entry["default_reasoning_level"], "high");
     }
 
-    /// The delegation gate must not change what a model without an explicit
-    /// default runs at. The catalog has always fallen back to the first
-    /// supported level; the gate reporting a synthesized default would have
-    /// overridden that for every third-party model.
+    /// The delegation gate must leave the provider default unresolved so the
+    /// catalog can apply its balanced fallback consistently.
     #[test]
     fn the_delegation_gate_leaves_a_missing_default_to_the_catalog_fallback() {
         let mut provider = route(ProviderKind::OpenAiCompatible, "third", "model-a");
@@ -1819,9 +1867,10 @@ mod tests {
         assert_eq!(models[0].reasoning_efforts, vec!["high", "medium"]);
         assert_eq!(models[0].default_reasoning_effort, None);
 
-        // The catalog's own fallback still picks the first supported level.
+        // The catalog's fallback prefers medium when the provider omitted a
+        // default, regardless of the provider's capability-list ordering.
         let value = catalog_json(&[provider]);
-        assert_eq!(value["models"][0]["default_reasoning_level"], "high");
+        assert_eq!(value["models"][0]["default_reasoning_level"], "medium");
     }
 
     #[test]

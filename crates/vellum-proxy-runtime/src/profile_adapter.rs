@@ -2750,6 +2750,15 @@ pub fn chat_tools(tool: &Value, profile: &HarnessProfile) -> Vec<Value> {
                 })
                 .unwrap_or_default()
         }
+        Some("tool_search") => vec![json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description": "Search for available tools",
+                "parameters": tool.get("parameters").cloned()
+                    .unwrap_or_else(|| json!({"type": "object"}))
+            }
+        })],
         // Same exact-or-nothing rule as the Responses path.
         Some(kind) => match harness_tools::builtin_tool(kind) {
             BuiltinDecision::Exact {
@@ -3049,6 +3058,32 @@ mod tests {
             chat_tools(&tool, &profile)[0]["function"]["parameters"],
             parameters
         );
+    }
+
+    #[test]
+    fn chat_translation_exposes_client_tool_search_as_a_function() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false
+        });
+        let tool = json!({
+            "type": "tool_search",
+            "execution": "client",
+            "parameters": parameters
+        });
+        let profile = resolve_with_options(
+            RuntimeProviderKind::OpenAiCompatible,
+            RuntimeWireFormat::Chat,
+            HarnessOptions::default(),
+            false,
+        );
+
+        let translated = chat_tools(&tool, &profile);
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0]["function"]["name"], "tool_search");
+        assert_eq!(translated[0]["function"]["parameters"], parameters);
     }
 
     /// A schema that lists `properties` without saying `type`, and the empty
