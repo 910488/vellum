@@ -563,13 +563,26 @@ pub(crate) fn refresh_catalog_if_running(state: &AppState) -> AppResult<()> {
         )?;
         let current = std::fs::read(&paths.catalog)
             .map_err(|error| AppError::Message(format!("無法讀取更新後的模型型錄：{error}")))?;
-        let catalog_changed = previous
+        let previous_bytes = previous
             .as_ref()
-            .is_none_or(|version| version.id != crate::runtime::catalog_id(&current));
+            .map(|version| std::fs::read(&version.path))
+            .transpose()
+            .map_err(|error| AppError::Message(format!("read previous catalog: {error}")))?;
+        let catalog_changed = previous_bytes.as_deref().is_none_or(|bytes| {
+            crate::runtime::catalog_requires_restart(bytes, &current)
+        });
         if catalog_changed {
-            state
-                .mark_restart_required(crate::model::RuntimeNotice::new("routesAndCatalogUpdated"));
-            state.set_restart_process_identity(crate::commands::runtime::codex_process_identity());
+            log::info!(
+                "[Restart] catalog contract changed previous={} current={}",
+                previous.as_ref().map_or("missing", |version| version.id.as_str()),
+                crate::runtime::catalog_id(&current)
+            );
+            let reason = crate::model::RuntimeNotice::new("routesAndCatalogUpdated");
+            if let Some(identity) = crate::commands::runtime::codex_process_identity() {
+                state.mark_restart_required_for_process(reason, identity);
+            } else {
+                state.mark_restart_required(reason);
+            }
         }
     }
     Ok(())
@@ -1214,6 +1227,30 @@ mod tests {
         refresh_catalog_if_running(&state).unwrap();
 
         assert!(!state.runtime_status().restart_required);
+    }
+
+    #[test]
+    fn cache_only_catalog_refresh_does_not_recreate_restart_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_test_fixtures(temp.path().to_path_buf());
+        state.activate_proxy_routes();
+        state.set_proxy_running(true, None, true, None);
+        refresh_catalog_if_running(&state).unwrap();
+        state.clear_restart_required();
+        let paths = crate::codex::CodexPaths::discover(&state.data_root());
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.catalog).unwrap()).unwrap();
+        for key in ["fetched_at", "etag", "client_version"] {
+            catalog[key] = "cache-only-change".into();
+        }
+        std::fs::write(&paths.catalog, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        refresh_catalog_if_running(&state).unwrap();
+        assert!(!state.runtime_status().restart_required);
+        // A real model-contract change must still require reloading Codex.
+        catalog["models"][0]["context_window"] = serde_json::json!(42);
+        std::fs::write(&paths.catalog, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        refresh_catalog_if_running(&state).unwrap();
+        assert!(state.runtime_status().restart_required);
     }
 
     /* 用量列裡的供應商名稱是寫入當下的快照。線路還在就用現在的名字 ——

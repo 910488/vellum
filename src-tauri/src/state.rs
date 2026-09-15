@@ -1842,6 +1842,7 @@ impl AppState {
     pub fn mark_restart_required(&self, reason: RuntimeNotice) {
         let mut proxy = self.proxy.lock().expect("proxy state poisoned");
         if !proxy.restart_reasons.contains(&reason) {
+            log::info!("[Restart] reason added code={}", reason.code);
             proxy.restart_reasons.push(reason);
         }
     }
@@ -1857,6 +1858,7 @@ impl AppState {
     ) {
         let mut proxy = self.proxy.lock().expect("proxy state poisoned");
         if !proxy.restart_reasons.contains(&reason) {
+            log::info!("[Restart] reason added code={} process_bound=true", reason.code);
             proxy.restart_reasons.push(reason);
         }
         proxy.restart_process_identity = Some(process_identity);

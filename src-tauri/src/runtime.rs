@@ -10,6 +10,24 @@ pub fn catalog_id(bytes: &[u8]) -> String {
     digest[..12].to_string()
 }
 
+/// Cache bookkeeping does not change the model contract loaded by Codex.
+/// Keep every other field (including unknown future fields) significant.
+pub fn catalog_requires_restart(previous: &[u8], current: &[u8]) -> bool {
+    fn contract(bytes: &[u8]) -> Option<serde_json::Value> {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let object = value.as_object_mut()?;
+        object.get("models")?.as_array()?;
+        for key in ["fetched_at", "etag", "client_version"] {
+            object.remove(key);
+        }
+        Some(value)
+    }
+    match (contract(previous), contract(current)) {
+        (Some(previous), Some(current)) => previous != current,
+        _ => true,
+    }
+}
+
 pub fn snapshot_catalog(root: &Path, catalog: &Path) -> AppResult<Option<CatalogVersion>> {
     let bytes = match std::fs::read(catalog) {
         Ok(bytes) => bytes,
@@ -129,6 +147,35 @@ pub fn codex_launch_spec(app_id: Option<&str>, executable: &Path) -> (PathBuf, V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_restart_ignores_cache_metadata_but_preserves_model_changes() {
+        let original = serde_json::json!({
+            "fetched_at": "old", "etag": "old", "client_version": "old",
+            "models": [{"slug": "qwen", "context_window": 128000,
+                "default_reasoning_level": "medium"}]
+        });
+        let mut refreshed = original.clone();
+        for key in ["fetched_at", "etag", "client_version"] {
+            refreshed[key] = "new".into();
+        }
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let encode = |value: &serde_json::Value| serde_json::to_vec_pretty(value).unwrap();
+        assert!(!catalog_requires_restart(&bytes, &encode(&refreshed)));
+        for (key, value) in [
+            ("context_window", serde_json::json!(256000)),
+            ("default_reasoning_level", serde_json::json!("high")),
+            ("new_runtime_field", serde_json::json!(true)),
+        ] {
+            let mut changed = refreshed.clone();
+            changed["models"][0][key] = value;
+            assert!(catalog_requires_restart(&bytes, &encode(&changed)));
+        }
+        refreshed["models"] = serde_json::json!([]);
+        assert!(catalog_requires_restart(&bytes, &encode(&refreshed)));
+        assert!(catalog_requires_restart(b"invalid", &bytes));
+        assert!(catalog_requires_restart(b"{}", &bytes));
+    }
 
     #[test]
     fn catalog_snapshots_are_deduplicated_and_rollback_is_exact() {
