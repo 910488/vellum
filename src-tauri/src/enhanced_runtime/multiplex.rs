@@ -395,6 +395,10 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     let mut command = tokio::process::Command::new(&relay_identity.executable);
     command
         .env("CODEX_HOME", &m.official.codex_home)
+        // Match the identity Codex Desktop sends to the native stdio App
+        // Server so the relay reuses that enrollment/environment instead of
+        // creating an empty-key duplicate that mobile still sees as offline.
+        .env("VELLUM_RELAY_APP_SERVER_CLIENT_NAME", "Codex Desktop")
         .env_remove("CODEX_CLI_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
