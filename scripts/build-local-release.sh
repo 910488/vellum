@@ -191,6 +191,32 @@ const manifest = {
 fs.writeFileSync(path.join(root, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 
+if [[ "$(uname -s)" == Darwin ]]; then
+  echo "==> Build Darwin ARM64 Agent and native Proxy"
+  rustup target add aarch64-apple-darwin
+  cargo build \
+    --manifest-path "$repo/Cargo.toml" \
+    -p vellum-remote-agent \
+    -p vellum-proxy-daemon \
+    --release \
+    --target aarch64-apple-darwin
+  darwin_root="$resource_root/darwin-arm64"
+  rm -rf "$darwin_root"
+  mkdir -p "$darwin_root"
+  cp "$repo/target/aarch64-apple-darwin/release/vellum-remote-agent" \
+    "$darwin_root/vellum-remote-agent"
+  cp "$repo/target/aarch64-apple-darwin/release/vellum-proxy-daemon" \
+    "$darwin_root/vellum-proxy-daemon"
+  codex_archive="$scratch_root/codex-darwin-arm64.tar.gz"
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    "https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-aarch64-apple-darwin.tar.gz" \
+    -o "$codex_archive"
+  tar -xzf "$codex_archive" -C "$scratch_root" codex-aarch64-apple-darwin
+  mv "$scratch_root/codex-aarch64-apple-darwin" "$darwin_root/codex"
+  rm "$codex_archive"
+  node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root"
+fi
+
 echo "==> Embedded remote payload"
 du -sh "$resource_root"
 for arch in amd64 arm64; do
@@ -199,6 +225,11 @@ for arch in amd64 arm64; do
   done
 done
 test -s "$resource_root/manifest.json"
+if [[ "$(uname -s)" == Darwin ]]; then
+  for name in vellum-remote-agent vellum-proxy-daemon codex; do
+    test -s "$resource_root/darwin-arm64/$name"
+  done
+fi
 
 if [[ "$bundle" != stage-only ]]; then
   command -v pnpm >/dev/null || { echo "pnpm is required to bundle the desktop app" >&2; exit 1; }

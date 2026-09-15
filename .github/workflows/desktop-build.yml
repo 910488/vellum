@@ -50,10 +50,22 @@ jobs:
 
   remote-payload-darwin:
     name: Embedded Remote Manager Darwin payload
+    needs: remote-payload
     runs-on: macos-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Download Linux remote payload and manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: vellum-remote-payload-${{ github.sha }}
+          path: src-tauri/resources/remote
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -66,18 +78,25 @@ jobs:
           mkdir -p src-tauri/resources/remote/darwin-arm64
           cp target/aarch64-apple-darwin/release/vellum-remote-agent src-tauri/resources/remote/darwin-arm64/vellum-remote-agent
           cp target/aarch64-apple-darwin/release/vellum-proxy-daemon src-tauri/resources/remote/darwin-arm64/vellum-proxy-daemon
+          CODEX_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/resources/remote/manifest.json', 'utf8')).codex.pinnedVersion")"
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-aarch64-apple-darwin.tar.gz" \
+            -o target/codex-darwin-arm64.tar.gz
+          tar -xzf target/codex-darwin-arm64.tar.gz -C target codex-aarch64-apple-darwin
+          mv target/codex-aarch64-apple-darwin src-tauri/resources/remote/darwin-arm64/codex
+          node scripts/finalize-remote-darwin-manifest.mjs src-tauri/resources/remote
 
       - name: Upload Darwin payload
         uses: actions/upload-artifact@v4
         with:
           name: vellum-remote-payload-darwin-${{ github.sha }}
-          path: src-tauri/resources/remote/darwin-arm64
+          path: src-tauri/resources/remote
           if-no-files-found: error
           retention-days: 1
 
   macos-dmg:
     name: macOS DMG
-    needs: [remote-payload, remote-payload-darwin]
+    needs: remote-payload-darwin
     runs-on: macos-latest
     steps:
       - name: Check out source
@@ -103,17 +122,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Download embedded payload
-        uses: actions/download-artifact@v4
-        with:
-          name: vellum-remote-payload-${{ github.sha }}
-          path: src-tauri/resources/remote
-
-      - name: Download Darwin remote payload
+      - name: Download complete remote payload
         uses: actions/download-artifact@v4
         with:
           name: vellum-remote-payload-darwin-${{ github.sha }}
-          path: src-tauri/resources/remote/darwin-arm64
+          path: src-tauri/resources/remote
 
       - name: Build DMG and app archive
         env:
@@ -146,7 +159,7 @@ jobs:
 
   windows-installer:
     name: Windows installer
-    needs: [remote-payload, remote-payload-darwin]
+    needs: remote-payload-darwin
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -172,17 +185,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Download embedded payload
-        uses: actions/download-artifact@v4
-        with:
-          name: vellum-remote-payload-${{ github.sha }}
-          path: src-tauri/resources/remote
-
-      - name: Download Darwin remote payload
+      - name: Download complete remote payload
         uses: actions/download-artifact@v4
         with:
           name: vellum-remote-payload-darwin-${{ github.sha }}
-          path: src-tauri/resources/remote/darwin-arm64
+          path: src-tauri/resources/remote
 
       - name: Build NSIS installer
         env:

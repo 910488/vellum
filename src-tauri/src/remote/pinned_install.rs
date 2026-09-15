@@ -126,6 +126,22 @@ impl ReleaseManifest {
         if self.proxy.image.trim().is_empty() {
             return Err("ReleaseManifestInvalid: proxy image is missing".into());
         }
+        if self.schema_version == RELEASE_SCHEMA_VERSION {
+            for artifact in [
+                self.codex.artifacts.darwin_arm64.as_ref(),
+                self.agent.artifacts.darwin_arm64.as_ref(),
+                self.proxy.artifacts.darwin_arm64.as_ref(),
+            ] {
+                let artifact = artifact.ok_or_else(|| {
+                    "ReleaseManifestInvalid: schema 4 requires Darwin ARM64 artifacts".to_string()
+                })?;
+                if artifact.url.trim().is_empty() || !valid_sha256(&artifact.sha256) {
+                    return Err(
+                        "ReleaseManifestInvalid: Darwin ARM64 artifact is invalid".into(),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -278,6 +294,7 @@ pub(crate) fn component_artifact_for_os_arch(
     artifact_for_os_arch(artifacts, os, arch).cloned()
 }
 
+#[cfg(test)]
 fn select_artifact<'a>(manifest: &'a ReleaseManifest, arch: &str) -> AppResult<&'a CodexArtifact> {
     artifact_for_arch(&manifest.codex.artifacts, arch)
 }
@@ -382,11 +399,7 @@ pub fn install_pinned_codex(
     let target = crate::remote::RemoteHostManager::resolve_target(state, host_id)?;
     let client = RemoteAgentClient::new(target.clone());
     let inventory = client.host_inventory_v2()?;
-    let arch = inventory
-        .pointer("/system/arch")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| AppError::Message("host inventory missing system.arch".into()))?;
-    let artifact = select_artifact(&manifest, arch)?;
+    let artifact = codex_artifact_from_inventory(&manifest, &inventory)?;
 
     // Download + local digest verification.
     let local_staged = download_artifact(artifact)?;
@@ -420,6 +433,21 @@ pub fn install_pinned_codex(
         false,
     )?;
     Ok(result)
+}
+
+fn codex_artifact_from_inventory<'a>(
+    manifest: &'a ReleaseManifest,
+    inventory: &serde_json::Value,
+) -> AppResult<&'a CodexArtifact> {
+    let arch = inventory
+        .pointer("/system/arch")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Message("host inventory missing system.arch".into()))?;
+    let os = inventory
+        .pointer("/system/os")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Message("host inventory missing system.os".into()))?;
+    artifact_for_os_arch(&manifest.codex.artifacts, os, arch)
 }
 
 /// M30/M31: update the remote agent to the manifest-pinned version. Reports
@@ -686,6 +714,14 @@ mod tests {
         let mut schema3 = manifest_fixture();
         schema3.schema_version = 3;
         assert!(schema3.validate().is_ok());
+        let mut schema4 = manifest_fixture();
+        schema4.schema_version = 4;
+        assert_eq!(
+            schema4.validate(),
+            Err(
+                "ReleaseManifestInvalid: schema 4 requires Darwin ARM64 artifacts".into()
+            )
+        );
     }
 
     #[test]
@@ -703,6 +739,21 @@ mod tests {
         );
         assert!(artifact_for_os_arch(&manifest.codex.artifacts, "darwin", "x86_64").is_err());
         assert!(artifact_for_os_arch(&manifest.codex.artifacts, "linux", "amd64").is_ok());
+
+        let inventory = serde_json::json!({
+            "system": {"os": "Darwin", "arch": "arm64"}
+        });
+        assert_eq!(
+            codex_artifact_from_inventory(&manifest, &inventory)
+                .unwrap()
+                .url,
+            "bundle://darwin-arm64/codex"
+        );
+        assert!(codex_artifact_from_inventory(
+            &manifest,
+            &serde_json::json!({"system": {"arch": "arm64"}})
+        )
+        .is_err());
     }
 
     #[test]
