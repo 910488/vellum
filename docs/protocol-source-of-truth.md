@@ -125,6 +125,9 @@ after Desktop initializes, it receives the relay's current
 state is not proof that Remote Control is online; the bridge must bootstrap
 the current status so Desktop can restore an enabled preference, and relay
 startup/auth failures must remain visible in Desktop diagnostics.
+The relay uses the same `Codex Desktop` persistence identity as the native
+stdio App Server so an Enhanced bridge restart reconnects the existing mobile
+environment rather than creating a second empty-key enrollment.
 
 ### Tool continuations
 
