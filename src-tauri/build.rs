@@ -13,23 +13,34 @@ fn main() {
     }
     record_bridge_sidecar();
     record_enhanced_runtime();
-    let relay = format!(
-        "binaries/vellum-codex-relay{}",
-        if std::env::var("TARGET")
+    let relay_pointer = std::path::PathBuf::from("binaries/vellum-codex-relay.dev-path");
+    println!("cargo:rerun-if-changed={}", relay_pointer.display());
+    let relay = if std::env::var("PROFILE").as_deref() == Ok("debug") {
+        std::fs::read_to_string(&relay_pointer)
+            .ok()
+            .map(|value| value.trim().replace('\\', "/"))
+            .filter(|value| value.starts_with("binaries/dev/") && !value.contains(".."))
             .unwrap_or_default()
-            .contains("windows")
-        {
-            ".exe"
-        } else {
-            ""
-        }
-    );
+    } else {
+        format!(
+            "binaries/vellum-codex-relay{}",
+            if std::env::var("TARGET")
+                .unwrap_or_default()
+                .contains("windows")
+            {
+                ".exe"
+            } else {
+                ""
+            }
+        )
+    };
     println!("cargo:rerun-if-changed={relay}");
     let relay_digest = std::fs::read(&relay)
         .ok()
         .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
         .unwrap_or_default();
     println!("cargo:rustc-env=VELLUM_BUNDLED_RELAY_SHA256={relay_digest}");
+    println!("cargo:rustc-env=VELLUM_BUNDLED_RELAY_RELATIVE_PATH={relay}");
     tauri_build::build()
 }
 

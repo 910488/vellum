@@ -23,10 +23,11 @@ the next development build. Do not replace that with a bare
 does not stage the bytes whose digest `build.rs` embeds in the Vellum host,
 leaving Settings with a correct fail-closed bridge hash mismatch.
 
-The multi-client Remote Control relay is also a **Desktop component**. It
-belongs beside the App Server bridge in `src-tauri/binaries/` and follows the
-Desktop update stream; it is not part of the Linux Remote payload or the
-independently updated Enhanced Core. When a Desktop build has no verified
+The multi-client Remote Control relay is also a **Desktop component**. Its
+source lives with the pinned Enhanced Core so it can reuse Codex's authenticated
+Remote Control transport, while `build-sidecar` stages it beside the App Server
+bridge in `src-tauri/binaries/` and the Desktop manifest pins its bytes. It is
+not part of the Linux Remote payload. When a Desktop build has no verified
 `vellum-codex-relay` binary, the bridge deliberately falls back to a single
 Remote Control owner on Official Codex and disables Remote Control in the
 Enhanced child. This fallback prevents the two children from racing for the
@@ -98,7 +99,7 @@ all three components into each installer.
 
 `Publish signed hot update` is different: its selector publishes exactly one
 of `desktop-v*`, `remote-v*`, or `core-v*`. For the `desktop` choice,
-`src-tauri/tauri.hot-update.conf.json` keeps only the Desktop bridge resource,
+`src-tauri/tauri.hot-update.conf.json` keeps only the Desktop bridge and relay resources,
 and `VELLUM_DESKTOP_HOT_UPDATE=1` prevents `build-sidecar` from staging Core:
 
 ```

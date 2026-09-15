@@ -880,15 +880,15 @@ fn packaged_relay() -> Option<super::launch_manifest::RelayBinaryIdentity> {
     if expected.is_empty() {
         return None;
     }
-    let name = if cfg!(windows) {
-        "vellum-codex-relay.exe"
+    let relative = env!("VELLUM_BUNDLED_RELAY_RELATIVE_PATH");
+    let staged = PathBuf::from(relative);
+    let name = staged.file_name()?.to_owned();
+    let mut candidates = if staged.is_absolute() {
+        vec![staged]
     } else {
-        "vellum-codex-relay"
+        vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)]
     };
-    let mut candidates = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries")
-        .join(name)];
-    candidates.extend(crate::install_paths::bundled_binary_candidates(name));
+    candidates.extend(crate::install_paths::bundled_binary_candidates(&name));
     candidates
         .into_iter()
         .find(|path| {
