@@ -245,6 +245,15 @@ Display the human account identity returned by the authenticated account data
 when available. An internal account identifier is a fallback, not the preferred
 label, and no email address is hard-coded into the protocol.
 
+A managed ChatGPT credential is identified by both its human user principal and
+its selected ChatGPT workspace. `chatgpt_account_id` is the workspace/billing
+identifier sent upstream; it is not a unique login identity because two users
+can hold seats in the same workspace. Credential storage, selection, quota
+caches, and Remote Control slots use a stable hash of user plus workspace, while
+the upstream header continues to carry only the workspace id. Account surfaces
+show email together with workspace name (or plan/id fallback), so one user's
+Personal and workspace memberships remain visibly distinct.
+
 Opaque Official reasoning and compaction state belongs to the Official plane.
 It must not be forwarded to third-party providers.
 

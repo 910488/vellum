@@ -235,13 +235,14 @@ pub fn login_poll(paths: &AgentPaths, login_id: &str) -> Result<OfficialAccountP
     let tokens: TokenResponse = token_response
         .json()
         .map_err(|error| format!("OfficialAccountTokenProtocol: {error}"))?;
-    let account_id = extract_account_id(&tokens)?;
+    let identity = extract_account_identity(&tokens)?;
     let refresh_token = tokens
         .refresh_token
         .ok_or_else(|| "OfficialAccountTokenProtocol: missing refresh token".to_string())?;
-    let account_id_hash = hash_account_id(&account_id);
+    let account_id_hash = hash_account_id(&identity.credential_id);
     let grant = FileOfficialGrant {
-        account_id,
+        credential_id: Some(identity.credential_id),
+        account_id: identity.workspace_id,
         access_token: tokens.access_token,
         refresh_token,
         expires_at_ms: chrono::Utc::now().timestamp_millis()
@@ -324,10 +325,10 @@ pub fn select(
         return Err("OfficialExecutionAccountNotFound".into());
     }
     let grant: FileOfficialGrant = read_json(&grant_path, "Official execution grant")?;
-    if hash_account_id(&grant.account_id) != account_id_hash {
+    if hash_account_id(grant_identity_id(&grant)) != account_id_hash {
         return Err("OfficialAccountIdentityMismatch".into());
     }
-    if parse_account_id(&grant.access_token).as_deref() != Some(grant.account_id.as_str()) {
+    if !grant_token_identity_matches(&grant) {
         return Err("OfficialAccountAuthenticationFailed: access token identity differs".into());
     }
     let catalog = read_catalog(paths)?;
@@ -398,8 +399,8 @@ pub fn selected_credential_ready(paths: &AgentPaths) -> bool {
     let Ok(grant) = read_json::<FileOfficialGrant>(&path, "Official execution grant") else {
         return false;
     };
-    hash_account_id(&grant.account_id) == selected.account_id_hash
-        && parse_account_id(&grant.access_token).as_deref() == Some(grant.account_id.as_str())
+    hash_account_id(grant_identity_id(&grant)) == selected.account_id_hash
+        && grant_token_identity_matches(&grant)
 }
 
 fn prepare(paths: &AgentPaths) -> Result<(), String> {
@@ -515,6 +516,20 @@ fn hash_account_id(account_id: &str) -> String {
     hex::encode(Sha256::digest(account_id.as_bytes()))
 }
 
+fn grant_identity_id(grant: &FileOfficialGrant) -> &str {
+    grant.credential_id.as_deref().unwrap_or(&grant.account_id)
+}
+
+fn grant_token_identity_matches(grant: &FileOfficialGrant) -> bool {
+    if parse_account_id(&grant.access_token).as_deref() != Some(grant.account_id.as_str()) {
+        return false;
+    }
+    grant.credential_id.as_deref().is_none_or(|expected| {
+        vellum_proxy_runtime::chatgpt_identity_from_jwt(&grant.access_token)
+            .is_some_and(|identity| identity.credential_id == expected)
+    })
+}
+
 fn validate_account_hash(value: &str) -> Result<(), String> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("InvalidOfficialAccountHash".into());
@@ -538,15 +553,20 @@ fn parse_interval(value: Option<&Value>) -> u64 {
     interval.max(1) + 3
 }
 
-fn extract_account_id(tokens: &TokenResponse) -> Result<String, String> {
-    let access = parse_account_id(&tokens.access_token).ok_or_else(|| {
-        "OfficialAccountTokenProtocol: access token has no account identity".to_string()
-    })?;
-    if let Some(id_token) = tokens.id_token.as_deref() {
-        let id = parse_account_id(id_token).ok_or_else(|| {
-            "OfficialAccountAuthenticationFailed: id token has no account identity".to_string()
+fn extract_account_identity(
+    tokens: &TokenResponse,
+) -> Result<vellum_proxy_runtime::ChatGptIdentity, String> {
+    let access =
+        vellum_proxy_runtime::chatgpt_identity_from_jwt(&tokens.access_token).ok_or_else(|| {
+            "OfficialAccountTokenProtocol: access token has no credential identity".to_string()
         })?;
-        if id != access {
+    if let Some(id_token) = tokens.id_token.as_deref() {
+        let id = vellum_proxy_runtime::chatgpt_identity_from_jwt(id_token).ok_or_else(|| {
+            "OfficialAccountAuthenticationFailed: id token has no credential identity".to_string()
+        })?;
+        if id.workspace_id != access.workspace_id
+            || !vellum_proxy_runtime::same_chatgpt_principal(&id, &access)
+        {
             return Err(
                 "OfficialAccountAuthenticationFailed: token account identities differ".into(),
             );
@@ -580,6 +600,42 @@ mod tests {
         format!("header.{payload}.signature")
     }
 
+    fn jwt_for_identity(user_id: &str, account_id: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": user_id,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_user_id": user_id
+                }
+            })
+            .to_string(),
+        );
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn execution_login_separates_two_users_in_one_workspace() {
+        let tokens = |user: &str| TokenResponse {
+            access_token: jwt_for_identity(user, "workspace-crypto"),
+            refresh_token: Some(format!("refresh-{user}")),
+            id_token: Some(jwt_for_identity(user, "workspace-crypto")),
+            expires_in: Some(3_600),
+        };
+        let jp = extract_account_identity(&tokens("user-jp")).unwrap();
+        let crypto = extract_account_identity(&tokens("user-crypto")).unwrap();
+        assert_eq!(jp.workspace_id, crypto.workspace_id);
+        assert_ne!(jp.credential_id, crypto.credential_id);
+        let mismatched = FileOfficialGrant {
+            credential_id: Some(jp.credential_id),
+            account_id: crypto.workspace_id,
+            access_token: tokens("user-crypto").access_token,
+            refresh_token: "refresh".into(),
+            expires_at_ms: 1,
+        };
+        assert!(!grant_token_identity_matches(&mismatched));
+    }
+
     #[test]
     fn select_and_remove_never_expose_raw_account_or_token() {
         let temp = tempfile::tempdir().unwrap();
@@ -590,6 +646,7 @@ mod tests {
         write_grant_atomic(
             &grant_path(&paths, &hash),
             &FileOfficialGrant {
+                credential_id: None,
                 account_id: account_id.into(),
                 access_token: jwt_for_account(account_id),
                 refresh_token: "fixture".into(),
@@ -641,6 +698,7 @@ mod tests {
         write_grant_atomic(
             &grant_path(&paths, &hash),
             &FileOfficialGrant {
+                credential_id: None,
                 account_id: account_id.into(),
                 access_token: jwt_for_account(account_id),
                 refresh_token: "refresh".into(),

@@ -152,6 +152,9 @@ export type EffortProbeStatus =
 
 export interface CodexOAuthAccount {
   accountId: string;
+  workspaceId?: string;
+  workspaceName?: string | null;
+  planType?: string | null;
   email: string | null;
   authenticatedAt: number;
   isDefault: boolean;
@@ -1286,6 +1289,7 @@ export interface RemoteChatGptAccountLogin {
 export interface RemoteChatGptAccountPairing {
   accountId: string;
   email: string | null;
+  workspaceName?: string | null;
   isDesktopDefault: boolean;
   paired: boolean;
   active: boolean;

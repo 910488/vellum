@@ -1690,7 +1690,7 @@ async fn official_oauth_preflight(
         }
         Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
             let refreshed = manager
-                .refresh_after_rejection(&auth.account_id, &auth.access_token)
+                .refresh_after_rejection(&auth.credential_id, &auth.access_token)
                 .await
                 .map_err(|error| {
                     format!("OpenAI OAuth was rejected and refresh failed: {error}")

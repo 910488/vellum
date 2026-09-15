@@ -2755,6 +2755,7 @@ mod tests {
             crate::official_auth::write_grant_atomic(
                 &path,
                 &crate::official_auth::FileOfficialGrant {
+                    credential_id: None,
                     account_id: account_id.into(),
                     access_token: jwt_for(account_id),
                     refresh_token: format!("refresh-{account_id}"),

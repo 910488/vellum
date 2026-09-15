@@ -57,7 +57,14 @@ export function buildOnboardingConnections(
   const grokRouteAvailable = routes.some((route) => route.providerKind === "grokCli");
   return {
     chatgpt: {
-      accounts: oauth?.accounts.map((account) => account.email ?? account.accountId) ?? [],
+      accounts:
+        oauth?.accounts.map(
+          (account) =>
+            `${account.email ?? account.accountId} · ${
+              account.workspaceName ?? account.planType ??
+              `Workspace ${(account.workspaceId ?? account.accountId).slice(0, 8)}`
+            }`,
+        ) ?? [],
       pending: null,
     },
     grok: {

@@ -92,6 +92,10 @@ pub trait OfficialAuthProvider: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileOfficialGrant {
+    /// Stable user+workspace selector. Legacy grants omit this and remain
+    /// keyed by their workspace id until paired again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
     pub account_id: String,
     pub access_token: String,
     pub refresh_token: String,
@@ -196,7 +200,7 @@ impl FileManagedOfficialAuthProvider {
         .map_err(|error| format!("invalid Official execution credential: {error}"))?;
         if credential_id == SELECTED_OFFICIAL_CREDENTIAL_ID {
             let selected = read_selected_state(&self.root.join("selected.json"))?;
-            let expected = hash_account_id(&grant.account_id);
+            let expected = hash_account_id(grant_identity_id(&grant));
             if expected != selected.account_id_hash {
                 return Err("Official selected account and grant identity differ".into());
             }
@@ -205,6 +209,17 @@ impl FileManagedOfficialAuthProvider {
             return Err(
                 "Official grant access-token identity is missing or differs from grant".into(),
             );
+        }
+        if let Some(expected) = grant.credential_id.as_deref() {
+            if crate::chatgpt_identity_from_jwt(&grant.access_token)
+                .as_ref()
+                .map(|identity| identity.credential_id.as_str())
+                != Some(expected)
+            {
+                return Err(
+                    "Official grant access-token credential identity differs from grant".into(),
+                );
+            }
         }
         Ok((path, grant))
     }
@@ -267,7 +282,7 @@ impl FileManagedOfficialAuthProvider {
             .json()
             .await
             .map_err(|error| format!("invalid Official refresh response: {error}"))?;
-        validate_refresh_identity(&current.account_id, &refreshed)?;
+        validate_refresh_identity(&current, &refreshed)?;
         current.access_token = refreshed.access_token;
         if let Some(rotated) = refreshed.refresh_token {
             current.refresh_token = rotated;
@@ -369,17 +384,32 @@ fn hash_account_id(account_id: &str) -> String {
         .collect()
 }
 
+fn grant_identity_id(grant: &FileOfficialGrant) -> &str {
+    grant.credential_id.as_deref().unwrap_or(&grant.account_id)
+}
+
 fn validate_refresh_identity(
-    expected_account_id: &str,
+    expected: &FileOfficialGrant,
     refreshed: &RefreshResponse,
 ) -> Result<(), String> {
     let access_account = parse_jwt_account_id(&refreshed.access_token).ok_or_else(|| {
         "Official refresh response has no verifiable access-token account identity".to_string()
     })?;
-    if access_account != expected_account_id {
+    if access_account != expected.account_id {
         return Err(
             "Official refresh response account identity differs from selected grant".into(),
         );
+    }
+    if let Some(expected_credential) = expected.credential_id.as_deref() {
+        let access_credential = crate::chatgpt_identity_from_jwt(&refreshed.access_token)
+            .ok_or_else(|| {
+                "Official refresh response has no verifiable credential identity".to_string()
+            })?;
+        if access_credential.credential_id != expected_credential {
+            return Err(
+                "Official refresh response credential identity differs from selected grant".into(),
+            );
+        }
     }
     if let Some(id_token) = refreshed.id_token.as_deref() {
         let id_account = parse_jwt_account_id(id_token).ok_or_else(|| {
@@ -698,6 +728,7 @@ mod tests {
         write_grant_atomic(
             &grant_path,
             &FileOfficialGrant {
+                credential_id: None,
                 account_id: "acct-execution-b".into(),
                 access_token: jwt_for_account("acct-execution-b"),
                 refresh_token: "refresh-b".into(),
@@ -787,6 +818,7 @@ mod tests {
         write_grant_atomic(
             &path,
             &FileOfficialGrant {
+                credential_id: None,
                 account_id: "acct-b".into(),
                 access_token: jwt_for_account("acct-b"),
                 refresh_token: "old-refresh".into(),
@@ -846,6 +878,7 @@ mod tests {
         write_grant_atomic(
             &temp.path().join("grants").join(format!("{hash}.json")),
             &FileOfficialGrant {
+                credential_id: None,
                 account_id: "acct-b".into(),
                 access_token: jwt_for_account("acct-b"),
                 refresh_token: "refresh-b".into(),
@@ -888,6 +921,7 @@ mod tests {
         write_grant_atomic(
             &temp.path().join("grants").join(format!("{hash}.json")),
             &FileOfficialGrant {
+                credential_id: None,
                 account_id: "acct-c".into(),
                 access_token: jwt_for_account("acct-c"),
                 refresh_token: "fixture".into(),

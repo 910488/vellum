@@ -483,7 +483,7 @@ describe("Remote Manager operations UI", () => {
    */
   it("walks every unpaired desktop account and lands on the desktop default", async () => {
     apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([
-      { accountId: "acct-a", email: "a@example.com", isDesktopDefault: true, paired: true, active: true, detail: null },
+      { accountId: "acct-a", email: "a@example.com", workspaceName: "Personal", isDesktopDefault: true, paired: true, active: true, detail: null },
       { accountId: "acct-b", email: "b@example.com", isDesktopDefault: false, paired: false, active: false, detail: null },
       { accountId: "acct-c", email: "c@example.com", isDesktopDefault: false, paired: false, active: false, detail: null },
     ]);

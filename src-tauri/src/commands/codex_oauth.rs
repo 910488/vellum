@@ -372,7 +372,7 @@ pub async fn get_codex_oauth_account_quota(
     match crate::codex_quota::query(
         &auth.access_token,
         &auth.account_id,
-        &auth.account_id,
+        &auth.credential_id,
         force_refresh.unwrap_or(false),
     )
     .await
@@ -380,13 +380,13 @@ pub async fn get_codex_oauth_account_quota(
         Ok(windows) => Ok(windows),
         Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
             let refreshed = manager
-                .refresh_after_rejection(&auth.account_id, &auth.access_token)
+                .refresh_after_rejection(&auth.credential_id, &auth.access_token)
                 .await
                 .map_err(app_error)?;
             crate::codex_quota::query(
                 &refreshed.access_token,
                 &refreshed.account_id,
-                &refreshed.account_id,
+                &refreshed.credential_id,
                 true,
             )
             .await

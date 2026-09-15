@@ -1034,6 +1034,9 @@ export function Remote({
                     <div className={`accounts__row${row.active ? " accounts__row--active" : ""}`} key={row.accountId}>
                       <span className="accounts__who">
                         <b>{row.email ?? row.accountId}</b>
+                        {row.workspaceName ? (
+                          <small className="rows__hint">{row.workspaceName}</small>
+                        ) : null}
                         {/* 桌面端預設刻意不做成 pill —— 它不是狀態，是「Vellum
                             UI 切帳號時會推的是這一個」。跟狀態長得一樣就會被
                             當成第二種狀態讀。 */}
