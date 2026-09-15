@@ -1,8 +1,6 @@
-name: Nightly and manual bundled releases
+name: Manual bundled releases
 
 on:
-  schedule:
-    - cron: "17 18 * * *"
   workflow_dispatch:
     inputs:
       channel:
