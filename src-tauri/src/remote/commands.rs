@@ -404,7 +404,7 @@ fn requested_account_id(
             .codex_oauth()
             .peek_accounts()
             .iter()
-            .any(|(id, _)| *id == requested)
+            .any(|(id, _, _)| *id == requested)
             && super::desktop_control_account_id(state.inner()).as_deref()
                 != Some(requested.as_str())
         {
@@ -443,15 +443,15 @@ pub fn list_remote_codex_account_pairings(
     let mut accounts = state.codex_oauth().peek_accounts();
     let default_account_id = super::desktop_control_account_id(state.inner());
     if let Some(native) = default_account_id.as_ref() {
-        if !accounts.iter().any(|(account, _)| account == native) {
-            accounts.push((native.clone(), None));
+        if !accounts.iter().any(|(account, _, _)| account == native) {
+            accounts.push((native.clone(), None, None));
         }
     }
     accounts.sort_by(|left, right| left.0.cmp(&right.0));
     let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
     let client = crate::remote::RemoteAgentClient::new(target);
     let mut rows = Vec::with_capacity(accounts.len());
-    for (account_id, email) in accounts {
+    for (account_id, email, workspace_name) in accounts {
         // One unreachable or unpairable account must not blank the whole
         // panel: report it on its own row and keep going.
         let status = client.codex_account_status(Some(&account_id));
@@ -466,6 +466,7 @@ pub fn list_remote_codex_account_pairings(
         rows.push(serde_json::json!({
             "accountId": account_id,
             "email": email,
+            "workspaceName": workspace_name,
             "isDesktopDefault": default_account_id.as_deref() == Some(account_id.as_str()),
             "paired": paired,
             "active": active,

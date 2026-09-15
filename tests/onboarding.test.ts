@@ -42,7 +42,14 @@ describe("onboarding wiring", () => {
       {
         authenticated: true,
         defaultAccountId: "openai-1",
-        accounts: [{ accountId: "openai-1", email: "openai@example.test", authenticatedAt: 1, isDefault: true }],
+        accounts: [{
+          accountId: "openai-1",
+          workspaceId: "workspace-personal",
+          workspaceName: "Personal",
+          email: "openai@example.test",
+          authenticatedAt: 1,
+          isDefault: true,
+        }],
       },
       {
         authenticated: true,
@@ -57,7 +64,7 @@ describe("onboarding wiring", () => {
       },
       "Grok CLI unavailable",
     );
-    expect(connections.chatgpt.accounts).toEqual(["openai@example.test"]);
+    expect(connections.chatgpt.accounts).toEqual(["openai@example.test · Personal"]);
     expect(connections.grok.accounts).toEqual(["grok@example.test"]);
     expect(connections.grok.unavailable).toBeNull();
     expect(connections.custom.accounts).toEqual(["Self-hosted vLLM"]);

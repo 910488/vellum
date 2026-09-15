@@ -291,10 +291,17 @@ fn read_account_id(path: &Path) -> Result<Option<String>, String> {
     let value: Value = serde_json::from_slice(&raw)
         .map_err(|error| format!("invalid Codex auth.json: {error}"))?;
     Ok(value
-        .pointer("/tokens/account_id")
-        .or_else(|| value.pointer("/tokens/accountId"))
+        .pointer("/tokens/access_token")
         .and_then(Value::as_str)
-        .map(str::to_owned))
+        .and_then(vellum_proxy_runtime::chatgpt_identity_from_jwt)
+        .map(|identity| identity.credential_id)
+        .or_else(|| {
+            value
+                .pointer("/tokens/account_id")
+                .or_else(|| value.pointer("/tokens/accountId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }))
 }
 
 fn capture_original(
@@ -476,6 +483,7 @@ fn restore_optional(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use tempfile::tempdir;
 
     fn auth(account: &str, secret: &str) -> Vec<u8> {
@@ -483,6 +491,39 @@ mod tests {
             "tokens": {"account_id": account, "refresh_token": secret}
         }))
         .unwrap()
+    }
+
+    fn real_auth(user: &str, workspace: &str, secret: &str) -> Vec<u8> {
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": user,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": workspace,
+                    "chatgpt_user_id": user
+                }
+            })
+            .to_string(),
+        );
+        serde_json::to_vec(&serde_json::json!({
+            "tokens": {
+                "account_id": workspace,
+                "access_token": format!("header.{claims}.signature"),
+                "refresh_token": secret
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn two_users_in_one_workspace_have_distinct_remote_slots() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first.json");
+        let second = temp.path().join("second.json");
+        fs::write(&first, real_auth("user-jp", "workspace-crypto", "one")).unwrap();
+        fs::write(&second, real_auth("user-crypto", "workspace-crypto", "two")).unwrap();
+        let first = read_account_id(&first).unwrap().unwrap();
+        let second = read_account_id(&second).unwrap().unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]

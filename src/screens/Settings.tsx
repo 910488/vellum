@@ -876,7 +876,10 @@ export function Settings({
                       <option value="">{t("settings.page.review.billingFollowsDefault")}</option>
                       {(oauth?.accounts ?? []).map((account) => (
                         <option key={account.accountId} value={account.accountId}>
-                          {account.email ?? account.accountId}
+                          {`${account.email ?? account.accountId} · ${
+                            account.workspaceName ?? account.planType ??
+                            `Workspace ${(account.workspaceId ?? account.accountId).slice(0, 8)}`
+                          }`}
                         </option>
                       ))}
                     </select>

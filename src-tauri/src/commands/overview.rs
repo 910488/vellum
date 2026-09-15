@@ -391,7 +391,7 @@ async fn query_managed_profile(
         Ok(profile) => Ok(profile),
         Err(crate::codex_profile::CodexProfileError::Unauthorized) => {
             let refreshed = manager
-                .refresh_after_rejection(&auth.account_id, &auth.access_token)
+                .refresh_after_rejection(&auth.credential_id, &auth.access_token)
                 .await
                 .map_err(|error| error.to_string())?;
             crate::codex_profile::query(&refreshed.access_token, &refreshed.account_id, true)
@@ -944,7 +944,7 @@ async fn openai_quota_windows(
         Ok(windows) => (windows, None),
         Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
             let refreshed = match manager
-                .refresh_after_rejection(&auth.account_id, &auth.access_token)
+                .refresh_after_rejection(&auth.credential_id, &auth.access_token)
                 .await
             {
                 Ok(refreshed) => refreshed,

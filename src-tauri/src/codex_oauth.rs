@@ -44,7 +44,12 @@ pub enum OAuthError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexOAuthAccount {
+    /// Stable Vellum credential selector. This is intentionally not the
+    /// ChatGPT workspace id: two users may hold seats in one workspace.
     pub account_id: String,
+    pub workspace_id: String,
+    pub workspace_name: Option<String>,
+    pub plan_type: Option<String>,
     pub email: Option<String>,
     pub authenticated_at: i64,
     pub is_default: bool,
@@ -76,6 +81,9 @@ pub struct DeviceLogin {
 
 #[derive(Debug, Clone)]
 pub struct AppliedOAuth {
+    /// Stable selector used to find and refresh this exact credential.
+    pub credential_id: String,
+    /// ChatGPT workspace/billing account sent in ChatGPT-Account-Id.
     pub account_id: String,
     pub access_token: String,
     pub selection_revision: u64,
@@ -84,7 +92,16 @@ pub struct AppliedOAuth {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountMetadata {
+    /// Stable credential selector (user principal + workspace).
     account_id: String,
+    /// ChatGPT workspace/billing account. Legacy version-1 rows omit this and
+    /// use `account_id` for both meanings until that login is added again.
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    workspace_name: Option<String>,
+    #[serde(default)]
+    plan_type: Option<String>,
     email: Option<String>,
     authenticated_at: i64,
 }
@@ -147,30 +164,6 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct TokenClaims {
-    #[serde(default)]
-    chatgpt_account_id: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default, rename = "https://api.openai.com/auth")]
-    openai_auth: Option<OpenAiAuthClaim>,
-    #[serde(default)]
-    organizations: Vec<OrganizationClaim>,
-    #[serde(default)]
-    exp: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct OpenAiAuthClaim {
-    chatgpt_account_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct OrganizationClaim {
-    id: Option<String>,
-}
-
 pub struct CodexOAuthManager {
     root: PathBuf,
     client: reqwest::Client,
@@ -223,38 +216,27 @@ impl CodexOAuthManager {
             .and_then(serde_json::Value::as_str)
             .filter(|token| !token.trim().is_empty())
             .ok_or_else(|| OAuthError::Parse("native Codex auth has no access token".into()))?;
-        let claims = parse_claims(access_token)
+        let identity = vellum_proxy_runtime::chatgpt_identity_from_jwt(access_token)
             .ok_or_else(|| OAuthError::Parse("native Codex access token is not a JWT".into()))?;
-        let account_id = claims
-            .chatgpt_account_id
-            .clone()
-            .or_else(|| {
-                claims
-                    .openai_auth
-                    .as_ref()
-                    .and_then(|auth| auth.chatgpt_account_id.clone())
-            })
-            .or_else(|| claims.organizations.first().and_then(|org| org.id.clone()))
-            .ok_or_else(|| {
-                OAuthError::Parse("native Codex token has no ChatGPT account id".into())
-            })?;
-        let expires_at_ms = claims
-            .exp
+        let expires_at_ms = jwt_exp(access_token)
             .map(|seconds| seconds.saturating_mul(1_000))
             .ok_or_else(|| OAuthError::Parse("native Codex token has no expiry".into()))?;
         let metadata = AccountMetadata {
-            account_id: account_id.clone(),
-            email: claims.email,
+            account_id: identity.credential_id.clone(),
+            chatgpt_account_id: Some(identity.workspace_id.clone()),
+            workspace_name: identity.workspace_name,
+            plan_type: identity.plan_type,
+            email: identity.email,
             authenticated_at: chrono::Utc::now().timestamp(),
         };
         let mut accounts = HashMap::new();
-        accounts.insert(account_id.clone(), metadata);
+        accounts.insert(identity.credential_id.clone(), metadata);
         let manager = Self::from_store(
             root,
             AccountStore {
-                version: 1,
+                version: 2,
                 accounts,
-                default_account_id: Some(account_id.clone()),
+                default_account_id: Some(identity.credential_id.clone()),
                 selection_revision: 0,
                 selected_at: Some(chrono::Utc::now().timestamp_millis()),
                 selection_verified: true,
@@ -265,7 +247,7 @@ impl CodexOAuthManager {
             .try_write()
             .expect("new OAuth manager lock is uncontended")
             .insert(
-                account_id,
+                identity.credential_id,
                 CachedToken {
                     access_token: access_token.into(),
                     expires_at_ms,
@@ -308,13 +290,19 @@ impl CodexOAuthManager {
     /// account id so a pairing inventory presents the same rows in the same
     /// places on every refresh. An empty result means the lock was held, not
     /// that there are no accounts, so callers must not read it as "signed out".
-    pub fn peek_accounts(&self) -> Vec<(String, Option<String>)> {
+    pub fn peek_accounts(&self) -> Vec<(String, Option<String>, Option<String>)> {
         let Ok(accounts) = self.accounts.try_read() else {
             return Vec::new();
         };
-        let mut listed: Vec<(String, Option<String>)> = accounts
+        let mut listed: Vec<(String, Option<String>, Option<String>)> = accounts
             .values()
-            .map(|account| (account.account_id.clone(), account.email.clone()))
+            .map(|account| {
+                (
+                    account.account_id.clone(),
+                    account.email.clone(),
+                    account.workspace_name.clone(),
+                )
+            })
             .collect();
         listed.sort_by(|left, right| left.0.cmp(&right.0));
         listed
@@ -399,7 +387,9 @@ impl CodexOAuthManager {
         let tokens = self
             .exchange_code(&success.authorization_code, &success.code_verifier)
             .await?;
-        let (account_id, email) = extract_login_identity(&tokens)?;
+        let identity = extract_login_identity(&tokens)?;
+        let account_id = identity.credential_id.clone();
+        let email = identity.email.clone();
         let refresh_token = tokens
             .refresh_token
             .as_deref()
@@ -407,11 +397,36 @@ impl CodexOAuthManager {
         crate::credentials::save(&self.root, &credential_key(&account_id), refresh_token)
             .map_err(|error| OAuthError::Storage(error.to_string()))?;
 
+        // Version-1 used the workspace id as the credential selector. Once
+        // this exact user signs in again, replace only their matching legacy
+        // row; a legacy row for another user in the same workspace must stay
+        // intact until that user authenticates too.
+        let legacy_account_id = {
+            let accounts = self.accounts.read().await;
+            matching_legacy_account(&accounts, &identity.workspace_id, email.as_deref())
+        };
+        if let Some(legacy_account_id) = legacy_account_id.as_ref() {
+            crate::credentials::remove(&self.root, &credential_key(legacy_account_id))
+                .map_err(|error| OAuthError::Storage(error.to_string()))?;
+            self.accounts.write().await.remove(legacy_account_id);
+            self.access_tokens.write().await.remove(legacy_account_id);
+            let mut default = self.default_account_id.write().await;
+            if default.as_deref() == Some(legacy_account_id.as_str()) {
+                *default = Some(account_id.clone());
+                *self.selection_revision.write().await += 1;
+                *self.selected_at.write().await = Some(chrono::Utc::now().timestamp_millis());
+                *self.selection_verified.write().await = true;
+            }
+        }
+
         let authenticated_at = chrono::Utc::now().timestamp();
         self.accounts.write().await.insert(
             account_id.clone(),
             AccountMetadata {
                 account_id: account_id.clone(),
+                chatgpt_account_id: Some(identity.workspace_id.clone()),
+                workspace_name: identity.workspace_name.clone(),
+                plan_type: identity.plan_type.clone(),
                 email: email.clone(),
                 authenticated_at,
             },
@@ -434,6 +449,9 @@ impl CodexOAuthManager {
         let default = self.resolve_default().await;
         Ok(Some(CodexOAuthAccount {
             account_id: account_id.clone(),
+            workspace_id: identity.workspace_id,
+            workspace_name: identity.workspace_name,
+            plan_type: identity.plan_type,
             email,
             authenticated_at,
             is_default: default.as_deref() == Some(&account_id),
@@ -447,6 +465,12 @@ impl CodexOAuthManager {
             .into_values()
             .map(|account| CodexOAuthAccount {
                 is_default: default.as_deref() == Some(&account.account_id),
+                workspace_id: account
+                    .chatgpt_account_id
+                    .clone()
+                    .unwrap_or_else(|| account.account_id.clone()),
+                workspace_name: account.workspace_name,
+                plan_type: account.plan_type,
                 account_id: account.account_id,
                 email: account.email,
                 authenticated_at: account.authenticated_at,
@@ -540,12 +564,14 @@ impl CodexOAuthManager {
         let revision = *self.selection_revision.read().await;
         let verified = *self.selection_verified.read().await;
         let access_token = self.valid_token_for(&account_id).await?;
+        let workspace_id = self.workspace_id_for(&account_id).await?;
         if !verified {
             *self.selection_verified.write().await = true;
             self.persist().await?;
         }
         Ok(Some(AppliedOAuth {
-            account_id,
+            credential_id: account_id,
+            account_id: workspace_id,
             access_token,
             selection_revision: revision,
             selection_verified: true,
@@ -560,8 +586,10 @@ impl CodexOAuthManager {
             return Err(OAuthError::AccountNotFound(account_id.into()));
         }
         let access_token = self.valid_token_for(account_id).await?;
+        let workspace_id = self.workspace_id_for(account_id).await?;
         Ok(AppliedOAuth {
-            account_id: account_id.into(),
+            credential_id: account_id.into(),
+            account_id: workspace_id,
             access_token,
             selection_revision: *self.selection_revision.read().await,
             selection_verified: *self.selection_verified.read().await,
@@ -573,21 +601,29 @@ impl CodexOAuthManager {
         account_id: &str,
         rejected_token: &str,
     ) -> Result<AppliedOAuth, OAuthError> {
-        let lock = self.refresh_lock(account_id).await;
+        // Runtime callbacks carry the upstream workspace id, which is not a
+        // unique credential selector. Resolve it by the rejected access token
+        // when the direct selector lookup misses.
+        let account_id = self
+            .resolve_credential_selector(account_id, rejected_token)
+            .await?;
+        let lock = self.refresh_lock(&account_id).await;
         let _guard = lock.lock().await;
-        if let Some(cached) = self.access_tokens.read().await.get(account_id) {
+        if let Some(cached) = self.access_tokens.read().await.get(&account_id) {
             if cached.access_token != rejected_token && !cached.expiring_soon() {
                 return Ok(AppliedOAuth {
-                    account_id: account_id.into(),
+                    credential_id: account_id.clone(),
+                    account_id: self.workspace_id_for(&account_id).await?,
                     access_token: cached.access_token.clone(),
                     selection_revision: *self.selection_revision.read().await,
                     selection_verified: *self.selection_verified.read().await,
                 });
             }
         }
-        let access_token = self.refresh_locked(account_id).await?;
+        let access_token = self.refresh_locked(&account_id).await?;
         Ok(AppliedOAuth {
-            account_id: account_id.into(),
+            credential_id: account_id.clone(),
+            account_id: self.workspace_id_for(&account_id).await?,
             access_token,
             selection_revision: *self.selection_revision.read().await,
             selection_verified: *self.selection_verified.read().await,
@@ -602,8 +638,10 @@ impl CodexOAuthManager {
         let lock = self.refresh_lock(&account_id).await;
         let _guard = lock.lock().await;
         let access_token = self.refresh_locked(&account_id).await?;
+        let workspace_id = self.workspace_id_for(&account_id).await?;
         Ok(AppliedOAuth {
-            account_id,
+            credential_id: account_id,
+            account_id: workspace_id,
             access_token,
             selection_revision: *self.selection_revision.read().await,
             selection_verified: *self.selection_verified.read().await,
@@ -624,6 +662,47 @@ impl CodexOAuthManager {
             }
         }
         self.refresh_locked(account_id).await
+    }
+
+    async fn workspace_id_for(&self, account_id: &str) -> Result<String, OAuthError> {
+        self.accounts
+            .read()
+            .await
+            .get(account_id)
+            .map(|account| {
+                account
+                    .chatgpt_account_id
+                    .clone()
+                    .unwrap_or_else(|| account.account_id.clone())
+            })
+            .ok_or_else(|| OAuthError::AccountNotFound(account_id.into()))
+    }
+
+    async fn resolve_credential_selector(
+        &self,
+        account_or_workspace_id: &str,
+        rejected_token: &str,
+    ) -> Result<String, OAuthError> {
+        if self
+            .accounts
+            .read()
+            .await
+            .contains_key(account_or_workspace_id)
+        {
+            return Ok(account_or_workspace_id.to_string());
+        }
+        let tokens = self.access_tokens.read().await;
+        let accounts = self.accounts.read().await;
+        accounts
+            .iter()
+            .find(|(credential_id, account)| {
+                account.chatgpt_account_id.as_deref() == Some(account_or_workspace_id)
+                    && tokens
+                        .get(*credential_id)
+                        .is_some_and(|cached| cached.access_token == rejected_token)
+            })
+            .map(|(credential_id, _)| credential_id.clone())
+            .ok_or_else(|| OAuthError::AccountNotFound(account_or_workspace_id.into()))
     }
 
     async fn refresh_locked(&self, account_id: &str) -> Result<String, OAuthError> {
@@ -665,23 +744,39 @@ impl CodexOAuthManager {
             .json()
             .await
             .map_err(|error| OAuthError::Parse(error.to_string()))?;
-        validate_token_identity(account_id, &tokens)?;
-        let (_, refreshed_email) = extract_login_identity(&tokens)?;
-        if let Some(email) = refreshed_email {
-            let changed = {
-                let mut accounts = self.accounts.write().await;
-                accounts.get_mut(account_id).is_some_and(|account| {
-                    if account.email.as_deref() == Some(email.as_str()) {
-                        false
-                    } else {
-                        account.email = Some(email.clone());
-                        true
-                    }
-                })
-            };
-            if changed {
-                self.persist().await?;
-            }
+        let expected = self
+            .accounts
+            .read()
+            .await
+            .get(account_id)
+            .cloned()
+            .ok_or_else(|| OAuthError::AccountNotFound(account_id.into()))?;
+        let refreshed_identity = validate_token_identity(&expected, &tokens)?;
+        let changed = {
+            let mut accounts = self.accounts.write().await;
+            accounts.get_mut(account_id).is_some_and(|account| {
+                let mut changed = false;
+                if refreshed_identity.email.is_some() && account.email != refreshed_identity.email {
+                    account.email = refreshed_identity.email.clone();
+                    changed = true;
+                }
+                if account.chatgpt_account_id.is_none() {
+                    account.chatgpt_account_id = Some(refreshed_identity.workspace_id.clone());
+                    changed = true;
+                }
+                if account.workspace_name != refreshed_identity.workspace_name {
+                    account.workspace_name = refreshed_identity.workspace_name.clone();
+                    changed = true;
+                }
+                if account.plan_type != refreshed_identity.plan_type {
+                    account.plan_type = refreshed_identity.plan_type.clone();
+                    changed = true;
+                }
+                changed
+            })
+        };
+        if changed {
+            self.persist().await?;
         }
         if let Some(rotated) = tokens.refresh_token.as_deref() {
             crate::credentials::save(&self.root, &credential_key(account_id), rotated)
@@ -750,7 +845,7 @@ impl CodexOAuthManager {
         let accounts = self.accounts.read().await.clone();
         let default_account_id = self.resolve_default().await;
         let store = AccountStore {
-            version: 1,
+            version: 2,
             accounts,
             default_account_id,
             selection_revision: *self.selection_revision.read().await,
@@ -767,16 +862,17 @@ impl CodexOAuthManager {
 pub(crate) fn native_codex_account_id(auth_path: &Path) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(auth_path).ok()?).ok()?;
     value
-        .pointer("/tokens/account_id")
-        .or_else(|| value.pointer("/tokens/accountId"))
+        .pointer("/tokens/access_token")
         .and_then(serde_json::Value::as_str)
-        .filter(|account| !account.trim().is_empty())
-        .map(str::to_owned)
+        .and_then(vellum_proxy_runtime::chatgpt_identity_from_jwt)
+        .map(|identity| identity.credential_id)
         .or_else(|| {
-            let token = value
-                .pointer("/tokens/access_token")
-                .and_then(serde_json::Value::as_str)?;
-            parse_claims(token).and_then(|claims| claim_identity(&claims))
+            value
+                .pointer("/tokens/account_id")
+                .or_else(|| value.pointer("/tokens/accountId"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|account| !account.trim().is_empty())
+                .map(str::to_owned)
         })
 }
 
@@ -861,6 +957,26 @@ fn replace_file_atomically(tmp: &Path, path: &Path) -> Result<(), OAuthError> {
     }
 }
 
+fn matching_legacy_account(
+    accounts: &HashMap<String, AccountMetadata>,
+    workspace_id: &str,
+    email: Option<&str>,
+) -> Option<String> {
+    let email = email?.trim();
+    if email.is_empty() {
+        return None;
+    }
+    accounts.values().find_map(|account| {
+        (account.chatgpt_account_id.is_none()
+            && account.account_id == workspace_id
+            && account
+                .email
+                .as_deref()
+                .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(email)))
+        .then(|| account.account_id.clone())
+    })
+}
+
 fn credential_key(account_id: &str) -> String {
     let digest = Sha256::digest(account_id.as_bytes());
     let suffix = digest[..12]
@@ -883,73 +999,75 @@ fn expires_at(expires_in: Option<i64>) -> i64 {
     chrono::Utc::now().timestamp_millis() + expires_in.unwrap_or(3_600).max(1) * 1_000
 }
 
-fn parse_claims(token: &str) -> Option<TokenClaims> {
+fn jwt_exp(token: &str) -> Option<i64> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 #[cfg(test)]
 fn extract_identity(tokens: &TokenResponse) -> (Option<String>, Option<String>) {
     extract_login_identity(tokens)
         .ok()
-        .map_or((None, None), |(account, email)| (Some(account), email))
-}
-
-fn claim_identity(claims: &TokenClaims) -> Option<String> {
-    claims
-        .chatgpt_account_id
-        .clone()
-        .or_else(|| {
-            claims
-                .openai_auth
-                .as_ref()
-                .and_then(|auth| auth.chatgpt_account_id.clone())
+        .map_or((None, None), |identity| {
+            (Some(identity.workspace_id), identity.email)
         })
-        .or_else(|| claims.organizations.first().and_then(|org| org.id.clone()))
 }
 
-fn extract_login_identity(tokens: &TokenResponse) -> Result<(String, Option<String>), OAuthError> {
-    let access_claims = parse_claims(&tokens.access_token).ok_or_else(|| {
-        OAuthError::AuthenticationFailed("access token has no verifiable JWT claims".into())
-    })?;
-    let access_account = claim_identity(&access_claims).ok_or_else(|| {
-        OAuthError::AuthenticationFailed("access token has no ChatGPT account id".into())
-    })?;
-    let id_claims = tokens
+fn extract_login_identity(
+    tokens: &TokenResponse,
+) -> Result<vellum_proxy_runtime::ChatGptIdentity, OAuthError> {
+    let access_identity = vellum_proxy_runtime::chatgpt_identity_from_jwt(&tokens.access_token)
+        .ok_or_else(|| {
+            OAuthError::AuthenticationFailed("access token has no verifiable JWT claims".into())
+        })?;
+    let id_identity = tokens
         .id_token
         .as_deref()
         .map(|token| {
-            parse_claims(token).ok_or_else(|| {
+            vellum_proxy_runtime::chatgpt_identity_from_jwt(token).ok_or_else(|| {
                 OAuthError::AuthenticationFailed("id token has no verifiable JWT claims".into())
             })
         })
         .transpose()?;
-    if let Some(id_account) = id_claims.as_ref().and_then(claim_identity) {
-        if id_account != access_account {
+    if let Some(id_identity) = id_identity.as_ref() {
+        if id_identity.workspace_id != access_identity.workspace_id
+            || !vellum_proxy_runtime::same_chatgpt_principal(id_identity, &access_identity)
+        {
             return Err(OAuthError::AuthenticationFailed(
                 "id token and access token account identities differ".into(),
             ));
         }
     }
-    let email = access_claims
-        .email
-        .clone()
-        .or_else(|| id_claims.and_then(|claims| claims.email));
-    Ok((access_account, email))
+    let mut identity = access_identity;
+    if let Some(id_identity) = id_identity {
+        identity.email = identity.email.or(id_identity.email);
+        identity.workspace_name = identity.workspace_name.or(id_identity.workspace_name);
+        identity.plan_type = identity.plan_type.or(id_identity.plan_type);
+    }
+    Ok(identity)
 }
 
 fn validate_token_identity(
-    expected_account_id: &str,
+    expected: &AccountMetadata,
     tokens: &TokenResponse,
-) -> Result<(), OAuthError> {
-    let (actual, _) = extract_login_identity(tokens)?;
-    if actual != expected_account_id {
-        return Err(OAuthError::AuthenticationFailed(format!(
-            "token account identity `{actual}` does not match expected account"
-        )));
+) -> Result<vellum_proxy_runtime::ChatGptIdentity, OAuthError> {
+    let actual = extract_login_identity(tokens)?;
+    let expected_workspace = expected
+        .chatgpt_account_id
+        .as_deref()
+        .unwrap_or(&expected.account_id);
+    let credential_matches =
+        expected.chatgpt_account_id.is_none() || actual.credential_id == expected.account_id;
+    if actual.workspace_id != expected_workspace || !credential_matches {
+        return Err(OAuthError::AuthenticationFailed(
+            "token account identity does not match expected credential".to_string(),
+        ));
     }
-    Ok(())
+    Ok(actual)
 }
 
 fn request_error(error: reqwest::Error) -> OAuthError {
@@ -997,8 +1115,12 @@ mod tests {
     fn identity_supports_namespaced_claim() {
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::json!({
+                "sub": "user-1",
                 "email": "person@example.test",
-                "https://api.openai.com/auth": {"chatgpt_account_id": "acct-1"}
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-1",
+                    "chatgpt_user_id": "user-1"
+                }
             })
             .to_string(),
         );
@@ -1016,8 +1138,16 @@ mod tests {
     #[test]
     fn identity_rejects_conflicting_id_and_access_token_claims() {
         let claim = |account: &str| {
-            let payload = URL_SAFE_NO_PAD
-                .encode(serde_json::json!({"chatgpt_account_id": account}).to_string());
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "sub": "user-1",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": account,
+                        "chatgpt_user_id": "user-1"
+                    }
+                })
+                .to_string(),
+            );
             format!("header.{payload}.signature")
         };
         let error = extract_login_identity(&TokenResponse {
@@ -1037,11 +1167,21 @@ mod tests {
             format!("header.{payload}.signature")
         };
         let (account, email) = extract_identity(&TokenResponse {
-            access_token: claim(serde_json::json!({"chatgpt_account_id": "acct-1"})),
+            access_token: claim(serde_json::json!({
+                "sub": "user-1",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-1",
+                    "chatgpt_user_id": "user-1"
+                }
+            })),
             refresh_token: None,
             id_token: Some(claim(serde_json::json!({
-                "chatgpt_account_id": "acct-1",
-                "email": "person@example.test"
+                "sub": "user-1",
+                "email": "person@example.test",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-1",
+                    "chatgpt_user_id": "user-1"
+                }
             }))),
             expires_in: None,
         });
@@ -1050,12 +1190,83 @@ mod tests {
     }
 
     #[test]
+    fn login_identity_separates_users_sharing_one_workspace() {
+        let tokens = |user: &str, email: &str| {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "sub": user,
+                    "email": email,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "workspace-crypto",
+                        "chatgpt_user_id": user
+                    }
+                })
+                .to_string(),
+            );
+            TokenResponse {
+                access_token: format!("header.{payload}.signature"),
+                refresh_token: Some(format!("refresh-{user}")),
+                id_token: None,
+                expires_in: Some(3_600),
+            }
+        };
+        let jp = extract_login_identity(&tokens("user-jp", "jp@example.test")).unwrap();
+        let crypto = extract_login_identity(&tokens("user-crypto", "crypto@example.test")).unwrap();
+        assert_eq!(jp.workspace_id, crypto.workspace_id);
+        assert_ne!(jp.credential_id, crypto.credential_id);
+    }
+
+    #[test]
+    fn legacy_migration_only_replaces_the_same_user() {
+        let accounts = HashMap::from([(
+            "workspace-crypto".into(),
+            AccountMetadata {
+                account_id: "workspace-crypto".into(),
+                chatgpt_account_id: None,
+                workspace_name: None,
+                plan_type: None,
+                email: Some("crypto@example.test".into()),
+                authenticated_at: 1,
+            },
+        )]);
+        assert_eq!(
+            matching_legacy_account(&accounts, "workspace-crypto", Some("CRYPTO@example.test"))
+                .as_deref(),
+            Some("workspace-crypto")
+        );
+        assert_eq!(
+            matching_legacy_account(&accounts, "workspace-crypto", Some("jp@example.test")),
+            None
+        );
+        assert_eq!(
+            matching_legacy_account(&accounts, "workspace-crypto", None),
+            None
+        );
+    }
+
+    #[test]
     fn refresh_identity_must_match_expected_account() {
-        let payload = URL_SAFE_NO_PAD
-            .encode(serde_json::json!({"chatgpt_account_id": "acct-other"}).to_string());
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": "user-other",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-other",
+                    "chatgpt_user_id": "user-other"
+                }
+            })
+            .to_string(),
+        );
         let token = format!("header.{payload}.signature");
+        let expected = AccountMetadata {
+            account_id: "credential-expected".into(),
+            chatgpt_account_id: Some("acct-expected".into()),
+            workspace_name: None,
+            plan_type: None,
+            email: None,
+            authenticated_at: 1,
+        };
         let error = validate_token_identity(
-            "acct-expected",
+            &expected,
             &TokenResponse {
                 access_token: token,
                 refresh_token: None,
@@ -1076,6 +1287,9 @@ mod tests {
                 id.into(),
                 AccountMetadata {
                     account_id: id.into(),
+                    chatgpt_account_id: None,
+                    workspace_name: None,
+                    plan_type: None,
                     email: None,
                     authenticated_at: 1,
                 },
@@ -1112,6 +1326,9 @@ mod tests {
                 id.into(),
                 AccountMetadata {
                     account_id: id.into(),
+                    chatgpt_account_id: None,
+                    workspace_name: None,
+                    plan_type: None,
                     email: None,
                     authenticated_at: 1,
                 },
@@ -1146,6 +1363,9 @@ mod tests {
                 id.into(),
                 AccountMetadata {
                     account_id: id.into(),
+                    chatgpt_account_id: None,
+                    workspace_name: None,
+                    plan_type: None,
                     email: None,
                     authenticated_at: 1,
                 },
@@ -1189,6 +1409,9 @@ mod tests {
             account_id.into(),
             AccountMetadata {
                 account_id: account_id.into(),
+                chatgpt_account_id: None,
+                workspace_name: None,
+                plan_type: None,
                 email: Some("person@example.test".into()),
                 authenticated_at: 1,
             },

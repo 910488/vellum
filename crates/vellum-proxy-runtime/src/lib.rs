@@ -48,6 +48,7 @@ pub mod investigation_runtime;
 pub mod lifecycle;
 pub mod live_attribution;
 pub mod official_auth;
+pub mod official_identity;
 pub mod opencode;
 pub mod outbound;
 pub mod profile_adapter;
@@ -175,6 +176,9 @@ pub use official_auth::{
     write_grant_atomic, FileManagedOfficialAuthProvider, FileOfficialGrant,
     NativeCodexOfficialAuthProvider, OfficialAuthDecision, OfficialAuthProvider,
     OfficialAuthorization, UnconfiguredOfficialAuthProvider, SELECTED_OFFICIAL_CREDENTIAL_ID,
+};
+pub use official_identity::{
+    chatgpt_credential_id, chatgpt_identity_from_jwt, same_chatgpt_principal, ChatGptIdentity,
 };
 pub use opencode::{
     infer_provider_profile, is_opencode_endpoint, OPENCODE_GO_BASE_URL, OPENCODE_PUBLIC_TOKEN,
