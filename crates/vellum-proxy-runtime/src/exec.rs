@@ -7639,11 +7639,45 @@ fn record_chat_wire_diagnostics(
     chat_diagnostics: &mut Option<crate::replay::HarnessTranscriptDiagnostics>,
     upstream_status: Option<u16>,
 ) {
+    if let Some(diagnostics) = chat_diagnostics.as_mut() {
+        populate_chat_wire_component_sizes(encoded_body, diagnostics);
+    }
     if let Some(mut diagnostics) = chat_diagnostics.take() {
         diagnostics.upstream_status = upstream_status;
         diagnostics_sink.record(DiagnosticEvent::HarnessTranscript(diagnostics));
     }
     log_chat_wire_shape(route, encoded_body, upstream_status);
+}
+
+/// Break the request size down without retaining prompt text, tool names,
+/// schemas, arguments, or results. This makes platform/tool-surface inflation
+/// diagnosable from the persisted event instead of requiring a raw-body log.
+fn populate_chat_wire_component_sizes(
+    encoded_body: &[u8],
+    diagnostics: &mut crate::replay::HarnessTranscriptDiagnostics,
+) {
+    let Ok(body) = serde_json::from_slice::<Value>(encoded_body) else {
+        return;
+    };
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        diagnostics.message_bytes = serde_json::to_vec(messages)
+            .ok()
+            .map(|encoded| encoded.len() as u64);
+        diagnostics.system_message_bytes = Some(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .filter_map(|message| serde_json::to_vec(message).ok())
+                .map(|encoded| encoded.len() as u64)
+                .sum(),
+        );
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        diagnostics.tool_count = tools.len().min(u64::MAX as usize) as u64;
+        diagnostics.tool_bytes = serde_json::to_vec(tools)
+            .ok()
+            .map(|encoded| encoded.len() as u64);
+    }
 }
 
 /// Emit a content-free fingerprint for Chat dispatches. This is deliberately
@@ -10960,7 +10994,16 @@ mod tests {
             .execute(
                 request(json!({
                     "model": "vlm-test",
-                    "input": [{"role": "user", "content": "CHAT_SECRET_TEXT"}]
+                    "input": [{"role": "user", "content": "CHAT_SECRET_TEXT"}],
+                    "tools": [{
+                        "type": "function",
+                        "name": "inspect_workspace",
+                        "description": "TOOL_SECRET_TEXT",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}}
+                        }
+                    }]
                 })),
                 "chat_transport_error",
             )
@@ -10982,9 +11025,14 @@ mod tests {
         assert_eq!(transcripts[0].upstream_status, None);
         assert_eq!(transcripts[0].model.as_deref(), Some("test-model"));
         assert!(transcripts[0].body_bytes.unwrap_or_default() > 0);
+        assert!(transcripts[0].message_bytes.unwrap_or_default() > 0);
+        assert!(transcripts[0].system_message_bytes.unwrap_or_default() > 0);
+        assert_eq!(transcripts[0].tool_count, 1);
+        assert!(transcripts[0].tool_bytes.unwrap_or_default() > 0);
         assert!(transcripts[0].role_sequence.contains("user"));
         let encoded = serde_json::to_string(&transcripts[0]).unwrap();
         assert!(!encoded.contains("CHAT_SECRET_TEXT"), "{encoded}");
+        assert!(!encoded.contains("TOOL_SECRET_TEXT"), "{encoded}");
     }
 
     #[tokio::test]

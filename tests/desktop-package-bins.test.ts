@@ -38,6 +38,7 @@ describe("daily Desktop package", () => {
 
     expect(hotUpdateConfig.bundle.resources).toEqual([
       "binaries/vellum-codex-app-server*",
+      "binaries/vellum-codex-relay*",
     ]);
     expect(buildSidecar).toMatch(/VELLUM_DESKTOP_HOT_UPDATE/);
     expect(buildSidecar).toMatch(/delete cargoEnvironment\.TAURI_CONFIG/);

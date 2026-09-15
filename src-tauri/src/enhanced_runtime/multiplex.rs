@@ -76,6 +76,73 @@ impl Ids {
     }
 }
 
+/// The native App Server publishes the current Remote Control status as part
+/// of its initialize notifications. The relay is intentionally quiet until it
+/// is spoken to, so the bridge has to request and cache that initial status;
+/// otherwise a freshly started Desktop never learns that it must restore its
+/// enabled preference and the relay remains alive but offline.
+struct RemoteStatusBridge {
+    bootstrap_id: String,
+    current: Option<Value>,
+    delivered: Option<Value>,
+    desktop_initialized: bool,
+}
+
+impl RemoteStatusBridge {
+    fn new(launch_id: &str) -> Self {
+        Self {
+            bootstrap_id: format!("vellum:relay:status:{launch_id}"),
+            current: None,
+            delivered: None,
+            desktop_initialized: false,
+        }
+    }
+
+    fn bootstrap_request(&self) -> Value {
+        json!({
+            "kind": "control",
+            "message": {
+                "id": self.bootstrap_id,
+                "method": "remoteControl/status/read",
+                "params": {}
+            }
+        })
+    }
+
+    fn on_control_response(&mut self, message: &Value) -> (bool, Option<Value>) {
+        if message.get("id").and_then(Value::as_str) != Some(self.bootstrap_id.as_str()) {
+            return (false, None);
+        }
+        let notification = message
+            .get("result")
+            .cloned()
+            .and_then(|status| self.on_status(status));
+        (true, notification)
+    }
+
+    fn on_status(&mut self, status: Value) -> Option<Value> {
+        self.current = Some(status);
+        self.notification_if_ready()
+    }
+
+    fn on_desktop_initialized(&mut self) -> Option<Value> {
+        self.desktop_initialized = true;
+        self.notification_if_ready()
+    }
+
+    fn notification_if_ready(&mut self) -> Option<Value> {
+        let status = self.current.as_ref()?;
+        if !self.desktop_initialized || self.delivered.as_ref() == Some(status) {
+            return None;
+        }
+        self.delivered = Some(status.clone());
+        Some(json!({
+            "method": "remoteControl/status/changed",
+            "params": status
+        }))
+    }
+}
+
 pub(super) fn run(config: BridgeConfig) -> Result<(), BridgeError> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -331,13 +398,20 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         .env_remove("CODEX_CLI_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Relay startup/auth failures must reach Desktop's existing log
+        // capture instead of leaving only an unexplained offline process.
+        .stderr(Stdio::inherit())
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let mut relay = command.spawn()?;
     let mut relay_in = relay.stdin.take().unwrap();
     let mut relay_lines = tokio::io::BufReader::new(relay.stdout.take().unwrap()).lines();
+    let mut remote_status = RemoteStatusBridge::new(&m.launch_id);
+    let mut bootstrap = serde_json::to_vec(&remote_status.bootstrap_request())?;
+    bootstrap.push(b'\n');
+    relay_in.write_all(&bootstrap).await?;
+    relay_in.flush().await?;
     let (tx, mut rx) = channel::channel(128);
     let relay_tx = tx.clone();
     tokio::spawn(async move {
@@ -399,6 +473,18 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                     Some("close") => Event::Close(client),
                     Some("control") => {
                         let mut message = value["message"].clone();
+                        let (bootstrap, notification) = remote_status.on_control_response(&message);
+                        if bootstrap {
+                            observations.remote.state = message
+                                .pointer("/result/status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .into();
+                            if let Some(notification) = notification {
+                                deliver(0, notification, &mut out, &mut relay_in).await?;
+                            }
+                            continue;
+                        }
                         if ids.response(0, &mut message).is_ok() {
                             deliver(0, message, &mut out, &mut relay_in).await?;
                         }
@@ -410,7 +496,10 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
                             .into();
-                        deliver(0,json!({"method":"remoteControl/status/changed","params":value["status"]}),&mut out,&mut relay_in).await?;
+                        if let Some(notification) = remote_status.on_status(value["status"].clone())
+                        {
+                            deliver(0, notification, &mut out, &mut relay_in).await?;
+                        }
                         continue;
                     }
                     Some("ready") => {
@@ -569,6 +658,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                 }
                 BridgeAction::ToClient(mut value) => {
                     if let Ok(method) = ids.response(client, &mut value) {
+                        let initialized = client == 0
+                            && method.as_deref() == Some("initialize")
+                            && value.get("error").is_none();
                         if client != 0 {
                             if value.get("error").is_some() {
                                 if method.as_deref().is_some_and(is_remote_acceptance_method) {
@@ -599,6 +691,11 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                             }
                         }
                         deliver(client, value, &mut out, &mut relay_in).await?;
+                        if initialized {
+                            if let Some(notification) = remote_status.on_desktop_initialized() {
+                                deliver(0, notification, &mut out, &mut relay_in).await?;
+                            }
+                        }
                     }
                 }
             }
@@ -668,5 +765,48 @@ mod tests {
         ] {
             assert!(is_remote_acceptance_method(method), "{method}");
         }
+    }
+
+    #[test]
+    fn relay_bootstrap_status_is_delivered_after_desktop_initialize() {
+        let mut status = RemoteStatusBridge::new("launch-test");
+        assert_eq!(
+            status.bootstrap_request()["message"]["method"],
+            "remoteControl/status/read"
+        );
+        let response = json!({
+            "id": "vellum:relay:status:launch-test",
+            "result": {
+                "status": "disabled",
+                "serverName": "desktop",
+                "installationId": "installation",
+                "environmentId": null
+            }
+        });
+        let (handled, notification) = status.on_control_response(&response);
+        assert!(handled);
+        assert_eq!(notification, None, "status must wait for initialize");
+
+        let notification = status.on_desktop_initialized().unwrap();
+        assert_eq!(notification["method"], "remoteControl/status/changed");
+        assert_eq!(notification["params"]["status"], "disabled");
+        assert_eq!(status.on_desktop_initialized(), None, "do not duplicate");
+    }
+
+    #[test]
+    fn relay_status_changes_are_forwarded_after_initialize() {
+        let mut status = RemoteStatusBridge::new("launch-test");
+        assert_eq!(status.on_desktop_initialized(), None);
+        let connected = json!({
+            "status": "connected",
+            "serverName": "desktop",
+            "installationId": "installation",
+            "environmentId": "environment"
+        });
+        assert_eq!(
+            status.on_status(connected.clone()).unwrap()["params"],
+            connected
+        );
+        assert_eq!(status.on_status(connected), None, "do not duplicate");
     }
 }

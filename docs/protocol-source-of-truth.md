@@ -119,6 +119,13 @@ Remote Control on Official Codex so a phone can read and resume Desktop's
 native conversations. A build with the sidecar must route each remote request
 through the thread's immutable execution-plane binding.
 
+The relay must also preserve the native App Server initialization contract:
+after Desktop initializes, it receives the relay's current
+`remoteControl/status/changed` state. A relay process reaching its stdio-ready
+state is not proof that Remote Control is online; the bridge must bootstrap
+the current status so Desktop can restore an enabled preference, and relay
+startup/auth failures must remain visible in Desktop diagnostics.
+
 ### Tool continuations
 
 When Vellum executes a provider-requested tool locally, the continuation must
@@ -249,6 +256,11 @@ boundaries, including:
 - unmaterialized foreign compaction items; and
 - transport-only metadata that the destination provider does not understand.
 
+When a verified third-party capability probe advertises reasoning efforts but
+does not name a default, the Desktop catalog selects `medium` when available,
+otherwise the lightest non-`none` effort. It must not silently default a
+reasoning-capable route to `none` merely because that is the first slider item.
+
 The portable state consists of system/developer instructions, user and
 assistant text, supported tool declarations, tool calls and results, and
 Vellum-owned checkpoint summaries.
@@ -317,6 +329,12 @@ Search is a tool capability, not permission to invent citations. A provider may
 use native search only when the configured route supports it. Otherwise Vellum
 uses its declared search tool path or reports that search is unavailable.
 Returned citations must originate from actual provider or tool output.
+
+Codex's catalog field `supports_search_tool` also enables client-side deferred
+MCP/App tool discovery. Vellum advertises that transport for third-party models
+independently of whether the optional Brave web-search loop is enabled. Turning
+off web search must not force every deferred tool schema into the first model
+request or change its context footprint.
 
 Unknown or unsupported tools must produce a bounded compatibility error. They
 must not be silently dropped when doing so would change the requested behavior.
