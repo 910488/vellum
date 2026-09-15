@@ -116,11 +116,6 @@ await stageEnhancedRuntime();
 // it on every `pnpm dev` is not worth it. `binaries/vellum-enhanced-codex.dev-path`
 // names the fork's output instead, and `build.rs` reads that pointer.
 async function stageEnhancedRuntime() {
-  if (process.env.VELLUM_DESKTOP_HOT_UPDATE === "1") {
-    console.log("enhanced core: excluded from the Desktop-only hot update");
-    return;
-  }
-
   const pointer = join(root, "src-tauri", "binaries", "vellum-enhanced-codex.dev-path");
   const pointerValue = existsSync(pointer) ? readFileSync(pointer, "utf8").trim() : "";
   const fromPointer = pointerValue ? dirname(pointerValue) : null;
@@ -130,6 +125,7 @@ async function stageEnhancedRuntime() {
   if (profile === "debug") {
     source ??= fromPointer;
     const core = source ? join(source, `codex${suffix}`) : null;
+    stageRelay(source, true);
     console.log(
       core && existsSync(core)
         ? `enhanced core (dev, not copied): ${core}`
@@ -151,6 +147,12 @@ async function stageEnhancedRuntime() {
   }
   if (!source) {
     source = await downloadPinnedRuntime(lock, platform, expected);
+  }
+
+  stageRelay(source, false);
+  if (process.env.VELLUM_DESKTOP_HOT_UPDATE === "1") {
+    console.log("enhanced core: excluded from the Desktop-only hot update");
+    return;
   }
 
   const core = join(source, `codex${suffix}`);
@@ -188,6 +190,33 @@ async function stageEnhancedRuntime() {
   if (missing.length) {
     throw new Error(`Enhanced helpers missing from ${source}: ${missing.join(", ")}`);
   }
+}
+
+function stageRelay(source, debug) {
+  const relay = source ? join(source, `vellum-codex-relay${suffix}`) : null;
+  if (!relay || !existsSync(relay)) {
+    if (debug) {
+      console.log("Remote Control relay: not configured for this development build");
+      return;
+    }
+    throw new Error(`Remote Control relay missing from ${source}`);
+  }
+  const digest = createHash("sha256").update(readFileSync(relay)).digest("hex");
+  const relative = debug
+    ? `binaries/dev/vellum-codex-relay-${digest}${suffix}`
+    : `binaries/vellum-codex-relay${suffix}`;
+  const staged = join(root, "src-tauri", relative);
+  mkdirSync(dirname(staged), { recursive: true });
+  stageUnchangedSkip(relay, staged);
+  if (debug) {
+    writeFileSync(
+      join(root, "src-tauri", "binaries", "vellum-codex-relay.dev-path"),
+      `${relative.replaceAll("\\", "/")}\n`,
+      "utf8",
+    );
+  }
+  console.log(`Remote Control relay staged: ${staged}`);
+  console.log(`Remote Control relay sha256: ${digest}`);
 }
 
 // The Windows archive is a zip, which only bsdtar reads, and a Git for Windows
