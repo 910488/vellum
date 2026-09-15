@@ -68,6 +68,8 @@ struct ProfileClaims {
 #[derive(Debug, Default, Deserialize)]
 struct OrganizationClaim {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     is_default: bool,
@@ -119,7 +121,12 @@ pub fn chatgpt_identity_from_jwt(token: &str) -> Option<ChatGptIdentity> {
         .unwrap_or(&claims.organizations);
     let workspace_name = organizations
         .iter()
-        .find(|organization| organization.is_default)
+        .find(|organization| organization.id.as_deref() == Some(workspace_id.as_str()))
+        .or_else(|| {
+            organizations
+                .iter()
+                .find(|organization| organization.is_default)
+        })
         .or_else(|| organizations.first())
         .and_then(|organization| organization.title.clone())
         .filter(|title| !title.trim().is_empty());
@@ -171,7 +178,10 @@ mod tests {
                     "chatgpt_account_id": "workspace-crypto",
                     "chatgpt_user_id": user,
                     "chatgpt_plan_type": "team",
-                    "organizations": [{"title": "Crypto", "is_default": true}]
+                    "organizations": [
+                        {"id": "personal", "title": "Personal", "is_default": true},
+                        {"id": "workspace-crypto", "title": "Crypto", "is_default": false}
+                    ]
                 },
                 "https://api.openai.com/profile": {"email": email}
             }))
