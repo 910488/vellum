@@ -6,11 +6,22 @@
 export function startVisiblePoll(options: {
   active: boolean;
   intervalMs: number;
-  load: () => void;
+  load: () => void | Promise<void>;
 }): () => void {
   if (!options.active) return () => undefined;
+  let inFlight = false;
   const tick = () => {
-    if (document.visibilityState === "visible") options.load();
+    if (document.visibilityState !== "visible" || inFlight) return;
+    inFlight = true;
+    try {
+      Promise.resolve(options.load())
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false;
+        });
+    } catch {
+      inFlight = false;
+    }
   };
   const timer = window.setInterval(tick, options.intervalMs);
   const onVisibility = () => {

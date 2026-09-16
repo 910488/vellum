@@ -8,7 +8,10 @@
 //! credentials, replaced atomically, and stamped with a launch id so an
 //! attestation can be matched to the launch that produced it.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -199,12 +202,67 @@ fn walk_keys(value: &Value, visit: &mut impl FnMut(&str)) {
     }
 }
 
+#[derive(Clone)]
+struct DigestCacheEntry {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    digest: String,
+    checked_at: Instant,
+}
+
+static DIGEST_CACHE: OnceLock<Mutex<Vec<DigestCacheEntry>>> = OnceLock::new();
+
 pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
-    let bytes = std::fs::read(path).map_err(|error| LaunchManifestError::Read {
+    let metadata = std::fs::metadata(path).map_err(|error| LaunchManifestError::Read {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let modified = metadata.modified().ok();
+    let cache = DIGEST_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(entries) = cache.lock() {
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.path == canonical
+                && entry.len == metadata.len()
+                && entry.modified == modified
+                && entry.checked_at.elapsed() <= Duration::from_secs(300)
+        }) {
+            return Ok(entry.digest.clone());
+        }
+    }
+
+    let mut file = std::fs::File::open(path).map_err(|error| LaunchManifestError::Read {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| LaunchManifestError::Read {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if let Ok(mut entries) = cache.lock() {
+        entries.retain(|entry| entry.path != canonical);
+        entries.push(DigestCacheEntry {
+            path: canonical,
+            len: metadata.len(),
+            modified,
+            digest: digest.clone(),
+            checked_at: Instant::now(),
+        });
+        if entries.len() > 16 {
+            entries.remove(0);
+        }
+    }
+    Ok(digest)
 }
 
 #[derive(Debug, thiserror::Error)]

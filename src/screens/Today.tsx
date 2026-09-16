@@ -1,6 +1,6 @@
 import { useLocaleFormat } from "@/i18n/useLocaleFormat";
 import { useTranslation } from "react-i18next";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { shouldApplyProxyLifecycle } from "@/lib/proxyLifecycle";
 import { startVisiblePoll } from "@/lib/visiblePoll";
@@ -65,6 +65,7 @@ export function Today({
   const [quotaBusy, setQuotaBusy] = useState<string | null>(null);
   const [askedAt, setAskedAt] = useState<Record<string, number>>({});
   const [sessions, setSessions] = useState<SessionStatus[]>([]);
+  const loadGeneration = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,15 +82,14 @@ export function Today({
     };
   }, [onProxyChanged, proxy]);
 
-  useEffect(() => {
-    let alive = true;
-    const load = async (forceRefresh: boolean) => {
+  const load = useCallback(async (forceRefresh: boolean) => {
+      const generation = ++loadGeneration.current;
       const [nextProviders, nextRoutes, nextSessions] = await Promise.allSettled([
         api.getProviderOverviews(forceRefresh),
         api.listRoutes(),
         api.listSessions(),
       ]);
-      if (!alive) return;
+      if (generation !== loadGeneration.current) return;
       if (nextProviders.status === "fulfilled") setProviders(nextProviders.value);
       if (nextSessions.status === "fulfilled") setSessions(nextSessions.value);
       if (nextRoutes.status === "fulfilled") {
@@ -118,20 +118,17 @@ export function Today({
           : null,
       );
       if (forceRefresh && refreshVersion > 0) onRefreshComplete(refreshVersion);
-    };
-    if (active) void load(refreshVersion > 0);
-    const stopPoll = startVisiblePoll({
-      active,
-      intervalMs: 300_000,
-      load: () => {
-        void load(false);
-      },
-    });
-    return () => {
-      alive = false;
-      stopPoll();
-    };
-  }, [refreshVersion, active]);
+  }, [onRefreshComplete, refreshVersion, t]);
+
+  useEffect(() => {
+    void load(refreshVersion > 0);
+  }, [load, refreshVersion]);
+
+  useEffect(() => startVisiblePoll({
+    active,
+    intervalMs: 300_000,
+    load: () => load(false),
+  }), [active, load]);
 
   const routeId = overview?.route?.id ?? null;
   const routeModel = overview?.route?.model ?? null;

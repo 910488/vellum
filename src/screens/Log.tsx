@@ -12,7 +12,7 @@ import { useTranslation } from "react-i18next";
  *
  * OpenAI 熱區圖直接使用 Codex 個人檔案的官方統計；第三方模型再合併
  * Vellum Proxy 的逐請求用量，避免把同一筆官方請求重複計算。 */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, getInvokeRing, type InvokeRingEntry } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { tokens } from "@/lib/format";
@@ -150,56 +150,55 @@ export function Log({
   const [error, setError] = useState<string | null>(null);
   const [invokes, setInvokes] = useState<InvokeRingEntry[]>([]);
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
+  const loadLog = useCallback(async () => {
       const focus = focusEntryId.current;
       focusEntryId.current = null;
-      const [log, usage, boot] = await Promise.allSettled([
-        api.getRequestLog({
+      const log = await api.getRequestLog({
           limit: PAGE_SIZE,
           offset: (page - 1) * PAGE_SIZE,
           failedOnly: statusFilter === "failed",
           routeId: providerFilter === "all" ? undefined : providerFilter,
           focusEntryId: focus ?? undefined,
-        }),
-        api.getUsageActivity(),
-        api.getBootTelemetry(),
-      ]);
-      if (!alive) return;
-      if (log.status === "fulfilled") {
-        setData(log.value);
-        if (focus != null && typeof log.value.entryOffset === "number") {
-          const nextPage = Math.floor(log.value.entryOffset / PAGE_SIZE) + 1;
+        });
+      setData(log);
+      if (focus != null && typeof log.entryOffset === "number") {
+          const nextPage = Math.floor(log.entryOffset / PAGE_SIZE) + 1;
           if (nextPage !== page) setPage(nextPage);
-        }
       }
-      if (usage.status === "fulfilled") setActivity(usage.value);
-      if (boot.status === "fulfilled") setBoot(boot.value);
       setInvokes(getInvokeRing());
-      const failures = [log, usage, boot].filter(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
-      setError(
-        failures.length
-          ? t("log.errors.partialRefresh", { detail: failures.map((failure) => String(failure.reason)).join(t("common.listSeparator")) })
-          : null,
-      );
       if (refreshVersion > 0) onRefreshComplete(refreshVersion);
-    };
-    void load();
-    const stopPoll = startVisiblePoll({
+  }, [onRefreshComplete, page, providerFilter, refreshVersion, statusFilter]);
+
+  const loadSummary = useCallback(async () => {
+    const [usage, boot] = await Promise.allSettled([
+      api.getUsageActivity(),
+      api.getBootTelemetry(),
+    ]);
+    if (usage.status === "fulfilled") setActivity(usage.value);
+    if (boot.status === "fulfilled") setBoot(boot.value);
+    const failures = [usage, boot].filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    setError(failures.length
+      ? t("log.errors.partialRefresh", { detail: failures.map((failure) => String(failure.reason)).join(t("common.listSeparator")) })
+      : null);
+  }, [t]);
+
+  useEffect(() => {
+    void loadLog().catch((cause) => setError(String(cause)));
+  }, [loadLog, focusTick]);
+
+  useEffect(() => {
+    void loadSummary();
+  }, [loadSummary, refreshVersion]);
+
+  useEffect(() => startVisiblePoll({
       active,
       intervalMs: 60_000,
-      load: () => {
-        void load();
+      load: async () => {
+        await Promise.all([loadLog(), loadSummary()]);
       },
-    });
-    return () => {
-      alive = false;
-      stopPoll();
-    };
-  }, [refreshVersion, active, page, statusFilter, providerFilter, focusTick]);
+    }), [active, loadLog, loadSummary]);
 
   const entries = data?.entries ?? [];
   const entryTotal = data?.entryTotal ?? entries.length;
@@ -919,6 +918,9 @@ export function Log({
                 <div className="req" key={`${entry.at}-${entry.cmd}-${index}`}>
                   <span className="req__time">{clock(Math.floor(entry.at / 1000))}</span>
                   <span className="req__who">{entry.cmd}</span>
+                  {entry.durationMs != null ? (
+                    <span className="req__dur">{Math.round(entry.durationMs)}ms</span>
+                  ) : null}
                   <span
                     className={`req__status req__status--${entry.ok ? "ok" : "bad"}`}
                   >

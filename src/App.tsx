@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "@/lib/api";
+import { api, recordInvokeResult } from "@/lib/api";
 import {
   buildOnboardingConnections,
   codexCompatibleProbeModels,
@@ -37,6 +37,8 @@ function emptyOnboardingConnections(): Record<ConnectKind, OnboardingConnection>
   };
 }
 
+const MAX_WARM_SCREENS = 3;
+
 /**
  * 系統狀態集中在這裡抓一次，往下傳。
  *
@@ -46,11 +48,14 @@ function emptyOnboardingConnections(): Record<ConnectKind, OnboardingConnection>
 export function App() {
   const { t } = useTranslation();
   const [screen, setScreen] = useState<ScreenId>("today");
+  const [mountedScreens, setMountedScreens] = useState<Set<ScreenId>>(
+    () => new Set<ScreenId>(["today"]),
+  );
   const [dismissedAlerts, setDismissedAlerts] = useState<string[]>([]);
   const [status, setStatus] = useState<SystemStatus>(EMPTY_STATUS);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
-  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [refreshVersions, setRefreshVersions] = useState<Partial<Record<ScreenId, number>>>({});
   const refreshSequence = useRef(0);
   const statusLoadGeneration = useRef(0);
   const refreshInFlight = useRef<Promise<void> | null>(null);
@@ -66,6 +71,35 @@ export function App() {
   const oauthPollGeneration = useRef(0);
   const grokPollGeneration = useRef(0);
   const grokLoginId = useRef<string | null>(null);
+
+  const navigate = useCallback((next: ScreenId) => {
+    if (next === screen) return;
+    const startedAt = performance.now();
+    setMountedScreens((current) => {
+      const updated = new Set(current);
+      // Set insertion order doubles as a tiny LRU. Keeping the current page
+      // and two recent pages makes ordinary back-and-forth instant without
+      // retaining every large screen DOM for the lifetime of the app.
+      updated.delete(next);
+      updated.add(next);
+      while (updated.size > MAX_WARM_SCREENS) {
+        const oldest = updated.values().next().value as ScreenId | undefined;
+        if (!oldest) break;
+        updated.delete(oldest);
+      }
+      return updated;
+    });
+    setScreen(next);
+    window.requestAnimationFrame(() => {
+      recordInvokeResult(
+        `ui:navigate:${next}`,
+        true,
+        undefined,
+        Date.now(),
+        performance.now() - startedAt,
+      );
+    });
+  }, [screen]);
 
   const reloadOnboardingConnections = useCallback(async () => {
     const statusGeneration = ++statusLoadGeneration.current;
@@ -289,7 +323,7 @@ export function App() {
     const pageRefresh = new Promise<void>((resolve) => {
       pageRefreshWaiter.current = { version, resolve };
     });
-    setRefreshVersion(version);
+    setRefreshVersions((current) => ({ ...current, [screen]: version }));
     try {
       await Promise.all([
         refresh(true, false),
@@ -302,7 +336,7 @@ export function App() {
       pageRefreshWaiter.current = null;
       setRefreshing(false);
     }
-  }, [refresh]);
+  }, [refresh, screen]);
 
   const pageRefreshComplete = useCallback((version: number) => {
     if (pageRefreshWaiter.current?.version === version) {
@@ -378,11 +412,11 @@ export function App() {
       const target = SCREENS[index];
       if (!target) return;
       event.preventDefault();
-      setScreen(target.id);
+      navigate(target.id);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [navigate]);
 
   if (!onboardingComplete) {
     return (
@@ -449,51 +483,62 @@ export function App() {
           onRefresh={() => void manualRefresh()}
         />
 
-        <Rail active={screen} onNavigate={setScreen} attention={attention(status)} />
+        <Rail active={screen} onNavigate={navigate} attention={attention(status)} />
 
         <main className="canvas">
-          {screen === "enhanced" ? <EnhancedCore status={status.enhancedRuntime ?? null} refreshVersion={refreshVersion} onRefreshComplete={pageRefreshComplete} /> : null}
-          {screen === "today" ? (
+          {mountedScreens.has("enhanced") ? <div className="screen-slot" hidden={screen !== "enhanced"}><EnhancedCore status={status.enhancedRuntime ?? null} refreshVersion={refreshVersions.enhanced ?? 0} onRefreshComplete={pageRefreshComplete} /></div> : null}
+          {mountedScreens.has("today") ? (
+            <div className="screen-slot" hidden={screen !== "today"}>
             <Today
               proxy={status.proxy}
               overview={status.overview}
-              onNavigate={setScreen}
+              onNavigate={navigate}
               onChanged={() => void refresh()}
               onProxyChanged={applyProxyStatus}
-              refreshVersion={refreshVersion}
+              refreshVersion={refreshVersions.today ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "today"}
             />
+            </div>
           ) : null}
-          {screen === "models" ? (
+          {mountedScreens.has("models") ? (
+            <div className="screen-slot" hidden={screen !== "models"}>
             <Models
               onChanged={() => void refresh()}
-              refreshVersion={refreshVersion}
+              refreshVersion={refreshVersions.models ?? 0}
               onRefreshComplete={pageRefreshComplete}
             />
+            </div>
           ) : null}
-          {screen === "context" ? (
+          {mountedScreens.has("context") ? (
+            <div className="screen-slot" hidden={screen !== "context"}>
             <Context
-              refreshVersion={refreshVersion}
+              refreshVersion={refreshVersions.context ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "context"}
             />
+            </div>
           ) : null}
-          {screen === "remote" ? (
+          {mountedScreens.has("remote") ? (
+            <div className="screen-slot" hidden={screen !== "remote"}>
             <Remote
-              refreshVersion={refreshVersion}
+              refreshVersion={refreshVersions.remote ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "remote"}
             />
+            </div>
           ) : null}
-          {screen === "log" ? (
+          {mountedScreens.has("log") ? (
+            <div className="screen-slot" hidden={screen !== "log"}>
             <Log
-              refreshVersion={refreshVersion}
+              refreshVersion={refreshVersions.log ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "log"}
             />
+            </div>
           ) : null}
-          {screen === "settings" ? (
+          {mountedScreens.has("settings") ? (
+            <div className="screen-slot" hidden={screen !== "settings"}>
             <Settings
               onChanged={() => void refresh()}
               onOpenOnboarding={() => {
@@ -501,10 +546,11 @@ export function App() {
                 setOnboardingError(null);
                 setOnboardingComplete(false);
               }}
-              refreshVersion={refreshVersion}
+              refreshVersion={refreshVersions.settings ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "settings"}
             />
+            </div>
           ) : null}
         </main>
 

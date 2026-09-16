@@ -224,6 +224,14 @@ html[data-performance="low"] *::after {
   gap: var(--gap-block);
 }
 
+.screen-slot {
+  display: contents;
+}
+
+.screen-slot[hidden] {
+  display: none;
+}
+
 /* 一次編排好的進場，勝過到處散落的微互動。
    每個區塊晚 40ms，眼睛會照著順序讀下去 —— 這也順便教會使用者版面的層級。 */
 @media (prefers-reduced-motion: no-preference) {
