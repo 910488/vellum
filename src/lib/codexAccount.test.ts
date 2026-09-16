@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CodexOAuthAccount } from "../types";
-import { codexAccountLabel, codexWorkspaceLabel } from "./codexAccount";
+import { codexAccountLabel, codexPoolSegmentLabel, codexWorkspaceLabel } from "./codexAccount";
 
 function account(overrides: Partial<CodexOAuthAccount>): CodexOAuthAccount {
   return {
@@ -45,5 +45,21 @@ describe("Codex account labels", () => {
         account({ workspaceKind: "business", workspaceName: "Crypto", planType: "team" }),
       ),
     ).toBe("Business · Crypto");
+  });
+
+  it("distinguishes Personal and Business segments owned by the same email", () => {
+    const personal = account({
+      accountId: "personal",
+      workspaceKind: "personal",
+      planType: "plus",
+    });
+    const business = account({
+      accountId: "business",
+      workspaceKind: "business",
+      planType: "team",
+    });
+    expect(codexPoolSegmentLabel(personal)).toBe("PERSONAL");
+    expect(codexPoolSegmentLabel(business)).toBe("BUSINESS");
+    expect(codexPoolSegmentLabel(personal)).not.toBe(codexPoolSegmentLabel(business));
   });
 });

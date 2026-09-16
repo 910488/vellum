@@ -1600,10 +1600,10 @@ mod tests {
                 id.into(),
                 AccountMetadata {
                     account_id: id.into(),
-                    chatgpt_account_id: None,
+                    chatgpt_account_id: Some(id.into()),
                     workspace_name: None,
                     plan_type: None,
-                    email: None,
+                    email: Some("same-user@example.test".into()),
                     authenticated_at: 1,
                 },
             );
