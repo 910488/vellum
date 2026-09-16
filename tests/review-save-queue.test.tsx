@@ -281,6 +281,32 @@ describe("auto review settings save behavior", () => {
     vi.clearAllMocks();
   });
 
+  it("explains which ChatGPT account is charged while auto review is off", async () => {
+    apiMocks.getReviewSettings.mockResolvedValue({
+      ...explicitReview,
+      beforeSend: false,
+    });
+    renderSettings();
+
+    const help = await screen.findByRole("button", {
+      name: t("settings.page.review.billingHelp"),
+    });
+    fireEvent.click(help);
+
+    expect(
+      screen.getByRole("heading", {
+        name: t("settings.page.review.billingHelpTitle"),
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(t("settings.page.review.billingHelpFacts.disabled.body")),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(t("settings.page.review.billingHelpFacts.pool.body")),
+    ).toBeTruthy();
+    expect(apiMocks.setReviewSettings).not.toHaveBeenCalled();
+  });
+
   /**
    * 計費帳號只有 Official 才問得出來，而且它是本機身分，不是策略。這三件
    * 事一起測：選單只在 Official 出現、選了會存下去、換回第三方會清掉。
