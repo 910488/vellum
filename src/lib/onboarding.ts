@@ -6,6 +6,7 @@ import type {
   Route,
 } from "@/types";
 import type { ConnectKind, OnboardingConnection } from "@/screens/Onboarding";
+import { codexAccountLabel } from "./codexAccount";
 
 export const ONBOARDING_COMPLETED_KEY = "vellum.onboarding.completed.v1";
 
@@ -58,13 +59,7 @@ export function buildOnboardingConnections(
   return {
     chatgpt: {
       accounts:
-        oauth?.accounts.map(
-          (account) =>
-            `${account.email ?? account.accountId} · ${
-              account.workspaceName ?? account.planType ??
-              `Workspace ${(account.workspaceId ?? account.accountId).slice(0, 8)}`
-            }`,
-        ) ?? [],
+        oauth?.accounts.map(codexAccountLabel) ?? [],
       pending: null,
     },
     grok: {

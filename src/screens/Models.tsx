@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
  */
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { codexAccountLabel } from "@/lib/codexAccount";
 import { providerNameFromEndpoint } from "@/lib/providerName";
 import {
   accountQuotaWindows,
@@ -1369,11 +1370,7 @@ export function Models({
         {oauth?.accounts.length ? (
           <Rows>
             {oauth.accounts.map((account) => {
-              const accountLabel =
-                `${account.email ?? `ChatGPT ${account.accountId.slice(0, 8)}`} · ${
-                  account.workspaceName ?? account.planType ??
-                  `Workspace ${(account.workspaceId ?? account.accountId).slice(0, 8)}`
-                }`;
+              const accountLabel = codexAccountLabel(account);
               const credits = resetCredits[account.accountId];
               const available =
                 credits?.credits.filter((credit) => credit.status === "available").length ??

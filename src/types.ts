@@ -155,6 +155,7 @@ export interface CodexOAuthAccount {
   workspaceId?: string;
   workspaceName?: string | null;
   planType?: string | null;
+  workspaceKind?: "personal" | "business" | "unknown";
   email: string | null;
   authenticatedAt: number;
   isDefault: boolean;

@@ -179,6 +179,7 @@ pub use official_auth::{
 };
 pub use official_identity::{
     chatgpt_credential_id, chatgpt_identity_from_jwt, same_chatgpt_principal, ChatGptIdentity,
+    ChatGptWorkspaceKind,
 };
 pub use opencode::{
     infer_provider_profile, is_opencode_endpoint, OPENCODE_GO_BASE_URL, OPENCODE_PUBLIC_TOKEN,

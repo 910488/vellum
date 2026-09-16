@@ -16,7 +16,37 @@ pub struct ChatGptIdentity {
     pub email: Option<String>,
     pub workspace_name: Option<String>,
     pub plan_type: Option<String>,
+    pub workspace_kind: ChatGptWorkspaceKind,
     principal: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatGptWorkspaceKind {
+    Personal,
+    Business,
+    Unknown,
+}
+
+impl ChatGptWorkspaceKind {
+    pub fn from_plan_type(plan_type: Option<&str>) -> Self {
+        match plan_type
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("free" | "go" | "plus" | "pro") => Self::Personal,
+            Some("team" | "business" | "enterprise" | "edu") => Self::Business,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Business => "business",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -119,15 +149,29 @@ pub fn chatgpt_identity_from_jwt(token: &str) -> Option<ChatGptIdentity> {
         .map(|auth| auth.organizations.as_slice())
         .filter(|organizations| !organizations.is_empty())
         .unwrap_or(&claims.organizations);
-    let workspace_name = organizations
+    let plan_type = claims
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.chatgpt_plan_type.clone())
+        .or_else(|| claims.chatgpt_plan_type.clone());
+    let workspace_kind = ChatGptWorkspaceKind::from_plan_type(plan_type.as_deref());
+    let selected_organization = organizations
         .iter()
-        .find(|organization| organization.id.as_deref() == Some(workspace_id.as_str()))
+        .find(|organization| organization.id.as_deref() == Some(workspace_id.as_str()));
+    // Personal JWTs do not always make chatgpt_account_id match the sole
+    // Personal organization claim. That fallback is safe only for a personal
+    // plan. Applying it to team/business tokens mislabeled Business as Personal.
+    let workspace_name = selected_organization
         .or_else(|| {
-            organizations
-                .iter()
-                .find(|organization| organization.is_default)
+            (workspace_kind == ChatGptWorkspaceKind::Personal)
+                .then(|| {
+                    organizations
+                        .iter()
+                        .find(|organization| organization.is_default)
+                        .or_else(|| organizations.first())
+                })
+                .flatten()
         })
-        .or_else(|| organizations.first())
         .and_then(|organization| organization.title.clone())
         .filter(|title| !title.trim().is_empty());
     Some(ChatGptIdentity {
@@ -137,11 +181,8 @@ pub fn chatgpt_identity_from_jwt(token: &str) -> Option<ChatGptIdentity> {
             .email
             .or_else(|| claims.profile.and_then(|profile| profile.email)),
         workspace_name,
-        plan_type: claims
-            .auth
-            .as_ref()
-            .and_then(|auth| auth.chatgpt_plan_type.clone())
-            .or(claims.chatgpt_plan_type),
+        plan_type,
+        workspace_kind,
         principal,
     })
 }
@@ -200,5 +241,61 @@ mod tests {
         let workspace = chatgpt_credential_id("user-jp", "workspace-crypto");
         assert_ne!(personal, workspace);
         assert_eq!(personal, chatgpt_credential_id("user-jp", "personal"));
+    }
+
+    #[test]
+    fn team_plan_does_not_fall_back_to_personal_organization_name() {
+        let token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-business",
+                "chatgpt_user_id": "user-jp",
+                "chatgpt_plan_type": "team",
+                "organizations": [
+                    {"id": "different-personal-id", "title": "Personal", "is_default": true}
+                ]
+            }
+        }));
+
+        let identity = chatgpt_identity_from_jwt(&token).unwrap();
+        assert_eq!(identity.workspace_kind, ChatGptWorkspaceKind::Business);
+        assert_eq!(identity.workspace_name, None);
+    }
+
+    #[test]
+    fn personal_plan_can_use_the_default_personal_organization_name() {
+        let token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "personal-workspace",
+                "chatgpt_user_id": "user-jp",
+                "chatgpt_plan_type": "plus",
+                "organizations": [
+                    {"id": "different-organization-id", "title": "Personal", "is_default": true}
+                ]
+            }
+        }));
+
+        let identity = chatgpt_identity_from_jwt(&token).unwrap();
+        assert_eq!(identity.workspace_kind, ChatGptWorkspaceKind::Personal);
+        assert_eq!(identity.workspace_name.as_deref(), Some("Personal"));
+    }
+
+    #[test]
+    fn classifies_known_personal_and_business_plans() {
+        for plan in ["free", "go", "plus", "pro"] {
+            assert_eq!(
+                ChatGptWorkspaceKind::from_plan_type(Some(plan)),
+                ChatGptWorkspaceKind::Personal
+            );
+        }
+        for plan in ["team", "business", "enterprise", "edu"] {
+            assert_eq!(
+                ChatGptWorkspaceKind::from_plan_type(Some(plan)),
+                ChatGptWorkspaceKind::Business
+            );
+        }
+        assert_eq!(
+            ChatGptWorkspaceKind::from_plan_type(Some("future-plan")),
+            ChatGptWorkspaceKind::Unknown
+        );
     }
 }
