@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import desktopToml from "../src-tauri/Cargo.toml?raw";
 import buildSidecar from "../scripts/build-sidecar.mjs?raw";
+import buildLocalRelease from "../scripts/build-local-release.sh?raw";
 import desktopWorkflow from "../.github/workflows/desktop-build.yml?raw";
 import hotUpdateConfig from "../src-tauri/tauri.hot-update.conf.json";
 import releaseWorkflow from "../.github/workflows/release.yml?raw";
+import finalizeDarwinManifest from "../scripts/finalize-remote-darwin-manifest.mjs?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 import workspaceToml from "../Cargo.toml?raw";
 
@@ -56,5 +58,36 @@ describe("daily Desktop package", () => {
       expect(job).toMatch(/tauri\.hot-update\.conf\.json/);
       expect(job).not.toMatch(/build-only-remote-payload|build-local-release/);
     }
+  });
+
+  it("finalizes one complete Darwin-aware manifest before building either installer", () => {
+    const darwinJob = desktopWorkflow.slice(
+      desktopWorkflow.indexOf("  remote-payload-darwin:"),
+      desktopWorkflow.indexOf("  macos-dmg:"),
+    );
+    expect(darwinJob).toMatch(/needs: remote-payload/);
+    expect(darwinJob).toMatch(/codex-aarch64-apple-darwin\.tar\.gz/);
+    expect(darwinJob).toMatch(/finalize-remote-darwin-manifest\.mjs/);
+    expect(buildLocalRelease).toMatch(/aarch64-apple-darwin/);
+    expect(buildLocalRelease).toMatch(/finalize-remote-darwin-manifest\.mjs/);
+    expect(finalizeDarwinManifest).toMatch(/schemaVersion = 4/);
+    expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/codex/);
+    expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-remote-agent/);
+    expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-proxy-daemon/);
+
+    for (const jobName of ["  macos-dmg:", "  windows-installer:"]) {
+      const start = desktopWorkflow.indexOf(jobName);
+      const rest = desktopWorkflow.slice(start + jobName.length);
+      const nextJob = rest.search(/\n  [a-z][a-z-]+:/);
+      const job =
+        nextJob < 0
+          ? desktopWorkflow.slice(start)
+          : desktopWorkflow.slice(start, start + jobName.length + nextJob);
+      expect(job).toMatch(/needs: remote-payload-darwin/);
+      expect(job).toMatch(/Download complete remote payload/);
+    }
+
+    const signJob = releaseWorkflow.slice(releaseWorkflow.indexOf("  sign-and-release:"));
+    expect(signJob).toMatch(/- remote-darwin/);
   });
 });

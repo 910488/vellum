@@ -50,6 +50,7 @@ pub struct CodexOAuthAccount {
     pub workspace_id: String,
     pub workspace_name: Option<String>,
     pub plan_type: Option<String>,
+    pub workspace_kind: String,
     pub email: Option<String>,
     pub authenticated_at: i64,
     pub is_default: bool,
@@ -452,6 +453,7 @@ impl CodexOAuthManager {
             workspace_id: identity.workspace_id,
             workspace_name: identity.workspace_name,
             plan_type: identity.plan_type,
+            workspace_kind: identity.workspace_kind.as_str().into(),
             email,
             authenticated_at,
             is_default: default.as_deref() == Some(&account_id),
@@ -470,6 +472,11 @@ impl CodexOAuthManager {
                     .clone()
                     .unwrap_or_else(|| account.account_id.clone()),
                 workspace_name: account.workspace_name,
+                workspace_kind: vellum_proxy_runtime::ChatGptWorkspaceKind::from_plan_type(
+                    account.plan_type.as_deref(),
+                )
+                .as_str()
+                .into(),
                 plan_type: account.plan_type,
                 account_id: account.account_id,
                 email: account.email,

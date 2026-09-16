@@ -15,6 +15,7 @@ import { useTranslation } from "react-i18next";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { I18N_LANGUAGE_SELECTOR_ENABLED, type LocalePreference } from "@/i18n/locale";
 import { api } from "@/lib/api";
+import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
 import { Btn, Cap, Card, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
@@ -876,10 +877,7 @@ export function Settings({
                       <option value="">{t("settings.page.review.billingFollowsDefault")}</option>
                       {(oauth?.accounts ?? []).map((account) => (
                         <option key={account.accountId} value={account.accountId}>
-                          {`${account.email ?? account.accountId} · ${
-                            account.workspaceName ?? account.planType ??
-                            `Workspace ${(account.workspaceId ?? account.accountId).slice(0, 8)}`
-                          }`}
+                          {codexAccountLabel(account)}
                         </option>
                       ))}
                     </select>

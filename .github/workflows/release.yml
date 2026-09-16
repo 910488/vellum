@@ -444,6 +444,7 @@ jobs:
       - windows-updater
       - macos-updater
       - remote-linux
+      - remote-darwin
       - core-from-lockfile
     if: |
       always()
