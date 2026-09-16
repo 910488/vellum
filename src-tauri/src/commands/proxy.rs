@@ -447,8 +447,10 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     };
     match armed {
         Ok(launch) => {
-            if let Some(process_identity) = launch
-                .is_some()
+            let status = crate::enhanced_runtime::desktop_runtime_status(&state.data_root());
+            let adopted = status.ready && !status.restart_required;
+            state.reconcile_enhanced_adoption(adopted);
+            if let Some(process_identity) = (launch.is_some() && !adopted)
                 .then(crate::commands::runtime::codex_process_identity)
                 .flatten()
             {

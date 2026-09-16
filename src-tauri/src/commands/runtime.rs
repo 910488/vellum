@@ -72,7 +72,20 @@ async fn read_desktop_runtime_status(
     state: &AppState,
 ) -> AppResult<crate::enhanced_runtime::DesktopRuntimeStatus> {
     let data_root = state.data_root();
-    off_main_thread(move || crate::enhanced_runtime::desktop_runtime_status(&data_root)).await
+    let state = state.clone();
+    off_main_thread(move || {
+        // Serialize observation and reconciliation with launch publication.
+        // A poll of the previous launch must not clear a newer restart notice.
+        // A managed restart can hold this lock for 90 seconds. Keep polling
+        // responsive; reconcile on the next poll if publication is in flight.
+        let guard = state.lifecycle_lock().try_lock();
+        let status = crate::enhanced_runtime::desktop_runtime_status(&data_root);
+        if guard.is_ok() {
+            state.reconcile_enhanced_adoption(status.ready && !status.restart_required);
+        }
+        status
+    })
+    .await
 }
 
 /// Rebuilds Proxy launch state after Codex Desktop replaces its core.

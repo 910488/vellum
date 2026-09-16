@@ -1864,6 +1864,25 @@ impl AppState {
         proxy.restart_process_identity = Some(process_identity);
     }
 
+    /// A verified live launch satisfies only the Enhanced adoption notice.
+    /// Catalog/config changes still require their own restart acknowledgement.
+    pub fn reconcile_enhanced_adoption(&self, adopted: bool) {
+        if !adopted {
+            return;
+        }
+        let mut proxy = self.proxy.lock().expect("proxy state poisoned");
+        let before = proxy.restart_reasons.len();
+        proxy
+            .restart_reasons
+            .retain(|reason| reason.code != "enhancedDesktopRuntimeChanged");
+        if proxy.restart_reasons.len() != before {
+            log::info!("[Restart] Enhanced launch adoption verified; cleared runtime change notice");
+        }
+        if proxy.restart_reasons.is_empty() {
+            proxy.restart_process_identity = None;
+        }
+    }
+
     pub fn set_restart_process_identity(&self, identity: Option<String>) {
         self.proxy
             .lock()
@@ -3144,6 +3163,38 @@ mod tests {
             .live_applied
             .iter()
             .any(|notice| notice.code == "codexRestartDetected"));
+    }
+
+    #[test]
+    fn enhanced_adoption_clears_delayed_start_notice_without_another_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+            "100:1000".into(),
+        );
+        state.reconcile_enhanced_adoption(false);
+        assert!(state.runtime_status().restart_required);
+        state.reconcile_enhanced_adoption(true);
+        assert!(!state.runtime_status().restart_required);
+        state.reconcile_codex_restart(Some("100:1000".into()));
+        assert!(!state.runtime_status().restart_required);
+    }
+
+    #[test]
+    fn enhanced_adoption_preserves_catalog_restart_and_process_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        for code in ["enhancedDesktopRuntimeChanged", "catalogUpdated"] {
+            state.mark_restart_required_for_process(RuntimeNotice::new(code), "100:1000".into());
+        }
+        state.reconcile_enhanced_adoption(true);
+        assert_eq!(
+            state.runtime_status().restart_reasons,
+            vec![RuntimeNotice::new("catalogUpdated")]
+        );
+        state.reconcile_codex_restart(Some("200:2000".into()));
+        assert!(!state.runtime_status().restart_required);
     }
 
     #[test]
