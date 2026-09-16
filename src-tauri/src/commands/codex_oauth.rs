@@ -129,6 +129,25 @@ pub async fn get_codex_oauth_status(state: State<'_, AppState>) -> AppResult<Cod
 }
 
 #[tauri::command]
+pub async fn get_codex_quota_pool(
+    state: State<'_, AppState>,
+) -> AppResult<crate::codex_oauth::QuotaPoolStatus> {
+    Ok(state.codex_oauth().quota_pool_status().await)
+}
+
+#[tauri::command]
+pub async fn set_codex_quota_pool(
+    settings: crate::codex_oauth::QuotaPoolSettings,
+    state: State<'_, AppState>,
+) -> AppResult<crate::codex_oauth::QuotaPoolStatus> {
+    state
+        .codex_oauth()
+        .set_quota_pool(settings)
+        .await
+        .map_err(app_error)
+}
+
+#[tauri::command]
 pub async fn start_codex_oauth_login(
     app: AppHandle,
     state: State<'_, AppState>,

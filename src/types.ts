@@ -170,6 +170,25 @@ export interface CodexOAuthStatus {
   accounts: CodexOAuthAccount[];
 }
 
+export type QuotaPoolStrategy = "rank" | "most" | "soonest";
+
+export interface QuotaPoolMember {
+  accountId: string;
+  inPool: boolean;
+  paused: boolean;
+  weeklyFloor: number;
+}
+
+export interface QuotaPoolSettings {
+  enabled: boolean;
+  strategy: QuotaPoolStrategy;
+  members: QuotaPoolMember[];
+}
+
+export interface QuotaPoolStatus extends QuotaPoolSettings {
+  activeAccountId: string | null;
+}
+
 export interface CodexOAuthDeviceLogin {
   deviceCode: string;
   userCode: string;

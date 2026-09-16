@@ -14,6 +14,8 @@ import type {
   CodexOAuthAccount,
   CodexOAuthDeviceLogin,
   CodexOAuthStatus,
+  QuotaPoolSettings,
+  QuotaPoolStatus,
   CodexResetCredits,
   CodexResetResult,
   ContextBudget,
@@ -533,6 +535,23 @@ export const api = {
   listRoutes(): Promise<Route[]> {
     if (!hasTauri()) return delay(mock.routes());
     return call<Route[]>("list_routes");
+  },
+
+  getCodexQuotaPool(): Promise<QuotaPoolStatus> {
+    if (!hasTauri()) {
+      return delay({
+        enabled: false,
+        strategy: "rank",
+        members: [],
+        activeAccountId: null,
+      });
+    }
+    return call<QuotaPoolStatus>("get_codex_quota_pool");
+  },
+
+  setCodexQuotaPool(settings: QuotaPoolSettings): Promise<QuotaPoolStatus> {
+    if (!hasTauri()) return delay({ ...settings, activeAccountId: null });
+    return call<QuotaPoolStatus>("set_codex_quota_pool", { settings });
   },
 
   refreshOpenCodeModelCatalogs(): Promise<Route[]> {

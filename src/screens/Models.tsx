@@ -11,7 +11,7 @@ import { useTranslation } from "react-i18next";
  * 布林（下次啟動載入／排除、型錄已加入・待重啟套用、設定已保存・待重新啟動…），
  * 而且「最近請求」跟「已啟用」用同一種 pill，讓歷史看起來像狀態。
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { codexAccountLabel } from "@/lib/codexAccount";
 import { providerNameFromEndpoint } from "@/lib/providerName";
@@ -35,6 +35,12 @@ import {
   soonestResetExpiry,
 } from "@/lib/resetCredits";
 import { expiresAtRef, expiresInRef } from "@/lib/format";
+import {
+  normalizeQuotaPool,
+  quotaPoolAccounts,
+  quotaPoolRotation,
+  type QuotaPoolAccount,
+} from "@/lib/quotaPool";
 import { providerState } from "@/lib/vocabulary";
 import { Btn, Cap, Card, Confirm, Empty, KV, Meter, Pill, Row, Rows, State, Toggle, Tray } from "@/components/ui";
 import type {
@@ -50,6 +56,8 @@ import type {
   ModelRoute,
   ProbeResult,
   QuotaSnapshot,
+  QuotaPoolSettings,
+  QuotaPoolStatus,
   Route,
   RouteReprobeReport,
 } from "@/types";
@@ -205,6 +213,85 @@ function AccountQuota({
   );
 }
 
+function QuotaPoolGate({
+  entry,
+  color,
+  t,
+  resetLabel,
+  disabled,
+  onChange,
+}: {
+  entry: QuotaPoolAccount;
+  color: string;
+  t: Translate;
+  resetLabel: (iso: string | null) => string;
+  disabled: boolean;
+  onChange: (floor: number) => void;
+}) {
+  const weeklyLeft = entry.weeklyRemaining ?? 0;
+  const fiveHourLeft = entry.fiveHourRemaining ?? 0;
+  const [floor, setFloor] = useState(entry.member.weeklyFloor);
+  const committedFloor = useRef(entry.member.weeklyFloor);
+  useEffect(() => {
+    setFloor(entry.member.weeklyFloor);
+    committedFloor.current = entry.member.weeklyFloor;
+  }, [entry.member.weeklyFloor]);
+  const burnable = Math.max(0, weeklyLeft - floor);
+  const commitFloor = (next: number) => {
+    setFloor(next);
+    if (next !== committedFloor.current) {
+      committedFloor.current = next;
+      onChange(next);
+    }
+  };
+  return (
+    <span className="quota-pool__limits" style={{ ["--quota-color" as string]: color }}>
+      <span className="quota-pool__gate">
+        <span className="quota-pool__limit-label">
+          {t("models.ui.pool.weeklyWindow")}
+          {entry.weekly?.resetAt ? ` · ${resetLabel(entry.weekly.resetAt)}` : ""}
+        </span>
+        <span className="quota-pool__limit-read">
+          {burnable > 0
+            ? t("models.ui.pool.burnable", { value: burnable })
+            : t("models.ui.pool.atGate")}
+          {` · ${t("models.ui.pool.leftAndGate", { left: weeklyLeft, floor })}`}
+        </span>
+        <span className={`quota-pool__track${floor > weeklyLeft ? " quota-pool__track--over" : ""}`}>
+          <span className="quota-pool__track-left" style={{ width: `${weeklyLeft}%` }} />
+          <span className="quota-pool__track-keep" style={{ width: `${floor}%` }} />
+          <input
+            className="quota-pool__track-input"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={floor}
+            disabled={disabled}
+            aria-label={t("models.ui.pool.gateLabel", { account: codexAccountLabel(entry.account) })}
+            aria-valuetext={t("models.ui.pool.gateValue", { floor, left: weeklyLeft })}
+            onChange={(event) => setFloor(Number(event.currentTarget.value))}
+            onPointerUp={(event) => commitFloor(Number(event.currentTarget.value))}
+            onKeyUp={(event) => commitFloor(Number(event.currentTarget.value))}
+            onBlur={(event) => commitFloor(Number(event.currentTarget.value))}
+          />
+          <span className="quota-pool__track-focus" />
+        </span>
+      </span>
+      <span className={`quota-pool__hour${fiveHourLeft <= 0 ? " quota-pool__hour--blocking" : ""}`}>
+        <span className="quota-pool__limit-label">{t("models.ui.pool.fiveHourWindow")}</span>
+        <span className="quota-pool__limit-read">
+          {fiveHourLeft <= 0
+            ? t("models.ui.pool.fiveHourEmpty")
+            : t("models.ui.pool.fiveHourLeft", { value: fiveHourLeft })}
+          {entry.fiveHour?.resetAt ? ` · ${resetLabel(entry.fiveHour.resetAt)}` : ""}
+        </span>
+        <span className="quota-pool__hour-meter"><i style={{ width: `${fiveHourLeft}%` }} /></span>
+      </span>
+    </span>
+  );
+}
+
 /** 一個帳號手上每一張 Reset 券。
  *
  * 一張券一列，到期時間寫在名稱底下，右邊是它自己的「使用重置」——
@@ -350,6 +437,9 @@ export function Models({
   const [openResets, setOpenResets] = useState<string | null>(null);
   const [accountQuotas, setAccountQuotas] = useState<Record<string, QuotaSnapshot[]>>({});
   const [accountQuotaErrors, setAccountQuotaErrors] = useState<Record<string, string>>({});
+  const [quotaPool, setQuotaPool] = useState<QuotaPoolStatus | null>(null);
+  const [quotaPoolBusy, setQuotaPoolBusy] = useState(false);
+  const [poolRulesOpen, setPoolRulesOpen] = useState(false);
   const [grokAccounts, setGrokAccounts] = useState<GrokAccountStatus | null>(null);
   const [grokLogin, setGrokLogin] = useState<GrokLoginStatus | null>(null);
   const [grokBusy, setGrokBusy] = useState<string | null>(null);
@@ -401,16 +491,18 @@ export function Models({
         api.getCatalogStatus(),
         api.getCodexOAuthStatus(),
         api.getGrokAccountStatus(),
+        api.getCodexQuotaPool(),
       ]);
       if (!alive) return;
-      const [nextRoutes, models, status, oauthStatus, grokStatus] = results;
+      const [nextRoutes, models, status, oauthStatus, grokStatus, poolStatus] = results;
       if (nextRoutes.status === "fulfilled") setRoutes(nextRoutes.value);
       if (models.status === "fulfilled") setModelRoutes(models.value);
       if (status.status === "fulfilled") setCatalogStatus(status.value);
       if (oauthStatus.status === "fulfilled") setOauth(oauthStatus.value);
       if (grokStatus.status === "fulfilled") setGrokAccounts(grokStatus.value);
+      if (poolStatus.status === "fulfilled") setQuotaPool(poolStatus.value);
       const failures = results
-        .slice(0, 4)
+        .filter((_, index) => index !== 4)
         .filter((result): result is PromiseRejectedResult => result.status === "rejected");
       const failureDetails = failures.map((failure) => String(failure.reason));
       if (openCodeRefreshFailure) failureDetails.unshift(String(openCodeRefreshFailure));
@@ -531,6 +623,62 @@ export function Models({
       alive = false;
     };
   }, [oauth, refreshVersion]);
+
+  const normalizedQuotaPool = useMemo(
+    () => normalizeQuotaPool(
+      quotaPool ?? { enabled: false, strategy: "rank", members: [] },
+      oauth?.accounts ?? [],
+    ),
+    [quotaPool, oauth],
+  );
+  const pooledAccounts = useMemo(
+    () => quotaPoolAccounts(normalizedQuotaPool, oauth?.accounts ?? [], accountQuotas),
+    [normalizedQuotaPool, oauth, accountQuotas],
+  );
+  const poolRotation = useMemo(
+    () => quotaPoolRotation(normalizedQuotaPool, pooledAccounts),
+    [normalizedQuotaPool, pooledAccounts],
+  );
+
+  async function saveQuotaPool(settings: QuotaPoolSettings) {
+    const previous = quotaPool;
+    setQuotaPool({ ...settings, activeAccountId: quotaPool?.activeAccountId ?? null });
+    setQuotaPoolBusy(true);
+    try {
+      setQuotaPool(await api.setCodexQuotaPool(settings));
+      onChanged();
+    } catch (cause) {
+      setQuotaPool(previous);
+      setError(t("models.ui.pool.saveFailed", { detail: String(cause) }));
+    } finally {
+      setQuotaPoolBusy(false);
+    }
+  }
+
+  function updatePoolMember(
+    accountId: string,
+    update: (member: QuotaPoolSettings["members"][number]) => QuotaPoolSettings["members"][number],
+  ) {
+    const settings = normalizeQuotaPool(normalizedQuotaPool, oauth?.accounts ?? []);
+    void saveQuotaPool({
+      ...settings,
+      members: settings.members.map((member) => member.accountId === accountId ? update(member) : member),
+    });
+  }
+
+  function movePoolMember(accountId: string, direction: -1 | 1) {
+    const settings = normalizeQuotaPool(normalizedQuotaPool, oauth?.accounts ?? []);
+    const from = settings.members.findIndex((member) => member.accountId === accountId);
+    if (from < 0) return;
+    let to = from + direction;
+    while (to >= 0 && to < settings.members.length && !settings.members[to]!.inPool) to += direction;
+    if (to < 0 || to >= settings.members.length) return;
+    const members = [...settings.members];
+    const moving = members[from]!;
+    members[from] = members[to]!;
+    members[to] = moving;
+    void saveQuotaPool({ ...settings, members });
+  }
 
   useEffect(() => {
     let alive = true;
@@ -1326,7 +1474,106 @@ export function Models({
         <Cap>{t("models.ui.chatgpt.title")}</Cap>
         <p className="prose" style={{ marginTop: 12 }}>
           {t("models.ui.chatgpt.description")}
+          {" "}
+          <button type="button" className="quota-pool__rules-button" onClick={() => setPoolRulesOpen(true)}>
+            {t("models.ui.pool.rules")}
+          </button>
         </p>
+
+        <div className={`quota-pool__bar${normalizedQuotaPool.enabled ? " quota-pool__bar--on" : ""}`}>
+          <span className="quota-pool__bar-name">{t("models.ui.pool.title")}</span>
+          <span className="quota-pool__bar-copy">
+            {t(normalizedQuotaPool.enabled ? "models.ui.pool.onHint" : "models.ui.pool.offHint")}
+          </span>
+          <button
+            type="button"
+            className="quota-pool__switch"
+            role="switch"
+            aria-checked={normalizedQuotaPool.enabled}
+            aria-label={t("models.ui.pool.title")}
+            disabled={quotaPoolBusy}
+            onClick={() => void saveQuotaPool({
+              ...normalizedQuotaPool,
+              enabled: !normalizedQuotaPool.enabled,
+            })}
+          />
+        </div>
+
+        {normalizedQuotaPool.enabled ? (
+          <div className="quota-pool__head">
+            {pooledAccounts.some((entry) => entry.member.inPool) ? (
+              <>
+                <div className="quota-pool__strategy" role="group" aria-label={t("models.ui.pool.strategyLabel")}>
+                  {(["rank", "most", "soonest"] as const).map((strategy) => (
+                    <button
+                      type="button"
+                      key={strategy}
+                      aria-pressed={normalizedQuotaPool.strategy === strategy}
+                      disabled={quotaPoolBusy}
+                      onClick={() => void saveQuotaPool({ ...normalizedQuotaPool, strategy })}
+                    >
+                      {t(`models.ui.pool.strategy.${strategy}`)}
+                    </button>
+                  ))}
+                </div>
+                <small>
+                  {t(normalizedQuotaPool.strategy === "rank"
+                    ? "models.ui.pool.rankHint"
+                    : "models.ui.pool.computedRankHint")}
+                </small>
+                {(() => {
+                  const members = pooledAccounts.filter((entry) => entry.member.inPool);
+                  const total = members.reduce(
+                    (sum, entry) => sum + (entry.member.paused ? 0 : entry.burnable),
+                    0,
+                  );
+                  const percent = members.length ? Math.round(total / (members.length * 100) * 100) : 0;
+                  return (
+                    <div className="quota-pool__confluence">
+                      <div className="quota-pool__confluence-head">
+                        <span>{t("models.ui.pool.availableThisWeek")}</span>
+                        <strong>{percent}<i>%</i></strong>
+                      </div>
+                      <div
+                        className="quota-pool__confluence-bar"
+                        role="img"
+                        aria-label={t("models.ui.pool.availablePercent", { value: percent })}
+                      >
+                        {members.map((entry, index) => {
+                          const share = entry.member.paused ? 0 : entry.burnable;
+                          return (
+                            <span
+                              key={entry.account.accountId}
+                              className={`quota-pool__confluence-segment${share > 0 ? " quota-pool__confluence-segment--live" : ""}${entry.reason === "fiveHour" ? " quota-pool__confluence-segment--waiting" : ""}`}
+                              style={{
+                                flexGrow: share,
+                                ["--quota-color" as string]: `var(--flow-${(["a", "b", "c", "d"] as const)[index % 4]!})`,
+                              }}
+                              title={`${codexAccountLabel(entry.account)} · ${t("models.ui.pool.burnable", { value: share })}`}
+                            >
+                              {share >= 14 ? (entry.account.email?.split("@").at(0)?.slice(0, 8).toUpperCase() ?? `${index + 1}`) : ""}
+                            </span>
+                          );
+                        })}
+                        <span className="quota-pool__confluence-rest" style={{ flexGrow: Math.max(0, members.length * 100 - total) }} />
+                      </div>
+                      <p className="prose">
+                        {poolRotation.length
+                          ? t("models.ui.pool.currentAndNext", {
+                              current: codexAccountLabel(poolRotation[0]!.account),
+                              next: poolRotation[1] ? codexAccountLabel(poolRotation[1].account) : t("common.emDash"),
+                            })
+                          : t("models.ui.pool.stalled")}
+                      </p>
+                    </div>
+                  );
+                })()}
+              </>
+            ) : (
+              <p className="prose">{t("models.ui.pool.empty")}</p>
+            )}
+          </div>
+        ) : null}
 
         {deviceLogin ? (
           <div className="detect" style={{ marginTop: 16 }}>
@@ -1368,6 +1615,120 @@ export function Models({
         ) : null}
 
         {oauth?.accounts.length ? (
+          normalizedQuotaPool.enabled ? (
+            <div className="quota-pool__rows">
+              {pooledAccounts.map((entry, index) => {
+                const account = entry.account;
+                const accountLabel = codexAccountLabel(account);
+                const credits = resetCredits[account.accountId];
+                const available = credits?.credits.filter((credit) => credit.status === "available").length
+                  ?? credits?.availableCount
+                  ?? 0;
+                const resetError = resetErrors[account.accountId];
+                const resetsOpen = openResets === account.accountId;
+                const soonest = credits ? soonestResetExpiry(credits.credits) : null;
+                const rank = poolRotation.findIndex((candidate) => candidate.account.accountId === account.accountId) + 1;
+                const memberOrder = pooledAccounts.filter((candidate) => candidate.member.inPool);
+                const memberRank = memberOrder.findIndex((candidate) => candidate.account.accountId === account.accountId);
+                const reason = entry.member.inPool
+                  ? entry.reason
+                    ? t(`models.ui.pool.reason.${entry.reason}`)
+                    : rank === 1
+                      ? t("models.ui.pool.using")
+                      : rank === 2
+                        ? t("models.ui.pool.next")
+                        : t("models.ui.pool.standby")
+                  : t("models.ui.pool.outside");
+                const color = `var(--flow-${(["a", "b", "c", "d"] as const)[index % 4]!})`;
+                return (
+                  <div
+                    className={`quota-pool__row${entry.member.paused ? " quota-pool__row--paused" : ""}${!entry.member.inPool ? " quota-pool__row--outside" : ""}`}
+                    key={account.accountId}
+                    style={{ ["--quota-color" as string]: color }}
+                  >
+                    <span className="quota-pool__rank">
+                      <span className={`quota-pool__rank-no${rank === 1 ? " quota-pool__rank-no--active" : rank ? "" : " quota-pool__rank-no--out"}`}>
+                        {rank || "–"}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={quotaPoolBusy || normalizedQuotaPool.strategy !== "rank" || memberRank <= 0}
+                        aria-label={t("models.ui.pool.moveUp")}
+                        onClick={() => movePoolMember(account.accountId, -1)}
+                      >▲</button>
+                      <button
+                        type="button"
+                        disabled={quotaPoolBusy || normalizedQuotaPool.strategy !== "rank" || memberRank < 0 || memberRank >= memberOrder.length - 1}
+                        aria-label={t("models.ui.pool.moveDown")}
+                        onClick={() => movePoolMember(account.accountId, 1)}
+                      >▼</button>
+                    </span>
+                    <span className="quota-pool__who">
+                      <b>{entry.member.inPool ? <i /> : null}{accountLabel}</b>
+                      <small>{account.planType ?? "ChatGPT"} · {account.accountId.slice(-12)}</small>
+                    </span>
+                    <span className="quota-pool__actions">
+                      <State tone={rank === 1 ? "ok" : entry.reason && entry.reason !== "paused" ? "warn" : "quiet"} label={reason} />
+                      <span className="acct__resets">
+                        {resetError || !credits ? (
+                          <Pill tone={resetError ? "warn" : "quiet"}>
+                            {resetError ? t("models.ui.reset.failed") : t("models.ui.reset.loading")}
+                          </Pill>
+                        ) : (
+                          <button
+                            type="button"
+                            id={`resets-${account.accountId}`}
+                            className={`pill pill--tap${soonest && resetExpiryTone(soonest) === "soon" ? " pill--warn" : available > 0 ? " pill--ok" : " pill--quiet"}`}
+                            aria-expanded={resetsOpen}
+                            aria-controls={`resets-tray-${account.accountId}`}
+                            onClick={() => setOpenResets((current) => current === account.accountId ? null : account.accountId)}
+                          >
+                            {`Reset ${available}`}<i className="pill__caret" data-open={resetsOpen} aria-hidden="true" />
+                          </button>
+                        )}
+                      </span>
+                      {entry.member.inPool ? (
+                        <>
+                          <Btn soft mini disabled={quotaPoolBusy} onClick={() => updatePoolMember(account.accountId, (member) => ({ ...member, paused: !member.paused }))}>
+                            {t(entry.member.paused ? "models.ui.pool.resume" : "models.ui.pool.pause")}
+                          </Btn>
+                          <Btn soft mini disabled={quotaPoolBusy} onClick={() => updatePoolMember(account.accountId, (member) => ({ ...member, inPool: false, paused: false }))}>
+                            {t("models.ui.pool.remove")}
+                          </Btn>
+                        </>
+                      ) : (
+                        <Btn soft mini disabled={quotaPoolBusy} onClick={() => updatePoolMember(account.accountId, (member) => ({ ...member, inPool: true }))}>
+                          {t("models.ui.pool.add")}
+                        </Btn>
+                      )}
+                    </span>
+                    {entry.member.inPool ? (
+                      <QuotaPoolGate
+                        entry={entry}
+                        color={color}
+                        t={t}
+                        resetLabel={resetLabel}
+                        disabled={quotaPoolBusy || entry.member.paused}
+                        onChange={(weeklyFloor) => updatePoolMember(account.accountId, (member) => ({ ...member, weeklyFloor }))}
+                      />
+                    ) : null}
+                    {resetsOpen && credits?.credits.length ? (
+                      <span className="quota-pool__tray">
+                        <ResetLedger
+                          id={`resets-tray-${account.accountId}`}
+                          credits={credits.credits}
+                          t={t}
+                          labelledBy={`resets-${account.accountId}`}
+                          busy={resetBusy !== null}
+                          onUse={(creditId) => confirmConsumeReset(account.accountId, accountLabel, creditId)}
+                        />
+                      </span>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
           <Rows>
             {oauth.accounts.map((account) => {
               const accountLabel = codexAccountLabel(account);
@@ -1485,6 +1846,7 @@ export function Models({
               );
             })}
           </Rows>
+          )
         ) : null}
 
         {resetFeedback ? (
@@ -1508,6 +1870,17 @@ export function Models({
             </>
           ) : null}
         </div>
+        <Confirm
+          open={poolRulesOpen}
+          title={t("models.ui.pool.rulesTitle")}
+          facts={(["gate", "fiveHour", "strategy", "pause", "reset", "empty"] as const).map((key) => ({
+            key: t(`models.ui.pool.rule.${key}.title`),
+            value: t(`models.ui.pool.rule.${key}.body`),
+          }))}
+          confirmLabel={t("common.close")}
+          onConfirm={() => setPoolRulesOpen(false)}
+          onCancel={() => setPoolRulesOpen(false)}
+        />
       </Card>
 
       {grokRoute ? (

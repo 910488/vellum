@@ -158,7 +158,7 @@ impl OfficialAuthProvider for DesktopOfficialAuth {
     async fn authorize(&self, _route_id: &str) -> Result<OfficialAuthDecision, String> {
         self.state
             .codex_oauth()
-            .valid_default_auth()
+            .valid_routing_auth()
             .await
             .map(|auth| match auth {
                 Some(auth) => OfficialAuthDecision::Managed(OfficialAuthorization {

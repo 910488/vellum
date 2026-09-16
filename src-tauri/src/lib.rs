@@ -263,6 +263,8 @@ pub fn run() {
             commands::stop_proxy_and_restore,
             commands::repair_codex_config,
             commands::get_codex_oauth_status,
+            commands::get_codex_quota_pool,
+            commands::set_codex_quota_pool,
             commands::start_codex_oauth_login,
             commands::poll_codex_oauth_login,
             commands::set_default_codex_oauth_account,

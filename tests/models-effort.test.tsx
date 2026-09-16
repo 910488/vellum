@@ -15,6 +15,10 @@ const apiMocks = vi.hoisted(() => ({
   listModelRoutes: vi.fn(),
   getCatalogStatus: vi.fn(),
   getCodexOAuthStatus: vi.fn(),
+  getCodexQuotaPool: vi.fn(),
+  setCodexQuotaPool: vi.fn(),
+  getCodexOAuthAccountQuota: vi.fn(),
+  getCodexOAuthResetCredits: vi.fn(),
   getGrokAccountStatus: vi.fn(),
   reprobeRouteCapabilities: vi.fn(),
   reprobeRouteModelCapability: vi.fn(),
@@ -154,6 +158,12 @@ describe("Models screen Effort probe status", () => {
       defaultAccountId: null,
       accounts: [],
     });
+    apiMocks.getCodexQuotaPool.mockResolvedValue({
+      enabled: false,
+      strategy: "rank",
+      members: [],
+      activeAccountId: null,
+    });
     apiMocks.getGrokAccountStatus.mockResolvedValue({
       authenticated: false,
       defaultAccountId: null,
@@ -164,6 +174,36 @@ describe("Models screen Effort probe status", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it("saves a gate only on commit and allows reordering a paused pool member", async () => {
+    apiMocks.getCodexOAuthStatus.mockResolvedValue({ authenticated: true, defaultAccountId: "a", accounts: [
+      { accountId: "a", email: "a@example.test", authenticatedAt: 1, isDefault: true },
+      { accountId: "b", email: "b@example.test", authenticatedAt: 1, isDefault: false },
+    ] });
+    apiMocks.getCodexQuotaPool.mockResolvedValue({ enabled: true, strategy: "rank", activeAccountId: null, members: [
+      { accountId: "a", inPool: true, paused: false, weeklyFloor: 20 },
+      { accountId: "b", inPool: true, paused: true, weeklyFloor: 0 },
+    ] });
+    apiMocks.getCodexOAuthAccountQuota.mockResolvedValue([
+      { usedPercent: 10, period: { unit: "hour", amount: 5 }, resetAt: null },
+      { usedPercent: 10, period: { unit: "week", amount: null }, resetAt: null },
+    ]);
+    apiMocks.getCodexOAuthResetCredits.mockResolvedValue({ credits: [], availableCount: 0 });
+    apiMocks.setCodexQuotaPool.mockImplementation(async (settings) => ({ ...settings, activeAccountId: null }));
+    renderModels();
+    const slider = (await screen.findAllByRole("slider"))[0]!;
+    fireEvent.change(slider, { target: { value: "35" } });
+    expect(apiMocks.setCodexQuotaPool).not.toHaveBeenCalled();
+    fireEvent.pointerUp(slider);
+    fireEvent.blur(slider);
+    await waitFor(() => expect(apiMocks.setCodexQuotaPool).toHaveBeenCalledTimes(1));
+    expect(apiMocks.setCodexQuotaPool.mock.calls[0]![0].members[0].weeklyFloor).toBe(35);
+    const up = screen.getAllByRole("button", { name: t("models.ui.pool.moveUp") })[1]!;
+    await waitFor(() => expect((up as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(up);
+    await waitFor(() => expect(apiMocks.setCodexQuotaPool).toHaveBeenCalledTimes(2));
+    expect(apiMocks.setCodexQuotaPool.mock.calls[1]![0].members[0].accountId).toBe("b");
   });
 
   // The Effort label lives alongside sibling text nodes inside one
