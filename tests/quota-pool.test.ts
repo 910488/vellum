@@ -54,12 +54,24 @@ describe("quota pool", () => {
     expect(entries[1]).toMatchObject({ burnable: 92, usable: false, reason: "fiveHour" });
   });
 
-  it("applies rank, most-remaining, and soonest-reset ordering only to usable members", () => {
+  it("rotates in member order and only through usable members", () => {
     const entries = quotaPoolAccounts(settings, accounts, {
       a: [quota("hour", 10), quota("week", 41)],
       b: [quota("hour", 10), quota("week", 8)],
     });
-    expect(quotaPoolRotation(settings, entries).map((entry) => entry.account.accountId)).toEqual(["a", "b"]);
-    expect(quotaPoolRotation({ ...settings, strategy: "most" }, entries).map((entry) => entry.account.accountId)).toEqual(["b", "a"]);
+    expect(quotaPoolRotation(entries).map((entry) => entry.account.accountId)).toEqual(["a", "b"]);
+  });
+
+  it("folds a stored legacy strategy back to manual rank", () => {
+    // b has far more weekly left; under the removed "most" strategy it would
+    // have jumped ahead of a. The order must stay the user's.
+    const legacySettings = { ...settings, strategy: "most" } as unknown as QuotaPoolSettings;
+    const legacy = normalizeQuotaPool(legacySettings, accounts);
+    expect(legacy.strategy).toBe("rank");
+    const entries = quotaPoolAccounts(legacy, accounts, {
+      a: [quota("hour", 10), quota("week", 41)],
+      b: [quota("hour", 10), quota("week", 8)],
+    });
+    expect(quotaPoolRotation(entries).map((entry) => entry.account.accountId)).toEqual(["a", "b"]);
   });
 });

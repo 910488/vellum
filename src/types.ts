@@ -170,7 +170,7 @@ export interface CodexOAuthStatus {
   accounts: CodexOAuthAccount[];
 }
 
-export type QuotaPoolStrategy = "rank" | "most" | "soonest";
+export type QuotaPoolStrategy = "rank";
 
 export interface QuotaPoolMember {
   accountId: string;

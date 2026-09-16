@@ -2326,65 +2326,89 @@ html[data-performance="low"] .card {
   color: var(--ink-faint);
 }
 
-/* ---------- ChatGPT 額度池 ---------- */
+/* ---------- ChatGPT 額度池 ----------
+   開池不換一套 UI。帳號列還是 Rows／.acct，欄位還是那五格（狀態、額度、
+   Reset、兩顆動作），量條還是 .meter。池只多兩件事：標籤前面一個順位號碼，
+   以及週視窗那條量條上一道拉得動的閘門。
+
+   第一版把開池做成另一套列 —— 自己的 grid、自己的量條、每個帳號配一種
+   身分色。扳一個開關整張卡就換了長相，看的人沒有東西可以對照著讀；而且
+   身分色蓋掉了 honey／coral，那兩個色本來在說「這個帳號快見底了」。
+   顏色現在只留在匯流條上，因為那裡「哪一段是誰」正是它要回答的事。 */
+
+/* 說明文字尾端的入口。規則是想不起來時才翻的東西，常駐一張卡只會把要
+   操作的那幾列往下推。 */
 .quota-pool__rules-button { font: inherit; color: var(--ink-faint); background: none; border: 0; border-bottom: 1px dotted color-mix(in srgb, var(--ink-faint) 52%, transparent); padding: 0 0 1px; cursor: pointer; }
 .quota-pool__rules-button:hover { color: var(--lavender-deep); border-color: var(--lavender-deep); }
-.quota-pool__bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 18px; align-items: center; margin-top: 18px; padding: 15px 18px 16px; border-radius: var(--r-md); background: var(--surface-sunk); box-shadow: inset 0 1px 2px var(--rim-shade); }
+
+/* 開關沿用 .toggle、策略沿用 .segment —— 這裡只負責把它們排好。
+   自己刻一顆 52×28 的開關跟一組 16px 的分段鈕，等於在一張卡裡混進第二套
+   控制項尺寸。 */
+.quota-pool__bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 18px; align-items: center; margin-top: 18px; padding: 14px 16px 15px; border-radius: var(--r-md); background: var(--surface-sunk); box-shadow: inset 0 1px 2px var(--rim-shade); }
 .quota-pool__bar--on { background: var(--lavender-wash); box-shadow: inset 0 1px 2px var(--rim-shade), inset 0 0 0 1px color-mix(in srgb, var(--lavender) 26%, transparent); }
-.quota-pool__bar-name { font-size: 14px; font-weight: 600; }
-.quota-pool__bar-copy { grid-column: 1; font-size: 12.5px; line-height: 1.7; color: var(--ink-faint); }
-.quota-pool__switch { position: relative; grid-column: 2; grid-row: 1 / span 2; width: 52px; height: 28px; border: 0; padding: 0; border-radius: var(--r-pill); background: color-mix(in srgb, var(--ink-ghost) 26%, transparent); box-shadow: inset 0 1px 3px var(--rim-shade); cursor: pointer; }
-.quota-pool__switch[aria-checked="true"] { background: linear-gradient(140deg, var(--accent-from), var(--accent-to)); }
-.quota-pool__switch::after { content: ""; position: absolute; top: 4px; left: 5px; width: 8px; height: 20px; border-radius: 3px 4px; background: var(--surface-solid); box-shadow: 0 1px 3px var(--rim-shade); transition: transform .24s cubic-bezier(.22,.86,.24,1); }
-.quota-pool__switch[aria-checked="true"]::after { transform: translateX(29px); }
-.quota-pool__head { display: grid; gap: 10px; margin-top: 16px; }
-.quota-pool__head > small { color: var(--ink-faint); }
-.quota-pool__strategy { display: inline-flex; justify-self: start; padding: 3px; gap: 2px; border-radius: var(--r-pill); background: color-mix(in srgb, var(--surface-solid) 54%, transparent); box-shadow: inset 0 1px 2px var(--rim-shade); }
-.quota-pool__strategy button { border: 0; background: transparent; color: var(--ink-faint); padding: 6px 13px; border-radius: var(--r-pill); cursor: pointer; }
-.quota-pool__strategy button[aria-pressed="true"] { color: var(--ink); background: color-mix(in srgb, var(--surface-solid) 88%, transparent); box-shadow: inset 0 1px 0 var(--rim-light), 0 1px 3px var(--rim-shade); }
-.quota-pool__confluence { display: grid; gap: 8px; margin-top: 2px; }
-.quota-pool__confluence-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--ink-soft); }
-.quota-pool__confluence-head strong { font-family: var(--font-display); font-size: 30px; line-height: 1; color: var(--apricot-ink); }
-.quota-pool__confluence-head i { font: normal 13px var(--font-body); margin-left: 2px; color: var(--ink-faint); }
-.quota-pool__confluence-bar { display: flex; height: 24px; overflow: hidden; border-radius: var(--r-pill); background: var(--surface-sunk); box-shadow: inset 0 1px 3px var(--rim-shade); }
-.quota-pool__confluence-segment { flex-basis: 0; min-width: 0; display: grid; place-items: center; overflow: hidden; white-space: nowrap; font-size: 10px; font-weight: 700; color: var(--on-signal); background: var(--quota-color); transition: flex-grow .4s ease; }
+.quota-pool__bar-name { font-size: 13.5px; font-weight: 600; }
+.quota-pool__bar-copy { grid-column: 1; font-size: 12px; line-height: 1.7; color: var(--ink-faint); }
+.quota-pool__bar .toggle { grid-column: 2; grid-row: 1 / span 2; }
+
+.quota-pool__head { display: grid; gap: 10px; margin-top: 14px; }
+.quota-pool__head > small { font-size: 12px; color: var(--ink-faint); }
+.quota-pool__head .segment { justify-self: start; }
+.quota-pool__head .prose { margin: 0; }
+
+/* 匯流讀數：一個數字回答「合併起來這週還可以自動取用多少」，底下那條說明
+   它是由誰組成的。段內那幾個字母就是色票的圖例 —— 沒有它們，四種顏色只是
+   裝飾。flex-basis: 0 不能省：不設的話字會把段撐寬，段寬就不再正比於數值，
+   變成一條會說謊的讀數。 */
+.quota-pool__confluence { display: grid; gap: 7px; }
+.quota-pool__confluence-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 12.5px; color: var(--ink-soft); }
+.quota-pool__confluence-head strong { font-family: var(--font-display); font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums lining-nums; line-height: 1; color: var(--apricot-ink); }
+.quota-pool__confluence-head i { font: normal 12px var(--font-body); margin-left: 2px; color: var(--ink-faint); }
+.quota-pool__confluence-bar { display: flex; height: 18px; overflow: hidden; border-radius: var(--r-pill); background: var(--surface-sunk); box-shadow: inset 0 1px 2px var(--rim-shade); }
+.quota-pool__confluence-segment { flex-basis: 0; min-width: 0; display: grid; place-items: center; overflow: hidden; white-space: nowrap; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; color: var(--on-signal); background: var(--quota-color); transition: flex-grow 0.4s ease; }
 .quota-pool__confluence-segment--live { min-width: 5px; }
-.quota-pool__confluence-segment--waiting { background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--on-signal) 20%, transparent) 0 4px, transparent 4px 9px), var(--quota-color); }
+/* 週額度還在，但 5 小時窗見底，現在輪不到。淡掉而不是打斜紋 —— 18px 高的
+   條子上斜紋只會變成一團雜訊。 */
+.quota-pool__confluence-segment--waiting { opacity: 0.45; }
 .quota-pool__confluence-rest { flex-basis: 0; min-width: 0; }
-.quota-pool__rows { display: flex; flex-direction: column; margin-top: 8px; }
-.quota-pool__row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px 14px; padding: 15px 2px 17px; align-items: start; }
-.quota-pool__row + .quota-pool__row { border-top: 1px solid var(--edge); }
-.quota-pool__row--paused { opacity: .6; }
-.quota-pool__rank { display: grid; grid-template-columns: auto auto; align-items: center; gap: 2px 7px; }
-.quota-pool__rank-no { grid-row: 1 / span 2; width: 26px; height: 26px; display: grid; place-items: center; font: 700 15px var(--font-display); border-radius: 9px 10px 8px 9px; background: color-mix(in srgb, var(--surface-solid) 66%, transparent); box-shadow: inset 0 0 0 1px var(--edge); }
-.quota-pool__rank-no--active { color: var(--on-accent); background: linear-gradient(140deg, var(--accent-from), var(--accent-to)); box-shadow: none; }
-.quota-pool__rank-no--out { color: var(--ink-ghost); background: transparent; }
-.quota-pool__rank button { border: 0; background: transparent; color: var(--ink-ghost); font-size: 9px; padding: 2px 4px; cursor: pointer; }
-.quota-pool__rank button:disabled { opacity: .25; cursor: default; }
-.quota-pool__who { display: grid; gap: 3px; min-width: 0; }
-.quota-pool__who b { display: inline-flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
-.quota-pool__who b i { width: 9px; height: 9px; flex: none; border-radius: 3px 4px; background: var(--quota-color); }
-.quota-pool__who small { font-family: var(--font-mono); color: var(--ink-faint); overflow-wrap: anywhere; }
-.quota-pool__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px; }
-.quota-pool__limits, .quota-pool__tray { grid-column: 2 / -1; display: grid; gap: 12px; margin-top: 6px; }
-.quota-pool__gate, .quota-pool__hour { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 14px; align-items: baseline; }
-.quota-pool__limit-label, .quota-pool__limit-read { font-size: 11.5px; color: var(--ink-faint); }
-.quota-pool__limit-read { text-align: right; }
-.quota-pool__track { grid-column: 1 / -1; position: relative; height: 20px; border-radius: var(--r-pill); background: var(--surface-sunk); box-shadow: inset 0 1px 2px var(--rim-shade); }
-.quota-pool__track-left, .quota-pool__track-keep { position: absolute; inset-block: 0; left: 0; border-radius: var(--r-pill); }
-.quota-pool__track-left { background: linear-gradient(90deg, color-mix(in srgb, var(--quota-color) 55%, transparent), var(--quota-color)); }
-.quota-pool__track-keep { background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--ink) 30%, transparent) 0 4px, transparent 4px 9px); }
-.quota-pool__track--over .quota-pool__track-keep { background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--warn) 58%, transparent) 0 4px, transparent 4px 9px); }
-.quota-pool__track-input { position: absolute; inset-inline: 0; top: 50%; transform: translateY(-50%); width: 100%; height: 34px; margin: 0; background: transparent; appearance: none; cursor: ew-resize; }
-.quota-pool__track-input::-webkit-slider-runnable-track { height: 34px; background: transparent; }
-.quota-pool__track-input::-webkit-slider-thumb { appearance: none; width: 10px; height: 30px; border: 0; border-radius: 4px 5px; background: var(--ink-soft); box-shadow: inset 0 1px 0 var(--rim-light), 0 2px 5px var(--rim-shade); }
-.quota-pool__track-focus { position: absolute; inset: -4px; border-radius: var(--r-pill); pointer-events: none; }
-.quota-pool__track-input:focus-visible { outline: none; }
-.quota-pool__track-input:focus-visible ~ .quota-pool__track-focus { box-shadow: 0 0 0 2px var(--lavender-deep); }
-.quota-pool__hour-meter { grid-column: 1 / -1; height: 5px; border-radius: var(--r-pill); background: var(--surface-sunk); overflow: hidden; }
-.quota-pool__hour-meter i { display: block; height: 100%; background: var(--quota-color); }
-.quota-pool__hour--blocking .quota-pool__limit-read { color: var(--warn-ink); }
-@media (max-width: 760px) { .quota-pool__row { grid-template-columns: auto minmax(0, 1fr); } .quota-pool__actions, .quota-pool__limits, .quota-pool__tray { grid-column: 1 / -1; justify-content: flex-start; } }
+
+/* 順位。就是一個數字，不做成方章 —— 那是整張卡上最重的一塊，卻標著最不
+   重要的數字。取用中的那個換成強調色，其餘留在 ghost。 */
+.acct__rank { display: inline-flex; align-items: baseline; gap: 9px; min-width: 0; }
+.acct__rank > b { flex: none; min-width: 1.2em; text-align: right; font-family: var(--font-display); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums lining-nums; color: var(--ink-ghost); }
+.acct__rank--active > b { color: var(--lavender-deep); }
+/* ▲▼ 只在「依順位」時存在。其他策略下順序是算出來的，永遠按不動 ——
+   一排按不動的按鈕比沒有按鈕更難讀。 */
+.acct__rank-move { display: inline-flex; gap: 1px; }
+.acct__rank-move button { border: 0; background: none; padding: 1px 4px; border-radius: 4px; font-size: 10px; line-height: 1; color: var(--ink-ghost); cursor: pointer; }
+.acct__rank-move button:hover:not(:disabled) { color: var(--ink); background: var(--surface-sunk); }
+.acct__rank-move button:disabled { opacity: 0.3; cursor: default; }
+.acct--paused { opacity: 0.62; }
+
+/* 閘門：週視窗那條量條上一道拉得動的刻度，就是 Meter 的 markAt。不另外
+   畫一條 bar —— 閘門要回答的是「離現在的餘量還差多遠」，那個對照只有畫在
+   同一條上才成立。
+
+   範圍輸入疊在上面、整條透明：抓得到（28px 的手把），但看不見（量條還是
+   7px），所以開池的列高跟關池時一模一樣。 */
+.acct__gate { position: relative; min-width: 0; cursor: ew-resize; }
+.acct__gate .meter { overflow: visible; }
+.acct__gate .meter__mark { top: -5px; bottom: -5px; width: 3px; margin-left: -1.5px; border-radius: 2px; opacity: 0.62; transition: opacity 0.18s ease; }
+.acct__gate:hover .meter__mark { opacity: 1; }
+/* 閘門已經高過這週的餘量：這個帳號自動輪替取不到東西了。換成 --crit ——
+   這套色票裡只有這個顏色代表「擋住了」。 */
+.acct__gate--over .meter__mark { background: var(--crit); opacity: 1; }
+/* 閘門以下那段是留給你自己的。平塗一層墨，不打斜紋：7px 高的條子上斜紋
+   只是雜訊。 */
+.acct__gate-keep { position: absolute; inset-block: 0; left: 0; border-radius: var(--r-pill); background: color-mix(in srgb, var(--ink) 20%, transparent); pointer-events: none; }
+.acct__gate-input { position: absolute; inset-inline: 0; top: 50%; transform: translateY(-50%); width: 100%; height: 28px; margin: 0; padding: 0; background: transparent; appearance: none; cursor: ew-resize; }
+.acct__gate-input:disabled { cursor: default; }
+.acct__gate-input::-webkit-slider-runnable-track { height: 28px; background: transparent; }
+.acct__gate-input::-webkit-slider-thumb { appearance: none; width: 14px; height: 28px; border: 0; background: transparent; }
+.acct__gate-input::-moz-range-track { height: 28px; background: transparent; }
+.acct__gate-input::-moz-range-thumb { width: 14px; height: 28px; border: 0; background: transparent; }
+.acct__gate-input:focus-visible { outline: none; }
+.acct__gate-focus { position: absolute; inset: -5px -2px; border-radius: var(--r-pill); pointer-events: none; }
+.acct__gate-input:focus-visible ~ .acct__gate-focus { box-shadow: 0 0 0 2px var(--lavender-deep); }
 
 .runtime-control {
   display: grid;

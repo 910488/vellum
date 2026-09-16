@@ -35,7 +35,9 @@ export function normalizeQuotaPool(
       ordered.push({ accountId: account.accountId, inPool: false, paused: false, weeklyFloor: 0 });
     }
   }
-  return { ...settings, members: ordered };
+  // 順序只有一種：使用者排的那一種。後端存的設定可能還帶著舊的 most／soonest，
+  // 這裡一律收成 rank —— 畫面上的號碼才會跟實際順序一致，下一次存檔也會把它寫回去。
+  return { ...settings, strategy: "rank", members: ordered };
 }
 
 export function quotaPoolAccounts(
@@ -79,20 +81,7 @@ export function quotaPoolAccounts(
   });
 }
 
-export function quotaPoolRotation(
-  settings: QuotaPoolSettings,
-  accounts: QuotaPoolAccount[],
-): QuotaPoolAccount[] {
-  const live = accounts.filter((entry) => entry.usable);
-  if (settings.strategy === "most") {
-    return [...live].sort((left, right) => right.burnable - left.burnable);
-  }
-  if (settings.strategy === "soonest") {
-    const reset = (entry: QuotaPoolAccount) => {
-      const value = entry.weekly?.resetAt ? Date.parse(entry.weekly.resetAt) : Number.POSITIVE_INFINITY;
-      return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
-    };
-    return [...live].sort((left, right) => reset(left) - reset(right));
-  }
-  return live;
+/** 輪替順序就是成員順序，跳過現在用不了的帳號。跳過不會改變其餘的先後。 */
+export function quotaPoolRotation(accounts: QuotaPoolAccount[]): QuotaPoolAccount[] {
+  return accounts.filter((entry) => entry.usable);
 }
