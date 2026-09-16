@@ -13,7 +13,7 @@ import { useTranslation } from "react-i18next";
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
-import { codexAccountLabel } from "@/lib/codexAccount";
+import { codexAccountLabel, codexPoolSegmentLabel } from "@/lib/codexAccount";
 import { providerNameFromEndpoint } from "@/lib/providerName";
 import {
   accountQuotaWindows,
@@ -1551,7 +1551,7 @@ export function Models({
                               }}
                               title={`${codexAccountLabel(entry.account)} · ${t("models.ui.pool.burnable", { value: share })}`}
                             >
-                              {share >= 14 ? (entry.account.email?.split("@").at(0)?.slice(0, 8).toUpperCase() ?? `${index + 1}`) : ""}
+                              {share >= 14 ? codexPoolSegmentLabel(entry.account) : ""}
                             </span>
                           );
                         })}

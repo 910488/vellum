@@ -32,3 +32,9 @@ export function codexWorkspaceLabel(account: CodexOAuthAccount): string {
 export function codexAccountLabel(account: CodexOAuthAccount): string {
   return `${account.email ?? `ChatGPT ${account.accountId.slice(0, 8)}`} · ${codexWorkspaceLabel(account)}`;
 }
+
+/** Compact pool bars identify the billed workspace because one email can own
+ * both Personal and Business credentials. */
+export function codexPoolSegmentLabel(account: CodexOAuthAccount): string {
+  return codexWorkspaceLabel(account).toLocaleUpperCase();
+}
