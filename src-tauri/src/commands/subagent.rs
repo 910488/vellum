@@ -16,8 +16,10 @@ pub fn get_subagent_settings(state: State<'_, AppState>) -> AppResult<SubagentSe
 }
 
 #[tauri::command]
-pub fn get_subagent_capability() -> AppResult<SubagentCapability> {
-    Ok(crate::codex::native_subagent_capability())
+pub async fn get_subagent_capability() -> AppResult<SubagentCapability> {
+    tauri::async_runtime::spawn_blocking(|| Ok(crate::codex::native_subagent_capability()))
+        .await
+        .map_err(|error| crate::error::AppError::Message(format!("subagent capability task failed: {error}")))?
 }
 
 #[tauri::command]

@@ -1520,7 +1520,9 @@ fn verify_settings(
 }
 
 fn hex_sha256_file(path: &Path) -> Result<String, std::io::Error> {
-    Ok(hex::encode(Sha256::digest(std::fs::read(path)?)))
+    sha256_file(path)
+        .map(|digest| digest.trim_start_matches("sha256:").to_string())
+        .map_err(std::io::Error::other)
 }
 
 fn canonical(path: &Path) -> PathBuf {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   cachedQuery,
   coalesceQuery,
@@ -78,5 +78,34 @@ describe("visible poll", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     stop();
     expect(loads).toBe(1);
+  });
+
+  it("does not overlap a slow visible poll", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    let loads = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const stop = startVisiblePoll({
+      active: true,
+      intervalMs: 10,
+      load: async () => {
+        loads += 1;
+        await pending;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(35);
+    expect(loads).toBe(1);
+    release();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(loads).toBe(2);
+    stop();
+    vi.useRealTimers();
   });
 });

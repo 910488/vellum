@@ -88,6 +88,7 @@ export type InvokeRingEntry = {
   ok: boolean;
   error?: string;
   at: number;
+  durationMs?: number;
 };
 
 const invokeRing: InvokeRingEntry[] = [];
@@ -97,8 +98,9 @@ export function recordInvokeResult(
   ok: boolean,
   error?: string,
   at = Date.now(),
+  durationMs?: number,
 ): void {
-  invokeRing.push({ cmd, ok, ...(error ? { error } : {}), at });
+  invokeRing.push({ cmd, ok, ...(error ? { error } : {}), at, ...(durationMs == null ? {} : { durationMs }) });
   if (invokeRing.length > INVOKE_RING_CAP) {
     invokeRing.splice(0, invokeRing.length - INVOKE_RING_CAP);
   }
@@ -126,14 +128,15 @@ function afterSettingsChange<T>(promise: Promise<T>): Promise<T> {
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const at = Date.now();
+  const startedAt = performance.now();
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const result = await invoke<T>(cmd, args);
-    recordInvokeResult(cmd, true, undefined, at);
+    recordInvokeResult(cmd, true, undefined, at, performance.now() - startedAt);
     return result;
   } catch (cause) {
     const error = cause instanceof Error ? cause.message : String(cause);
-    recordInvokeResult(cmd, false, error, at);
+    recordInvokeResult(cmd, false, error, at, performance.now() - startedAt);
     throw cause;
   }
 }
@@ -534,7 +537,7 @@ export const api = {
 
   listRoutes(): Promise<Route[]> {
     if (!hasTauri()) return delay(mock.routes());
-    return call<Route[]>("list_routes");
+    return cachedQuery("routes", () => call<Route[]>("list_routes"), { ttlMs: 30_000 });
   },
 
   getCodexQuotaPool(): Promise<QuotaPoolStatus> {
@@ -556,7 +559,7 @@ export const api = {
 
   refreshOpenCodeModelCatalogs(): Promise<Route[]> {
     if (!hasTauri()) return delay(mock.routes());
-    return call<Route[]>("refresh_opencode_model_catalogs");
+    return afterSettingsChange(call<Route[]>("refresh_opencode_model_catalogs"));
   },
 
   selectRoute(routeId: string): Promise<void> {
@@ -685,7 +688,7 @@ export const api = {
         ),
       );
     }
-    return call<ModelRoute[]>("list_model_routes");
+    return cachedQuery("model-routes", () => call<ModelRoute[]>("list_model_routes"), { ttlMs: 30_000 });
   },
 
   listReviewModelRoutes(): Promise<ModelRoute[]> {
@@ -824,7 +827,7 @@ export const api = {
    */
   listSessions(): Promise<SessionStatus[]> {
     if (!hasTauri()) return delay(mock.sessions(), 240);
-    return cachedQuery("sessions", () => call<SessionStatus[]>("get_sessions"), { ttlMs: 2_000 });
+    return cachedQuery("sessions", () => call<SessionStatus[]>("get_sessions"), { ttlMs: 15_000 });
   },
 
   getReviewStats(): Promise<ReviewStats> {

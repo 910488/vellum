@@ -297,8 +297,8 @@ export function Remote({
     return startVisiblePoll({
       active,
       intervalMs: 1000,
-      load: () => {
-        void api.getRemoteOperation(operation.operationId).then((next) => {
+      load: async () => {
+        await api.getRemoteOperation(operation.operationId).then((next) => {
           trackOperation(next);
           if (next.state !== "running") void load();
         }).catch((cause) => setDiscoveryError(String(cause)));
@@ -312,8 +312,8 @@ export function Remote({
     return startVisiblePoll({
       active,
       intervalMs: 2000,
-      load: () => {
-        void api.pollRemoteGrokLogin(selectedHostId).then(() => load()).catch((cause) => setDiscoveryError(String(cause)));
+      load: async () => {
+        await api.pollRemoteGrokLogin(selectedHostId).then(() => load()).catch((cause) => setDiscoveryError(String(cause)));
       },
     });
   }, [selectedHostId, statuses, load, active]);
@@ -352,8 +352,8 @@ export function Remote({
     return startVisiblePoll({
       active,
       intervalMs: Math.max(2000, executionLogin.interval * 1000),
-      load: () => {
-        void api
+      load: async () => {
+        await api
           .pollRemoteOfficialExecutionAccountLogin(selectedHostId, executionLogin.loginId)
           .then(async (next) => {
             if (next.state === "authenticated") {
@@ -371,8 +371,8 @@ export function Remote({
     return startVisiblePoll({
       active,
       intervalMs: 2000,
-      load: () => {
-        void api.pollRemoteCodexAccountLogin(selectedHostId).then(async (next) => {
+      load: async () => {
+        await api.pollRemoteCodexAccountLogin(selectedHostId).then(async (next) => {
           if (next.state !== "synchronized") return;
           setChatgptLogin(null);
           if (await advancePairQueue(selectedHostId)) return;

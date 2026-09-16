@@ -149,14 +149,15 @@ export function Context({
     return startVisiblePoll({
       active,
       intervalMs: 60_000,
-      load: () => {
+      load: async () => {
         setNowSeconds(Math.floor(Date.now() / 1000));
-        void api
+        const sessionsLoad = api
           .listSessions()
           .then(setSessions)
           .catch((cause) => setError(String(cause)));
+        let detailLoad: Promise<unknown> = Promise.resolve();
         if (selected) {
-          void Promise.all([
+          detailLoad = Promise.all([
             api.getCompactionPreview(selected.id),
             api.getCompactionTranscript(selected.id),
           ])
@@ -167,6 +168,7 @@ export function Context({
             })
             .catch((cause) => setCompactError(String(cause)));
         }
+        await Promise.all([sessionsLoad, detailLoad]);
       },
     });
   }, [selected?.id, refreshVersion, active]);

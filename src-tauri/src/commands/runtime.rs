@@ -33,9 +33,13 @@ struct CodexLaunchTarget {
 }
 
 #[tauri::command]
-pub fn get_runtime_status(state: State<'_, AppState>) -> AppResult<RuntimeStatus> {
-    state.reconcile_codex_restart(codex_process_identity());
-    Ok(state.runtime_status())
+pub async fn get_runtime_status(state: State<'_, AppState>) -> AppResult<RuntimeStatus> {
+    let state = state.inner().clone();
+    off_main_thread(move || {
+        state.reconcile_codex_restart(codex_process_identity());
+        state.runtime_status()
+    })
+    .await
 }
 
 /// Runs `work` off the thread that draws the window.

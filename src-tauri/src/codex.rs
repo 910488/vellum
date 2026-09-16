@@ -497,15 +497,40 @@ pub fn local_codex_candidates() -> Vec<PathBuf> {
     )
 }
 
+fn command_output_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "command did not exit before capability probe timeout",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 pub fn native_subagent_capability() -> crate::model::SubagentCapability {
     let minimum = parse_codex_version(MIN_NATIVE_SUBAGENT_DEFAULTS_VERSION)
         .expect("native sub-agent minimum version is valid");
     let mut failures = Vec::new();
     for candidate in local_codex_candidates() {
-        match crate::process::background_command(&candidate)
-            .arg("--version")
-            .output()
-        {
+        let mut command = crate::process::background_command(&candidate);
+        command.arg("--version");
+        match command_output_with_timeout(&mut command, std::time::Duration::from_secs(3)) {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1069,8 +1094,9 @@ fn visit_session_files(
             (None, Some(_)) => false,
         };
         if is_newer_rollout {
-            runtime.model = latest_turn_model(&path);
-            if let Some((used, window)) = latest_token_count(&path) {
+            let (model, token_count) = latest_rollout_state(&path);
+            runtime.model = model;
+            if let Some((used, window)) = token_count {
                 runtime.used_tokens = Some(used);
                 runtime.window_tokens = Some(window);
             }
@@ -1141,55 +1167,68 @@ fn thread_id_from_rollout_path(path: &Path) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn latest_token_count(path: &Path) -> Option<(u64, u64)> {
-    const TAIL_BYTES: u64 = 2 * 1024 * 1024;
-    let mut file = std::fs::File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES)))
-        .ok()?;
-    let mut bytes = Vec::with_capacity(length.min(TAIL_BYTES) as usize);
-    file.read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    text.lines().rev().find_map(|line| {
-        if !line.contains("\"type\":\"token_count\"") {
-            return None;
-        }
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        let used = value
-            .pointer("/payload/info/last_token_usage/total_tokens")
-            .and_then(serde_json::Value::as_u64)?;
-        let window = value
-            .pointer("/payload/info/model_context_window")
-            .and_then(serde_json::Value::as_u64)?;
-        (used > 0 && window > 0).then_some((used, window))
-    })
+    latest_rollout_state(path).1
 }
 
-/// Read the model from the latest `turn_context` in a rollout. Context rows
-/// must use this per-session fact instead of the route's mutable default.
+#[cfg(test)]
 fn latest_turn_model(path: &Path) -> Option<String> {
+    latest_rollout_state(path).0
+}
+
+/// Parse the newest model and token counter from one shared tail read. Context
+/// used to read the same multi-megabyte rollout twice for every session.
+fn latest_rollout_state(path: &Path) -> (Option<String>, Option<(u64, u64)>) {
     const TAIL_BYTES: u64 = 2 * 1024 * 1024;
-    let mut file = std::fs::File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES)))
-        .ok()?;
+    let Some(mut file) = std::fs::File::open(path).ok() else {
+        return (None, None);
+    };
+    let Some(length) = file.metadata().ok().map(|metadata| metadata.len()) else {
+        return (None, None);
+    };
+    if file
+        .seek(SeekFrom::Start(length.saturating_sub(TAIL_BYTES)))
+        .is_err()
+    {
+        return (None, None);
+    }
     let mut bytes = Vec::with_capacity(length.min(TAIL_BYTES) as usize);
-    file.read_to_end(&mut bytes).ok()?;
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .rev()
-        .find_map(|line| {
-            if !line.contains("\"type\":\"turn_context\"") {
-                return None;
+    if file.read_to_end(&mut bytes).is_err() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut model = None;
+    let mut token_count = None;
+    for line in text.lines().rev() {
+        if token_count.is_none() && line.contains("\"type\":\"token_count\"") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                let used = value
+                    .pointer("/payload/info/last_token_usage/total_tokens")
+                    .and_then(serde_json::Value::as_u64);
+                let window = value
+                    .pointer("/payload/info/model_context_window")
+                    .and_then(serde_json::Value::as_u64);
+                if let (Some(used), Some(window)) = (used, window) {
+                    token_count = (used > 0 && window > 0).then_some((used, window));
+                }
             }
-            let value: serde_json::Value = serde_json::from_str(line).ok()?;
-            value
-                .pointer("/payload/model")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .map(str::to_string)
-        })
+        }
+        if model.is_none() && line.contains("\"type\":\"turn_context\"") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                model = value
+                    .pointer("/payload/model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+        }
+        if model.is_some() && token_count.is_some() {
+            break;
+        }
+    }
+    (model, token_count)
 }
 
 fn first_meaningful_user_message(path: &Path) -> Option<String> {

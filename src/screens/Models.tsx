@@ -458,45 +458,51 @@ export function Models({
   useEffect(() => {
     let alive = true;
     refreshParts.current = { version: refreshVersion, done: new Set() };
-    // Routes are persisted snapshots. Refresh OpenCode's cheap `/models`
-    // catalogs before reading those snapshots so entering this page, a hard
-    // reload, and the app-wide Refresh action all expose newly published Go /
-    // Zen models without spending quota on inference capability probes.
+    // Paint persisted local state first. Remote catalog refresh may take
+    // seconds or time out; it must not hold the entire tab behind a spinner.
     void (async () => {
-      let openCodeRefreshFailure: unknown = null;
+      const readSnapshots = async () => {
+        const results = await Promise.allSettled([
+          api.listRoutes(),
+          api.listModelRoutes(),
+          api.getCatalogStatus(),
+          api.getCodexOAuthStatus(),
+          api.getGrokAccountStatus(),
+          api.getCodexQuotaPool(),
+        ]);
+        if (!alive) return [] as string[];
+        const [nextRoutes, models, status, oauthStatus, grokStatus, poolStatus] = results;
+        if (nextRoutes.status === "fulfilled") setRoutes(nextRoutes.value);
+        if (models.status === "fulfilled") setModelRoutes(models.value);
+        if (status.status === "fulfilled") setCatalogStatus(status.value);
+        if (oauthStatus.status === "fulfilled") setOauth(oauthStatus.value);
+        if (grokStatus.status === "fulfilled") setGrokAccounts(grokStatus.value);
+        if (poolStatus.status === "fulfilled") setQuotaPool(poolStatus.value);
+        // Grok is optional. A missing CLI does not turn the entire page into
+        // an application failure.
+        return results
+          .filter((_, index) => index !== 4)
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map((failure) => String(failure.reason));
+      };
+
+      const localFailures = await readSnapshots();
+      if (!alive) return;
+      setError(localFailures.length
+        ? t("models.ui.errors.partialRefresh", { detail: localFailures.join(t("common.listSeparator")) })
+        : null);
+
+      let remoteFailure: unknown = null;
       try {
         await api.refreshOpenCodeModelCatalogs();
+        await readSnapshots();
       } catch (cause) {
-        openCodeRefreshFailure = cause;
+        remoteFailure = cause;
       }
-      const results = await Promise.allSettled([
-        api.listRoutes(),
-        api.listModelRoutes(),
-        api.getCatalogStatus(),
-        api.getCodexOAuthStatus(),
-        api.getGrokAccountStatus(),
-        api.getCodexQuotaPool(),
-      ]);
       if (!alive) return;
-      const [nextRoutes, models, status, oauthStatus, grokStatus, poolStatus] = results;
-      if (nextRoutes.status === "fulfilled") setRoutes(nextRoutes.value);
-      if (models.status === "fulfilled") setModelRoutes(models.value);
-      if (status.status === "fulfilled") setCatalogStatus(status.value);
-      if (oauthStatus.status === "fulfilled") setOauth(oauthStatus.value);
-      if (grokStatus.status === "fulfilled") setGrokAccounts(grokStatus.value);
-      if (poolStatus.status === "fulfilled") setQuotaPool(poolStatus.value);
-      const failures = results
-        .filter((_, index) => index !== 4)
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected");
-      const failureDetails = failures.map((failure) => String(failure.reason));
-      if (openCodeRefreshFailure) failureDetails.unshift(String(openCodeRefreshFailure));
-      setError(
-        failureDetails.length
-          ? t("models.ui.errors.partialRefresh", { detail: failureDetails.join(t("common.listSeparator")) })
-          : null,
-      );
-      // Grok is optional. A missing CLI does not turn the entire model page
-      // refresh into an application failure.
+      if (remoteFailure) {
+        setError(t("models.ui.errors.partialRefresh", { detail: String(remoteFailure) }));
+      }
       markRefreshPart("main");
     })();
     return () => {

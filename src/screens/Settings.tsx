@@ -124,63 +124,13 @@ export function Settings({
   useEffect(() => {
     let alive = true;
     const load = async () => {
-      const [
-        nextSettings,
-        nextRoutes,
-        nextModels,
-        nextRuntime,
-        nextVersions,
-        nextStats,
-        nextWebSearch,
-        nextSubagent,
-        nextSubagentCapability,
-        nextSubagentModels,
-        nextOauth,
-        nextUpdates,
-      ] = await Promise.allSettled([
-          api.getReviewSettings(),
-          api.listRoutes(),
-          api.listReviewModelRoutes(),
-          api.getRuntimeStatus(),
-          api.listCatalogVersions(),
-          api.getReviewStats(),
-          api.getWebSearchSettings(),
-          api.getSubagentSettings(),
-          api.getSubagentCapability(),
-          api.listModelRoutes(),
-          api.getCodexOAuthStatus(),
-          api.getUpdateStatus(),
-        ]);
-      if (!alive) return;
-      if (nextSettings.status === "fulfilled") {
-        reviewRef.current = nextSettings.value;
-        reviewLastSavedRef.current = nextSettings.value;
-        setSettings(nextSettings.value);
-      }
-      if (nextSubagent.status === "fulfilled") {
-        subagentRef.current = nextSubagent.value;
-        subagentLastSavedRef.current = nextSubagent.value;
-        setSubagent(nextSubagent.value);
-      }
-      if (nextSubagentCapability.status === "fulfilled") {
-        setSubagentCapability(nextSubagentCapability.value);
-      }
-      if (nextSubagentModels.status === "fulfilled") setSubagentModels(nextSubagentModels.value);
-      // 帳號清單拿不到不算失敗：沒有 Official 帳號的安裝根本不會看到這個
-      // 選單，所以它不進下面的 failures，也不該把整頁標成載入失敗。
-      if (nextOauth.status === "fulfilled") setOauth(nextOauth.value);
-      if (nextWebSearch.status === "fulfilled") {
-        setWebSearch(nextWebSearch.value);
-        setAllowDraft(formatDomainList(nextWebSearch.value.settings.domainPolicy.allow));
-        setBlockDraft(formatDomainList(nextWebSearch.value.settings.domainPolicy.block));
-      }
-      if (nextModels.status === "fulfilled") setModels(nextModels.value);
-      if (nextRuntime.status === "fulfilled") setRuntime(nextRuntime.value);
-      if (nextUpdates.status === "fulfilled") setUpdates(nextUpdates.value);
-      if (nextVersions.status === "fulfilled") setVersions(nextVersions.value);
-      if (nextStats.status === "fulfilled") setStats(nextStats.value);
-      if (nextRoutes.status === "fulfilled") {
-        setRoutes(nextRoutes.value);
+      const apply = <T,>(promise: Promise<T>, onValue: (value: T) => void) =>
+        promise.then((value) => {
+          if (alive) onValue(value);
+          return value;
+        });
+      const loadRoutes = apply(api.listRoutes(), (value) => {
+        setRoutes(value);
         const saved = window.localStorage.getItem(DASHBOARD_KEY);
         let selected: string[] = [];
         if (saved) {
@@ -190,24 +140,48 @@ export function Settings({
             selected = [];
           }
         }
-        const available = new Set(nextRoutes.value.map((route) => route.id));
+        const available = new Set(value.map((route) => route.id));
         selected = selected.filter((id) => available.has(id));
         if (!selected.length) {
-          selected = nextRoutes.value.filter((route) => route.enabled).map((route) => route.id);
+          selected = value.filter((route) => route.enabled).map((route) => route.id);
         }
         setDashboardRouteIds(selected);
-      }
-      const failures = [
-        nextSettings,
-        nextRoutes,
-        nextModels,
-        nextRuntime,
-        nextVersions,
-        nextStats,
-        nextWebSearch,
-        nextSubagent,
-        nextSubagentModels,
-      ].filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      });
+      const required = [
+        apply(api.getReviewSettings(), (value) => {
+          reviewRef.current = value;
+          reviewLastSavedRef.current = value;
+          setSettings(value);
+        }),
+        loadRoutes,
+        apply(api.listReviewModelRoutes(), setModels),
+        apply(api.getRuntimeStatus(), setRuntime),
+        apply(api.listCatalogVersions(), setVersions),
+        apply(api.getReviewStats(), setStats),
+        apply(api.getWebSearchSettings(), (value) => {
+          setWebSearch(value);
+          setAllowDraft(formatDomainList(value.settings.domainPolicy.allow));
+          setBlockDraft(formatDomainList(value.settings.domainPolicy.block));
+        }),
+        apply(api.getSubagentSettings(), (value) => {
+          subagentRef.current = value;
+          subagentLastSavedRef.current = value;
+          setSubagent(value);
+        }),
+        apply(api.listModelRoutes(), setSubagentModels),
+      ];
+      // These sections are optional and paint independently without delaying
+      // the primary settings form.
+      const optional = [
+        apply(api.getSubagentCapability(), setSubagentCapability),
+        apply(api.getCodexOAuthStatus(), setOauth),
+        apply(api.getUpdateStatus(), setUpdates),
+      ];
+      const results = await Promise.allSettled([...required, ...optional]);
+      if (!alive) return;
+      const failures = results
+        .slice(0, required.length)
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected");
       setError(
         failures.length
           ? t("settings.page.errors.partialRefresh", { detail: failures.map((failure) => String(failure.reason)).join(t("common.listSeparator")) })
@@ -216,18 +190,19 @@ export function Settings({
       if (refreshVersion > 0) onRefreshComplete(refreshVersion);
     };
     void load();
-    const stopPoll = startVisiblePoll({
-      active,
-      intervalMs: 60_000,
-      load: () => {
-        void api.getReviewStats().then((next) => alive && setStats(next)).catch(() => {});
-      },
-    });
     return () => {
       alive = false;
-      stopPoll();
     };
-  }, [refreshVersion, active]);
+  }, [refreshVersion]);
+
+  useEffect(() => startVisiblePoll({
+    active,
+    intervalMs: 60_000,
+    load: async () => {
+      const next = await api.getReviewStats();
+      setStats(next);
+    },
+  }), [active]);
 
   /**
    * 存自動審查設定。

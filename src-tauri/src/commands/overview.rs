@@ -162,7 +162,14 @@ pub fn resolve_provider_name(
 }
 
 #[tauri::command]
-pub fn get_sessions(state: State<'_, AppState>) -> AppResult<Vec<SessionStatus>> {
+pub async fn get_sessions(state: State<'_, AppState>) -> AppResult<Vec<SessionStatus>> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || get_sessions_inner(&state))
+        .await
+        .map_err(|error| AppError::Message(format!("session scan task failed: {error}")))?
+}
+
+fn get_sessions_inner(state: &AppState) -> AppResult<Vec<SessionStatus>> {
     let routes = state.routes();
     let models = state.model_routes();
     // A bug in one stored row (bad blob, malformed JSON) must not crash the
@@ -223,7 +230,7 @@ pub fn get_sessions(state: State<'_, AppState>) -> AppResult<Vec<SessionStatus>>
             let (configured_window, compact_threshold_percent) = model
                 .map(|model| {
                     let budget =
-                        crate::commands::budget::resolve_model_budget(&state, route, model);
+                        crate::commands::budget::resolve_model_budget(state, route, model);
                     (budget.effective_window, budget.compact_threshold_percent)
                 })
                 .unwrap_or((

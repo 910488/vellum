@@ -133,17 +133,22 @@ pub fn set_review_settings(
 }
 
 #[tauri::command]
-pub fn get_review_stats(state: State<'_, AppState>) -> AppResult<ReviewStats> {
-    let mut stats = state.usage_store().review_stats()?;
-    let names = state.route_display_names();
-    for provider in &mut stats.providers {
-        crate::commands::overview::resolve_provider_name(
-            &names,
-            &provider.route_id,
-            &mut provider.provider,
-        );
-    }
-    Ok(stats)
+pub async fn get_review_stats(state: State<'_, AppState>) -> AppResult<ReviewStats> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut stats = state.usage_store().review_stats()?;
+        let names = state.route_display_names();
+        for provider in &mut stats.providers {
+            crate::commands::overview::resolve_provider_name(
+                &names,
+                &provider.route_id,
+                &mut provider.provider,
+            );
+        }
+        Ok(stats)
+    })
+    .await
+    .map_err(|error| crate::error::AppError::Message(format!("review stats task failed: {error}")))?
 }
 
 /// doc/06：跑一次自動審查。回排序去重後的 findings（沒問題就空）。
