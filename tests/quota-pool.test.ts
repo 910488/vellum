@@ -65,7 +65,8 @@ describe("quota pool", () => {
   it("folds a stored legacy strategy back to manual rank", () => {
     // b has far more weekly left; under the removed "most" strategy it would
     // have jumped ahead of a. The order must stay the user's.
-    const legacy = normalizeQuotaPool({ ...settings, strategy: "most" }, accounts);
+    const legacySettings = { ...settings, strategy: "most" } as unknown as QuotaPoolSettings;
+    const legacy = normalizeQuotaPool(legacySettings, accounts);
     expect(legacy.strategy).toBe("rank");
     const entries = quotaPoolAccounts(legacy, accounts, {
       a: [quota("hour", 10), quota("week", 41)],

@@ -74,9 +74,8 @@ pub struct CodexOAuthStatus {
 #[serde(rename_all = "camelCase")]
 pub enum QuotaPoolStrategy {
     #[default]
+    #[serde(alias = "most", alias = "soonest")]
     Rank,
-    Most,
-    Soonest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -760,7 +759,7 @@ impl CodexOAuthManager {
             };
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
                 if observation.usable {
-                    candidates.push((rank, observation, auth));
+                    candidates.push((rank, observation.burnable, auth));
                 }
             } else {
                 failures.push(format!(
@@ -770,19 +769,7 @@ impl CodexOAuthManager {
             }
         }
 
-        candidates.sort_by(|left, right| match settings.strategy {
-            QuotaPoolStrategy::Rank => left.0.cmp(&right.0),
-            QuotaPoolStrategy::Most => right
-                .1
-                .burnable
-                .total_cmp(&left.1.burnable)
-                .then_with(|| left.0.cmp(&right.0)),
-            QuotaPoolStrategy::Soonest => left
-                .1
-                .weekly_reset_at
-                .cmp(&right.1.weekly_reset_at)
-                .then_with(|| left.0.cmp(&right.0)),
-        });
+        candidates.sort_by_key(|candidate| candidate.0);
         let Some((_, _, auth)) = candidates.into_iter().next() else {
             *self.active_pool_account_id.write().await = None;
             let detail = if failures.is_empty() {
@@ -1085,7 +1072,6 @@ impl CodexOAuthManager {
 #[derive(Debug, Clone, Copy)]
 struct QuotaPoolObservation {
     burnable: f64,
-    weekly_reset_at: i64,
     usable: bool,
 }
 
@@ -1102,15 +1088,8 @@ fn quota_pool_observation(
     let weekly_remaining = 100.0 - weekly.used_percent.clamp(0.0, 100.0);
     let five_hour_remaining = 100.0 - five_hour.used_percent.clamp(0.0, 100.0);
     let burnable = (weekly_remaining - f64::from(weekly_floor)).max(0.0);
-    let weekly_reset_at = weekly
-        .reset_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.timestamp())
-        .unwrap_or(i64::MAX);
     Some(QuotaPoolObservation {
         burnable,
-        weekly_reset_at,
         usable: burnable > 0.0 && five_hour_remaining > 0.0,
     })
 }
@@ -1418,6 +1397,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_quota_pool_strategies_migrate_to_member_order() {
+        for legacy in ["most", "soonest"] {
+            let settings: QuotaPoolSettings = serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "strategy": legacy,
+                "members": []
+            }))
+            .unwrap();
+            assert_eq!(settings.strategy, QuotaPoolStrategy::Rank);
+            assert_eq!(serde_json::to_value(settings).unwrap()["strategy"], "rank");
+        }
+    }
+
+    #[test]
     fn device_poll_interval_has_safety_margin() {
         assert_eq!(parse_interval(Some(&serde_json::json!(5))), 8);
         assert_eq!(parse_interval(Some(&serde_json::json!("2"))), 5);
@@ -1651,7 +1644,7 @@ mod tests {
                 .credential_id,
             "pool-a"
         );
-        settings.strategy = QuotaPoolStrategy::Most;
+        settings.members.swap(0, 1);
         manager.set_quota_pool(settings.clone()).await.unwrap();
         assert_eq!(
             manager
@@ -1662,7 +1655,7 @@ mod tests {
                 .credential_id,
             "pool-b"
         );
-        settings.members[1].weekly_floor = 80;
+        settings.members[0].weekly_floor = 80;
         manager.set_quota_pool(settings.clone()).await.unwrap();
         assert_eq!(
             manager
@@ -1673,7 +1666,7 @@ mod tests {
                 .credential_id,
             "pool-a"
         );
-        settings.members[0].paused = true;
+        settings.members[1].paused = true;
         manager.set_quota_pool(settings.clone()).await.unwrap();
         assert!(manager.valid_routing_auth().await.is_err());
         settings.enabled = false;
@@ -1702,7 +1695,6 @@ mod tests {
         store.quota_pool = QuotaPoolSettings::default();
         let manager = CodexOAuthManager::from_store(temp.path().to_path_buf(), store);
         let mut members = Vec::new();
-        let mut observations = Vec::new();
         let mut workspaces = std::collections::HashSet::new();
         for (index, account) in live.status().await.accounts.iter().enumerate() {
             let auth = match live.valid_auth_for(&account.account_id).await {
@@ -1747,7 +1739,6 @@ mod tests {
                 },
             );
             if observation.usable {
-                observations.push(observation);
                 members.push(QuotaPoolMember {
                     account_id: auth.credential_id,
                     in_pool: true,
@@ -1760,35 +1751,16 @@ mod tests {
             members.len() >= 2,
             "live multi-account test requires at least two usable accounts"
         );
-        for strategy in [
-            QuotaPoolStrategy::Rank,
-            QuotaPoolStrategy::Most,
-            QuotaPoolStrategy::Soonest,
-        ] {
-            let settings = QuotaPoolSettings {
-                enabled: true,
-                strategy,
-                members: members.clone(),
-            };
-            manager.set_quota_pool(settings.clone()).await.unwrap();
-            assert_eq!(load_store(temp.path()).unwrap().quota_pool, settings);
-            let selected = manager.valid_routing_auth().await.unwrap().unwrap();
-            let expected = match strategy {
-                QuotaPoolStrategy::Rank => 0,
-                QuotaPoolStrategy::Most => (0..members.len())
-                    .min_by(|a, b| {
-                        observations[*b]
-                            .burnable
-                            .total_cmp(&observations[*a].burnable)
-                    })
-                    .unwrap(),
-                QuotaPoolStrategy::Soonest => (0..members.len())
-                    .min_by_key(|i| observations[*i].weekly_reset_at)
-                    .unwrap(),
-            };
-            assert_eq!(selected.credential_id, members[expected].account_id);
-            eprintln!("live strategy {strategy:?}: PASS");
-        }
+        let ordered = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Rank,
+            members: members.clone(),
+        };
+        manager.set_quota_pool(ordered.clone()).await.unwrap();
+        assert_eq!(load_store(temp.path()).unwrap().quota_pool, ordered);
+        let selected = manager.valid_routing_auth().await.unwrap().unwrap();
+        assert_eq!(selected.credential_id, members[0].account_id);
+        eprintln!("live member-order routing: PASS");
         let mut settings = QuotaPoolSettings {
             enabled: true,
             strategy: QuotaPoolStrategy::Rank,

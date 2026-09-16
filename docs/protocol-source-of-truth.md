@@ -261,15 +261,16 @@ It must not be forwarded to third-party providers.
 
 Desktop may opt managed ChatGPT credentials into an automatic quota pool. The
 pool is disabled by default; while disabled, the verified manual account
-selection remains authoritative. Pool membership, pause state, rank, strategy,
+selection remains authoritative. Pool membership, pause state, member order,
 and each account's weekly remaining-floor are persisted locally.
 
 For each new ordinary Official request, the Desktop authorization boundary
 reads current 5-hour and weekly quota windows and selects only an explicitly
 pooled, unpaused account whose 5-hour window is non-zero and whose weekly
-remaining percentage is above its configured floor. `rank`, `most`, and
-`soonest` respectively mean explicit member order, greatest spendable weekly
-remainder, and earliest weekly reset. Missing quota data fails that member
+remaining percentage is above its configured floor. Rotation follows the
+explicit member order and skips members that are currently unavailable without
+reordering the others. Legacy `most` and `soonest` settings deserialize as
+`rank` and serialize back as `rank`. Missing quota data fails that member
 closed. An enabled pool with no members keeps the manual selection until the
 user adds one; once at least one member is configured, having no usable member
 must not cross a weekly floor, consume a Reset credit, or silently use a
@@ -288,7 +289,7 @@ settings.
 Opt-in local validation: `cargo test -p vellum --lib live_quota_pool_routing
 -- --ignored --nocapture`. It refreshes existing managed grants, reads real
 upstream quota, and requires two usable accounts. Pool settings and runtime
-history are isolated in a temporary directory. It checks all strategies,
+history are isolated in a temporary directory. It checks member-order routing,
 gates, pause, exhaustion, persistence, then sends two minimal Official Luna
 requests through the Desktop proxy, one per selected account. It never redeems
 Reset credits or changes the production pool.
