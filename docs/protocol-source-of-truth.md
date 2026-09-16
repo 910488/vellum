@@ -282,9 +282,11 @@ force-refresh invalidates the previous reading. Gates control admission of new
 requests, not the final cost of an already admitted turn. Usage by other
 clients and in-flight turns can therefore cross a floor before the next
 reading. No in-flight request is replayed automatically after a quota error.
-One credential per workspace may be pooled at a time. A configuration change
-during selection rejects that selection so the caller can retry with the new
-settings.
+Each managed credential is a distinct pool member. Multiple user seats in the
+same workspace may be pooled because upstream quota windows can be scoped to
+the authenticated user; their access tokens, quota caches, gates, and rotation
+state remain separate. A configuration change during selection rejects that
+selection so the caller can retry with the new settings.
 
 Opt-in local validation: `cargo test -p vellum --lib live_quota_pool_routing
 -- --ignored --nocapture`. It refreshes existing managed grants, reads real

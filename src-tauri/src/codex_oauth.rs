@@ -563,20 +563,6 @@ impl CodexOAuthManager {
         settings.members.retain(|member| {
             accounts.contains_key(&member.account_id) && seen.insert(member.account_id.clone())
         });
-        let mut pooled_workspaces = std::collections::HashSet::new();
-        for member in settings.members.iter().filter(|member| member.in_pool) {
-            let account = &accounts[&member.account_id];
-            let workspace_id = account
-                .chatgpt_account_id
-                .as_deref()
-                .unwrap_or(&account.account_id);
-            if !pooled_workspaces.insert(workspace_id) {
-                return Err(OAuthError::AuthenticationFailed(
-                    "quota pool cannot contain multiple credentials for the same ChatGPT workspace"
-                        .into(),
-                ));
-            }
-        }
         drop(accounts);
         for member in &mut settings.members {
             member.weekly_floor = member.weekly_floor.min(100);
@@ -1584,7 +1570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_pool_routes_fail_closed_and_persists() {
+    async fn quota_pool_routes_distinct_credentials_in_one_workspace() {
         let temp = tempfile::tempdir().unwrap();
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         let mut members = Vec::new();
@@ -1593,10 +1579,10 @@ mod tests {
                 id.into(),
                 AccountMetadata {
                     account_id: id.into(),
-                    chatgpt_account_id: Some(id.into()),
+                    chatgpt_account_id: Some("shared-workspace".into()),
                     workspace_name: None,
                     plan_type: None,
-                    email: Some("same-user@example.test".into()),
+                    email: Some(format!("{id}@example.test")),
                     authenticated_at: 1,
                 },
             );
@@ -1609,7 +1595,7 @@ mod tests {
             );
             crate::codex_quota::seed_test_quota(
                 id,
-                id,
+                "shared-workspace",
                 vec![
                     quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 10.0, None),
                     quota_window(crate::model::QuotaPeriodUnit::Week, None, used, None),
@@ -1695,7 +1681,6 @@ mod tests {
         store.quota_pool = QuotaPoolSettings::default();
         let manager = CodexOAuthManager::from_store(temp.path().to_path_buf(), store);
         let mut members = Vec::new();
-        let mut workspaces = std::collections::HashSet::new();
         for (index, account) in live.status().await.accounts.iter().enumerate() {
             let auth = match live.valid_auth_for(&account.account_id).await {
                 Ok(auth) => auth,
@@ -1704,9 +1689,6 @@ mod tests {
                     continue;
                 }
             };
-            if !workspaces.insert(auth.account_id.clone()) {
-                continue;
-            }
             let windows = match crate::codex_quota::query(
                 &auth.access_token,
                 &auth.account_id,
