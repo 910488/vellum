@@ -257,6 +257,42 @@ Personal and workspace memberships remain visibly distinct.
 Opaque Official reasoning and compaction state belongs to the Official plane.
 It must not be forwarded to third-party providers.
 
+### Managed ChatGPT quota pool
+
+Desktop may opt managed ChatGPT credentials into an automatic quota pool. The
+pool is disabled by default; while disabled, the verified manual account
+selection remains authoritative. Pool membership, pause state, rank, strategy,
+and each account's weekly remaining-floor are persisted locally.
+
+For each new ordinary Official request, the Desktop authorization boundary
+reads current 5-hour and weekly quota windows and selects only an explicitly
+pooled, unpaused account whose 5-hour window is non-zero and whose weekly
+remaining percentage is above its configured floor. `rank`, `most`, and
+`soonest` respectively mean explicit member order, greatest spendable weekly
+remainder, and earliest weekly reset. Missing quota data fails that member
+closed. An enabled pool with no members keeps the manual selection until the
+user adds one; once at least one member is configured, having no usable member
+must not cross a weekly floor, consume a Reset credit, or silently use a
+pool-external account. Auto Review's explicitly selected billing account
+bypasses this ordinary-request policy.
+
+Quota readings are cached for at most 30 seconds per token and workspace;
+force-refresh invalidates the previous reading. Gates control admission of new
+requests, not the final cost of an already admitted turn. Usage by other
+clients and in-flight turns can therefore cross a floor before the next
+reading. No in-flight request is replayed automatically after a quota error.
+One credential per workspace may be pooled at a time. A configuration change
+during selection rejects that selection so the caller can retry with the new
+settings.
+
+Opt-in local validation: `cargo test -p vellum --lib live_quota_pool_routing
+-- --ignored --nocapture`. It refreshes existing managed grants, reads real
+upstream quota, and requires two usable accounts. Pool settings and runtime
+history are isolated in a temporary directory. It checks all strategies,
+gates, pause, exhaustion, persistence, then sends two minimal Official Luna
+requests through the Desktop proxy, one per selected account. It never redeems
+Reset credits or changes the production pool.
+
 ## Third-party provider portability
 
 Third-party providers receive only portable conversation state. Vellum must

@@ -70,6 +70,46 @@ pub struct CodexOAuthStatus {
     pub accounts: Vec<CodexOAuthAccount>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuotaPoolStrategy {
+    #[default]
+    Rank,
+    Most,
+    Soonest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaPoolMember {
+    pub account_id: String,
+    #[serde(default)]
+    pub in_pool: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub weekly_floor: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaPoolSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub strategy: QuotaPoolStrategy,
+    #[serde(default)]
+    pub members: Vec<QuotaPoolMember>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaPoolStatus {
+    #[serde(flatten)]
+    pub settings: QuotaPoolSettings,
+    pub active_account_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceLogin {
@@ -121,6 +161,8 @@ struct AccountStore {
     selected_at: Option<i64>,
     #[serde(default)]
     selection_verified: bool,
+    #[serde(default)]
+    quota_pool: QuotaPoolSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +215,8 @@ pub struct CodexOAuthManager {
     selection_revision: RwLock<u64>,
     selected_at: RwLock<Option<i64>>,
     selection_verified: RwLock<bool>,
+    quota_pool: RwLock<QuotaPoolSettings>,
+    active_pool_account_id: RwLock<Option<String>>,
     selection_lock: Mutex<()>,
     access_tokens: RwLock<HashMap<String, CachedToken>>,
     refresh_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
@@ -197,6 +241,7 @@ impl CodexOAuthManager {
             return Err(OAuthError::AccountNotFound(account_id.into()));
         }
         store.default_account_id = Some(account_id.into());
+        store.quota_pool.enabled = false;
         Ok(Self::from_store(root, store))
     }
 
@@ -241,6 +286,7 @@ impl CodexOAuthManager {
                 selection_revision: 0,
                 selected_at: Some(chrono::Utc::now().timestamp_millis()),
                 selection_verified: true,
+                quota_pool: QuotaPoolSettings::default(),
             },
         );
         manager
@@ -270,6 +316,8 @@ impl CodexOAuthManager {
             selection_revision: RwLock::new(store.selection_revision),
             selected_at: RwLock::new(store.selected_at),
             selection_verified: RwLock::new(store.selection_verified),
+            quota_pool: RwLock::new(store.quota_pool),
+            active_pool_account_id: RwLock::new(None),
             selection_lock: Mutex::const_new(()),
             access_tokens: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
@@ -498,6 +546,57 @@ impl CodexOAuthManager {
         }
     }
 
+    pub async fn quota_pool_status(&self) -> QuotaPoolStatus {
+        let settings = self.quota_pool.read().await.clone();
+        QuotaPoolStatus {
+            settings,
+            active_account_id: self.active_pool_account_id.read().await.clone(),
+        }
+    }
+
+    pub async fn set_quota_pool(
+        &self,
+        mut settings: QuotaPoolSettings,
+    ) -> Result<QuotaPoolStatus, OAuthError> {
+        let _selection_guard = self.selection_lock.lock().await;
+        let accounts = self.accounts.read().await;
+        let mut seen = std::collections::HashSet::new();
+        settings.members.retain(|member| {
+            accounts.contains_key(&member.account_id) && seen.insert(member.account_id.clone())
+        });
+        let mut pooled_workspaces = std::collections::HashSet::new();
+        for member in settings.members.iter().filter(|member| member.in_pool) {
+            let account = &accounts[&member.account_id];
+            let workspace_id = account
+                .chatgpt_account_id
+                .as_deref()
+                .unwrap_or(&account.account_id);
+            if !pooled_workspaces.insert(workspace_id) {
+                return Err(OAuthError::AuthenticationFailed(
+                    "quota pool cannot contain multiple credentials for the same ChatGPT workspace"
+                        .into(),
+                ));
+            }
+        }
+        drop(accounts);
+        for member in &mut settings.members {
+            member.weekly_floor = member.weekly_floor.min(100);
+            if !member.in_pool {
+                member.paused = false;
+            }
+        }
+        let previous = self.quota_pool.read().await.clone();
+        *self.quota_pool.write().await = settings;
+        if let Err(error) = self.persist().await {
+            *self.quota_pool.write().await = previous;
+            return Err(error);
+        }
+        if !self.quota_pool.read().await.enabled {
+            *self.active_pool_account_id.write().await = None;
+        }
+        Ok(self.quota_pool_status().await)
+    }
+
     pub async fn set_default(&self, account_id: &str) -> Result<(), OAuthError> {
         let _selection_guard = self.selection_lock.lock().await;
         if !self.accounts.read().await.contains_key(account_id) {
@@ -539,6 +638,14 @@ impl CodexOAuthManager {
         }
         self.access_tokens.write().await.remove(account_id);
         self.refresh_locks.write().await.remove(account_id);
+        self.quota_pool
+            .write()
+            .await
+            .members
+            .retain(|member| member.account_id != account_id);
+        if self.active_pool_account_id.read().await.as_deref() == Some(account_id) {
+            *self.active_pool_account_id.write().await = None;
+        }
         crate::credentials::remove(&self.root, &credential_key(account_id))
             .map_err(|error| OAuthError::Storage(error.to_string()))?;
         if self.default_account_id.read().await.as_deref() == Some(account_id) {
@@ -557,6 +664,8 @@ impl CodexOAuthManager {
         self.access_tokens.write().await.clear();
         self.refresh_locks.write().await.clear();
         self.pending.write().await.clear();
+        *self.quota_pool.write().await = QuotaPoolSettings::default();
+        *self.active_pool_account_id.write().await = None;
         *self.default_account_id.write().await = None;
         self.persist().await
     }
@@ -583,6 +692,115 @@ impl CodexOAuthManager {
             selection_revision: revision,
             selection_verified: true,
         }))
+    }
+
+    /// Resolve one account for a new ordinary Official request. An empty pool
+    /// intentionally falls back to the manual selection; once the user adds a
+    /// member, exhaustion fails closed instead of silently charging a pool-external
+    /// account. Auto Review calls `valid_auth_for` and remains explicitly billed.
+    pub async fn valid_routing_auth(&self) -> Result<Option<AppliedOAuth>, OAuthError> {
+        let settings = self.quota_pool.read().await.clone();
+        if !settings.enabled || !settings.members.iter().any(|member| member.in_pool) {
+            *self.active_pool_account_id.write().await = None;
+            return self.valid_default_auth().await;
+        }
+
+        let mut candidates = Vec::new();
+        let mut failures = Vec::new();
+        for (rank, member) in settings.members.iter().enumerate() {
+            if !member.in_pool || member.paused {
+                continue;
+            }
+            let mut auth = match self.valid_auth_for(&member.account_id).await {
+                Ok(auth) => auth,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", member.account_id));
+                    continue;
+                }
+            };
+            let windows = match crate::codex_quota::query(
+                &auth.access_token,
+                &auth.account_id,
+                &auth.credential_id,
+                false,
+            )
+            .await
+            {
+                Ok(windows) => windows,
+                Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
+                    auth = match self
+                        .refresh_after_rejection(&auth.credential_id, &auth.access_token)
+                        .await
+                    {
+                        Ok(refreshed) => refreshed,
+                        Err(error) => {
+                            failures.push(format!("{}: {error}", member.account_id));
+                            continue;
+                        }
+                    };
+                    match crate::codex_quota::query(
+                        &auth.access_token,
+                        &auth.account_id,
+                        &auth.credential_id,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(windows) => windows,
+                        Err(error) => {
+                            failures.push(format!("{}: {error}", member.account_id));
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!("{}: {error}", member.account_id));
+                    continue;
+                }
+            };
+            if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
+                if observation.usable {
+                    candidates.push((rank, observation, auth));
+                }
+            } else {
+                failures.push(format!(
+                    "{}: required 5-hour/weekly windows are missing",
+                    member.account_id
+                ));
+            }
+        }
+
+        candidates.sort_by(|left, right| match settings.strategy {
+            QuotaPoolStrategy::Rank => left.0.cmp(&right.0),
+            QuotaPoolStrategy::Most => right
+                .1
+                .burnable
+                .total_cmp(&left.1.burnable)
+                .then_with(|| left.0.cmp(&right.0)),
+            QuotaPoolStrategy::Soonest => left
+                .1
+                .weekly_reset_at
+                .cmp(&right.1.weekly_reset_at)
+                .then_with(|| left.0.cmp(&right.0)),
+        });
+        let Some((_, _, auth)) = candidates.into_iter().next() else {
+            *self.active_pool_account_id.write().await = None;
+            let detail = if failures.is_empty() {
+                "all members are paused, throttled, or at their weekly gate".to_string()
+            } else {
+                failures.join("; ")
+            };
+            return Err(OAuthError::AuthenticationFailed(format!(
+                "quota pool has no usable ChatGPT account: {detail}"
+            )));
+        };
+        if *self.quota_pool.read().await != settings {
+            return Err(OAuthError::AuthenticationFailed(
+                "quota pool changed during account selection; retry the request".into(),
+            ));
+        }
+        *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
+        Ok(Some(auth))
     }
 
     /// Resolve a valid access token for one specific managed ChatGPT account.
@@ -858,9 +1076,43 @@ impl CodexOAuthManager {
             selection_revision: *self.selection_revision.read().await,
             selected_at: *self.selected_at.read().await,
             selection_verified: *self.selection_verified.read().await,
+            quota_pool: self.quota_pool.read().await.clone(),
         };
         write_store(&self.root, &store)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuotaPoolObservation {
+    burnable: f64,
+    weekly_reset_at: i64,
+    usable: bool,
+}
+
+fn quota_pool_observation(
+    windows: &[crate::model::QuotaSnapshot],
+    weekly_floor: u8,
+) -> Option<QuotaPoolObservation> {
+    let weekly = windows
+        .iter()
+        .find(|window| window.period.unit == crate::model::QuotaPeriodUnit::Week)?;
+    let five_hour = windows.iter().find(|window| {
+        window.period.unit == crate::model::QuotaPeriodUnit::Hour && window.period.amount == Some(5)
+    })?;
+    let weekly_remaining = 100.0 - weekly.used_percent.clamp(0.0, 100.0);
+    let five_hour_remaining = 100.0 - five_hour.used_percent.clamp(0.0, 100.0);
+    let burnable = (weekly_remaining - f64::from(weekly_floor)).max(0.0);
+    let weekly_reset_at = weekly
+        .reset_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp())
+        .unwrap_or(i64::MAX);
+    Some(QuotaPoolObservation {
+        burnable,
+        weekly_reset_at,
+        usable: burnable > 0.0 && five_hour_remaining > 0.0,
+    })
 }
 
 /// Read only the account identity from Codex Desktop's native auth file.
@@ -1112,6 +1364,59 @@ fn oauth_error_detail(body: &str) -> String {
 mod tests {
     use super::*;
 
+    fn quota_window(
+        unit: crate::model::QuotaPeriodUnit,
+        amount: Option<i64>,
+        used_percent: f64,
+        reset_at: Option<&str>,
+    ) -> crate::model::QuotaSnapshot {
+        crate::model::QuotaSnapshot {
+            route_id: "account".into(),
+            used_percent,
+            period: crate::model::QuotaPeriod { unit, amount },
+            reset_at: reset_at.map(str::to_owned),
+            tier: None,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn quota_pool_gate_uses_weekly_remaining_and_five_hour_throttle() {
+        let windows = vec![
+            quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 62.0, None),
+            quota_window(
+                crate::model::QuotaPeriodUnit::Week,
+                None,
+                41.0,
+                Some("2026-09-20T00:00:00Z"),
+            ),
+        ];
+        let open = quota_pool_observation(&windows, 30).unwrap();
+        assert_eq!(open.burnable, 29.0);
+        assert!(open.usable);
+
+        let gated = quota_pool_observation(&windows, 59).unwrap();
+        assert_eq!(gated.burnable, 0.0);
+        assert!(!gated.usable);
+
+        let throttled = vec![
+            quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 100.0, None),
+            windows[1].clone(),
+        ];
+        assert!(!quota_pool_observation(&throttled, 0).unwrap().usable);
+    }
+
+    #[test]
+    fn quota_pool_requires_both_authoritative_windows() {
+        let weekly_only = vec![quota_window(
+            crate::model::QuotaPeriodUnit::Week,
+            None,
+            10.0,
+            None,
+        )];
+        assert!(quota_pool_observation(&weekly_only, 0).is_none());
+    }
+
     #[test]
     fn device_poll_interval_has_safety_margin() {
         assert_eq!(parse_interval(Some(&serde_json::json!(5))), 8);
@@ -1283,6 +1588,327 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("authentication_failed"));
+    }
+
+    #[tokio::test]
+    async fn quota_pool_routes_fail_closed_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let mut members = Vec::new();
+        for (id, used) in [("pool-a", 70.0), ("pool-b", 20.0)] {
+            manager.accounts.write().await.insert(
+                id.into(),
+                AccountMetadata {
+                    account_id: id.into(),
+                    chatgpt_account_id: None,
+                    workspace_name: None,
+                    plan_type: None,
+                    email: None,
+                    authenticated_at: 1,
+                },
+            );
+            manager.access_tokens.write().await.insert(
+                id.into(),
+                CachedToken {
+                    access_token: id.into(),
+                    expires_at_ms: i64::MAX,
+                },
+            );
+            crate::codex_quota::seed_test_quota(
+                id,
+                id,
+                vec![
+                    quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 10.0, None),
+                    quota_window(crate::model::QuotaPeriodUnit::Week, None, used, None),
+                ],
+            )
+            .await;
+            members.push(QuotaPoolMember {
+                account_id: id.into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 0,
+            });
+        }
+        *manager.default_account_id.write().await = Some("pool-a".into());
+        let mut settings = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Rank,
+            members,
+        };
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(load_store(temp.path()).unwrap().quota_pool, settings);
+        let pinned =
+            CodexOAuthManager::new_with_default_override(temp.path().to_path_buf(), "pool-a")
+                .unwrap();
+        assert!(!pinned.quota_pool_status().await.settings.enabled);
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "pool-a"
+        );
+        settings.strategy = QuotaPoolStrategy::Most;
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "pool-b"
+        );
+        settings.members[1].weekly_floor = 80;
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "pool-a"
+        );
+        settings.members[0].paused = true;
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert!(manager.valid_routing_auth().await.is_err());
+        settings.enabled = false;
+        manager.set_quota_pool(settings).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "pool-a"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "uses local managed accounts and live upstream quota; no Reset credits"]
+    async fn live_quota_pool_routing() {
+        // Real grants are refreshed through their original encrypted store.
+        // All pool configuration and selection tests run in a temporary manager.
+        let root = crate::state::app_data_dir();
+        let live = CodexOAuthManager::new(root.clone());
+        let original_pool = live.quota_pool_status().await.settings;
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = load_store(&root).unwrap();
+        store.quota_pool = QuotaPoolSettings::default();
+        let manager = CodexOAuthManager::from_store(temp.path().to_path_buf(), store);
+        let mut members = Vec::new();
+        let mut observations = Vec::new();
+        let mut workspaces = std::collections::HashSet::new();
+        for (index, account) in live.status().await.accounts.iter().enumerate() {
+            let auth = match live.valid_auth_for(&account.account_id).await {
+                Ok(auth) => auth,
+                Err(_) => {
+                    eprintln!("account {}: authentication unavailable", index + 1);
+                    continue;
+                }
+            };
+            if !workspaces.insert(auth.account_id.clone()) {
+                continue;
+            }
+            let windows = match crate::codex_quota::query(
+                &auth.access_token,
+                &auth.account_id,
+                &auth.credential_id,
+                true,
+            )
+            .await
+            {
+                Ok(windows) => windows,
+                Err(_) => {
+                    eprintln!("account {}: upstream quota unavailable", index + 1);
+                    continue;
+                }
+            };
+            let Some(observation) = quota_pool_observation(&windows, 0) else {
+                eprintln!("account {}: required windows missing", index + 1);
+                continue;
+            };
+            eprintln!(
+                "account {}: live spendable={} usable={}",
+                index + 1,
+                observation.burnable,
+                observation.usable
+            );
+            manager.access_tokens.write().await.insert(
+                auth.credential_id.clone(),
+                CachedToken {
+                    expires_at_ms: jwt_exp(&auth.access_token).unwrap() * 1000,
+                    access_token: auth.access_token,
+                },
+            );
+            if observation.usable {
+                observations.push(observation);
+                members.push(QuotaPoolMember {
+                    account_id: auth.credential_id,
+                    in_pool: true,
+                    paused: false,
+                    weekly_floor: 0,
+                });
+            }
+        }
+        assert!(
+            members.len() >= 2,
+            "live multi-account test requires at least two usable accounts"
+        );
+        for strategy in [
+            QuotaPoolStrategy::Rank,
+            QuotaPoolStrategy::Most,
+            QuotaPoolStrategy::Soonest,
+        ] {
+            let settings = QuotaPoolSettings {
+                enabled: true,
+                strategy,
+                members: members.clone(),
+            };
+            manager.set_quota_pool(settings.clone()).await.unwrap();
+            assert_eq!(load_store(temp.path()).unwrap().quota_pool, settings);
+            let selected = manager.valid_routing_auth().await.unwrap().unwrap();
+            let expected = match strategy {
+                QuotaPoolStrategy::Rank => 0,
+                QuotaPoolStrategy::Most => (0..members.len())
+                    .min_by(|a, b| {
+                        observations[*b]
+                            .burnable
+                            .total_cmp(&observations[*a].burnable)
+                    })
+                    .unwrap(),
+                QuotaPoolStrategy::Soonest => (0..members.len())
+                    .min_by_key(|i| observations[*i].weekly_reset_at)
+                    .unwrap(),
+            };
+            assert_eq!(selected.credential_id, members[expected].account_id);
+            eprintln!("live strategy {strategy:?}: PASS");
+        }
+        let mut settings = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Rank,
+            members,
+        };
+        settings.members[0].weekly_floor = 100;
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            settings.members[1].account_id
+        );
+        settings.members[0].weekly_floor = 0;
+        settings.members[0].paused = true;
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            settings.members[1].account_id
+        );
+        for member in &mut settings.members {
+            member.weekly_floor = 100;
+        }
+        manager.set_quota_pool(settings).await.unwrap();
+        assert!(manager.valid_routing_auth().await.is_err());
+        // Exercise the real Desktop authorization adapter and proxy HTTP path,
+        // selecting a different live account on each of two tiny turns.
+        let manager = Arc::new(manager);
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("settings.json")).unwrap()).unwrap();
+        let routes: Vec<crate::model::Route> =
+            serde_json::from_value(config["routes"].clone()).unwrap();
+        let state = crate::state::AppState::with_eval_routes_and_oauth(
+            temp.path().join("runtime"),
+            routes,
+            manager.clone(),
+        );
+        state.activate_proxy_routes();
+        let mut review = state.review_settings();
+        review.before_send = false;
+        review.on_edit = false;
+        review.before_compact = false;
+        state.set_review_settings(review).unwrap();
+        let desktop = crate::proxy_runtime_bridge::DesktopProxyRuntimeState::new(state).unwrap();
+        use vellum_proxy_runtime::ProxyRuntimeState;
+        let model = desktop
+            .active_model_routes()
+            .into_iter()
+            .find(|route| {
+                route.route_id == "openai-official"
+                    && vellum_proxy_runtime::official_catalog_is_luna(&route.upstream_model)
+            })
+            .expect("live Official Luna catalog required");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let boundary = vellum_proxy_runtime::BoundaryKey::generate().unwrap();
+        let router = vellum_proxy_runtime::build_headless_router(
+            Arc::new(desktop),
+            vellum_proxy_runtime::InboundAccessPolicy::authenticated(
+                vellum_proxy_runtime::BOUNDARY_CREDENTIAL_ID,
+                boundary.clone(),
+                address.port(),
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        for selected_index in 0..2 {
+            let mut pool = manager.quota_pool_status().await.settings;
+            for (index, member) in pool.members.iter_mut().enumerate() {
+                member.paused = false;
+                member.weekly_floor = if index == selected_index { 0 } else { 100 };
+            }
+            let expected = pool.members[selected_index].account_id.clone();
+            manager.set_quota_pool(pool).await.unwrap();
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/responses"))
+                .header(
+                    vellum_proxy_runtime::BOUNDARY_KEY_HEADER,
+                    boundary.expose_for_storage(),
+                )
+                .timeout(std::time::Duration::from_secs(60))
+                .json(&vellum_proxy_runtime::official_live_http_body(
+                    &model.catalog_id,
+                    &vellum_proxy_runtime::official_live_marker_input("POOL_OK"),
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "live proxy HTTP {}",
+                response.status()
+            );
+            let body = response.text().await.unwrap();
+            assert!(
+                body.contains("response.completed") && body.contains("POOL_OK"),
+                "live turn did not complete with marker"
+            );
+            assert_eq!(
+                manager
+                    .quota_pool_status()
+                    .await
+                    .active_account_id
+                    .as_deref(),
+                Some(expected.as_str())
+            );
+            eprintln!("live proxy inference account {}: PASS", selected_index + 1);
+        }
+        server.abort();
+        assert_eq!(load_store(&root).unwrap().quota_pool, original_pool);
+        eprintln!("live gate, pause, exhaustion, persistence: PASS; production pool unchanged");
     }
 
     #[tokio::test]
