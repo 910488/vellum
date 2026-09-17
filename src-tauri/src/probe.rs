@@ -715,7 +715,10 @@ pub fn infer_wire_from_status(status: u16, tried: WireFormat) -> Option<WireForm
 
 /// 從回應 JSON 萃取 reasoning 能力（純函式）。
 /// Responses wire：`output[].type == "reasoning"`。
-/// Chat wire：`choices[].message.reasoning` 或 `reasoning_content`。
+/// Chat wire：`choices[].message.reasoning` / `reasoning_content`，或 usage
+/// 明確帶有 reasoning token 計數器。計數器即使本次是 0，仍代表端點
+/// 知道這個模型的 reasoning channel；短探測剛好沒有觸發思考，不應因此
+/// 阻止後續較嚴格的 Effort negative-control probe。
 pub fn extract_reasoning(body: &Value) -> bool {
     if let Some(output) = body.get("output").and_then(Value::as_array) {
         return output
@@ -727,7 +730,9 @@ pub fn extract_reasoning(body: &Value) -> bool {
             let msg = c.get("message");
             msg.and_then(|m| m.get("reasoning")).is_some()
                 || msg.and_then(|m| m.get("reasoning_content")).is_some()
-        });
+        }) || body
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .is_some();
     }
     false
 }
@@ -6198,6 +6203,19 @@ mod tests {
             }]
         });
         assert!(extract_reasoning(&body2));
+
+        // Provider 806 / NInfer reports the model's reasoning accounting even
+        // when a tiny completion happens to spend zero reasoning tokens. This
+        // is capability metadata, not evidence that the model lacks reasoning.
+        let body3 = json!({
+            "choices": [{
+                "message": { "content": "Hello" }
+            }],
+            "usage": {
+                "completion_tokens_details": { "reasoning_tokens": 0 }
+            }
+        });
+        assert!(extract_reasoning(&body3));
     }
 
     #[test]
