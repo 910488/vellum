@@ -6,6 +6,10 @@ import type {
   QuotaSnapshot,
 } from "@/types";
 
+// Match the backend admission reserve: a request selected at the last few
+// percent can itself cross the upstream five-hour limit.
+export const FIVE_HOUR_ROUTING_RESERVE_PERCENT = 5;
+
 export interface QuotaPoolAccount {
   account: CodexOAuthAccount;
   member: QuotaPoolMember;
@@ -64,7 +68,7 @@ export function quotaPoolAccounts(
           ? "missingQuota"
           : burnable <= 0
             ? "weeklyGate"
-            : fiveHourRemaining <= 0
+            : fiveHourRemaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT
               ? "fiveHour"
               : null;
     return [{

@@ -690,9 +690,8 @@ impl CodexOAuthManager {
             return self.valid_default_auth().await;
         }
 
-        let mut candidates = Vec::new();
         let mut failures = Vec::new();
-        for (rank, member) in settings.members.iter().enumerate() {
+        for member in &settings.members {
             if !member.in_pool || member.paused {
                 continue;
             }
@@ -703,11 +702,12 @@ impl CodexOAuthManager {
                     continue;
                 }
             };
-            let windows = match crate::codex_quota::query(
+            let windows = match crate::codex_quota::query_with_cache_ttl(
                 &auth.access_token,
                 &auth.account_id,
                 &auth.credential_id,
                 false,
+                crate::codex_quota::ROUTING_QUOTA_CACHE_TTL,
             )
             .await
             {
@@ -745,7 +745,13 @@ impl CodexOAuthManager {
             };
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
                 if observation.usable {
-                    candidates.push((rank, observation.burnable, auth));
+                    if *self.quota_pool.read().await != settings {
+                        return Err(OAuthError::AuthenticationFailed(
+                            "quota pool changed during account selection; retry the request".into(),
+                        ));
+                    }
+                    *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
+                    return Ok(Some(auth));
                 }
             } else {
                 failures.push(format!(
@@ -755,25 +761,15 @@ impl CodexOAuthManager {
             }
         }
 
-        candidates.sort_by_key(|candidate| candidate.0);
-        let Some((_, _, auth)) = candidates.into_iter().next() else {
-            *self.active_pool_account_id.write().await = None;
-            let detail = if failures.is_empty() {
-                "all members are paused, throttled, or at their weekly gate".to_string()
-            } else {
-                failures.join("; ")
-            };
-            return Err(OAuthError::AuthenticationFailed(format!(
-                "quota pool has no usable ChatGPT account: {detail}"
-            )));
+        *self.active_pool_account_id.write().await = None;
+        let detail = if failures.is_empty() {
+            "all members are paused, throttled, or at their weekly gate".to_string()
+        } else {
+            failures.join("; ")
         };
-        if *self.quota_pool.read().await != settings {
-            return Err(OAuthError::AuthenticationFailed(
-                "quota pool changed during account selection; retry the request".into(),
-            ));
-        }
-        *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
-        Ok(Some(auth))
+        Err(OAuthError::AuthenticationFailed(format!(
+            "quota pool has no usable ChatGPT account: {detail}"
+        )))
     }
 
     /// Resolve a valid access token for one specific managed ChatGPT account.
@@ -1057,9 +1053,13 @@ impl CodexOAuthManager {
 
 #[derive(Debug, Clone, Copy)]
 struct QuotaPoolObservation {
-    burnable: f64,
     usable: bool,
 }
+
+/// Leave enough headroom for the request being admitted now. The upstream
+/// usage endpoint reports completed consumption, so treating the last sliver
+/// as spendable can select an account whose in-flight request crosses 100%.
+const FIVE_HOUR_ROUTING_RESERVE_PERCENT: f64 = 5.0;
 
 fn quota_pool_observation(
     windows: &[crate::model::QuotaSnapshot],
@@ -1075,8 +1075,7 @@ fn quota_pool_observation(
     let five_hour_remaining = 100.0 - five_hour.used_percent.clamp(0.0, 100.0);
     let burnable = (weekly_remaining - f64::from(weekly_floor)).max(0.0);
     Some(QuotaPoolObservation {
-        burnable,
-        usable: burnable > 0.0 && five_hour_remaining > 0.0,
+        usable: burnable > 0.0 && five_hour_remaining > FIVE_HOUR_ROUTING_RESERVE_PERCENT,
     })
 }
 
@@ -1357,11 +1356,9 @@ mod tests {
             ),
         ];
         let open = quota_pool_observation(&windows, 30).unwrap();
-        assert_eq!(open.burnable, 29.0);
         assert!(open.usable);
 
         let gated = quota_pool_observation(&windows, 59).unwrap();
-        assert_eq!(gated.burnable, 0.0);
         assert!(!gated.usable);
 
         let throttled = vec![
@@ -1369,6 +1366,26 @@ mod tests {
             windows[1].clone(),
         ];
         assert!(!quota_pool_observation(&throttled, 0).unwrap().usable);
+
+        let inside_request_reserve = vec![
+            quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 96.0, None),
+            windows[1].clone(),
+        ];
+        assert!(
+            !quota_pool_observation(&inside_request_reserve, 0)
+                .unwrap()
+                .usable
+        );
+
+        let outside_request_reserve = vec![
+            quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 94.0, None),
+            windows[1].clone(),
+        ];
+        assert!(
+            quota_pool_observation(&outside_request_reserve, 0)
+                .unwrap()
+                .usable
+        );
     }
 
     #[test]
@@ -1708,9 +1725,8 @@ mod tests {
                 continue;
             };
             eprintln!(
-                "account {}: live spendable={} usable={}",
+                "account {}: live pool usable={}",
                 index + 1,
-                observation.burnable,
                 observation.usable
             );
             manager.access_tokens.write().await.insert(

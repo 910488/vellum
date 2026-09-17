@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+pub const ROUTING_QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 struct CachedQuota {
@@ -16,6 +17,10 @@ struct CachedQuota {
 fn quota_cache() -> &'static tokio::sync::RwLock<HashMap<String, CachedQuota>> {
     static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, CachedQuota>>> = OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn cache_is_fresh(fetched_at: std::time::Instant, ttl: std::time::Duration) -> bool {
+    fetched_at.elapsed() < ttl
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,13 +39,33 @@ pub async fn query(
     route_id: &str,
     force_refresh: bool,
 ) -> Result<Vec<QuotaSnapshot>, CodexQuotaError> {
+    query_with_cache_ttl(
+        access_token,
+        account_id,
+        route_id,
+        force_refresh,
+        QUOTA_CACHE_TTL,
+    )
+    .await
+}
+
+/// Query quota with a caller-selected cache age. UI/profile reads tolerate a
+/// short display cache, but request routing must react much sooner when a
+/// five-hour window reaches its edge.
+pub async fn query_with_cache_ttl(
+    access_token: &str,
+    account_id: &str,
+    route_id: &str,
+    force_refresh: bool,
+    cache_ttl: std::time::Duration,
+) -> Result<Vec<QuotaSnapshot>, CodexQuotaError> {
     // The display route id is not necessarily a credential selector. Key by a
     // one-way digest of the access token so two users in the same workspace do
     // not share quota, while no token material is retained in the cache key.
     let cache_key = format!("{account_id}:{:x}", Sha256::digest(access_token.as_bytes()));
     if !force_refresh {
         if let Some(cached) = quota_cache().read().await.get(&cache_key).cloned() {
-            if cached.fetched_at.elapsed() < QUOTA_CACHE_TTL {
+            if cache_is_fresh(cached.fetched_at, cache_ttl) {
                 return Ok(cached
                     .windows
                     .into_iter()
@@ -182,6 +207,13 @@ pub(crate) async fn seed_test_quota(token: &str, account: &str, windows: Vec<Quo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn request_routing_expires_quota_reads_before_the_display_cache() {
+        let fetched_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        assert!(!cache_is_fresh(fetched_at, ROUTING_QUOTA_CACHE_TTL));
+        assert!(cache_is_fresh(fetched_at, QUOTA_CACHE_TTL));
+    }
 
     #[tokio::test]
     async fn cached_quota_uses_the_callers_route_id() {
