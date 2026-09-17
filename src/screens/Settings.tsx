@@ -18,7 +18,7 @@ import { api } from "@/lib/api";
 import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
-import { Btn, Cap, Card, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
+import { Btn, Cap, Card, Confirm, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
 import { UpdateCards } from "@/components/UpdateCards";
 import {
   REVIEW_POLICIES,
@@ -92,6 +92,7 @@ export function Settings({
   const [logExportPath, setLogExportPath] = useState<string | null>(null);
   const [reviewSaving, setReviewSaving] = useState(false);
   const [reviewNotice, setReviewNotice] = useState<string | null>(null);
+  const [reviewBillingHelpOpen, setReviewBillingHelpOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<ReviewStats | null>(null);
   const [webSearch, setWebSearch] = useState<WebSearchSettingsView | null>(null);
@@ -768,7 +769,30 @@ export function Settings({
           </div>
           <p className="prose" style={{ marginTop: 4 }}>
             {t("settings.page.review.description")}
+            {" "}
+            <button
+              type="button"
+              className="quota-pool__rules-button"
+              onClick={() => setReviewBillingHelpOpen(true)}
+            >
+              {t("settings.page.review.billingHelp")}
+            </button>
           </p>
+
+          <Confirm
+            open={reviewBillingHelpOpen}
+            title={t("settings.page.review.billingHelpTitle")}
+            facts={(settings.beforeSend
+              ? (["enabled", "pool", "native"] as const)
+              : (["disabled", "pool", "native"] as const)
+            ).map((key) => ({
+              key: t(`settings.page.review.billingHelpFacts.${key}.title`),
+              value: t(`settings.page.review.billingHelpFacts.${key}.body`),
+            }))}
+            confirmLabel={t("common.close")}
+            onConfirm={() => setReviewBillingHelpOpen(false)}
+            onCancel={() => setReviewBillingHelpOpen(false)}
+          />
 
           {settings.beforeSend ? (
             <>

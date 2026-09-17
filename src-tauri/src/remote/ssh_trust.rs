@@ -46,6 +46,12 @@ use crate::state::AppState;
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const KEYSCAN_TIMEOUT_SECS: u64 = 10;
+// `ssh-keyscan` opens a separate pre-auth connection for every requested key
+// type. Its default is several types in parallel, which can trip strict
+// fail2ban rules before Vellum has authenticated even once. All supported
+// Remote Manager targets use modern OpenSSH and must offer Ed25519, so keep a
+// trust probe to exactly one connection.
+const KEYSCAN_KEY_TYPE: &str = "ed25519";
 
 /// Preference order used when a host offers more than one key type. Matches
 /// OpenSSH's own default `HostKeyAlgorithms` ordering (best assurance first).
@@ -269,6 +275,12 @@ pub fn fetch_pending_fingerprints(target: &SshTarget) -> AppResult<Vec<PendingHo
                     return Ok(results);
                 }
                 diagnostics.push(keyscan_diagnostic(&program, &output));
+                // A keyscan process that started has already contacted the
+                // host. Do not immediately repeat the same network probe with
+                // another implementation: that used to double the pre-auth
+                // burst on Windows and could trigger fail2ban. The fallback
+                // below is only for a scanner that could not be launched.
+                break;
             }
             Err(error) => {
                 diagnostics.push(format!("{} could not start: {error}", program.display()))
@@ -285,14 +297,20 @@ pub fn fetch_pending_fingerprints(target: &SshTarget) -> AppResult<Vec<PendingHo
 
 fn run_keyscan(program: &Path, target: &SshTarget) -> std::io::Result<Output> {
     background_command(program.as_os_str())
-        .args([
-            "-T",
-            &KEYSCAN_TIMEOUT_SECS.to_string(),
-            "-p",
-            &target.port.to_string(),
-            &target.host,
-        ])
+        .args(keyscan_args(target))
         .output()
+}
+
+fn keyscan_args(target: &SshTarget) -> Vec<String> {
+    vec![
+        "-T".into(),
+        KEYSCAN_TIMEOUT_SECS.to_string(),
+        "-t".into(),
+        KEYSCAN_KEY_TYPE.into(),
+        "-p".into(),
+        target.port.to_string(),
+        target.host.clone(),
+    ]
 }
 
 fn parse_keyscan_output(target: &SshTarget, stdout: &[u8]) -> Vec<PendingHostFingerprint> {
@@ -362,7 +380,8 @@ fn keyscan_programs() -> Vec<PathBuf> {
         // sntrup761x25519-sha512@openssh.com, even though `ssh` itself
         // correctly negotiates curve25519. Git for Windows' keyscan does not
         // have that incompatibility, so prefer it when installed in one of
-        // Git's standard locations. The system tool remains the fallback.
+        // Git's standard locations. The system tool is only a launch
+        // fallback; a completed Git keyscan is never repeated with it.
         let mut roots = Vec::new();
         if let Some(program_files) = std::env::var_os("ProgramFiles") {
             roots.push(PathBuf::from(program_files).join("Git"));
@@ -649,6 +668,27 @@ mod tests {
         if programs.iter().any(|program| program.is_absolute()) {
             assert_ne!(programs[0], PathBuf::from("ssh-keyscan"));
         }
+    }
+
+    #[test]
+    fn keyscan_requests_exactly_one_modern_host_key_type() {
+        let target = SshTarget {
+            host: "host.example.test".into(),
+            port: 8787,
+        };
+
+        assert_eq!(
+            keyscan_args(&target),
+            vec![
+                "-T",
+                "10",
+                "-t",
+                "ed25519",
+                "-p",
+                "8787",
+                "host.example.test"
+            ]
+        );
     }
 
     #[test]

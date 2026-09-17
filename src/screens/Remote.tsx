@@ -123,6 +123,10 @@ export function Remote({
     fingerprint: PendingHostFingerprint | null;
     fetchError: string | null;
   } | null>(null);
+  // Discovery and a refresh can converge on the same host in one render.
+  // Share their trust check so an unconfirmed host gets one keyscan rather
+  // than a small burst of identical pre-auth connections.
+  const sshTrustRequests = useRef(new Map<string, Promise<boolean>>());
   const retry = useRef<(() => void) | null>(null);
   // State updates do not become visible until React renders again. Keep a
   // synchronous lock as well so two clicks in the same frame cannot launch
@@ -139,17 +143,31 @@ export function Remote({
     setOperation(next);
   }, []);
 
-  const ensureSshTrust = useCallback(async (hostId: string): Promise<boolean> => {
-    setSshTrust({ hostId, confirmed: false, checking: true, fingerprint: null, fetchError: null });
-    try {
-      const status = await api.getRemoteSshTrustStatus(hostId);
-      if (status.confirmed) {
-        setSshTrust({ hostId, confirmed: true, checking: false, fingerprint: null, fetchError: null });
-        return true;
-      }
+  const ensureSshTrust = useCallback((hostId: string): Promise<boolean> => {
+    const existing = sshTrustRequests.current.get(hostId);
+    if (existing) return existing;
+
+    const request = (async () => {
+      setSshTrust({ hostId, confirmed: false, checking: true, fingerprint: null, fetchError: null });
       try {
-        const fingerprint = await api.fetchRemoteSshFingerprint(hostId);
-        setSshTrust({ hostId, confirmed: false, checking: false, fingerprint, fetchError: null });
+        const status = await api.getRemoteSshTrustStatus(hostId);
+        if (status.confirmed) {
+          setSshTrust({ hostId, confirmed: true, checking: false, fingerprint: null, fetchError: null });
+          return true;
+        }
+        try {
+          const fingerprint = await api.fetchRemoteSshFingerprint(hostId);
+          setSshTrust({ hostId, confirmed: false, checking: false, fingerprint, fetchError: null });
+        } catch (cause) {
+          setSshTrust({
+            hostId,
+            confirmed: false,
+            checking: false,
+            fingerprint: null,
+            fetchError: String(cause),
+          });
+        }
+        return false;
       } catch (cause) {
         setSshTrust({
           hostId,
@@ -158,18 +176,16 @@ export function Remote({
           fingerprint: null,
           fetchError: String(cause),
         });
+        return false;
       }
-      return false;
-    } catch (cause) {
-      setSshTrust({
-        hostId,
-        confirmed: false,
-        checking: false,
-        fingerprint: null,
-        fetchError: String(cause),
-      });
-      return false;
-    }
+    })();
+    sshTrustRequests.current.set(hostId, request);
+    void request.finally(() => {
+      if (sshTrustRequests.current.get(hostId) === request) {
+        sshTrustRequests.current.delete(hostId);
+      }
+    });
+    return request;
   }, []);
 
   const inspectHost = useCallback(async (hostId: string) => {
