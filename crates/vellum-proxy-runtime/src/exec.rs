@@ -44,7 +44,8 @@ use crate::diagnostics::{
     bounded_text, hash_text, input_item_manifest, redact_sensitive_json, redact_sensitive_text,
     spawn_prompt, ChildTurn, CodexMetadataConflictDiagnostic, CompactionDecision, CompactionEngine,
     CompactionOutcome, DetailLevel, DiagnosticEvent, DiagnosticsSink, InputItemManifest,
-    LinkConfidence, NoopSink, SpawnCompleted, SpawnRequested, SubagentGraphLinked,
+    LinkConfidence, NoopSink, OfficialAuthMode, OfficialRequestPrepared,
+    OfficialRequestTransport, SpawnCompleted, SpawnRequested, SubagentGraphLinked,
     SubagentLinkComparison, SubagentLinkMethod, TrajectoryDecisionDiagnostic, UsageWriteFailure,
 };
 use crate::error::RuntimeError;
@@ -1237,6 +1238,55 @@ impl ProxyRuntime {
         }
     }
 
+    pub(crate) fn record_official_request_prepared(
+        &self,
+        request: &RuntimeRequest,
+        route: &RuntimeModelRoute,
+        auth: &ResolvedAuth,
+        transport: OfficialRequestTransport,
+        requested_body: &Value,
+        effective_body: &Value,
+    ) {
+        let (control_account_hash, execution_account_hash) =
+            official_usage_identity(auth, request);
+        let (auth_mode, selection_revision, selection_verified) = match auth {
+            ResolvedAuth::OfficialManaged {
+                selection_revision,
+                selection_verified,
+                ..
+            } => (
+                OfficialAuthMode::Managed,
+                *selection_revision,
+                Some(*selection_verified),
+            ),
+            ResolvedAuth::OfficialPreserveIncoming { .. } => {
+                (OfficialAuthMode::PreserveIncoming, None, None)
+            }
+            _ => return,
+        };
+        let requested_reasoning_summary = official_reasoning_summary_label(requested_body);
+        let effective_reasoning_summary = official_reasoning_summary_label(effective_body);
+        self.record_diagnostic(DiagnosticEvent::OfficialRequestPrepared(
+            OfficialRequestPrepared {
+                request_id: request.metadata.request_id.clone(),
+                route_id: route.route_id.clone(),
+                catalog_id: route.catalog_id.clone(),
+                upstream_model: route.upstream_model.clone(),
+                transport,
+                auth_mode,
+                control_account_hash,
+                execution_account_hash,
+                selection_revision,
+                selection_verified,
+                reasoning_summary_normalized: requested_reasoning_summary.as_deref()
+                    == Some("none")
+                    && effective_reasoning_summary.as_deref() == Some("auto"),
+                requested_reasoning_summary,
+                effective_reasoning_summary,
+            },
+        ));
+    }
+
     /// Surface a terminal usage-write rejection as one bounded structured
     /// diagnostic (see [`record_usage_write_failure_diagnostic`]).
     fn record_usage_write_failure(
@@ -2380,6 +2430,16 @@ impl ProxyRuntime {
                 },
             });
         }
+        let effective_body =
+            crate::adapter::prepare_openai_official_native(&request.body, &route.upstream_model);
+        self.record_official_request_prepared(
+            request,
+            &route,
+            &auth,
+            OfficialRequestTransport::WebSocket,
+            &request.body,
+            &effective_body,
+        );
         let preserve_incoming_auth = matches!(auth, ResolvedAuth::OfficialPreserveIncoming { .. });
         let upstream_url = official_websocket_endpoint(&route.base_url)?;
         let connection_key = OfficialWebSocketConnectionKey {
@@ -4229,6 +4289,16 @@ impl ProxyRuntime {
         let mut prepared = prepared_result.body;
         if route.effective_provider_profile().is_some() {
             crate::opencode::strip_openai_only_fields(&mut prepared);
+        }
+        if route.provider_kind == RuntimeProviderKind::Official {
+            self.record_official_request_prepared(
+                request,
+                route,
+                &auth,
+                OfficialRequestTransport::Http,
+                &execution_body,
+                &prepared,
+            );
         }
         let mut encoded_body = serde_json::to_vec(&prepared)
             .map_err(|error| RuntimeError::Internal(format!("encode upstream body: {error}")))?;
@@ -8022,6 +8092,15 @@ fn official_selection_revision(auth: &ResolvedAuth) -> Option<u64> {
     }
 }
 
+fn official_reasoning_summary_label(body: &Value) -> Option<String> {
+    let summary = body.pointer("/reasoning/summary")?;
+    Some(match summary.as_str() {
+        Some(value @ ("none" | "auto" | "concise" | "detailed")) => value.to_string(),
+        Some(_) => "other".into(),
+        None => "non_string".into(),
+    })
+}
+
 fn official_refresh_matches_snapshot(
     rejected: &OfficialAuthorization,
     refreshed: &OfficialAuthorization,
@@ -8543,6 +8622,28 @@ mod tests {
     use crate::transport::{FixtureTransport, TransportError, UpstreamResponse, UpstreamStream};
     use crate::usage::UsageSummary;
     use serde_json::json;
+
+    #[test]
+    fn official_reasoning_summary_diagnostic_is_allowlisted() {
+        assert_eq!(
+            official_reasoning_summary_label(&json!({"reasoning": {"summary": "none"}}))
+                .as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            official_reasoning_summary_label(
+                &json!({"reasoning": {"summary": "must-not-leak"}})
+            )
+            .as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            official_reasoning_summary_label(&json!({"reasoning": {"summary": {"secret": 1}}}))
+                .as_deref(),
+            Some("non_string")
+        );
+        assert_eq!(official_reasoning_summary_label(&json!({})), None);
+    }
 
     #[test]
     fn stream_open_frame_is_an_sse_comment() {
@@ -10476,6 +10577,84 @@ mod tests {
             Arc::new(CountingRequestLifecycle::new()),
             transport,
         )
+    }
+
+    #[tokio::test]
+    async fn official_websocket_plan_records_safe_effective_request_diagnostics() {
+        let events = Arc::new(RecordingStore::new());
+        let runtime = official_runtime_with_transport(Arc::new(RecordingTransport::new(
+            Vec::new(),
+        )))
+        .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
+        let request = request(json!({
+            "type": "response.create",
+            "model": "vlm-test",
+            "reasoning": {"effort": "high", "summary": "none"},
+            "input": "hi",
+            "stream": true
+        }));
+
+        runtime
+            .prepare_official_websocket(&request)
+            .await
+            .unwrap()
+            .expect("Official Responses route must select native WebSocket");
+
+        let recorded = events.events.lock().unwrap();
+        let prepared = recorded
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::OfficialRequestPrepared(prepared) => Some(prepared),
+                _ => None,
+            })
+            .expect("Official preparation diagnostic");
+        assert_eq!(prepared.transport, OfficialRequestTransport::WebSocket);
+        assert_eq!(prepared.auth_mode, OfficialAuthMode::Managed);
+        assert_eq!(prepared.selection_revision, Some(0));
+        assert_eq!(prepared.selection_verified, Some(true));
+        assert_eq!(prepared.requested_reasoning_summary.as_deref(), Some("none"));
+        assert_eq!(prepared.effective_reasoning_summary.as_deref(), Some("auto"));
+        assert!(prepared.reasoning_summary_normalized);
+        assert!(prepared.execution_account_hash.is_some());
+        let encoded = serde_json::to_string(prepared).unwrap();
+        assert!(!encoded.contains("official-token"));
+        assert!(!encoded.contains("acct-1"));
+    }
+
+    #[tokio::test]
+    async fn official_http_dispatch_records_the_same_safe_effective_diagnostic() {
+        let events = Arc::new(RecordingStore::new());
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone())
+            .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
+        runtime
+            .execute(
+                request(json!({
+                    "model": "vlm-test",
+                    "reasoning": {"summary": "none"},
+                    "input": "hi"
+                })),
+                "official_http_diagnostic",
+            )
+            .await
+            .unwrap();
+
+        let requests = transport.requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        drop(requests);
+        let recorded = events.events.lock().unwrap();
+        let prepared = recorded
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::OfficialRequestPrepared(prepared) => Some(prepared),
+                _ => None,
+            })
+            .expect("Official preparation diagnostic");
+        assert_eq!(prepared.transport, OfficialRequestTransport::Http);
+        assert_eq!(prepared.requested_reasoning_summary.as_deref(), Some("none"));
+        assert_eq!(prepared.effective_reasoning_summary.as_deref(), Some("auto"));
+        assert!(prepared.reasoning_summary_normalized);
     }
 
     #[tokio::test]

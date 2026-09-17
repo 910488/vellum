@@ -241,6 +241,23 @@ Official OpenAI Responses is a native passthrough contract:
 - preserve the selected ChatGPT account and its OAuth behavior; and
 - report authentication, quota, protocol, and transport failures accurately.
 
+The legacy catalog value `default_reasoning_summary: "none"` is not accepted
+by the current ChatGPT Responses endpoint. Vellum normalizes that exact value
+to `"auto"` in the projected Official catalog and again at the shared Official
+HTTP/WebSocket outbound boundary. Supported values and absent fields are
+preserved, third-party catalog defaults are unchanged, and the source Codex
+catalog cache remains read-only.
+
+Every Official dispatch records a bounded structured diagnostic containing the
+request/route/model identities, HTTP versus WebSocket transport, managed versus
+incoming authentication mode, selection revision and verification state,
+hashed control/execution workspace identities, and the allow-listed requested
+and effective reasoning-summary values. It never records tokens, authorization
+headers, raw account identifiers, or request bodies. Together with the
+credential-identity hash in `official_account_selected`, the revision joins an
+execution back to the exact explicit account choice even when two users share
+one ChatGPT workspace.
+
 Display the human account identity returned by the authenticated account data
 when available. An internal account identifier is a fallback, not the preferred
 label, and no email address is hard-coded into the protocol.

@@ -689,6 +689,16 @@ pub fn catalog_json_with_official_and_compaction(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Codex caches can outlive the upstream protocol value they describe.
+    // ChatGPT currently rejects the legacy `none` sentinel, so repair the
+    // projected Official copy without rewriting Codex's source cache. The
+    // final HTTP/WebSocket boundary repeats this normalization as defense in
+    // depth for already-materialized catalogs.
+    for model in &mut models {
+        if let Some(summary) = model.get_mut("default_reasoning_summary") {
+            vellum_proxy_runtime::normalize_official_reasoning_summary(summary);
+        }
+    }
     let mut seen = models
         .iter()
         .filter_map(|model| model.get("slug").and_then(Value::as_str))
@@ -1744,6 +1754,49 @@ mod tests {
         let grok = route(ProviderKind::GrokCli, "grok-cli", "grok-4.6");
         let catalog = catalog_json(&[grok]);
         assert_eq!(catalog["models"][0]["supports_search_tool"], true);
+    }
+
+    #[test]
+    fn official_none_summary_is_normalized_without_mutating_cache_or_third_party() {
+        let official = json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "default_reasoning_summary": "none",
+                    "base_instructions": "official"
+                },
+                {
+                    "slug": "gpt-5.6-luna",
+                    "default_reasoning_summary": "detailed",
+                    "base_instructions": "official"
+                }
+            ]
+        });
+        let third = route(ProviderKind::OpenAiCompatible, "third", "local-model");
+
+        let projected = catalog_json_with_official(std::slice::from_ref(&third), Some(&official));
+        let models = projected["models"].as_array().unwrap();
+        let by_slug = |slug: &str| {
+            models
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .unwrap()
+        };
+        let third_slug = model_routes(std::slice::from_ref(&third))[0]
+            .catalog_id
+            .clone();
+
+        assert_eq!(by_slug("gpt-5.6-sol")["default_reasoning_summary"], "auto");
+        assert_eq!(
+            by_slug("gpt-5.6-luna")["default_reasoning_summary"],
+            "detailed"
+        );
+        assert_eq!(by_slug(&third_slug)["default_reasoning_summary"], "none");
+        assert_eq!(
+            official["models"][0]["default_reasoning_summary"],
+            "none",
+            "the upstream Codex cache is read-only input"
+        );
     }
 
     /// Issue #6 §B: the third-party prompt used to be `models.first()`, so it
