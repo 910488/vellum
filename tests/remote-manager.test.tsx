@@ -874,6 +874,24 @@ describe("Remote Manager operations UI", () => {
     await waitFor(() => expect(apiMocks.inspectRemoteHost).toHaveBeenCalledWith("jetson"));
   });
 
+  it("coalesces overlapping trust checks into one host-key scan", async () => {
+    let resolveTrustStatus!: (value: { host: string; port: number; confirmed: boolean }) => void;
+    apiMocks.getRemoteSshTrustStatus.mockImplementation(() => new Promise((resolve) => {
+      resolveTrustStatus = resolve;
+    }));
+
+    const view = renderRemote();
+    await waitFor(() => expect(apiMocks.getRemoteSshTrustStatus).toHaveBeenCalledTimes(1));
+
+    view.rerender(<Remote refreshVersion={1} onRefreshComplete={() => {}} />);
+    await waitFor(() => expect(apiMocks.discoverRemoteConnections).toHaveBeenCalledTimes(2));
+    expect(apiMocks.getRemoteSshTrustStatus).toHaveBeenCalledTimes(1);
+
+    resolveTrustStatus({ host: "192.0.2.10", port: 22, confirmed: false });
+    await waitFor(() => expect(apiMocks.fetchRemoteSshFingerprint).toHaveBeenCalledTimes(1));
+    expect(apiMocks.inspectRemoteHost).not.toHaveBeenCalled();
+  });
+
   it("hard-fails a changed host key without an auto-accept button", async () => {
     apiMocks.inspectRemoteHost.mockRejectedValue(
       new Error("SshHostKeyFingerprintMismatch: 192.0.2.10:22 is no longer offering the confirmed fingerprint; refusing to trust it"),

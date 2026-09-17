@@ -34,7 +34,7 @@ Codex 原生 daemon 是 thread、turn、approval、workspace 與 session 的唯�
 - macOS 遠端 state 在 `~/Library/Application Support/vellum-remote`，獨立 Codex home 為 `~/.vellum-remote/codex`。不複製或改寫本機 `~/.codex`、Enhanced 或全域 shell。
 - Proxy container 不掛載 Docker socket、`~/.codex` 或任意 workspace。
 - Agent 不接受 renderer 傳來的任意 shell command。
-- SSH host key 必須先顯示指紋並由使用者明確確認，之後只寫入 Vellum 私有的 `known_hosts`。Windows 若偵測到標準位置的 Git for Windows，優先使用其相容版 `ssh-keyscan`，並以系統 OpenSSH 作後備；兩者都只讀取遠端公開 host key，不會匯入或自動信任使用者既有的 `known_hosts`。
+- SSH host key 必須先顯示指紋並由使用者明確確認，之後只寫入 Vellum 私有的 `known_hosts`。探測只要求 Ed25519 key，避免 `ssh-keyscan` 預設為多種 key type 同時建立多條 pre-auth 連線而觸發 fail2ban。Windows 若偵測到標準位置的 Git for Windows，優先使用其相容版 `ssh-keyscan`；只有該程式無法啟動時才改用系統 OpenSSH，不會在一次操作中對遠端重複掃描。兩者都只讀取遠端公開 host key，不會匯入或自動信任使用者既有的 `known_hosts`。
 - Secret 只存在 remote `0600` credential file，不進 renderer、log、container label 或 CLI argument。
 - 退役 route 由 deployment planner 無條件排除；環境清理紀錄不得寫入此架構文件。
 - Image 更換時即使 config hash 無 drift，也必須重新套用 desired config，避免 bootstrap mock config 取代正式 catalog。
