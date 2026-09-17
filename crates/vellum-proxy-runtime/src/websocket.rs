@@ -1756,9 +1756,9 @@ fn should_forward_official_header(name: &str) -> bool {
 }
 
 /// `response.create.model` is rewritten because catalog IDs are local aliases.
-/// The shared Official compatibility guard also normalizes the rejected
-/// legacy `reasoning.summary = "none"` sentinel. Every other application and
-/// control field is forwarded unchanged.
+/// The shared Official compatibility guard omits the Codex-local
+/// `reasoning.summary = "none"` sentinel. Every other application and control
+/// field is forwarded unchanged.
 fn prepare_official_frame(
     message: AxumWsMessage,
     upstream_model: &str,
@@ -2465,7 +2465,7 @@ mod tests {
     }
 
     #[test]
-    fn official_response_create_changes_only_model_and_rejected_summary_sentinel() {
+    fn official_response_create_changes_only_model_and_omits_disabled_summary() {
         let original = br#"{"type":"response.create","model":"catalog-alias","reasoning":{"effort":"high","summary":"none"},"input":[{"type":"reasoning","encrypted_content":"opaque"}],"stream":true}"#;
         let prepared = prepare_response_create_bytes(original, "gpt-upstream")
             .unwrap()
@@ -2474,7 +2474,7 @@ mod tests {
         assert_eq!(value["type"], "response.create");
         assert_eq!(value["model"], "gpt-upstream");
         assert_eq!(value["reasoning"]["effort"], "high");
-        assert_eq!(value["reasoning"]["summary"], "auto");
+        assert!(value["reasoning"].get("summary").is_none());
         assert_eq!(value["input"][0]["encrypted_content"], "opaque");
         assert_eq!(value["stream"], true);
     }

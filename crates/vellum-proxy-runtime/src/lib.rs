@@ -84,9 +84,9 @@ pub mod websocket;
 pub use adapter::{
     chat_reasoning_text, chat_response_to_responses, chat_response_to_responses_with_context,
     contains_vellum_synthetic_item, content_to_plain_string, content_to_text, custom_tool_input,
-    flatten_namespace_name, is_apply_patch, normalize_official_reasoning_summary,
-    normalize_patch_delimiters, prepare_openai_official_native, sanitize_for_official,
-    strip_cross_realm_fields, strip_cross_realm_fields_for_official,
+    flatten_namespace_name, is_apply_patch, normalize_patch_delimiters,
+    omit_disabled_official_reasoning_summary, prepare_openai_official_native,
+    sanitize_for_official, strip_cross_realm_fields, strip_cross_realm_fields_for_official,
     strip_opaque_reasoning_keep_summary, validate_patch, ChatSseAdapter, CodexToolContext,
     FileChange, FileChangeKind, NamespaceToolContext, PatchSummary, APPLY_PATCH_TOOL_NAME,
 };
@@ -121,9 +121,10 @@ pub use diagnostics::{
     ChildTurn, CodexMetadataConflictDiagnostic, CompactionDecision, CompactionEngine,
     CompactionOutcome, DetailLevel, DiagnosticEvent, DiagnosticsSink, InputItemManifest,
     LinkConfidence, NoopSink, OfficialAccountSelected, OfficialAuthMode,
-    OfficialRequestPrepared, OfficialRequestTransport, RuntimeDiagnostics, SpawnCompleted,
-    SpawnRequested, SubagentGraphLinked, SubagentLinkComparison, SubagentLinkMethod,
-    T3CaptureSession, WebSocketClosed, WebSocketOpened, WebSocketTransport, T3_MAX_AGE, T3_MAX_BYTES,
+    OfficialReasoningSummaryAction, OfficialRequestPrepared, OfficialRequestTransport,
+    RuntimeDiagnostics, SpawnCompleted, SpawnRequested, SubagentGraphLinked,
+    SubagentLinkComparison, SubagentLinkMethod, T3CaptureSession, WebSocketClosed, WebSocketOpened,
+    WebSocketTransport, T3_MAX_AGE, T3_MAX_BYTES,
 };
 pub use environment::{
     ExecutionEnvironment, ExecutorCapability, RuntimeAmpersandSemantics, RuntimePathStyle,

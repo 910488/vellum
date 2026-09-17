@@ -44,9 +44,10 @@ use crate::diagnostics::{
     bounded_text, hash_text, input_item_manifest, redact_sensitive_json, redact_sensitive_text,
     spawn_prompt, ChildTurn, CodexMetadataConflictDiagnostic, CompactionDecision, CompactionEngine,
     CompactionOutcome, DetailLevel, DiagnosticEvent, DiagnosticsSink, InputItemManifest,
-    LinkConfidence, NoopSink, OfficialAuthMode, OfficialRequestPrepared,
-    OfficialRequestTransport, SpawnCompleted, SpawnRequested, SubagentGraphLinked,
-    SubagentLinkComparison, SubagentLinkMethod, TrajectoryDecisionDiagnostic, UsageWriteFailure,
+    LinkConfidence, NoopSink, OfficialAuthMode, OfficialReasoningSummaryAction,
+    OfficialRequestPrepared, OfficialRequestTransport, SpawnCompleted, SpawnRequested,
+    SubagentGraphLinked, SubagentLinkComparison, SubagentLinkMethod, TrajectoryDecisionDiagnostic,
+    UsageWriteFailure,
 };
 use crate::error::RuntimeError;
 use crate::grok_session::{conversation_key_from_request, GrokSessionRegistry};
@@ -1266,6 +1267,8 @@ impl ProxyRuntime {
         };
         let requested_reasoning_summary = official_reasoning_summary_label(requested_body);
         let effective_reasoning_summary = official_reasoning_summary_label(effective_body);
+        let summary_omitted = requested_reasoning_summary.as_deref() == Some("none")
+            && effective_reasoning_summary.is_none();
         self.record_diagnostic(DiagnosticEvent::OfficialRequestPrepared(
             OfficialRequestPrepared {
                 request_id: request.metadata.request_id.clone(),
@@ -1278,9 +1281,12 @@ impl ProxyRuntime {
                 execution_account_hash,
                 selection_revision,
                 selection_verified,
-                reasoning_summary_normalized: requested_reasoning_summary.as_deref()
-                    == Some("none")
-                    && effective_reasoning_summary.as_deref() == Some("auto"),
+                reasoning_summary_action: if summary_omitted {
+                    OfficialReasoningSummaryAction::OmittedDisabled
+                } else {
+                    OfficialReasoningSummaryAction::Preserved
+                },
+                reasoning_summary_normalized: summary_omitted,
                 requested_reasoning_summary,
                 effective_reasoning_summary,
             },
@@ -10612,8 +10618,15 @@ mod tests {
         assert_eq!(prepared.auth_mode, OfficialAuthMode::Managed);
         assert_eq!(prepared.selection_revision, Some(0));
         assert_eq!(prepared.selection_verified, Some(true));
-        assert_eq!(prepared.requested_reasoning_summary.as_deref(), Some("none"));
-        assert_eq!(prepared.effective_reasoning_summary.as_deref(), Some("auto"));
+        assert_eq!(
+            prepared.requested_reasoning_summary.as_deref(),
+            Some("none")
+        );
+        assert_eq!(prepared.effective_reasoning_summary, None);
+        assert_eq!(
+            prepared.reasoning_summary_action,
+            OfficialReasoningSummaryAction::OmittedDisabled
+        );
         assert!(prepared.reasoning_summary_normalized);
         assert!(prepared.execution_account_hash.is_some());
         let encoded = serde_json::to_string(prepared).unwrap();
@@ -10641,7 +10654,7 @@ mod tests {
 
         let requests = transport.requests.lock().unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body.get("reasoning").is_none());
         drop(requests);
         let recorded = events.events.lock().unwrap();
         let prepared = recorded
@@ -10652,8 +10665,15 @@ mod tests {
             })
             .expect("Official preparation diagnostic");
         assert_eq!(prepared.transport, OfficialRequestTransport::Http);
-        assert_eq!(prepared.requested_reasoning_summary.as_deref(), Some("none"));
-        assert_eq!(prepared.effective_reasoning_summary.as_deref(), Some("auto"));
+        assert_eq!(
+            prepared.requested_reasoning_summary.as_deref(),
+            Some("none")
+        );
+        assert_eq!(prepared.effective_reasoning_summary, None);
+        assert_eq!(
+            prepared.reasoning_summary_action,
+            OfficialReasoningSummaryAction::OmittedDisabled
+        );
         assert!(prepared.reasoning_summary_normalized);
     }
 

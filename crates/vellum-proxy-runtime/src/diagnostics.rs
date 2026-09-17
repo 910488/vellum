@@ -148,6 +148,14 @@ pub enum OfficialAuthMode {
     PreserveIncoming,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialReasoningSummaryAction {
+    #[default]
+    Preserved,
+    OmittedDisabled,
+}
+
 /// Privacy-preserving facts frozen immediately before an Official request is
 /// dispatched. Summary values are reduced to a small allow-list and account
 /// identities are hashes, so diagnostics can distinguish catalog, request,
@@ -173,6 +181,10 @@ pub struct OfficialRequestPrepared {
     pub requested_reasoning_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_reasoning_summary: Option<String>,
+    #[serde(default)]
+    pub reasoning_summary_action: OfficialReasoningSummaryAction,
+    /// Kept for compatibility with existing diagnostic readers. `true` means
+    /// the requested summary value changed at the Official wire boundary.
     pub reasoning_summary_normalized: bool,
 }
 
@@ -902,5 +914,25 @@ mod tests {
         assert_eq!(session.detail_level(), DetailLevel::T3FullContext);
         session.record_bytes(T3_MAX_BYTES);
         assert_eq!(session.detail_level(), DetailLevel::T1Summary);
+    }
+
+    #[test]
+    fn legacy_official_request_diagnostic_defaults_summary_action() {
+        let legacy = serde_json::json!({
+            "requestId": "req-1",
+            "routeId": "route-1",
+            "catalogId": "gpt-test",
+            "upstreamModel": "gpt-test",
+            "transport": "http",
+            "authMode": "managed",
+            "reasoningSummaryNormalized": false
+        });
+
+        let decoded: OfficialRequestPrepared = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(
+            decoded.reasoning_summary_action,
+            OfficialReasoningSummaryAction::Preserved
+        );
     }
 }
