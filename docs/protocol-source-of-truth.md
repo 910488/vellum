@@ -241,18 +241,21 @@ Official OpenAI Responses is a native passthrough contract:
 - preserve the selected ChatGPT account and its OAuth behavior; and
 - report authentication, quota, protocol, and transport failures accurately.
 
-The legacy catalog value `default_reasoning_summary: "none"` is not accepted
-by the current ChatGPT Responses endpoint. Vellum normalizes that exact value
-to `"auto"` in the projected Official catalog and again at the shared Official
-HTTP/WebSocket outbound boundary. Supported values and absent fields are
-preserved, third-party catalog defaults are unchanged, and the source Codex
-catalog cache remains read-only.
+Codex configuration and catalog metadata use `default_reasoning_summary:
+"none"` to mean that reasoning summaries are disabled. Preserve that value in
+the projected Official catalog so Codex and its UI retain the user's intended
+setting. The ChatGPT Responses wire contract does not accept `"none"` as a
+`reasoning.summary` value, so the shared Official HTTP/WebSocket outbound
+boundary omits that optional field. It preserves `reasoning.effort`, supported
+summary values, absent fields, third-party catalog defaults, and the read-only
+source Codex catalog cache.
 
 Every Official dispatch records a bounded structured diagnostic containing the
 request/route/model identities, HTTP versus WebSocket transport, managed versus
 incoming authentication mode, selection revision and verification state,
-hashed control/execution workspace identities, and the allow-listed requested
-and effective reasoning-summary values. It never records tokens, authorization
+hashed control/execution workspace identities, the allow-listed requested and
+effective reasoning-summary values, and whether a disabled summary was omitted
+at the wire boundary. It never records tokens, authorization
 headers, raw account identifiers, or request bodies. Together with the
 credential-identity hash in `official_account_selected`, the revision joins an
 execution back to the exact explicit account choice even when two users share

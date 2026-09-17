@@ -492,15 +492,28 @@ impl NamespaceToolContext {
     }
 }
 
-/// Normalize the one legacy reasoning-summary sentinel which the current
-/// ChatGPT Responses endpoint rejects. This is shared by catalog projection
-/// and the final outbound boundary so a stale cached catalog cannot re-open
-/// the protocol failure.
-pub fn normalize_official_reasoning_summary(value: &mut Value) -> bool {
-    if value.as_str() != Some("none") {
+/// Translate Codex's local "disable summaries" sentinel at the Official wire
+/// boundary. `none` is valid in Codex configuration and model metadata, but it
+/// is not a valid Responses `reasoning.summary` value. Omitting the optional
+/// field preserves the user's disabled-summary intent without opting the
+/// request into `auto` summaries.
+pub fn omit_disabled_official_reasoning_summary(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
         return false;
+    };
+    let remove_reasoning = {
+        let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) else {
+            return false;
+        };
+        if reasoning.get("summary").and_then(Value::as_str) != Some("none") {
+            return false;
+        }
+        reasoning.remove("summary");
+        reasoning.is_empty()
+    };
+    if remove_reasoning {
+        object.remove("reasoning");
     }
-    *value = Value::String("auto".into());
     true
 }
 
@@ -511,12 +524,8 @@ pub fn prepare_openai_official_native(original: &Value, upstream_model: &str) ->
     let mut body = original.clone();
     if let Some(object) = body.as_object_mut() {
         object.insert("model".into(), Value::String(upstream_model.to_string()));
-        if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
-            if let Some(summary) = reasoning.get_mut("summary") {
-                normalize_official_reasoning_summary(summary);
-            }
-        }
     }
+    omit_disabled_official_reasoning_summary(&mut body);
     body
 }
 
@@ -1792,11 +1801,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn official_native_maps_unsupported_none_summary_to_auto() {
+    fn official_native_omits_disabled_summary_without_changing_effort() {
         let original = json!({
             "model": "gpt-5.6-sol",
             "reasoning": {
-                "effort": "high",
+                "effort": "none",
                 "summary": "none"
             },
             "input": "hello"
@@ -1805,23 +1814,39 @@ mod tests {
         let prepared = prepare_openai_official_native(&original, "gpt-5.6-sol-upstream");
 
         assert_eq!(prepared["model"], "gpt-5.6-sol-upstream");
-        assert_eq!(prepared["reasoning"]["summary"], "auto");
-        assert_eq!(prepared["reasoning"]["effort"], "high");
+        assert!(prepared["reasoning"].get("summary").is_none());
+        assert_eq!(prepared["reasoning"]["effort"], "none");
+        assert_eq!(original["reasoning"]["summary"], "none");
+    }
+
+    #[test]
+    fn official_native_removes_empty_reasoning_after_disabled_summary() {
+        let original = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"summary": "none"},
+            "input": "hello"
+        });
+
+        let prepared = prepare_openai_official_native(&original, "upstream");
+
+        assert!(prepared.get("reasoning").is_none());
         assert_eq!(original["reasoning"]["summary"], "none");
     }
 
     #[test]
     fn official_native_preserves_supported_or_absent_summary() {
-        let supported = json!({
-            "model": "gpt-5.6-sol",
-            "reasoning": {"summary": "detailed"}
-        });
+        for summary in ["auto", "concise", "detailed", "future-value"] {
+            let original = json!({
+                "model": "gpt-5.6-sol",
+                "reasoning": {"summary": summary}
+            });
+            let prepared = prepare_openai_official_native(&original, "upstream");
+            assert_eq!(prepared["reasoning"]["summary"], summary);
+        }
         let absent = json!({"model": "gpt-5.6-sol", "input": "hello"});
 
-        let supported = prepare_openai_official_native(&supported, "upstream");
         let absent = prepare_openai_official_native(&absent, "upstream");
 
-        assert_eq!(supported["reasoning"]["summary"], "detailed");
         assert!(absent.get("reasoning").is_none());
     }
 
