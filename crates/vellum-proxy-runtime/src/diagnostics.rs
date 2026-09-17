@@ -134,6 +134,48 @@ pub struct OfficialAccountSelected {
     pub selection_verified: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialRequestTransport {
+    Http,
+    WebSocket,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialAuthMode {
+    Managed,
+    PreserveIncoming,
+}
+
+/// Privacy-preserving facts frozen immediately before an Official request is
+/// dispatched. Summary values are reduced to a small allow-list and account
+/// identities are hashes, so diagnostics can distinguish catalog, request,
+/// and account-selection failures without retaining credentials or bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialRequestPrepared {
+    pub request_id: String,
+    pub route_id: String,
+    pub catalog_id: String,
+    pub upstream_model: String,
+    pub transport: OfficialRequestTransport,
+    pub auth_mode: OfficialAuthMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_account_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_account_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_summary: Option<String>,
+    pub reasoning_summary_normalized: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnRequested {
@@ -495,6 +537,7 @@ pub enum DiagnosticEvent {
     WebSocketOpened(WebSocketOpened),
     WebSocketClosed(WebSocketClosed),
     OfficialAccountSelected(OfficialAccountSelected),
+    OfficialRequestPrepared(OfficialRequestPrepared),
     SpawnRequested(SpawnRequested),
     ChildTurn(ChildTurn),
     SpawnCompleted(SpawnCompleted),

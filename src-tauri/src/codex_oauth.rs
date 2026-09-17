@@ -597,11 +597,10 @@ impl CodexOAuthManager {
             *self.selected_at.read().await,
             *self.selection_verified.read().await,
         );
-        if previous.0.as_deref() == Some(account_id) {
-            *self.selection_verified.write().await = true;
-            self.persist().await?;
-            return Ok(());
-        }
+        // `set_default` is an explicit user selection, even when the account
+        // was already the implicit first-login default. Always publish a new
+        // revision and timestamp so the UI, diagnostics, and request boundary
+        // can distinguish a verified choice from an untouched fallback.
         *self.default_account_id.write().await = Some(account_id.into());
         *self.selection_revision.write().await = previous.1.saturating_add(1);
         *self.selected_at.write().await = Some(chrono::Utc::now().timestamp_millis());
@@ -1916,6 +1915,48 @@ mod tests {
         let applied = manager.valid_default_auth().await.unwrap().unwrap();
         assert_eq!(applied.account_id, "acct-b");
         assert_eq!(applied.selection_revision, after.selection_revision);
+    }
+
+    #[tokio::test]
+    async fn explicitly_reselecting_implicit_default_publishes_selection_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        manager.accounts.write().await.insert(
+            "acct-a".into(),
+            AccountMetadata {
+                account_id: "acct-a".into(),
+                chatgpt_account_id: None,
+                workspace_name: None,
+                plan_type: None,
+                email: None,
+                authenticated_at: 1,
+            },
+        );
+        manager.access_tokens.write().await.insert(
+            "acct-a".into(),
+            CachedToken {
+                access_token: "token-acct-a".into(),
+                expires_at_ms: i64::MAX,
+            },
+        );
+        *manager.default_account_id.write().await = Some("acct-a".into());
+        manager.persist().await.unwrap();
+
+        manager.set_default("acct-a").await.unwrap();
+
+        let selected = manager.status().await;
+        assert_eq!(selected.default_account_id.as_deref(), Some("acct-a"));
+        assert_eq!(selected.selection_revision, 1);
+        assert!(selected.selected_at.is_some());
+        assert!(selected.selection_verified);
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(metadata_path(temp.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["default_account_id"], "acct-a");
+        assert_eq!(persisted["selection_revision"], 1);
+        assert!(persisted["selected_at"].as_i64().is_some());
+        assert_eq!(persisted["selection_verified"], true);
     }
 
     #[tokio::test]

@@ -1755,9 +1755,10 @@ fn should_forward_official_header(name: &str) -> bool {
         || name.starts_with("x-openai-")
 }
 
-/// Only `response.create.model` is rewritten, because catalog IDs are local
-/// aliases. Text/binary shape and every other application/control frame are
-/// forwarded unchanged.
+/// `response.create.model` is rewritten because catalog IDs are local aliases.
+/// The shared Official compatibility guard also normalizes the rejected
+/// legacy `reasoning.summary = "none"` sentinel. Every other application and
+/// control field is forwarded unchanged.
 fn prepare_official_frame(
     message: AxumWsMessage,
     upstream_model: &str,
@@ -1795,10 +1796,10 @@ fn prepare_response_create_bytes(
     if value.get("type").and_then(Value::as_str) != Some("response.create") {
         return Ok(None);
     }
-    let object = value.as_object_mut().ok_or_else(|| {
+    value.as_object_mut().ok_or_else(|| {
         RuntimeError::InvalidRequest("response.create must be a JSON object".into())
     })?;
-    object.insert("model".into(), Value::String(upstream_model.to_string()));
+    let value = crate::adapter::prepare_openai_official_native(&value, upstream_model);
     serde_json::to_vec(&value)
         .map(Some)
         .map_err(|error| RuntimeError::Internal(format!("encode response.create: {error}")))
@@ -2464,14 +2465,16 @@ mod tests {
     }
 
     #[test]
-    fn official_response_create_changes_only_the_model() {
-        let original = br#"{"type":"response.create","model":"catalog-alias","input":[{"type":"reasoning","encrypted_content":"opaque"}],"stream":true}"#;
+    fn official_response_create_changes_only_model_and_rejected_summary_sentinel() {
+        let original = br#"{"type":"response.create","model":"catalog-alias","reasoning":{"effort":"high","summary":"none"},"input":[{"type":"reasoning","encrypted_content":"opaque"}],"stream":true}"#;
         let prepared = prepare_response_create_bytes(original, "gpt-upstream")
             .unwrap()
             .unwrap();
         let value: Value = serde_json::from_slice(&prepared).unwrap();
         assert_eq!(value["type"], "response.create");
         assert_eq!(value["model"], "gpt-upstream");
+        assert_eq!(value["reasoning"]["effort"], "high");
+        assert_eq!(value["reasoning"]["summary"], "auto");
         assert_eq!(value["input"][0]["encrypted_content"], "opaque");
         assert_eq!(value["stream"], true);
     }

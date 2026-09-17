@@ -492,12 +492,30 @@ impl NamespaceToolContext {
     }
 }
 
-/// Official HTTP + WebSocket shared preparer: only exact upstream model mapping.
-/// No local hydrate, materialize, sanitize, or ID rewrite (issue #4 comment).
+/// Normalize the one legacy reasoning-summary sentinel which the current
+/// ChatGPT Responses endpoint rejects. This is shared by catalog projection
+/// and the final outbound boundary so a stale cached catalog cannot re-open
+/// the protocol failure.
+pub fn normalize_official_reasoning_summary(value: &mut Value) -> bool {
+    if value.as_str() != Some("none") {
+        return false;
+    }
+    *value = Value::String("auto".into());
+    true
+}
+
+/// Official HTTP + WebSocket shared preparer: exact upstream model mapping plus
+/// the narrow compatibility shim required by the ChatGPT Responses endpoint.
+/// No local hydrate, materialize, or ID rewrite (issue #4 comment).
 pub fn prepare_openai_official_native(original: &Value, upstream_model: &str) -> Value {
     let mut body = original.clone();
     if let Some(object) = body.as_object_mut() {
         object.insert("model".into(), Value::String(upstream_model.to_string()));
+        if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+            if let Some(summary) = reasoning.get_mut("summary") {
+                normalize_official_reasoning_summary(summary);
+            }
+        }
     }
     body
 }
@@ -1772,6 +1790,40 @@ fn now_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_native_maps_unsupported_none_summary_to_auto() {
+        let original = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {
+                "effort": "high",
+                "summary": "none"
+            },
+            "input": "hello"
+        });
+
+        let prepared = prepare_openai_official_native(&original, "gpt-5.6-sol-upstream");
+
+        assert_eq!(prepared["model"], "gpt-5.6-sol-upstream");
+        assert_eq!(prepared["reasoning"]["summary"], "auto");
+        assert_eq!(prepared["reasoning"]["effort"], "high");
+        assert_eq!(original["reasoning"]["summary"], "none");
+    }
+
+    #[test]
+    fn official_native_preserves_supported_or_absent_summary() {
+        let supported = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"summary": "detailed"}
+        });
+        let absent = json!({"model": "gpt-5.6-sol", "input": "hello"});
+
+        let supported = prepare_openai_official_native(&supported, "upstream");
+        let absent = prepare_openai_official_native(&absent, "upstream");
+
+        assert_eq!(supported["reasoning"]["summary"], "detailed");
+        assert!(absent.get("reasoning").is_none());
+    }
 
     #[test]
     fn chat_response_without_provider_usage_does_not_invent_zero_usage() {
