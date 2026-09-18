@@ -274,6 +274,7 @@ pub fn run() {
             commands::get_codex_oauth_reset_credits,
             commands::consume_codex_oauth_reset,
             commands::get_codex_oauth_account_quota,
+            commands::trigger_codex_oauth_five_hour_window,
             commands::get_grok_account_status,
             commands::start_grok_account_login,
             commands::poll_grok_account_login,

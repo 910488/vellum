@@ -460,6 +460,11 @@ export const api = {
     return call<QuotaSnapshot[]>("get_codex_oauth_account_quota", { accountId, forceRefresh });
   },
 
+  triggerCodexOAuthFiveHourWindow(accountId: string): Promise<void> {
+    if (!hasTauri()) return delay(undefined, 320);
+    return call<void>("trigger_codex_oauth_five_hour_window", { accountId });
+  },
+
   getGrokAccountStatus(): Promise<GrokAccountStatus> {
     if (!hasTauri()) {
       return delay({ authenticated: false, defaultAccountId: null, accounts: [] });

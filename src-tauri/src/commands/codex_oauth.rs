@@ -10,7 +10,10 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::sync::Mutex;
 
 const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const FIVE_HOUR_TRIGGER_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const FIVE_HOUR_TRIGGER_MODEL: &str = "gpt-5.6-luna";
 static RESET_LOCK: Mutex<()> = Mutex::const_new(());
+static FIVE_HOUR_TRIGGER_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +129,64 @@ async fn fetch_reset_credits(
 #[tauri::command]
 pub async fn get_codex_oauth_status(state: State<'_, AppState>) -> AppResult<CodexOAuthStatus> {
     Ok(state.codex_oauth().status().await)
+}
+
+fn five_hour_trigger_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| AppError::Message(format!("無法建立 5 小時視窗啟動連線：{error}")))
+}
+
+fn five_hour_trigger_body() -> Value {
+    serde_json::json!({
+        "model": FIVE_HOUR_TRIGGER_MODEL,
+        "store": false,
+        "stream": true,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Reply with exactly OK."
+            }]
+        }]
+    })
+}
+
+async fn send_five_hour_trigger(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: &str,
+) -> Result<(), (reqwest::StatusCode, String)> {
+    let response = client
+        .post(FIVE_HOUR_TRIGGER_URL)
+        .bearer_auth(access_token)
+        .header("ChatGPT-Account-Id", account_id)
+        .header("User-Agent", "codex-cli")
+        .header("Accept", "text/event-stream")
+        .header("OpenAI-Beta", "responses=experimental")
+        .json(&five_hour_trigger_body())
+        .send()
+        .await
+        .map_err(|error| {
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("5 小時視窗啟動請求失敗：{error}"),
+            )
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        (
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("無法讀取 5 小時視窗啟動回應：{error}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err((status, body));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -415,6 +476,42 @@ pub async fn get_codex_oauth_account_quota(
     }
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn trigger_codex_oauth_five_hour_window(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    // This deliberately spends a tiny amount of real quota. Serialize it so a
+    // double-click or a second Vellum window cannot submit duplicate triggers.
+    let _guard = FIVE_HOUR_TRIGGER_LOCK
+        .try_lock()
+        .map_err(|_| AppError::Message("另一筆 5 小時視窗啟動請求正在執行，請稍候再試。".into()))?;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err(AppError::Message("缺少 ChatGPT 帳號識別碼".into()));
+    }
+
+    let manager = state.codex_oauth();
+    let auth = manager
+        .valid_auth_for(account_id)
+        .await
+        .map_err(app_error)?;
+    let client = five_hour_trigger_client()?;
+    match send_five_hour_trigger(&client, &auth.access_token, &auth.account_id).await {
+        Ok(()) => Ok(()),
+        Err((reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN, _)) => {
+            let refreshed = manager
+                .refresh_after_rejection(&auth.credential_id, &auth.access_token)
+                .await
+                .map_err(app_error)?;
+            send_five_hour_trigger(&client, &refreshed.access_token, &refreshed.account_id)
+                .await
+                .map_err(|(status, body)| safe_upstream_error(status, &body, "無法啟動 5 小時視窗"))
+        }
+        Err((status, body)) => Err(safe_upstream_error(status, &body, "無法啟動 5 小時視窗")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +533,20 @@ mod tests {
         let frontend = serde_json::to_value(parsed).unwrap();
         assert_eq!(frontend["availableCount"], 1);
         assert_eq!(frontend["credits"][0]["resetType"], "full");
+    }
+
+    #[test]
+    fn five_hour_trigger_is_minimal_and_non_persistent() {
+        let body = five_hour_trigger_body();
+        assert_eq!(body["model"], FIVE_HOUR_TRIGGER_MODEL);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "Reply with exactly OK."
+        );
+        assert!(body.get("tools").is_none());
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]
