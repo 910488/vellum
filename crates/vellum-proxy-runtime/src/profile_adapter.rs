@@ -777,6 +777,24 @@ pub fn normalize_grok_responses_request(
     object.retain(|key, _| GROK_REQUEST_FIELDS.contains(&key.as_str()));
     object.remove("previous_response_id");
 
+    // Grok Build's current Responses models do not accept `none` as an
+    // effort value. A stale Codex thread can retain that selection even after
+    // the refreshed catalog advertises only low/medium/high/xhigh. Omitting
+    // the optional field restores the provider-owned model default; forwarding
+    // `none` makes every otherwise valid request fail with HTTP 400.
+    let remove_empty_reasoning = object
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|reasoning| {
+            if reasoning.get("effort").and_then(Value::as_str) == Some("none") {
+                reasoning.remove("effort");
+            }
+            reasoning.is_empty()
+        });
+    if remove_empty_reasoning {
+        object.remove("reasoning");
+    }
+
     let mut tools = normalize_responses_input_and_tools(object, profile)?;
     // Codex's local web-search compatibility wrapper is executed by Vellum,
     // not forwarded as an upstream custom function. Offer it only when the
@@ -796,9 +814,9 @@ pub fn normalize_grok_responses_request(
         object.remove("parallel_tool_calls");
     }
 
-    // Effort strings are capability-probed per model and must reach the
-    // upstream unchanged. Silent coercion makes the Codex selector lie about
-    // the level the provider actually receives.
+    // Supported Effort strings are provider-owned and reach upstream
+    // unchanged. `none` is the one compatibility sentinel handled above; it
+    // is omission, not a coercion to a different named level.
     Ok(())
 }
 
@@ -3602,6 +3620,45 @@ mod tests {
             has_web_search_tool(&enabled),
             "Brave enabled with a usable key must retain the wrapper: {enabled}"
         );
+    }
+
+    #[test]
+    fn grok_responses_omits_stale_none_effort_but_preserves_reasoning_options() {
+        let profile = resolve_with_options(
+            RuntimeProviderKind::GrokCli,
+            RuntimeWireFormat::Responses,
+            HarnessOptions::default(),
+            false,
+        );
+        let mut request = json!({
+            "model": "grok-4.6",
+            "reasoning": {"effort": "none", "summary": "auto"},
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        });
+
+        normalize_grok_responses_request(&mut request, &profile, false).unwrap();
+
+        assert!(request["reasoning"].get("effort").is_none());
+        assert_eq!(request["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn grok_responses_preserves_supported_effort_unchanged() {
+        let profile = resolve_with_options(
+            RuntimeProviderKind::GrokCli,
+            RuntimeWireFormat::Responses,
+            HarnessOptions::default(),
+            false,
+        );
+        let mut request = json!({
+            "model": "grok-4.6",
+            "reasoning": {"effort": "high"},
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        });
+
+        normalize_grok_responses_request(&mut request, &profile, false).unwrap();
+
+        assert_eq!(request["reasoning"]["effort"], "high");
     }
 
     /// Same corrected contract on the OpenAI-compatible Responses normalizer

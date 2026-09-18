@@ -269,11 +269,11 @@ describe("Remote Manager operations UI", () => {
 
     expect(screen.getByText(/正在讀取 Codex\/OpenSSH 連線設定/)).toBeTruthy();
     expect((await screen.findAllByText("Jetson")).length).toBeGreaterThan(0);
-    // 探測狀態標在那一台主機的那一列上，不再是一則全頁通報。
-    expect(await screen.findByText("探測中…")).toBeTruthy();
+    // 偵測狀態標在那一台主機的那一列上，不再是一則全頁通報。
+    expect(await screen.findByText("偵測中…")).toBeTruthy();
 
     resolveInspection(status);
-    await waitFor(() => expect(screen.queryByText("探測中…")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("偵測中…")).toBeNull());
   });
 
   it("keeps the last-good status visible with a live indicator while re-probing an already-probed host", async () => {
@@ -299,7 +299,7 @@ describe("Remote Manager operations UI", () => {
     // probe is in flight — only a small "updating" marker is added.
     expect(screen.getByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
     expect(screen.getByText("credential cc is unavailable")).toBeTruthy();
-    expect(screen.queryByText("探測中…")).toBeNull();
+    expect(screen.queryByText("偵測中…")).toBeNull();
     expect(await screen.findByText(/· 更新中/)).toBeTruthy();
 
     resolveSecondProbe(status);
@@ -311,7 +311,7 @@ describe("Remote Manager operations UI", () => {
     apiMocks.inspectRemoteHost.mockRejectedValue(new Error("ssh: connect timeout"));
     renderRemote();
 
-    expect(await screen.findByText("探測失敗")).toBeTruthy();
+    expect(await screen.findByText("偵測失敗")).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
@@ -417,7 +417,7 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
 
     expect(await screen.findByText("thread-native-123")).toBeTruthy();
-    expect(screen.getByText(/7 個 turn · 最後一個 inProgress/)).toBeTruthy();
+    expect(screen.getByText(/7 個 turn · 最近一次 inProgress/)).toBeTruthy();
     expect(screen.getByText("credential cc is unavailable")).toBeTruthy();
 
     openTray("維護");
@@ -433,7 +433,7 @@ describe("Remote Manager operations UI", () => {
     });
     renderRemote();
 
-    expect(await screen.findByText(/Codex App 目前直接持有此主機的 app-server/)).toBeTruthy();
+    expect(await screen.findByText(/Codex App 目前直接佔用此主機的 app-server/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "安全停止並重試" })).toBeTruthy();
   });
 
@@ -607,7 +607,7 @@ describe("Remote Manager operations UI", () => {
     // 失敗原地顯示，說出停在哪一步，並附上補救動作。使用者沒按任何東西之前，
     // 不會有任何視窗自己跳出來。
     expect(await screen.findByText(
-      "Codex App 目前直接持有此主機的 app-server，Vellum 無法接管。",
+      "Codex App 目前直接佔用此主機的 app-server，Vellum 無法接管。",
       {},
       { timeout: 2500 },
     )).toBeTruthy();
@@ -674,7 +674,7 @@ describe("Remote Manager operations UI", () => {
     fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
 
     const mismatch = await screen.findByText(
-      "遠端 Codex runtime 與目前 Desktop 協議不相容。請先同步 Desktop Codex runtime，再重新操作。",
+      "遠端 Codex runtime 與目前 Desktop 協定不相容。請先同步 Desktop Codex runtime，再重試一次。",
       {},
       { timeout: 2500 },
     );
@@ -741,7 +741,7 @@ describe("Remote Manager operations UI", () => {
     fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
 
     const notice = await screen.findByText(
-      "Codex App 目前直接持有此主機的 app-server，Vellum 無法接管。",
+      "Codex App 目前直接佔用此主機的 app-server，Vellum 無法接管。",
       {},
       { timeout: 2500 },
     );
@@ -898,7 +898,7 @@ describe("Remote Manager operations UI", () => {
     );
     renderRemote();
 
-    expect(await screen.findByText("探測失敗")).toBeTruthy();
+    expect(await screen.findByText("偵測失敗")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "信任並繼續" })).toBeNull();
     expect(apiMocks.confirmRemoteSshFingerprint).not.toHaveBeenCalled();
   });

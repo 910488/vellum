@@ -249,12 +249,18 @@ pub struct ProtocolDelta {
     pub subject: String,
     /// Field names, when the difference is field-level.
     pub fields: Vec<String>,
-    /// On a method the bridge itself must route, which is what makes a
-    /// difference fatal rather than merely unqualified.
+    /// On a method the bridge itself must route. Proven incompatibilities on
+    /// routed methods are fatal; an indeterminate shape remains unverified
+    /// evidence and must not be promoted into a break merely because the
+    /// bridge observes that method.
     pub routed: bool,
 }
 
 impl ProtocolDelta {
+    fn blocks_adoption(&self) -> bool {
+        self.routed && self.kind != DeltaKind::ShapeUnverified
+    }
+
     /// A one-line rendering for logs and blocker text. The UI has its own
     /// localized wording and uses the structured fields instead.
     pub fn describe(&self) -> String {
@@ -295,10 +301,15 @@ pub struct ProtocolCompatibility {
 }
 
 impl ProtocolCompatibility {
-    /// The differences that decided the verdict, for a UI that wants to lead
-    /// with those and put the rest behind a disclosure.
+    /// Every difference on a method observed by the bridge, including
+    /// indeterminate shape comparisons that are diagnostic-only.
     pub fn routed_deltas(&self) -> impl Iterator<Item = &ProtocolDelta> {
         self.deltas.iter().filter(|delta| delta.routed)
+    }
+
+    /// Proven routed breaks that actually withhold Enhanced adoption.
+    pub fn blocking_deltas(&self) -> impl Iterator<Item = &ProtocolDelta> {
+        self.deltas.iter().filter(|delta| delta.blocks_adoption())
     }
 }
 
@@ -456,7 +467,7 @@ pub fn compare(pinned: &ProtocolSurface, desktop: &ProtocolSurface) -> ProtocolC
             .then_with(|| left.subject.cmp(&right.subject))
     });
 
-    let verdict = if deltas.iter().any(|delta| delta.routed) {
+    let verdict = if deltas.iter().any(ProtocolDelta::blocks_adoption) {
         ProtocolVerdict::Incompatible
     } else if deltas.is_empty() && pinned.schema_sha256 == desktop.schema_sha256 {
         ProtocolVerdict::Verified
@@ -736,6 +747,65 @@ mod tests {
         assert_eq!(result.verdict, ProtocolVerdict::Incompatible);
         assert!(!result.verdict.may_arm());
         assert_eq!(result.routed_deltas().count(), 1);
+        assert_eq!(result.blocking_deltas().count(), 1);
+    }
+
+    #[test]
+    fn an_indeterminate_routed_union_is_unverified_and_may_arm() {
+        let request = |params: Value, digest: &str| ProtocolSurface {
+            documents: [(
+                "ClientRequest.json".into(),
+                serde_json::json!({
+                    "title": "ClientRequest",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "method": {"const": "thread/start"},
+                        "params": params
+                    },
+                    "required": ["method", "params"]
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            schema_sha256: digest.into(),
+            methods: [(
+                "ClientRequest".into(),
+                ["thread/start".into()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            shapes: BTreeMap::new(),
+        };
+        let pinned = request(
+            serde_json::json!({
+                "oneOf": [
+                    {"type": "number"},
+                    {"type": "string", "format": "codex-path"}
+                ]
+            }),
+            "pinned",
+        );
+        let desktop = request(serde_json::json!({"type": "string"}), "desktop");
+
+        let result = compare(&pinned, &desktop);
+        let delta = result
+            .deltas
+            .iter()
+            .find(|delta| {
+                delta.subject == "thread/start"
+                    && delta
+                        .fields
+                        .iter()
+                        .any(|field| field.contains("union acceptance is indeterminate"))
+            })
+            .expect("thread/start union must remain visible as a diagnostic");
+
+        assert_eq!(delta.kind, DeltaKind::ShapeUnverified);
+        assert!(delta.routed);
+        assert_eq!(result.verdict, ProtocolVerdict::Unverified);
+        assert!(result.verdict.may_arm());
+        assert_eq!(result.blocking_deltas().count(), 0);
     }
 
     /// An added optional field is how a protocol grows. Treating it as a break
