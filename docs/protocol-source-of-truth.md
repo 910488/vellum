@@ -375,6 +375,9 @@ Grok routes use their configured provider adapter. They follow the same
 portable-state and error rules as other third-party routes. Provider-specific
 normalization must stay isolated in the adapter and covered by focused tests;
 it must not leak into Official passthrough.
+Grok Build models that do not advertise `none` receive an omitted optional
+Effort field when an older Codex thread retains that stale selection; all
+provider-supported named Effort values are preserved unchanged.
 
 ### OpenCode routes
 

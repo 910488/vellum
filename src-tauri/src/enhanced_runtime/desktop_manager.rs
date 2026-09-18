@@ -1487,7 +1487,7 @@ fn verify_settings(
     if !protocol.verdict.may_arm() {
         return Err(DesktopRuntimeManagerError::OfficialProtocolIncompatible {
             details: protocol
-                .routed_deltas()
+                .blocking_deltas()
                 .map(ProtocolDelta::describe)
                 .collect::<Vec<_>>()
                 .join("; "),

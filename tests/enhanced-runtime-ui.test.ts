@@ -387,11 +387,16 @@ describe("Enhanced survives a Codex Desktop update", () => {
     expect(body).toContain("protocol.verdict.may_arm()");
     // 舊的等式判定不能留著：留著就等於這條路還在。
     expect(body).not.toMatch(/desktop_identity\.schema_sha256.*!=\s*APP_SERVER_PROTOCOL_HASH/s);
-    // 只有 routed 的差異可以擋。其他差異要被留下來講，不是被丟掉。
+    // 只有已證明 breaking 的 routed 差異可以擋。比較器無法判定的 routed
+    // shape 仍要留下來診斷，但不能把「不知道」升格成「已破壞」。
     expect(protocolSource).toMatch(/fn may_arm/);
     expect(protocolSource).toContain("Incompatible");
+    expect(protocolSource).toContain("fn blocks_adoption");
+    expect(protocolSource).toContain(
+      "self.routed && self.kind != DeltaKind::ShapeUnverified",
+    );
     const compare = protocolSource.slice(protocolSource.indexOf("pub fn compare"));
-    expect(compare).toContain("deltas.iter().any(|delta| delta.routed)");
+    expect(compare).toContain("deltas.iter().any(ProtocolDelta::blocks_adoption)");
   });
 
   /* 釘選的 appServerProtocolHash 從來沒有被拿去跟任何 binary 比對過:它是
