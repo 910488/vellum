@@ -13,8 +13,8 @@ const settings: QuotaPoolSettings = {
   enabled: true,
   strategy: "rank",
   members: [
-    { accountId: "a", inPool: true, paused: false, weeklyFloor: 30 },
-    { accountId: "b", inPool: true, paused: false, weeklyFloor: 0 },
+    { accountId: "a", inPool: true, paused: false, weeklyFloor: 30, maintainFiveHourWindow: false },
+    { accountId: "b", inPool: true, paused: false, weeklyFloor: 0, maintainFiveHourWindow: false },
   ],
 };
 
@@ -51,7 +51,7 @@ describe("quota pool", () => {
     expect(normalizeQuotaPool({ ...settings, members: [settings.members[0]!] }, accounts).members)
       .toEqual([
         settings.members[0],
-        { accountId: "b", inPool: false, paused: false, weeklyFloor: 0 },
+        { accountId: "b", inPool: false, paused: false, weeklyFloor: 0, maintainFiveHourWindow: false },
       ]);
   });
 

@@ -19,6 +19,7 @@ pub mod diagnostics_store;
 pub mod enhanced_runtime;
 pub mod error;
 pub mod eval;
+pub mod five_hour_cadence;
 pub mod grok_accounts;
 pub mod grok_auth;
 pub mod harness;
@@ -139,6 +140,7 @@ pub fn run() {
             }
             let data_root = app.state::<AppState>().data_root();
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
+            crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
             let boot = crate::boot::record_boot(&data_root);
             crate::trace::install(&data_root);
             log::info!(
