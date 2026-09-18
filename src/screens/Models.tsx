@@ -418,6 +418,7 @@ export function Models({
   const [openResets, setOpenResets] = useState<string | null>(null);
   const [accountQuotas, setAccountQuotas] = useState<Record<string, QuotaSnapshot[]>>({});
   const [accountQuotaErrors, setAccountQuotaErrors] = useState<Record<string, string>>({});
+  const [fiveHourBusy, setFiveHourBusy] = useState<string | null>(null);
   const [quotaPool, setQuotaPool] = useState<QuotaPoolStatus | null>(null);
   const [quotaPoolBusy, setQuotaPoolBusy] = useState(false);
   const [poolRulesOpen, setPoolRulesOpen] = useState(false);
@@ -792,6 +793,40 @@ export function Models({
       setResetFeedback({ tone: "warn", text: t("models.ui.errors.resetLookupFailed", { detail: String(cause) }) });
     } finally {
       setResetBusy(null);
+    }
+  }
+
+  async function triggerFiveHourWindow(accountId: string) {
+    setFiveHourBusy(accountId);
+    setResetFeedback(null);
+    try {
+      await api.triggerCodexOAuthFiveHourWindow(accountId);
+    } catch (cause) {
+      setResetFeedback({
+        tone: "warn",
+        text: t("models.ui.fiveHour.failed", { detail: String(cause) }),
+      });
+      setFiveHourBusy(null);
+      return;
+    }
+
+    try {
+      const windows = await api.getCodexOAuthAccountQuota(accountId, true);
+      setAccountQuotas((current) => ({ ...current, [accountId]: windows }));
+      setAccountQuotaErrors((current) => {
+        const next = { ...current };
+        delete next[accountId];
+        return next;
+      });
+      setResetFeedback({ tone: "ok", text: t("models.ui.fiveHour.success") });
+    } catch (cause) {
+      setAccountQuotaErrors((current) => ({ ...current, [accountId]: String(cause) }));
+      setResetFeedback({
+        tone: "warn",
+        text: t("models.ui.fiveHour.refreshFailed", { detail: String(cause) }),
+      });
+    } finally {
+      setFiveHourBusy(null);
     }
   }
 
@@ -1713,6 +1748,17 @@ export function Models({
                           </Pill>
                         )}
                         <span className="acct__resets">
+                          <Btn
+                            soft
+                            mini
+                            disabled={fiveHourBusy !== null || oauthBusy}
+                            title={t("models.ui.fiveHour.hint")}
+                            onClick={() => void triggerFiveHourWindow(account.accountId)}
+                          >
+                            {fiveHourBusy === account.accountId
+                              ? t("models.ui.fiveHour.starting")
+                              : t("models.ui.fiveHour.start")}
+                          </Btn>
                           {resetError || !credits ? (
                             <Pill tone={resetError ? "warn" : "quiet"}>
                               {resetError ? t("models.ui.reset.failed") : t("models.ui.reset.loading")}
@@ -1845,6 +1891,17 @@ export function Models({
                           個按不動的把手。重試接在同一格，不另外占一欄：那顆
                           按鈕只在出錯時存在，常設欄位會讓整列平常空一格。 */}
                       <span className="acct__resets">
+                        <Btn
+                          soft
+                          mini
+                          disabled={fiveHourBusy !== null || oauthBusy}
+                          title={t("models.ui.fiveHour.hint")}
+                          onClick={() => void triggerFiveHourWindow(account.accountId)}
+                        >
+                          {fiveHourBusy === account.accountId
+                            ? t("models.ui.fiveHour.starting")
+                            : t("models.ui.fiveHour.start")}
+                        </Btn>
                         {resetError || !credits ? (
                           <Pill tone={resetError ? "warn" : "quiet"}>
                             {resetError
