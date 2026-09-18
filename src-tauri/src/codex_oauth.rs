@@ -88,6 +88,10 @@ pub struct QuotaPoolMember {
     pub paused: bool,
     #[serde(default)]
     pub weekly_floor: u8,
+    /// Opt-in cadence keeper. Independent from pool membership so a manually
+    /// selected account can keep its five-hour window warm too.
+    #[serde(default)]
+    pub maintain_five_hour_window: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +224,7 @@ pub struct CodexOAuthManager {
     access_tokens: RwLock<HashMap<String, CachedToken>>,
     refresh_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pending: RwLock<HashMap<String, PendingDevice>>,
+    cadence_notify: Arc<tokio::sync::Notify>,
 }
 
 impl CodexOAuthManager {
@@ -321,6 +326,7 @@ impl CodexOAuthManager {
             access_tokens: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
+            cadence_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -553,6 +559,10 @@ impl CodexOAuthManager {
         }
     }
 
+    pub fn cadence_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.cadence_notify)
+    }
+
     pub async fn set_quota_pool(
         &self,
         mut settings: QuotaPoolSettings,
@@ -579,6 +589,7 @@ impl CodexOAuthManager {
         if !self.quota_pool.read().await.enabled {
             *self.active_pool_account_id.write().await = None;
         }
+        self.cadence_notify.notify_one();
         Ok(self.quota_pool_status().await)
     }
 
@@ -635,7 +646,9 @@ impl CodexOAuthManager {
         if self.default_account_id.read().await.as_deref() == Some(account_id) {
             *self.default_account_id.write().await = self.fallback_default().await;
         }
-        self.persist().await
+        let result = self.persist().await;
+        self.cadence_notify.notify_one();
+        result
     }
 
     pub async fn clear(&self) -> Result<(), OAuthError> {
@@ -651,7 +664,9 @@ impl CodexOAuthManager {
         *self.quota_pool.write().await = QuotaPoolSettings::default();
         *self.active_pool_account_id.write().await = None;
         *self.default_account_id.write().await = None;
-        self.persist().await
+        let result = self.persist().await;
+        self.cadence_notify.notify_one();
+        result
     }
 
     /// Returns `None` when Vellum has no managed ChatGPT account. This is the
@@ -1623,6 +1638,7 @@ mod tests {
                 in_pool: true,
                 paused: false,
                 weekly_floor: 0,
+                maintain_five_hour_window: false,
             });
         }
         *manager.default_account_id.write().await = Some("pool-a".into());
@@ -1741,6 +1757,7 @@ mod tests {
                     in_pool: true,
                     paused: false,
                     weekly_floor: 0,
+                    maintain_five_hour_window: false,
                 });
             }
         }
@@ -1949,10 +1966,8 @@ mod tests {
         assert_eq!(selected.selection_revision, 1);
         assert!(selected.selected_at.is_some());
         assert!(selected.selection_verified);
-        let persisted: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(metadata_path(temp.path())).unwrap(),
-        )
-        .unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(metadata_path(temp.path())).unwrap()).unwrap();
         assert_eq!(persisted["default_account_id"], "acct-a");
         assert_eq!(persisted["selection_revision"], 1);
         assert!(persisted["selected_at"].as_i64().is_some());

@@ -418,7 +418,6 @@ export function Models({
   const [openResets, setOpenResets] = useState<string | null>(null);
   const [accountQuotas, setAccountQuotas] = useState<Record<string, QuotaSnapshot[]>>({});
   const [accountQuotaErrors, setAccountQuotaErrors] = useState<Record<string, string>>({});
-  const [fiveHourBusy, setFiveHourBusy] = useState<string | null>(null);
   const [quotaPool, setQuotaPool] = useState<QuotaPoolStatus | null>(null);
   const [quotaPoolBusy, setQuotaPoolBusy] = useState(false);
   const [poolRulesOpen, setPoolRulesOpen] = useState(false);
@@ -793,40 +792,6 @@ export function Models({
       setResetFeedback({ tone: "warn", text: t("models.ui.errors.resetLookupFailed", { detail: String(cause) }) });
     } finally {
       setResetBusy(null);
-    }
-  }
-
-  async function triggerFiveHourWindow(accountId: string) {
-    setFiveHourBusy(accountId);
-    setResetFeedback(null);
-    try {
-      await api.triggerCodexOAuthFiveHourWindow(accountId);
-    } catch (cause) {
-      setResetFeedback({
-        tone: "warn",
-        text: t("models.ui.fiveHour.failed", { detail: String(cause) }),
-      });
-      setFiveHourBusy(null);
-      return;
-    }
-
-    try {
-      const windows = await api.getCodexOAuthAccountQuota(accountId, true);
-      setAccountQuotas((current) => ({ ...current, [accountId]: windows }));
-      setAccountQuotaErrors((current) => {
-        const next = { ...current };
-        delete next[accountId];
-        return next;
-      });
-      setResetFeedback({ tone: "ok", text: t("models.ui.fiveHour.success") });
-    } catch (cause) {
-      setAccountQuotaErrors((current) => ({ ...current, [accountId]: String(cause) }));
-      setResetFeedback({
-        tone: "warn",
-        text: t("models.ui.fiveHour.refreshFailed", { detail: String(cause) }),
-      });
-    } finally {
-      setFiveHourBusy(null);
     }
   }
 
@@ -1751,13 +1716,20 @@ export function Models({
                           <Btn
                             soft
                             mini
-                            disabled={fiveHourBusy !== null || oauthBusy}
-                            title={t("models.ui.fiveHour.hint")}
-                            onClick={() => void triggerFiveHourWindow(account.accountId)}
+                            disabled={quotaPoolBusy || oauthBusy}
+                            title={t("models.ui.fiveHour.autoHint")}
+                            onClick={() =>
+                              updatePoolMember(account.accountId, (member) => ({
+                                ...member,
+                                maintainFiveHourWindow: !member.maintainFiveHourWindow,
+                              }))
+                            }
                           >
-                            {fiveHourBusy === account.accountId
-                              ? t("models.ui.fiveHour.starting")
-                              : t("models.ui.fiveHour.start")}
+                            {t(
+                              entry.member.maintainFiveHourWindow
+                                ? "models.ui.fiveHour.autoOn"
+                                : "models.ui.fiveHour.autoOff",
+                            )}
                           </Btn>
                           {resetError || !credits ? (
                             <Pill tone={resetError ? "warn" : "quiet"}>
@@ -1870,6 +1842,9 @@ export function Models({
               const isVerifiedCurrent = account.isDefault && oauth.selectionVerified === true;
               const resetsOpen = openResets === account.accountId;
               const soonest = credits ? soonestResetExpiry(credits.credits) : null;
+              const cadenceMember = normalizedQuotaPool.members.find(
+                (member) => member.accountId === account.accountId,
+              );
               return (
                 <Row key={account.accountId} label={accountLabel}>
                   <span className="acct">
@@ -1894,13 +1869,20 @@ export function Models({
                         <Btn
                           soft
                           mini
-                          disabled={fiveHourBusy !== null || oauthBusy}
-                          title={t("models.ui.fiveHour.hint")}
-                          onClick={() => void triggerFiveHourWindow(account.accountId)}
+                          disabled={quotaPoolBusy || oauthBusy}
+                          title={t("models.ui.fiveHour.autoHint")}
+                          onClick={() =>
+                            updatePoolMember(account.accountId, (member) => ({
+                              ...member,
+                              maintainFiveHourWindow: !member.maintainFiveHourWindow,
+                            }))
+                          }
                         >
-                          {fiveHourBusy === account.accountId
-                            ? t("models.ui.fiveHour.starting")
-                            : t("models.ui.fiveHour.start")}
+                          {t(
+                            cadenceMember?.maintainFiveHourWindow
+                              ? "models.ui.fiveHour.autoOn"
+                              : "models.ui.fiveHour.autoOff",
+                          )}
                         </Btn>
                         {resetError || !credits ? (
                           <Pill tone={resetError ? "warn" : "quiet"}>

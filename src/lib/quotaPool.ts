@@ -33,10 +33,17 @@ export function normalizeQuotaPool(
       ...member,
       weeklyFloor: Math.max(0, Math.min(100, Math.round(member.weeklyFloor))),
       paused: member.inPool ? member.paused : false,
+      maintainFiveHourWindow: member.maintainFiveHourWindow ?? false,
     }));
   for (const account of accounts) {
     if (!byId.has(account.accountId)) {
-      ordered.push({ accountId: account.accountId, inPool: false, paused: false, weeklyFloor: 0 });
+      ordered.push({
+        accountId: account.accountId,
+        inPool: false,
+        paused: false,
+        weeklyFloor: 0,
+        maintainFiveHourWindow: false,
+      });
     }
   }
   // 順序只有一種：使用者排的那一種。後端存的設定可能還帶著舊的 most／soonest，

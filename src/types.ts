@@ -177,6 +177,7 @@ export interface QuotaPoolMember {
   inPool: boolean;
   paused: boolean;
   weeklyFloor: number;
+  maintainFiveHourWindow?: boolean;
 }
 
 export interface QuotaPoolSettings {

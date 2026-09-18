@@ -89,6 +89,7 @@ let poolState: QuotaPoolStatus = {
     inPool: true,
     paused: false,
     weeklyFloor: entry.floor,
+    maintainFiveHourWindow: false,
   })),
   activeAccountId: POOL_ACCOUNTS[0]!.accountId,
 };
