@@ -13,6 +13,8 @@ pub const TRIGGER_MODEL: &str = "gpt-5.6-luna";
 pub const TRIGGER_EFFORT: &str = "none";
 const RESET_SAFETY_DELAY: Duration = Duration::from_secs(2);
 const VERIFY_DELAY: Duration = Duration::from_secs(3);
+const ZERO_WINDOW_SAMPLE_DELAY: Duration = Duration::from_secs(3);
+const RECENT_TRIGGER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const ERROR_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 const VERIFY_RETRY_DELAY: Duration = Duration::from_secs(2 * 60);
 const IDLE_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -180,11 +182,108 @@ fn account_tag(account_id: &str) -> String {
     digest[..12].to_owned()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FiveHourObservation {
+    used_percent: f64,
+    reset_at: i64,
+}
+
+fn five_hour_observation(windows: &[QuotaSnapshot]) -> Option<FiveHourObservation> {
+    let window = windows.iter().find(|window| is_five_hour(window))?;
+    Some(FiveHourObservation {
+        used_percent: window.used_percent,
+        reset_at: reset_timestamp(window)?,
+    })
+}
+
+/// An unused upstream window reports a projection approximately equal to
+/// `observed_at + 5h`; each read moves that projection forward. An active
+/// window keeps one reset timestamp even when its tiny usage rounds to 0%.
+fn reset_moves_with_clock(
+    first_reset: i64,
+    second_reset: i64,
+    first_observed_at: i64,
+    second_observed_at: i64,
+) -> bool {
+    let elapsed = second_observed_at.saturating_sub(first_observed_at);
+    let reset_shift = second_reset.saturating_sub(first_reset);
+    reset_shift >= elapsed.saturating_sub(1).max(2)
+}
+
+async fn sample_zero_window(
+    manager: &Arc<CodexOAuthManager>,
+    account_id: &str,
+    first: FiveHourObservation,
+) -> Result<(FiveHourObservation, bool), String> {
+    let first_observed_at = Utc::now().timestamp();
+    tokio::time::sleep(ZERO_WINDOW_SAMPLE_DELAY).await;
+    let windows = query_quota(manager, account_id).await?;
+    let second = five_hour_observation(&windows)
+        .ok_or_else(|| "second quota sample has no usable 5-hour window".to_string())?;
+    let second_observed_at = Utc::now().timestamp();
+    let sliding = second.used_percent <= f64::EPSILON
+        && reset_moves_with_clock(
+            first.reset_at,
+            second.reset_at,
+            first_observed_at,
+            second_observed_at,
+        );
+    Ok((second, sliding))
+}
+
+fn recent_trigger_delay(
+    recent_triggers: &HashMap<String, i64>,
+    account_id: &str,
+) -> Option<Duration> {
+    let elapsed = Utc::now()
+        .timestamp()
+        .saturating_sub(*recent_triggers.get(account_id)?);
+    let cooldown = RECENT_TRIGGER_COOLDOWN.as_secs() as i64;
+    (elapsed < cooldown).then(|| Duration::from_secs((cooldown - elapsed).max(1) as u64))
+}
+
+async fn verify_trigger(
+    manager: &Arc<CodexOAuthManager>,
+    account_id: &str,
+    tag: &str,
+) -> Option<i64> {
+    tokio::time::sleep(VERIFY_DELAY).await;
+    let first_windows = match query_quota(manager, account_id).await {
+        Ok(windows) => windows,
+        Err(error) => {
+            log::warn!("[FiveHourCadence] event=verify_error account={tag} error={error}");
+            return None;
+        }
+    };
+    let Some(first) = five_hour_observation(&first_windows) else {
+        log::warn!("[FiveHourCadence] event=verify_error account={tag} error=missing_5h_window");
+        return None;
+    };
+    if first.used_percent > f64::EPSILON {
+        return Some(first.reset_at);
+    }
+    match sample_zero_window(manager, account_id, first).await {
+        Ok((second, false)) => Some(second.reset_at),
+        Ok((second, true)) => {
+            log::warn!(
+                "[FiveHourCadence] event=trigger_unverified account={tag} reason=reset_still_sliding first_reset_at={} second_reset_at={}",
+                first.reset_at,
+                second.reset_at
+            );
+            None
+        }
+        Err(error) => {
+            log::warn!("[FiveHourCadence] event=verify_error account={tag} error={error}");
+            None
+        }
+    }
+}
+
 async fn inspect_account(
     manager: &Arc<CodexOAuthManager>,
     account_id: &str,
     weekly_floor: u8,
-    triggered_epochs: &mut HashMap<String, i64>,
+    recent_triggers: &mut HashMap<String, i64>,
 ) -> Duration {
     let tag = account_tag(account_id);
     let windows = match query_quota(manager, account_id).await {
@@ -194,7 +293,7 @@ async fn inspect_account(
             return ERROR_RETRY_DELAY;
         }
     };
-    let Some(five_hour) = windows.iter().find(|window| is_five_hour(window)) else {
+    let Some(mut five_hour) = five_hour_observation(&windows) else {
         log::warn!("[FiveHourCadence] event=skip account={tag} reason=missing_5h_window");
         return ERROR_RETRY_DELAY;
     };
@@ -217,75 +316,86 @@ async fn inspect_account(
         );
         return retry;
     }
-    let Some(old_reset) = reset_timestamp(five_hour) else {
-        log::warn!("[FiveHourCadence] event=skip account={tag} reason=missing_reset_at");
-        return ERROR_RETRY_DELAY;
-    };
+    let mut trigger_reason = "expired_window";
+    if five_hour.used_percent <= f64::EPSILON {
+        match sample_zero_window(manager, account_id, five_hour).await {
+            Ok((second, sliding)) => {
+                log::info!(
+                    "[FiveHourCadence] event=window_probe account={tag} first_reset_at={} second_reset_at={} sliding={sliding}",
+                    five_hour.reset_at,
+                    second.reset_at
+                );
+                five_hour = second;
+                if sliding {
+                    trigger_reason = "inactive_sliding_reset";
+                } else {
+                    let due_at = five_hour.reset_at + RESET_SAFETY_DELAY.as_secs() as i64;
+                    if due_at > Utc::now().timestamp() {
+                        recent_triggers.remove(account_id);
+                        log::info!(
+                            "[FiveHourCadence] event=scheduled account={tag} used_percent={:.2} reset_at={} due_at={} reset_stable=true",
+                            five_hour.used_percent,
+                            five_hour.reset_at,
+                            due_at
+                        );
+                        return delay_until(due_at, Utc::now().timestamp());
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("[FiveHourCadence] event=quota_probe_error account={tag} error={error}");
+                return ERROR_RETRY_DELAY;
+            }
+        }
+    }
+
     let now = Utc::now().timestamp();
-    let due_at = old_reset + RESET_SAFETY_DELAY.as_secs() as i64;
-    if due_at > now {
-        triggered_epochs.remove(account_id);
+    let due_at = five_hour.reset_at + RESET_SAFETY_DELAY.as_secs() as i64;
+    if trigger_reason == "expired_window" && due_at > now {
+        recent_triggers.remove(account_id);
         log::info!(
             "[FiveHourCadence] event=scheduled account={tag} used_percent={:.2} reset_at={} due_at={}",
             five_hour.used_percent,
-            old_reset,
+            five_hour.reset_at,
             due_at
         );
         return delay_until(due_at, now);
     }
 
-    if triggered_epochs.get(account_id) == Some(&old_reset) {
+    if let Some(delay) = recent_trigger_delay(recent_triggers, account_id) {
         log::info!(
-            "[FiveHourCadence] event=awaiting_observation account={tag} old_reset_at={old_reset}"
+            "[FiveHourCadence] event=awaiting_observation account={tag} reason=recent_trigger cooldown_seconds={}",
+            delay.as_secs()
         );
-        return VERIFY_RETRY_DELAY;
+        return delay;
     }
 
     log::info!(
-        "[FiveHourCadence] event=trigger_start account={tag} old_reset_at={old_reset} model={TRIGGER_MODEL} effort={TRIGGER_EFFORT}"
+        "[FiveHourCadence] event=trigger_start account={tag} reason={trigger_reason} observed_reset_at={} model={TRIGGER_MODEL} effort={TRIGGER_EFFORT}",
+        five_hour.reset_at
     );
     if let Err(error) = trigger_account(manager, account_id).await {
         log::warn!("[FiveHourCadence] event=trigger_error account={tag} error={error}");
         return ERROR_RETRY_DELAY;
     }
-    // A successful upstream response is never repeated for the same expired
-    // epoch, even if the usage endpoint takes time to expose the new reset.
-    triggered_epochs.insert(account_id.to_owned(), old_reset);
-    tokio::time::sleep(VERIFY_DELAY).await;
-    match query_quota(manager, account_id).await {
-        Ok(windows) => {
-            let new_reset = windows
-                .iter()
-                .find(|window| is_five_hour(window))
-                .and_then(reset_timestamp);
-            if let Some(new_reset) = new_reset.filter(|reset| *reset > old_reset) {
-                triggered_epochs.remove(account_id);
-                log::info!(
-                    "[FiveHourCadence] event=trigger_verified account={tag} old_reset_at={old_reset} new_reset_at={new_reset}"
-                );
-                delay_until(
-                    new_reset + RESET_SAFETY_DELAY.as_secs() as i64,
-                    Utc::now().timestamp(),
-                )
-            } else {
-                log::warn!(
-                    "[FiveHourCadence] event=trigger_unverified account={tag} old_reset_at={old_reset} observed_reset_at={new_reset:?}"
-                );
-                VERIFY_RETRY_DELAY
-            }
-        }
-        Err(error) => {
-            log::warn!(
-                "[FiveHourCadence] event=verify_error account={tag} old_reset_at={old_reset} error={error}"
-            );
-            VERIFY_RETRY_DELAY
-        }
+    recent_triggers.insert(account_id.to_owned(), Utc::now().timestamp());
+    if let Some(new_reset) = verify_trigger(manager, account_id, &tag).await {
+        recent_triggers.remove(account_id);
+        log::info!(
+            "[FiveHourCadence] event=trigger_verified account={tag} new_reset_at={new_reset} reset_stable=true"
+        );
+        delay_until(
+            new_reset + RESET_SAFETY_DELAY.as_secs() as i64,
+            Utc::now().timestamp(),
+        )
+    } else {
+        recent_trigger_delay(recent_triggers, account_id).unwrap_or(VERIFY_RETRY_DELAY)
     }
 }
 
 async fn run_cycle(
     manager: &Arc<CodexOAuthManager>,
-    triggered_epochs: &mut HashMap<String, i64>,
+    recent_triggers: &mut HashMap<String, i64>,
 ) -> Duration {
     let settings = manager.quota_pool_status().await.settings;
     let members: Vec<_> = settings
@@ -303,7 +413,7 @@ async fn run_cycle(
                 manager,
                 &member.account_id,
                 member.weekly_floor,
-                triggered_epochs,
+                recent_triggers,
             )
             .await,
         );
@@ -314,13 +424,13 @@ async fn run_cycle(
 pub fn spawn(manager: Arc<CodexOAuthManager>) {
     let notify = manager.cadence_notifier();
     tauri::async_runtime::spawn(async move {
-        let mut triggered_epochs = HashMap::new();
+        let mut recent_triggers = HashMap::new();
         log::info!(
             "[FiveHourCadence] event=scheduler_start model={TRIGGER_MODEL} effort={TRIGGER_EFFORT} safety_delay_seconds={}",
             RESET_SAFETY_DELAY.as_secs()
         );
         loop {
-            let delay = run_cycle(&manager, &mut triggered_epochs).await;
+            let delay = run_cycle(&manager, &mut recent_triggers).await;
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {},
                 _ = notify.notified() => {
@@ -343,5 +453,17 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn detects_unused_reset_projection_moving_with_observation_clock() {
+        assert!(reset_moves_with_clock(10_000, 10_004, 5_000, 5_004));
+        assert!(reset_moves_with_clock(10_000, 10_003, 5_000, 5_004));
+    }
+
+    #[test]
+    fn keeps_stable_active_reset_even_when_usage_rounds_to_zero() {
+        assert!(!reset_moves_with_clock(10_000, 10_000, 5_000, 5_004));
+        assert!(!reset_moves_with_clock(10_000, 10_001, 5_000, 5_004));
     }
 }
