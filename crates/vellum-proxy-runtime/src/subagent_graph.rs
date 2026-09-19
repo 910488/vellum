@@ -435,6 +435,25 @@ impl SubagentGraphRegistry {
         }
     }
 
+    /// Return every route ever observed for one logical thread. A healthy
+    /// thread has exactly one. Keeping conflicts visible lets the data plane
+    /// fail a child closed instead of choosing whichever parent execution was
+    /// most recent.
+    pub fn routes_for_thread(&self, thread: &CodexThreadKey) -> Vec<String> {
+        let mut routes = self
+            .thread_executions
+            .get(thread)
+            .into_iter()
+            .flatten()
+            .filter_map(|execution_id| self.executions.get(execution_id))
+            .map(|binding| binding.route_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        routes.sort();
+        routes
+    }
+
     /// Bind an exact spawn call activity signal from Codex app-server.
     pub fn bind_spawn_activity(
         &mut self,

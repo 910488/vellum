@@ -858,8 +858,20 @@ impl DesktopProxyRuntimeState {
         .with_harness_environment(
             crate::harness::harness_options_from_env(),
             crate::harness::multi_agent::RUNTIME_WIRED,
+        )
+        // Codex 0.142.5 supplies stable session/thread/parent identities on
+        // native child turns.  Make that typed graph authoritative for normal
+        // Desktop traffic; legacy correlation remains the bounded fallback
+        // when an older client omits the fields.
+        .with_subagent_identity_mode(
+            vellum_proxy_runtime::SubagentIdentityMode::OfficialPreferred,
         );
-        if state.eval_recovery_enabled() {
+        // The exported runaway trace reached 401 provider turns and more than
+        // 150M cumulative input tokens because production left both guards in
+        // advisory shadow mode. Recovery and bounded finalization are safety
+        // behavior for production third-party routes; explicit shadow-mode
+        // evals remain observational so A/B evidence is still meaningful.
+        if !state.is_eval_mode() || state.eval_recovery_enabled() {
             runtime = runtime.with_task_recovery_policies(
                 vellum_proxy_runtime::task_stall::TaskStallPolicy::recover(),
                 vellum_proxy_runtime::task_efficiency::TaskEfficiencyPolicy::recover(),

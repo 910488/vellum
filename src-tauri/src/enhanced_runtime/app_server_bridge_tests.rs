@@ -588,6 +588,167 @@ fn native_spawn_lifecycle_is_forwarded_verbatim_and_binds_its_child() {
 }
 
 #[test]
+fn child_thread_started_binds_before_spawn_completion_and_routes_follow_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    start_enhanced_thread(&mut state, "qwen", "qwen3-coder", "parent-thread");
+
+    let started = json!({
+        "method": "thread/started",
+        "params": {
+            "thread": {
+                "id": "child-thread",
+                "parentThreadId": "parent-thread",
+                "modelProvider": "vellum"
+            }
+        }
+    });
+    assert_eq!(
+        state
+            .on_child_line(ExecutionPlane::EnhancedCodex, &started.to_string())
+            .unwrap(),
+        vec![BridgeAction::ToClient(started)]
+    );
+
+    let binding = state.store.get("child-thread").unwrap().unwrap();
+    assert_eq!(binding.plane, ExecutionPlane::EnhancedCodex);
+    assert_eq!(binding.provider_id, "qwen");
+    assert_eq!(binding.model_id, "qwen3-coder");
+
+    let follow_up = json!({
+        "id": 10,
+        "method": "turn/start",
+        "params": {"threadId": "child-thread", "input": []}
+    });
+    assert_eq!(
+        state.on_client_line(&follow_up.to_string()).unwrap(),
+        vec![BridgeAction::ToChild(
+            ExecutionPlane::EnhancedCodex,
+            follow_up
+        )]
+    );
+}
+
+#[test]
+fn later_spawn_confirmation_is_idempotent_for_a_same_route_model_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    for model in ["qwen-parent", "qwen-child"] {
+        state.model_provider_map.models.insert(
+            model.into(),
+            ModelProviderRoute {
+                provider_id: "qwen".into(),
+                child_provider_id: "vellum".into(),
+            },
+        );
+    }
+    start_enhanced_thread(&mut state, "qwen", "qwen-parent", "parent-thread");
+    let started = json!({
+        "method": "thread/started",
+        "params": {"thread": {
+            "id": "child-thread",
+            "parentThreadId": "parent-thread",
+            "modelProvider": "vellum"
+        }}
+    });
+    state
+        .on_child_line(ExecutionPlane::EnhancedCodex, &started.to_string())
+        .unwrap();
+    let completed = json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": "parent-thread",
+            "item": {
+                "type": "collabAgentToolCall",
+                "tool": "spawnAgent",
+                "senderThreadId": "parent-thread",
+                "receiverThreadIds": ["child-thread"],
+                "model": "qwen-child"
+            }
+        }
+    });
+    state
+        .on_child_line(ExecutionPlane::EnhancedCodex, &completed.to_string())
+        .unwrap();
+    assert_eq!(
+        state.store.get("child-thread").unwrap().unwrap().provider_id,
+        "qwen"
+    );
+}
+
+#[test]
+fn parallel_and_nested_children_inherit_their_own_parent_route() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    start_enhanced_thread(&mut state, "deepseek", "deepseek-v4", "root");
+
+    for (child, parent) in [
+        ("child-a", "root"),
+        ("child-b", "root"),
+        ("grandchild", "child-a"),
+    ] {
+        let started = json!({
+            "method": "thread/started",
+            "params": {"thread": {
+                "id": child,
+                "parentThreadId": parent,
+                "modelProvider": "vellum"
+            }}
+        });
+        state
+            .on_child_line(ExecutionPlane::EnhancedCodex, &started.to_string())
+            .unwrap();
+    }
+
+    for child in ["child-a", "child-b", "grandchild"] {
+        let binding = state.store.get(child).unwrap().unwrap();
+        assert_eq!(binding.plane, ExecutionPlane::EnhancedCodex);
+        assert_eq!(binding.provider_id, "deepseek");
+        assert_eq!(binding.model_id, "deepseek-v4");
+    }
+}
+
+#[test]
+fn child_thread_started_with_a_different_provider_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    start_enhanced_thread(&mut state, "qwen", "qwen3-coder", "parent-thread");
+    let started = json!({
+        "method": "thread/started",
+        "params": {"thread": {
+            "id": "leaked-child",
+            "parentThreadId": "parent-thread",
+            "modelProvider": "vellum-official"
+        }}
+    });
+
+    assert!(matches!(
+        state.on_child_line(ExecutionPlane::EnhancedCodex, &started.to_string()),
+        Err(BridgeError::ProviderSwitchForbidden { .. })
+    ));
+    assert!(state.store.get("leaked-child").unwrap().is_none());
+}
+
+#[test]
+fn child_thread_started_without_a_bound_parent_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    let started = json!({
+        "method": "thread/started",
+        "params": {"thread": {
+            "id": "orphan-child",
+            "parentThreadId": "missing-parent",
+            "modelProvider": "vellum"
+        }}
+    });
+    assert!(matches!(
+        state.on_child_line(ExecutionPlane::EnhancedCodex, &started.to_string()),
+        Err(BridgeError::UnboundThread(thread)) if thread == "missing-parent"
+    ));
+    assert!(state.store.get("orphan-child").unwrap().is_none());
+}
+
+#[test]
 fn legacy_subagent_lifecycle_also_binds_the_real_child_thread() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = state(&temp);

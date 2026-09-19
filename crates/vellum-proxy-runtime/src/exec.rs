@@ -1887,6 +1887,52 @@ impl ProxyRuntime {
         }
     }
 
+    fn ensure_subagent_route_inherited(
+        &self,
+        request: &RuntimeRequest,
+        requested_route_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let Some(identity) = request.metadata.codex_identity.as_ref() else {
+            return Ok(());
+        };
+        if identity.trust == crate::codex_metadata::CodexIdentityTrust::Conflict {
+            if identity.parent_thread_id.is_some() {
+                return Err(RuntimeError::InvalidRequest(
+                    "subagent route authority contains conflicting thread metadata".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let (Some(session_id), Some(parent_thread_id)) =
+            (&identity.session_id, &identity.parent_thread_id)
+        else {
+            return Ok(());
+        };
+        let parent = crate::subagent_graph::CodexThreadKey::new(
+            session_id.clone(),
+            parent_thread_id.clone(),
+        );
+        let graph = if self.subagent_identity_mode == SubagentIdentityMode::Shadow {
+            &self.shadow_subagent_graph
+        } else {
+            &self.subagent_graph
+        };
+        let routes = graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .routes_for_thread(&parent);
+        match routes.as_slice() {
+            [] => Ok(()),
+            [inherited] if inherited == requested_route_id => Ok(()),
+            [inherited] => Err(RuntimeError::InvalidRequest(format!(
+                "subagent route switch forbidden: parent is bound to {inherited}, child requested {requested_route_id}"
+            ))),
+            _ => Err(RuntimeError::InvalidRequest(
+                "subagent parent has conflicting route bindings".into(),
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_child_turn_diagnostic(
         &self,
@@ -2403,6 +2449,7 @@ impl ProxyRuntime {
             .resolve_route_snapshot(model)
             .ok_or_else(|| RuntimeError::RouteNotFound(format!("model not configured: {model}")))?;
         let route = route_snapshot.route.clone();
+        self.ensure_subagent_route_inherited(request, &route.route_id)?;
         if is_guardian_request(&request.body)
             || route.provider_kind != RuntimeProviderKind::Official
             || route.wire != RuntimeWireFormat::Responses
@@ -3545,6 +3592,7 @@ impl ProxyRuntime {
             .resolve_route_snapshot(model)
             .ok_or_else(|| RuntimeError::RouteNotFound(format!("model not configured: {model}")))?;
         let route = &route_snapshot.route;
+        self.ensure_subagent_route_inherited(request, &route.route_id)?;
         let conversation_key = self.resolve_request_conversation_key(request).key;
         // Third-party destinations only. Official OpenAI Responses is a native
         // passthrough and must never enter this validator ??prepare_official_websocket,
@@ -16513,6 +16561,67 @@ mod tests {
         // E2 and EC2 must NOT be cancelled (isolated turns on same parent thread)
         assert!(!*rx_p2.borrow());
         assert!(!*rx_c2.borrow());
+    }
+
+    #[test]
+    fn typed_subagent_metadata_cannot_switch_away_from_the_parent_route() {
+        let runtime = ProxyRuntime::new(
+            Arc::new(FixedCatalog { routes: Vec::new() }),
+            Arc::new(MemoryCredentialProvider::new()),
+            Arc::new(UnconfiguredOfficialAuthProvider),
+            Arc::new(CountingRequestLifecycle::new()),
+            Arc::new(RecordingTransport::new(Vec::new())),
+        )
+        .with_subagent_identity_mode(SubagentIdentityMode::OfficialPreferred);
+        let session = "0195328e-8765-7123-9876-0123456789ab";
+        let parent_body = json!({
+            "client_metadata": {
+                "session_id": session,
+                "thread_id": "parent",
+                "turn_id": "parent-turn",
+                "x-codex-turn-metadata": format!("{{\"session_id\":\"{session}\",\"thread_id\":\"parent\",\"turn_id\":\"parent-turn\"}}")
+            },
+            "model": "parent-model"
+        });
+        let mut parent = request(parent_body);
+        parent.metadata.codex_identity = crate::codex_metadata::extract_codex_turn_identity(
+            crate::codex_metadata::CodexMetadataSources::new(
+                &axum::http::HeaderMap::new(),
+                &parent.body,
+                parent.endpoint,
+            ),
+        )
+        .ok();
+        runtime.observe_codex_turn(&parent, "parent-exec", "third-party-route", "parent-model");
+
+        let child_body = json!({
+            "client_metadata": {
+                "session_id": session,
+                "thread_id": "child",
+                "turn_id": "child-turn",
+                "parent_thread_id": "parent",
+                "x-codex-turn-metadata": format!("{{\"session_id\":\"{session}\",\"thread_id\":\"child\",\"turn_id\":\"child-turn\",\"parent_thread_id\":\"parent\",\"parent_turn_id\":\"parent-turn\"}}")
+            },
+            "model": "child-model"
+        });
+        let mut child = request(child_body);
+        child.metadata.codex_identity = crate::codex_metadata::extract_codex_turn_identity(
+            crate::codex_metadata::CodexMetadataSources::new(
+                &axum::http::HeaderMap::new(),
+                &child.body,
+                child.endpoint,
+            ),
+        )
+        .ok();
+
+        assert!(runtime
+            .ensure_subagent_route_inherited(&child, "third-party-route")
+            .is_ok());
+        assert!(matches!(
+            runtime.ensure_subagent_route_inherited(&child, "official-route"),
+            Err(RuntimeError::InvalidRequest(message))
+                if message.contains("subagent route switch forbidden")
+        ));
     }
 
     struct FailingJournalHistoryStore;

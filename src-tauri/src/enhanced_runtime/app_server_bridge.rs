@@ -931,7 +931,7 @@ impl BridgeState {
                     self.close_turn(&thread_id);
                 }
             }
-            if let Some(thread_id) = value.get("params").and_then(find_thread_id) {
+            if let Some(thread_id) = notification_owner_thread_id(&method, &value) {
                 if self.require_binding(thread_id)?.plane != plane {
                     return Ok(Vec::new());
                 }
@@ -1021,6 +1021,46 @@ impl BridgeState {
         let Some(params) = notification.get("params") else {
             return Ok(());
         };
+
+        // A native child announces its complete Thread object before the
+        // parent's spawnAgent item is necessarily completed.  Waiting for the
+        // later item leaves a real race: Desktop can observe or address the
+        // child while it is still unbound, and the bridge used to discard that
+        // first lifecycle notification.  `parentThreadId` is typed App Server
+        // authority, so bind from it immediately and verify the child did not
+        // silently select another provider table.
+        if notification.get("method").and_then(Value::as_str) == Some("thread/started") {
+            let Some(thread) = params.get("thread") else {
+                return Err(BridgeError::Protocol(
+                    "thread/started notification has no thread".into(),
+                ));
+            };
+            let Some(parent_thread_id) = thread
+                .get("parentThreadId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            else {
+                return Ok(());
+            };
+            let child_thread_id = required_string(thread, "id")?;
+            let actual_provider = required_string(thread, "modelProvider")?;
+            let parent = self.require_binding(parent_thread_id)?;
+            if parent.plane != plane {
+                return Err(BridgeError::Protocol(format!(
+                    "child thread {child_thread_id} was announced by the wrong runtime"
+                )));
+            }
+            let expected_provider = self.child_provider_for_binding(&parent)?;
+            if actual_provider != expected_provider {
+                return Err(BridgeError::ProviderSwitchForbidden {
+                    thread_id: child_thread_id.into(),
+                    bound: expected_provider,
+                    requested: actual_provider.into(),
+                });
+            }
+            return self.inherit_child_binding(&parent, child_thread_id, &parent.model_id);
+        }
+
         let Some(parent_thread_id) = find_thread_id(params) else {
             return Ok(());
         };
@@ -1089,18 +1129,67 @@ impl BridgeState {
                 "spawn lifecycle for thread {parent_thread_id} came from the wrong runtime"
             )));
         }
-        for child_thread_id in child_thread_ids {
-            let child = ThreadRuntimeBinding::new(
-                child_thread_id,
-                parent.plane,
-                parent.runtime_digest.clone(),
-                parent.provider_id.clone(),
-                parent.model_id.clone(),
-                child_thread_id,
-                Utc::now().timestamp(),
-            );
-            self.store.insert_immutable(&child)?;
+        let requested_model = item
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or(&parent.model_id);
+        if let Some(route) = self.model_provider_map.resolve(requested_model) {
+            let same_official = (route.provider_id == "openai"
+                || route.provider_id == "openai-official")
+                && (parent.provider_id == "openai" || parent.provider_id == "openai-official");
+            if route.provider_id != parent.provider_id && !same_official {
+                return Err(BridgeError::ProviderSwitchForbidden {
+                    thread_id: parent_thread_id.into(),
+                    bound: parent.provider_id.clone(),
+                    requested: route.provider_id.clone(),
+                });
+            }
+        } else if requested_model != parent.model_id {
+            return Err(BridgeError::MissingRoutingAuthority);
         }
+        for child_thread_id in child_thread_ids {
+            // `thread/started` may already have committed this binding before
+            // the lifecycle item arrives. The Thread schema carries the
+            // provider but not the requested model, so retain the parent's
+            // route authority here; the proxy separately validates any child
+            // model override against that exact parent route.
+            self.inherit_child_binding(&parent, child_thread_id, &parent.model_id)?;
+        }
+        Ok(())
+    }
+
+    fn child_provider_for_binding(
+        &self,
+        binding: &ThreadRuntimeBinding,
+    ) -> Result<String, BridgeError> {
+        if let Some(route) = self.model_provider_map.resolve(&binding.model_id) {
+            return Ok(route.child_provider_id.clone());
+        }
+        Ok(match binding.plane {
+            ExecutionPlane::OfficialCodex => {
+                crate::codex::VELLUM_OFFICIAL_PROVIDER_NAME.to_string()
+            }
+            ExecutionPlane::EnhancedCodex => crate::codex::VELLUM_PROVIDER_NAME.to_string(),
+        })
+    }
+
+    fn inherit_child_binding(
+        &self,
+        parent: &ThreadRuntimeBinding,
+        child_thread_id: &str,
+        model_id: &str,
+    ) -> Result<(), BridgeError> {
+        let child = ThreadRuntimeBinding::new(
+            child_thread_id,
+            parent.plane,
+            parent.runtime_digest.clone(),
+            parent.provider_id.clone(),
+            model_id,
+            child_thread_id,
+            Utc::now().timestamp(),
+        );
+        self.store.insert_immutable(&child)?;
         Ok(())
     }
 
@@ -1149,6 +1238,19 @@ fn find_thread_id(params: &Value) -> Option<&str> {
         .get("threadId")
         .or_else(|| params.get("conversationId"))
         .and_then(Value::as_str)
+}
+
+fn notification_owner_thread_id<'a>(method: &str, value: &'a Value) -> Option<&'a str> {
+    let params = value.get("params")?;
+    find_thread_id(params).or_else(|| {
+        (method == "thread/started"
+            && params
+                .pointer("/thread/parentThreadId")
+                .and_then(Value::as_str)
+                .is_some())
+        .then(|| params.pointer("/thread/id").and_then(Value::as_str))
+        .flatten()
+    })
 }
 
 fn response_thread_id(value: &Value) -> Result<&str, BridgeError> {

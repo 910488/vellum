@@ -809,16 +809,21 @@ async fn ui_selected_third_party_model_is_used_by_a_real_native_codex_spawn() {
         .iter()
         .all(|key| key != &parent_history_key));
 
-    let comparison = rows
+    let authoritative_child_turns = rows
         .iter()
-        .filter(|(k, _)| k == "subagent_link_comparison")
-        .map(|(_, p)| serde_json::from_str::<Value>(p).expect("parse comparison payload"))
-        .find(|p| p.get("officialParent").and_then(Value::as_str) == Some(parent_thread))
-        .expect("must record subagent_link_comparison with officialParent matching parent thread");
-
+        .filter(|(kind, _)| kind == "child_turn")
+        .map(|(_, payload)| serde_json::from_str::<Value>(payload).expect("parse child_turn"))
+        .filter(|payload| {
+            payload.get("parentThreadId").and_then(Value::as_str) == Some(parent_thread)
+                && payload.get("linkMethod").and_then(Value::as_str)
+                    == Some("official_thread_metadata")
+                && payload.get("linkConfidence").and_then(Value::as_str) == Some("high")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        comparison.get("officialConfidence").and_then(Value::as_str),
-        Some("high")
+        authoritative_child_turns.len(),
+        2,
+        "production must route both children from typed parent metadata, not the legacy shadow comparator"
     );
 
     let _ = shutdown_tx.send(());

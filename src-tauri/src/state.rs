@@ -402,6 +402,10 @@ impl AppState {
                 .unwrap_or(false)
     }
 
+    pub(crate) fn is_eval_mode(&self) -> bool {
+        self.eval_mode
+    }
+
     #[cfg(test)]
     pub(crate) fn runtime_canonical_engine(
         &self,

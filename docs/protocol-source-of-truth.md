@@ -595,6 +595,11 @@ stable across spawn, message, wait, resume, close, and completion.
 Required behavior:
 
 - a child inherits the parent's bound execution plane and route;
+- the bridge commits that inherited binding from the typed `thread/started`
+  payload before forwarding it, then treats the later spawn lifecycle item as
+  an idempotent confirmation rather than the first routing authority;
+- a child whose `modelProvider` or data-plane route differs from its typed
+  parent fails closed before any further upstream dispatch;
 - child requests travel through the real App Server and proxy data path;
 - child lifecycle events are forwarded in their typed form;
 - child output is delivered to the parent through the native peer-message
@@ -618,6 +623,12 @@ Usage accounting is graph-based:
 - system-event counts are derived from typed events, not text matching; and
 - review, compaction, and subagent usage retain their own categories before
   aggregation.
+
+For third-party routes, task-stall and task-efficiency recovery run in
+production mode with bounded finalization. Official routes remain native and
+receive no Vellum-injected recovery. This prevents a non-advancing delegated
+task from remaining in advisory-only mode and issuing an unbounded sequence of
+provider turns.
 
 UI summaries may abbreviate token values with `K` and `B`, but stored
 accounting retains exact values.
