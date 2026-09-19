@@ -18,7 +18,7 @@
 //! already started; the auth is resolved once, so a credential rotation can
 //! never half-change an in-flight call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -80,7 +80,9 @@ use crate::review::{
     resolve_guardian_route_plan, ReviewModelRoute, ReviewSettings, ReviewSettingsSource,
     StaticReviewSettingsSource,
 };
-use crate::route::{RouteCatalog, RuntimeModelRoute, RuntimeProviderKind, RuntimeWireFormat};
+use crate::route::{
+    ReasoningReplay, RouteCatalog, RuntimeModelRoute, RuntimeProviderKind, RuntimeWireFormat,
+};
 use crate::search::{DisabledSearchEngine, SearchEngine};
 use crate::search_loop::{
     append_search_outputs, append_search_reasoning, completed_search_events,
@@ -415,6 +417,11 @@ pub struct ProxyRuntime {
     parent_cancel: Arc<Mutex<ParentCancelRegistry>>,
     generation_stop: watch::Sender<bool>,
     efficiency_recoveries: Arc<Mutex<HashMap<String, LiveEfficiencyRecoveryEntry>>>,
+    /// Runtime evidence can repair an inconclusive/false-negative probe for
+    /// the remainder of this proxy generation. Settings persistence remains
+    /// owned by Desktop's probe layer; execution only learns the minimum
+    /// route-local override proven by the provider's explicit rejection.
+    reasoning_replay_required_routes: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -823,7 +830,22 @@ impl ProxyRuntime {
             parent_cancel: Arc::new(Mutex::new(ParentCancelRegistry::default())),
             generation_stop: watch::channel(false).0,
             efficiency_recoveries: Arc::new(Mutex::new(HashMap::new())),
+            reasoning_replay_required_routes: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    fn reasoning_replay_required(&self, route: &RuntimeModelRoute) -> bool {
+        self.reasoning_replay_required_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&reasoning_replay_route_key(route))
+    }
+
+    fn note_reasoning_replay_required(&self, route: &RuntimeModelRoute) {
+        self.reasoning_replay_required_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(reasoning_replay_route_key(route));
     }
 
     /// Set the subagent identity and graph resolution rollout mode.
@@ -4280,7 +4302,10 @@ impl ProxyRuntime {
         stages.mark("authorized");
         // The route fields the translation reads, projected out so adapter
         // code cannot be tempted to treat the full route as dispatchable.
-        let adapter_route = ProfileAdapterRoute::from(route);
+        let mut adapter_route = ProfileAdapterRoute::from(route);
+        if self.reasoning_replay_required(route) {
+            adapter_route.chat_capabilities.reasoning_replay = ReasoningReplay::ToolCallBound;
+        }
         let prepared_result = prepare_upstream_request_details(
             &execution_body,
             &adapter_route,
@@ -4296,6 +4321,17 @@ impl ProxyRuntime {
         if route.effective_provider_profile().is_some() {
             crate::opencode::strip_openai_only_fields(&mut prepared);
         }
+        let reasoning_replay_retry_body = prepare_reasoning_replay_retry_body(
+            &execution_body,
+            &prepared,
+            &adapter_route,
+            &profile,
+            &request.execution_environment,
+            Some(&route_snapshot.catalog_entry),
+            snapshot.web_search.enabled,
+            &replay,
+            route.effective_provider_profile().is_some(),
+        )?;
         if route.provider_kind == RuntimeProviderKind::Official {
             self.record_official_request_prepared(
                 request,
@@ -4334,6 +4370,7 @@ impl ProxyRuntime {
                     auth,
                     started,
                     chat_diagnostics,
+                    reasoning_replay_retry_body,
                 )
                 .await;
         }
@@ -4369,6 +4406,36 @@ impl ProxyRuntime {
                 return Err(error);
             }
         };
+        if provider_requires_reasoning_replay(response.status, &response.body) {
+            self.note_reasoning_replay_required(route);
+            if let Some(retry_body) = reasoning_replay_retry_body {
+                tracing::warn!(
+                    route_id = %route.route_id,
+                    model = %route.upstream_model,
+                    "provider required tool-bound reasoning; retrying once with reasoning replay"
+                );
+                encoded_body = retry_body;
+                response = self
+                    .execute_upstream(
+                        UpstreamRequest {
+                            method: "POST".into(),
+                            url: upstream_endpoint(&route.base_url, route.wire),
+                            headers: json_upstream_headers(
+                                &auth,
+                                route,
+                                &request.body,
+                                &conversation_key,
+                                &encoded_body,
+                            ),
+                            body: encoded_body.clone(),
+                            timeout: non_streaming_timeout(route),
+                            max_response_bytes: third_party_response_cap(route),
+                        },
+                        route,
+                    )
+                    .await?;
+            }
+        }
         record_chat_wire_diagnostics(
             &self.diagnostics,
             route,
@@ -5541,6 +5608,7 @@ impl ProxyRuntime {
         mut auth: ResolvedAuth,
         baseline: std::time::Instant,
         mut chat_diagnostics: Option<crate::replay::HarnessTranscriptDiagnostics>,
+        mut reasoning_replay_retry_body: Option<Vec<u8>>,
     ) -> Result<RuntimeResponse, RuntimeError> {
         let upstream_request = UpstreamRequest {
             method: "POST".into(),
@@ -5671,17 +5739,71 @@ impl ProxyRuntime {
                 }
             }
         }
-        record_chat_wire_diagnostics(
-            &self.diagnostics,
-            route,
-            &encoded_body,
-            &mut chat_diagnostics,
-            Some(upstream.status),
-        );
         if !(200..300).contains(&upstream.status) {
             let status = upstream.status;
             let error_body = drain_upstream_error_body(&mut upstream).await?;
-            if official_rejects_tool_choice(route, status, &error_body) {
+            if provider_requires_reasoning_replay(status, &error_body) {
+                self.note_reasoning_replay_required(route);
+                if let Some(retry_body) = reasoning_replay_retry_body.take() {
+                    tracing::warn!(
+                        route_id = %route.route_id,
+                        model = %route.upstream_model,
+                        "provider required tool-bound reasoning; retrying stream once with reasoning replay"
+                    );
+                    encoded_body = retry_body;
+                    upstream = self
+                        .open_upstream_stream(&UpstreamRequest {
+                            method: "POST".into(),
+                            url: upstream_endpoint(&route.base_url, route.wire),
+                            headers: json_upstream_headers(
+                                &auth,
+                                route,
+                                &request.body,
+                                &conversation_key,
+                                &encoded_body,
+                            ),
+                            body: encoded_body.clone(),
+                            timeout: None,
+                            max_response_bytes: None,
+                        })
+                        .await?;
+                    self.note_opencode_quota(
+                        route,
+                        upstream.status,
+                        &upstream.headers,
+                        &[],
+                    );
+                    if !(200..300).contains(&upstream.status) {
+                        let retry_status = upstream.status;
+                        let retry_error_body = drain_upstream_error_body(&mut upstream).await?;
+                        record_chat_wire_diagnostics(
+                            &self.diagnostics,
+                            route,
+                            &encoded_body,
+                            &mut chat_diagnostics,
+                            Some(retry_status),
+                        );
+                        return Err(provider_error_from_upstream(
+                            retry_status,
+                            &retry_error_body,
+                            &upstream.headers,
+                        ));
+                    }
+                } else {
+                    record_chat_wire_diagnostics(
+                        &self.diagnostics,
+                        route,
+                        &encoded_body,
+                        &mut chat_diagnostics,
+                        Some(status),
+                    );
+                    return Err(provider_error_from_upstream(
+                        status,
+                        &error_body,
+                        &upstream.headers,
+                    ));
+                }
+            } else if official_rejects_tool_choice(route, status, &error_body) {
                 if let Some(fallback_body) = without_top_level_tool_choice(&encoded_body) {
                     encoded_body = fallback_body;
                     upstream = self
@@ -5695,7 +5817,7 @@ impl ProxyRuntime {
                                 &conversation_key,
                                 &encoded_body,
                             ),
-                            body: encoded_body,
+                            body: encoded_body.clone(),
                             timeout: None,
                             max_response_bytes: None,
                         })
@@ -5725,6 +5847,13 @@ impl ProxyRuntime {
                 ));
             }
         }
+        record_chat_wire_diagnostics(
+            &self.diagnostics,
+            route,
+            &encoded_body,
+            &mut chat_diagnostics,
+            Some(upstream.status),
+        );
         // Persist the original incremental request plus any synthetic
         // investigation recovery item. Persisting the fully hydrated replay
         // would duplicate the continuation chain; persisting the untouched
@@ -7675,6 +7804,98 @@ fn official_rejects_tool_choice(
             message.contains("unknown parameter") && message.contains("tool_choice")
         });
     param_matches && (code_matches || message_matches)
+}
+
+fn reasoning_replay_route_key(route: &RuntimeModelRoute) -> String {
+    format!(
+        "{}\0{}\0{}",
+        route.route_id, route.base_url, route.upstream_model
+    )
+}
+
+/// Build the one compatibility body that can repair a false-negative Chat
+/// capability probe. The candidate is retained only when replay adds a real,
+/// non-empty reasoning field to an assistant message that owns tool calls; an
+/// upstream rejection can therefore never turn into a blind duplicate retry.
+#[allow(clippy::too_many_arguments)]
+fn prepare_reasoning_replay_retry_body(
+    original: &Value,
+    prepared: &Value,
+    route: &ProfileAdapterRoute,
+    profile: &HarnessProfile,
+    environment: &crate::environment::ExecutionEnvironment,
+    catalog_entry: Option<&Value>,
+    web_search_enabled: bool,
+    replay: &ReplayContext,
+    strip_openai_fields: bool,
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    if route.wire != RuntimeWireFormat::Chat
+        || !route.reasoning
+        || route.chat_capabilities.reasoning_replay == ReasoningReplay::ToolCallBound
+    {
+        return Ok(None);
+    }
+
+    let mut retry_route = route.clone();
+    retry_route.chat_capabilities.reasoning_replay = ReasoningReplay::ToolCallBound;
+    let mut retry = prepare_upstream_request_details(
+        original,
+        &retry_route,
+        profile,
+        environment,
+        catalog_entry,
+        web_search_enabled,
+        replay,
+    )
+    .map_err(map_prepare_error)?
+    .body;
+    if strip_openai_fields {
+        crate::opencode::strip_openai_only_fields(&mut retry);
+    }
+
+    let has_bound_reasoning = retry
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                && message
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        });
+    if !has_bound_reasoning || retry == *prepared {
+        return Ok(None);
+    }
+
+    serde_json::to_vec(&retry)
+        .map(Some)
+        .map_err(|error| RuntimeError::Internal(format!("encode reasoning replay body: {error}")))
+}
+
+/// Console Go/DeepSeek returns this deterministic 4xx when a thinking tool
+/// call is replayed without its provider-owned readable reasoning. Keep the
+/// classifier narrow so unrelated invalid requests remain terminal.
+fn provider_requires_reasoning_replay(status: u16, body: &[u8]) -> bool {
+    if !(400..500).contains(&status) {
+        return false;
+    }
+    let message = provider_error_message(body, status).to_ascii_lowercase();
+    let mentions_reasoning =
+        message.contains("reasoning_content") || message.contains("reasoning content");
+    mentions_reasoning
+        && (message.contains("must be passed back")
+            || message.contains("must pass")
+            || message.contains("required")
+            || message.contains("missing"))
+        && !message.contains("not supported")
+        && !message.contains("unsupported")
+        && !message.contains("unknown field")
 }
 
 async fn drain_upstream_error_body(upstream: &mut UpstreamStream) -> Result<Vec<u8>, RuntimeError> {
@@ -11742,6 +11963,138 @@ mod tests {
         )
         .with_search_engine(engine)
         .with_web_search_wrapper_enabled(true)
+    }
+
+    #[test]
+    fn reasoning_replay_retry_classifier_is_narrow() {
+        let required = br#"{"error":{"type":"invalid_request_error","message":"The reasoning_content in the thinking mode must be passed back to the API."}}"#;
+        assert!(provider_requires_reasoning_replay(400, required));
+        assert!(!provider_requires_reasoning_replay(500, required));
+        assert!(!provider_requires_reasoning_replay(
+            400,
+            br#"{"error":{"message":"unknown field reasoning_content is not supported"}}"#
+        ));
+        assert!(!provider_requires_reasoning_replay(
+            400,
+            br#"{"error":{"message":"invalid request"}}"#
+        ));
+    }
+
+    /// Regression for a false-negative capability probe observed on Console
+    /// Go: the first request omits replay, the provider supplies authoritative
+    /// evidence that it is required, and the same route succeeds on one
+    /// rebuilt request carrying the tool-bound reasoning.
+    #[tokio::test]
+    async fn chat_stream_recovers_from_runtime_reasoning_replay_requirement() {
+        let transport = Arc::new(RecordingTransport::new(vec![
+            UpstreamResponse {
+                status: 400,
+                headers: Vec::new(),
+                body: br#"{"error":{"type":"invalid_request_error","message":"The reasoning_content in the thinking mode must be passed back to the API."}}"#.to_vec(),
+            },
+            UpstreamResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: chat_text_completion_sse("Recovered.").into_bytes(),
+            },
+            UpstreamResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: chat_text_completion_sse("Learned.").into_bytes(),
+            },
+        ]));
+        let mut route = sample_route(None);
+        route.auth_kind = RuntimeAuthKind::None;
+        route.wire = RuntimeWireFormat::Chat;
+        route.reasoning = true;
+        route.chat_capabilities = crate::route::RuntimeChatCapabilities::default();
+        let runtime = ProxyRuntime::new(
+            Arc::new(FixedCatalog {
+                routes: vec![route],
+            }),
+            Arc::new(MemoryCredentialProvider::new()),
+            Arc::new(UnconfiguredOfficialAuthProvider),
+            Arc::new(CountingRequestLifecycle::new()),
+            transport.clone(),
+        );
+
+        let recovery_request = request(json!({
+            "model": "vlm-test",
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }],
+            "input": [
+                {"type":"message","role":"user","content":"inspect the workspace"},
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"I need to inspect it first."}]},
+                {"type":"function_call","call_id":"call_inspect","name":"shell","arguments":"{\"cmd\":\"dir\"}"},
+                {"type":"function_call_output","call_id":"call_inspect","output":"ok"}
+            ]
+        }));
+        let response = runtime
+            .execute(
+                recovery_request.clone(),
+                "runtime-reasoning-replay-recovery",
+            )
+            .await
+            .unwrap();
+        let RuntimeResponse::Sse(mut stream) = response else {
+            panic!("streaming Chat request must return SSE");
+        };
+        let mut transcript = String::new();
+        while let Some(chunk) = stream.next().await {
+            transcript.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        assert!(transcript.contains("Recovered."), "{transcript}");
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+
+        let first = parsed_request_body(&transport, 0);
+        let retry = parsed_request_body(&transport, 1);
+        let first_assistant = first["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .unwrap();
+        let retry_assistant = retry["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .unwrap();
+        assert!(first_assistant.get("reasoning_content").is_none());
+        assert_eq!(
+            retry_assistant["reasoning_content"],
+            "I need to inspect it first."
+        );
+
+        let learned = runtime
+            .execute(recovery_request, "runtime-reasoning-replay-learned")
+            .await
+            .unwrap();
+        let RuntimeResponse::Sse(mut learned_stream) = learned else {
+            panic!("learned Chat request must return SSE");
+        };
+        while learned_stream.next().await.transpose().unwrap().is_some() {}
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            3,
+            "the learned route must not repeat the rejected request"
+        );
+        let learned_request = parsed_request_body(&transport, 2);
+        let learned_assistant = learned_request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(
+            learned_assistant["reasoning_content"],
+            "I need to inspect it first."
+        );
     }
 
     /// Regression for Console Go's `invalid_request_error`: thinking-mode
