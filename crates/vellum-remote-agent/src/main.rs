@@ -582,6 +582,18 @@ fn dispatch(
                 .map_err(|error| error.to_string())
             },
         ),
+        AgentRequest::ProxyOfficialAccountClearSelection { operation_id } => run_mutation(
+            store,
+            &operation_id,
+            "proxy.officialAccountClearSelection",
+            json!({}),
+            || {
+                serde_json::to_value(vellum_remote_agent::official_account::clear_selection(
+                    store.paths(),
+                )?)
+                .map_err(|error| error.to_string())
+            },
+        ),
         AgentRequest::ProxyOfficialAccountRemove {
             operation_id,
             account_id_hash,

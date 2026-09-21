@@ -26,7 +26,7 @@ const BLOCKER_CODES = [
   "injectionRequiresReadyProxy", "invalidCompactionThreshold",
   "managedRuntimeRecoveryRequired", "nativeCodexVersionMismatch",
   "nativeDaemonAppOwned", "noModelsSelected", "officialAccountActivationRequired",
-  "officialAccountPairingRequired", "proxyConfigurationMissing",
+  "officialAccountPairingRequired", "officialAccountReauthenticationRequired", "proxyConfigurationMissing",
   "systemdUserUnavailable", "versionMismatch",
 ];
 

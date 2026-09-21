@@ -401,6 +401,8 @@ pub enum AgentRequest {
         operation_id: String,
         account_id_hash: String,
     },
+    #[serde(rename = "proxy.officialAccountClearSelection")]
+    ProxyOfficialAccountClearSelection { operation_id: String },
     #[serde(rename = "proxy.officialAccountRemove")]
     ProxyOfficialAccountRemove {
         operation_id: String,
@@ -758,6 +760,9 @@ mod tests {
             AgentRequest::ProxyOfficialAccountSelect {
                 operation_id: "select-1".into(),
                 account_id_hash: "b".repeat(64),
+            },
+            AgentRequest::ProxyOfficialAccountClearSelection {
+                operation_id: "clear-selection-1".into(),
             },
             AgentRequest::ProxyOfficialAccountRemove {
                 operation_id: "remove-1".into(),

@@ -65,7 +65,7 @@ export function headline({ proxy, runtime, enhancedRuntime, overview, updates }:
   return { ...base, modelIsLive: true, tone: "ok", labelKey: "status.live" };
 }
 
-export function attention({ runtime, overview, updates }: SystemStatus): Partial<Record<ScreenId, number>> {
+export function attention({ runtime, overview }: SystemStatus): Partial<Record<ScreenId, number>> {
   const result: Partial<Record<ScreenId, number>> = {};
   const findings = overview?.findings.length ?? 0;
   if (findings > 0) result.today = findings;
@@ -76,9 +76,6 @@ export function attention({ runtime, overview, updates }: SystemStatus): Partial
     result.models = Math.max(1, modelReasons.length);
   } else if (runtime?.restartRequired && (runtime.restartReasons.length === 0)) {
     result.models = 1;
-  }
-  if (updates && updates.attention !== "none") {
-    result.settings = 1;
   }
   return result;
 }

@@ -35,6 +35,10 @@ const zhTW: ResourceTree = {
       "title": "紀錄",
       "blurb": "Token 統計與請求紀錄"
     },
+    "updates": {
+      "label": "更新",
+      "blurb": "檢查、下載與套用全部更新"
+    },
     "settings": {
       "label": "設定",
       "title": "設定",
@@ -138,7 +142,7 @@ const zhTW: ResourceTree = {
       "dashboard": { "title": "儀表板 Provider 顯示設定", "note": "已選擇 {{count}} 個 Provider。此設定僅控制現況頁的顯示內容，不會變更 Provider 的啟用狀態。", "disabledVisible": "顯示（已停用）" },
       "restore": { "title": "還原 Codex 原始設定", "description": "移除 Vellum 的 Proxy 位址、boundary key 與模型選單項目，並還原原本的預設 Provider。為了讓既有 Vellum 對話仍可由原生 Codex 開啟，會保留一個不經 Proxy、直接連到 OpenAI 的相容 Provider。登入憑證、聊天紀錄、專案分組及工作區資料均予以保留。", "action": "還原 Codex 原始設定", "cleared": "設定已還原", "result": "執行結果", "nothingToClear": "未偵測到需要移除的 Vellum 設定", "preserved": "保留項目：{{items}}。" },
       "enhancedRuntime": {"title": "Enhanced Codex Runtime", "description": "第三方 Provider 的新對話改由 Enhanced Codex 執行；OpenAI 官方模型維持原生 Codex Runtime。切換由哪一邊執行時，必須開新對話。", "desiredState": "要求狀態", "desiredEnabled": "要求啟用", "desiredDisabled": "要求停用", "activation": {"disabled": "未啟用", "artifactBlocked": "執行檔驗證失敗", "awaitingDesktopRestart": "等待重新啟動 Codex Desktop", "active": "已生效", "disablePendingRestart": "已要求停用，等待重新啟動", "environmentDrift": "接管狀態不一致", "failed": "Bridge 啟動失敗"}, "environment": {"leased": "Vellum 已安全接管", "released": "尚未接管", "orphanedBridge": "殘留舊版 Vellum bridge", "foreignValue": "由其他工具設定，Vellum 沒有覆寫", "unreadable": "無法讀取使用者環境變數"}, "environmentValue": "CODEX_CLI_PATH 目前的值", "environmentUnset": "尚未設定", "staleBridge": "這條路徑是舊版 Vellum 留下的 bridge，不是這個組建要用的那一支。按「停用並釋放接管」清掉它，再重新啟用。", "launchDetail": "{{launchId}} · {{state}} · bridge {{bridgePid}} · Official {{officialPid}} · Enhanced {{enhancedPid}}", "officialBinary": "官方 Codex core", "officialBinaryHint": "從已安裝的 Codex Desktop 偵測。必須與 Desktop 實際執行的那一支相同，所以不開放更改。", "enhancedBinary": "Enhanced Codex core", "bridgeBinary": "App Server bridge", "bridgeBinaryHint": "隨這個 Vellum 組建一起提供，雜湊寫死在程式裡，不能換成別的檔案。", "protocol": {"label": "協定檢查", "unavailable": "無法檢查", "details": "差異與診斷（{{count}}）", "routed": "路由", "verdict": {"verified": "與釘選版本一致", "unverified": "可用，但不保證正確性", "incompatible": "不相容，已回退"}, "mean": {"verified": "這正是這個 Vellum 版本釘選的組合，兩邊的協定逐位元組相同。", "unverified": "這個 Codex Desktop 版本沒有人驗證過。bridge 分派要用到的方法都還在，所以路由沒問題；下面列的差異是真的，只是沒被測過。", "incompatible": "Codex Desktop 動到了 bridge 分派時必須用的方法，沒有可以降級的跑法。"}, "delta": {"shapeIncompatible": "{{subject}} 的 wire 形狀對方不接受：{{fields}}", "shapeUnverified": "{{subject}} 的 wire 形狀無法判定：{{fields}}", "methodUnservable": "Desktop 可能呼叫 {{subject}}，Enhanced core 沒有實作", "methodUnknownToDesktop": "Enhanced core 可能送出 {{subject}}，Desktop 已不再宣告", "fieldNewlyRequired": "Desktop 現在要求 {{subject}} 的 {{fields}}，Enhanced core 不會送出", "fieldRemoved": "Desktop 不再送出 {{subject}} 的 {{fields}}，Enhanced core 會讀它"}, "fallback": "已回到原生 Codex。Codex 本身照常運作，只是 Enhanced 的功能都不在。"}, "protocolHash": "App Server 協定", "observedBridge": "實際執行中的 bridge", "unverified": "尚未驗證", "details": "技術細節與排查資料", "runInstalledGate": "重新執行安裝版驗證", "installedGateHint": "比重開一次更深的驗證：重新啟動 Codex Desktop，跑完整的安裝版檢驗，並留下一份報告。", "lastQualification": "上次驗證", "qualificationPassed": "{{mode}} 通過，可以升級", "qualificationComponentOnly": "{{mode}} 元件測試通過，但還沒達到實機升級門檻", "qualificationFailed": "{{mode}} 未通過 —— {{detail}}", "qualificationReport": "報告", "planeTitle": "每條路由現在走哪一邊", "contextNote": "壓縮由執行對話的 runtime 自己負責：官方路徑用 Official Codex 的原生壓縮，第三方路徑用 Enhanced Codex 的本機壓縮與上下文還原。Vellum 不會另外套用自己的壓縮策略。", "planeOfficial": "Official Codex · 原生壓縮", "planeEnhanced": "Enhanced Codex · 本機壓縮與上下文還原", "planeUnbound": "尚未綁定 Enhanced Codex", "activationLabel": "啟用狀態", "environmentLabel": "接管狀態", "inject": {"on": "已注入", "off": "未注入", "working": "注入中", "switchLabel": "注入 Enhanced Codex Runtime", "mean": {"staleLaunch": "Codex Desktop 現在正走在 Enhanced 上，但用的是較早那次啟動的設定。要讓最新的設定生效，重新啟動 Codex Desktop。", "on": "Codex Desktop 正跑在 Vellum 的 bridge 上。第三方 Provider 的新對話由 Enhanced Codex 執行，OpenAI 官方模型維持原生 Codex。", "off": "Codex Desktop 跑在原生 Codex 上。CODEX_CLI_PATH 沒有被 Vellum 動過。", "wanted": "Vellum 這邊設定好了，但 Codex Desktop 還沒接上，所以現在跑的還是原生 Codex。", "working": "正在驗證執行檔、接管 CODEX_CLI_PATH，並重新啟動 Codex Desktop。", "armed": "重新啟動 Codex Desktop 後生效。"}, "blocked": {"proxyStopped": "Proxy 沒有啟動。Proxy 沒在跑的時候 Vellum 不會接管啟動路徑 —— 不然 Codex Desktop 會啟動到一個後面沒有資料面的 bridge。先啟動 Proxy。", "stuck": "要求過注入，但路徑沒有被接管。下面的終端機寫著卡在哪一步；再扳一次開關可以重試。", "noCore": "這個 Vellum 組建裡沒有 Enhanced Codex core。這不是你漏了設定 —— core 由組建自己帶，缺了代表安裝不完整，請重新安裝 Vellum。"}}, "term": {"idle": "還沒跑過。扳動上面的開關，每一步會印在這裡。", "verify": "核對 Enhanced Codex 執行檔", "verifyOk": "檔案內容與這個版本預期的一致", "verifyFailed": "核對沒過，什麼都沒有動", "restart": "接管 CODEX_CLI_PATH 並重新啟動 Codex Desktop", "restartBack": "重新啟動 Codex Desktop，回到原生 Runtime", "restartRefused": "沒有重新啟動", "adopt": "確認 Codex Desktop 已接手 bridge", "injected": "已注入 · {{profile}}", "notInjected": "Codex Desktop 沒有接手 bridge", "release": "釋放 CODEX_CLI_PATH", "releasedOk": "已釋放，Codex Desktop 回到原生 Runtime", "envUnset": "（未設定）", "preflight": "檢查前置條件", "proxyStopped": "Proxy 沒有啟動，接管會被釋放掉。先啟動 Proxy 再注入。", "armed": "啟動路徑已接管。下次啟動 Codex Desktop 就會生效。", "alreadyInjected": "Codex Desktop 已經跑在這座 bridge 上了，不用重新啟動 · {{profile}}", "missingHelper": "缺少輔助程式 {{name}}"}, "missingHelpers": "這支 Enhanced Codex 旁邊少了官方安裝有的輔助程式：{{names}}。Codex 在執行時才到自己旁邊找它們，找不到會變成一個 Windows「找不到檔案」對話框。對話與路由不受影響；會壞的只有用到那支程式的功能 —— 沙箱 shell 指令要 codex-windows-sandbox-setup.exe 與 codex-command-runner.exe；code mode 要 codex-code-mode-host.exe，而 code mode 預設是關的，關著就沒有影響。", "enhancedBinaryHint": "由這個 Vellum 組建自己帶，並用 enhanced-runtime.lock.json 裡的雜湊逐位元組比對。換成別的只會驗證失敗，所以不開放選擇。", "coreMissing": "這個組建沒有帶"},
-      "updates": { "title": "軟體更新", "description": "本體、Remote 套件與 Enhanced core 可獨立更新。已下載的更新會保持待套用，直到符合套用條件。", "liveDisabled": "在發布簽章設定完成前，自動更新維持停用。", "actionFailed": "更新操作失敗：{{error}}", "autoCheck": "自動檢查更新", "autoDownload": "自動下載更新", "channel": "通道", "stable": "穩定", "preview": "預覽", "current": "目前版本", "available": "可用版本", "none": "無", "progress": "下載進度", "applyWhen": "套用條件", "notes": "發行說明", "failure": "失敗原因", "check": "檢查更新", "download": "下載", "apply": "套用", "cancel": "取消下載", "rollback": "還原", "hosts": "主機", "idleAuto": "閒置時自動更新", "idleHandoff": "預覽：閒置時套用 Enhanced core（預設關閉）", "layerDisabled": "此層更新尚未在目前建置中啟用。", "layer": { "desktop": "Vellum 本體", "remote": "Remote 套件", "core": "Enhanced Codex core" }, "condition": { "restartVellum": "已準備。重新啟動 Vellum 後套用。", "hostIdle": "已下載。等待主機閒置。", "nextCoreStart": "已下載。下次核心啟動時套用。", "download": "下載後暫存。", "failed": "見失敗原因。", "idle": "已是最新。", "checking": "檢查中…", "available": "有可用更新。", "downloading": "下載中…", "verifying": "驗證中…", "staged": "已暫存。", "waitingForIdle": "等待閒置。", "waitingForRestart": "等待重新啟動。", "applying": "套用中…", "validating": "驗證中…", "applied": "已套用。", "blocked": "已阻擋。", "rolledBack": "已還原。" }, "phase": { "idle": "待命", "checking": "檢查中", "available": "可用", "downloading": "下載中", "verifying": "驗證中", "staged": "已暫存", "waitingForIdle": "等待閒置", "waitingForRestart": "下次啟動套用", "applying": "套用中", "validating": "驗證中", "applied": "已套用", "blocked": "已阻擋", "failed": "失敗", "rolledBack": "已還原" } },
+      "updates": { "title": "軟體更新", "panelHint": "這是全域更新面板，不會切換目前頁面。", "overall": "整體更新", "overallHint": "一次檢查並安排 Vellum 本體、Remote 套件與 Enhanced core。", "checkAll": "檢查全部", "updateAll": "全部更新", "updatingAll": "正在更新全部元件…", "experimentalParts": "實驗性：分項更新", "experimentalPartsHint": "僅在需要單獨測試、取消或還原某個元件時使用。", "description": "本體、Remote 套件與 Enhanced core 可獨立更新。已下載的更新會保持待套用，直到符合套用條件。", "liveDisabled": "在發布簽章設定完成前，自動更新維持停用。", "actionFailed": "更新操作失敗：{{error}}", "autoCheck": "自動檢查更新", "autoDownload": "自動下載更新", "channel": "通道", "stable": "穩定", "preview": "預覽", "current": "目前版本", "available": "可用版本", "none": "無", "progress": "下載進度", "applyWhen": "套用條件", "notes": "發行說明", "failure": "失敗原因", "check": "檢查更新", "download": "下載", "apply": "套用", "cancel": "取消下載", "rollback": "還原", "hosts": "主機", "idleAuto": "閒置時自動更新", "idleHandoff": "預覽：閒置時套用 Enhanced core（預設關閉）", "layerDisabled": "此層更新尚未在目前建置中啟用。", "layer": { "desktop": "Vellum 本體", "remote": "Remote 套件", "core": "Enhanced Codex core" }, "condition": { "restartVellum": "已準備。重新啟動 Vellum 後套用。", "hostIdle": "已下載。等待主機閒置。", "nextCoreStart": "已下載。下次核心啟動時套用。", "download": "下載後暫存。", "failed": "見失敗原因。", "idle": "已是最新。", "checking": "檢查中…", "available": "有可用更新。", "downloading": "下載中…", "verifying": "驗證中…", "staged": "已暫存。", "waitingForIdle": "等待閒置。", "waitingForRestart": "等待重新啟動。", "applying": "套用中…", "validating": "驗證中…", "applied": "已套用。", "blocked": "已阻擋。", "rolledBack": "已還原。" }, "phase": { "idle": "待命", "checking": "檢查中", "available": "可用", "downloading": "下載中", "verifying": "驗證中", "staged": "已暫存", "waitingForIdle": "等待閒置", "waitingForRestart": "下次啟動套用", "applying": "套用中", "validating": "驗證中", "applied": "已套用", "blocked": "已阻擋", "failed": "失敗", "rolledBack": "已還原" } },
       "advanced": { "title": "進階設定", "description": "提供請求接收控制、Codex 安全重新啟動及模型選單還原功能，適用於故障排除與系統維護。", "activeRequests": "執行中的請求", "drainTitle": "暫停接收新請求", "draining": "已暫停接收新請求，正在等待執行中的請求完成", "accepting": "目前正常接收請求", "drainHint": "執行中的請求不會中斷。暫停後，Vellum 將拒絕所有新請求，直到手動恢復接收。", "resume": "恢復接收新請求", "stop": "暫停接收新請求", "catalogVersion": "目前模型選單版本", "notCreated": "尚未建立", "restartTitle": "重新啟動 Codex", "restartHint": "等待執行中的請求安全完成後，重新啟動 Codex。", "restartAction": "重新啟動 Codex", "restartAnyway": "仍要重新啟動", "guideTitle": "初次設定導覽", "guideHint": "重新檢視初次設定或連接其他 Provider，不會重置現有設定。", "guideAction": "開啟設定導覽", "catalogHistory": "模型選單版本紀錄", "rollback": "還原", "noVersions": "目前沒有可供還原的模型選單版本。每次更新模型選單時，系統會自動建立版本紀錄。", "restartRequired": "重新啟動後生效", "applied": "目前已生效" },
       "logs": { "title": "診斷紀錄", "description": "將 Vellum、Proxy 與 Enhanced Runtime 保留的文字紀錄匯出成 ZIP。匯出時會再次遮蔽金鑰、Token 與使用者路徑；不包含憑證、設定、聊天紀錄或資料庫。", "export": "匯出全部紀錄 ZIP", "exporting": "正在匯出…", "exported": "已匯出至 {{path}}", "hint": "ZIP 會儲存到下載資料夾，並附上檔案清單與截短紀錄。" },
       "app": { "title": "應用程式控制", "exit": "結束 Vellum", "exitHint": "結束 Vellum 時將停止 Proxy 並還原 Codex 原始連線設定；聊天紀錄與專案資料不受影響。" },
@@ -513,7 +517,10 @@ const zhTW: ResourceTree = {
       "chatgptActivate": "啟用桌面端選定的 ChatGPT 帳號",
       "chatgptPairRow": "配對", "chatgptActivateRow": "啟用", "chatgptPairAll": "配對桌面端全部 ChatGPT 帳號",
       "chatgptPairSkip": "跳過這個帳號",
+      "chatgptAuthorize": "授權到遠端",
+      "chatgptReauthenticate": "重新登入",
       "executionLogin": "新增 Official 執行帳號",
+      "executionFollowControl": "模型請求跟隨 Remote Control 帳號",
       "executionSelect": "用於模型請求",
       "executionRemove": "移除執行帳號",
       "devicePair": "配對這支手機"
@@ -606,6 +613,7 @@ const zhTW: ResourceTree = {
       "nativeDaemonAppOwned": "Codex App 目前直接佔用此主機的 app-server，Vellum 無法接管。",
       "noModelsSelected": "尚未選取任何模型，沒有可同步的內容。",
       "officialAccountActivationRequired": "遠端的 ChatGPT 帳號已配對，但尚未啟用。",
+      "officialAccountReauthenticationRequired": "遠端 ChatGPT 憑證已過期，請重新登入。",
       "officialAccountPairingRequired": "遠端尚未與桌面端選定的 ChatGPT 帳號配對。",
       "proxyConfigurationMissing": "主機上尚無 Proxy 設定。",
       "proxyConfigurationSchemaTooNew": "主機上的 Proxy 設定格式比此 Vellum 版本能理解的更新，為避免覆寫已封鎖部署——請先更新 Vellum。",
@@ -705,13 +713,17 @@ const zhTW: ResourceTree = {
       }
     },
     "account": {
-      "title": "帳號",
+      "title": "ChatGPT 帳號",
+      "catalogHint": "Desktop 已知帳號與這台主機的授權狀態",
       "chatgptUnavailable": "無法讀取",
       "chatgpt": {
+        "ready": "遠端憑證可用",
         "synchronized": "已同步",
         "pairingRequired": "需要配對",
         "pairingPending": "配對中",
         "activationRequired": "需要啟用",
+        "reauthenticationRequired": "憑證已過期",
+        "accountUnavailable": "遠端尚未選擇帳號",
         "desktopAccountUnavailable": "桌面端未選定帳號"
       },
       "grokReady": "已登入 {{account}}，refresh timer 執行中",
@@ -724,24 +736,35 @@ const zhTW: ResourceTree = {
       "pairingMissing": "這台主機尚未配對",
       "pairingUnknown": "讀不到",
       "desktopDefault": "桌面端預設",
+      "desktopCurrent": "目前 Desktop Codex 帳號",
+      "credentialReady": "遠端憑證可用",
+      "credentialExpired": "遠端憑證已過期",
+      "credentialMissing": "尚未授權到遠端",
       "grokDeviceLogin": "Grok 裝置登入：",
       "grokWaitingUrl": "等待登入網址…",
       "grokStarting": "正在等待 Grok CLI…"
     },
     "control": {
       "title": "Remote 控制",
-      "identity": "控制帳號 A",
+      "identity": "使用帳號",
+      "status": "憑證狀態",
+      "choose": "選擇 Remote Control 帳號",
+      "credentialExpired": "這個帳號的遠端憑證已過期。帳號身分仍相同，但模型請求與 Remote Control 驗證可能失敗。",
       "sameAccountHint": "Desktop 與手機必須使用相同的 ChatGPT 帳號及 workspace；裝置配對不會改變遠端 daemon 身份。",
       "deviceHint": "短效裝置配對資訊：",
       "expiresAt": "{{when}} 到期"
     },
     "execution": {
-      "title": "Proxy 執行帳號",
-      "independentHint": "Official 執行帳號 B 只用於模型請求；切換它不會改變或中斷 Remote 控制。",
+      "title": "官方模型執行帳號",
+      "identity": "模型請求使用",
+      "followControl": "跟隨 Remote Control 帳號",
+      "independentHint": "只決定官方模型請求使用哪個帳號與額度，不會改變 Remote Control 身分。",
+      "inheritedCredentialExpired": "目前跟隨 Remote Control 帳號，但該遠端憑證已過期。請重新登入控制帳號，或選擇獨立的模型執行帳號。",
       "empty": "尚未加入由 Vellum 管理的 Official 執行帳號。",
       "selected": "使用中",
       "select": "選用",
       "remove": "移除",
+      "removeSelected": "移除目前的獨立執行帳號",
       "namePlaceholder": "這個 Official 帳號的顯示名稱",
       "loginHint": "完成 Official 裝置登入："
     },

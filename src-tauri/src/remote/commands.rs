@@ -455,13 +455,25 @@ pub fn list_remote_codex_account_pairings(
         // One unreachable or unpairable account must not blank the whole
         // panel: report it on its own row and keep going.
         let status = client.codex_account_status(Some(&account_id));
-        let (paired, active, detail) = match &status {
+        let (paired, active, credential_state, expires_at, detail) = match &status {
             Ok(value) => (
                 value.get("paired").and_then(serde_json::Value::as_bool) == Some(true),
                 value.get("active").and_then(serde_json::Value::as_bool) == Some(true),
+                value
+                    .get("credentialState")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                value.get("expiresAt").and_then(serde_json::Value::as_i64),
                 None,
             ),
-            Err(error) => (false, false, Some(error.to_string())),
+            Err(error) => (
+                false,
+                false,
+                "unknown".into(),
+                None,
+                Some(error.to_string()),
+            ),
         };
         rows.push(serde_json::json!({
             "accountId": account_id,
@@ -470,6 +482,8 @@ pub fn list_remote_codex_account_pairings(
             "isDesktopDefault": default_account_id.as_deref() == Some(account_id.as_str()),
             "paired": paired,
             "active": active,
+            "credentialState": credential_state,
+            "expiresAt": expires_at,
             "detail": detail,
         }));
     }
@@ -524,11 +538,21 @@ pub fn start_remote_control_pairing(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let account_id = super::desktop_control_account_id(state.inner())
-        .ok_or_else(|| crate::error::AppError::Message("desktopOfficialAccountMissing".into()))?;
-    let expected_hash = format!("{:x}", Sha256::digest(account_id.as_bytes()));
     let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).codex_remote_control_pair_start(&expected_hash)
+    let client = crate::remote::RemoteAgentClient::new(target);
+    let status = client.codex_account_status(None)?;
+    let account_id = status
+        .get("accountId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|_| {
+            matches!(
+                status.get("state").and_then(serde_json::Value::as_str),
+                Some("ready" | "synchronized")
+            )
+        })
+        .ok_or_else(|| crate::error::AppError::Message("remoteControlAccountUnavailable".into()))?;
+    let expected_hash = format!("{:x}", Sha256::digest(account_id.as_bytes()));
+    client.codex_remote_control_pair_start(&expected_hash)
 }
 
 #[tauri::command]
@@ -581,6 +605,18 @@ pub fn select_remote_official_execution_account(
         &format!("official-execution-select-{}", ulid::Ulid::new()),
         &account_id_hash,
     )
+}
+
+#[tauri::command]
+pub fn clear_remote_official_execution_account_selection(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> AppResult<serde_json::Value> {
+    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+    crate::remote::RemoteAgentClient::new(target).proxy_official_account_clear_selection(&format!(
+        "official-execution-clear-{}",
+        ulid::Ulid::new()
+    ))
 }
 
 #[tauri::command]

@@ -35,6 +35,10 @@ const ja: ResourceTree = {
       "title": "ログ",
       "blurb": "Token 統計とリクエスト履歴"
     },
+    "updates": {
+      "label": "更新",
+      "blurb": "すべての更新を確認・ダウンロード・適用"
+    },
     "settings": {
       "label": "設定",
       "title": "設定",
@@ -138,7 +142,7 @@ const ja: ResourceTree = {
       "dashboard": { "title": "ダッシュボードの Provider 表示", "note": "{{count}} 件を選択中。現況ページの表示だけに影響し、Provider の有効化・無効化は行いません。", "disabledVisible": "表示（無効）" },
       "restore": { "title": "Codex の初期設定を復元", "description": "Vellum が Codex に書き込んだ Proxy URL、boundary key、モデルカタログの項目を削除し、元の既定 Provider に戻します。既存の Vellum のチャットをネイティブ Codex で開けるよう、Proxy を介さず OpenAI に直接接続する Provider は残します。ログイン情報、チャット、プロジェクトのグループ、ワークスペースのデータは変更しません。", "action": "Codex の初期設定を復元", "cleared": "復元済み", "result": "結果", "nothingToClear": "Codex に復元対象の Vellum 設定はありません", "preserved": "変更なし：{{items}}。" },
       "enhancedRuntime": {"title": "Enhanced Codex Runtime", "description": "サードパーティ Provider の新しい会話は Enhanced Codex で実行されます。OpenAI 公式モデルはネイティブの Codex Runtime のままです。実行先を切り替えるには新しい会話が必要です。", "desiredState": "要求された状態", "desiredEnabled": "有効化を要求", "desiredDisabled": "無効化を要求", "activation": {"disabled": "無効", "artifactBlocked": "実行ファイルの検証に失敗", "awaitingDesktopRestart": "Codex Desktop の再起動待ち", "active": "有効", "disablePendingRestart": "無効化を要求済み、再起動待ち", "environmentDrift": "引き取り状態が一致しません", "failed": "Bridge の起動に失敗"}, "environment": {"leased": "Vellum がリースして保持中", "released": "引き取っていません", "orphanedBridge": "旧バージョンの Vellum bridge が残っています", "foreignValue": "他のツールが設定した値。Vellum は上書きしていません", "unreadable": "ユーザー環境変数を読み取れません"}, "environmentValue": "現在の CODEX_CLI_PATH", "environmentUnset": "未設定", "staleBridge": "このパスは旧バージョンの Vellum が残した bridge で、このビルドが使うものではありません。「無効化して引き取りを解除」で消してから、もう一度有効化してください。", "launchDetail": "{{launchId}} · {{state}} · bridge {{bridgePid}} · Official {{officialPid}} · Enhanced {{enhancedPid}}", "officialBinary": "公式 Codex core", "officialBinaryHint": "インストール済みの Codex Desktop から検出します。Desktop が実際に実行するものと同一である必要があるため、変更できません。", "enhancedBinary": "Enhanced Codex core", "bridgeBinary": "App Server bridge", "bridgeBinaryHint": "この Vellum ビルドに同梱され、ハッシュが埋め込まれています。差し替えはできません。", "protocol": {"label": "プロトコル検査", "unavailable": "検査できません", "details": "差分と診断（{{count}}）", "routed": "ルーティング", "verdict": {"verified": "固定した版と一致", "unverified": "使用可能だが正確性は保証されない", "incompatible": "非互換、フォールバック済み"}, "mean": {"verified": "この Vellum が固定した組み合わせそのもので、プロトコルはバイト単位で同一です。", "unverified": "この Codex Desktop 版は誰も検証していません。bridge が振り分けに使うメソッドはすべて存在するためルーティングは健全ですが、下記の差分は実在する未テストのものです。", "incompatible": "Codex Desktop が bridge の振り分けに必須のメソッドを変更しました。縮退運用の余地がありません。"}, "delta": {"shapeIncompatible": "{{subject}} の wire 形式を相手側が受け取れません：{{fields}}", "shapeUnverified": "{{subject}} の wire 形式はこの検査では判定できません：{{fields}}", "methodUnservable": "Desktop が {{subject}} を呼ぶ可能性がありますが、Enhanced core は未実装です", "methodUnknownToDesktop": "Enhanced core が {{subject}} を送る可能性がありますが、Desktop はもう宣言していません", "fieldNewlyRequired": "Desktop は {{subject}} の {{fields}} を必須にしましたが、Enhanced core は送出しません", "fieldRemoved": "Desktop は {{subject}} の {{fields}} を送らなくなりましたが、Enhanced core はそれを読みます"}, "fallback": "ネイティブ Codex に戻りました。Codex 自体は正常に動作しますが、Enhanced の機能は一切ありません。"}, "protocolHash": "App Server プロトコル", "observedBridge": "実際に動作中の bridge", "unverified": "未検証", "details": "技術詳細と診断情報", "runInstalledGate": "インストール版の検証をやり直す", "installedGateHint": "1 回の再起動より深い検証です。Codex Desktop を再起動し、インストール版 gate 一式を実行してレポートを残します。", "lastQualification": "前回の検証", "qualificationPassed": "{{mode}} は合格、昇格できます", "qualificationComponentOnly": "{{mode}} はコンポーネント試験に合格しましたが、実機昇格の基準には未達です", "qualificationFailed": "{{mode}} は不合格 —— {{detail}}", "qualificationReport": "レポート", "planeTitle": "各ルートが今どちらで動いているか", "contextNote": "圧縮は会話を実行する runtime 自身の責任です。公式経路は Official Codex のネイティブ圧縮、サードパーティ経路は Enhanced Codex のローカル圧縮とコンテキスト回復を使います。Vellum は独自の圧縮ポリシーを適用しません。", "planeOfficial": "Official Codex · ネイティブ圧縮", "planeEnhanced": "Enhanced Codex · ローカル圧縮とコンテキスト回復", "planeUnbound": "Enhanced Codex に未バインド", "activationLabel": "有効化の状態", "environmentLabel": "引き継ぎの状態", "inject": {"on": "注入済み", "off": "未注入", "working": "注入中", "switchLabel": "Enhanced Codex Runtime を注入する", "mean": {"staleLaunch": "Codex Desktop は現在 Enhanced を経由していますが、以前の起動時の設定で動いています。最新の設定を反映するには Codex Desktop を再起動してください。", "on": "Codex Desktop は Vellum の bridge 上で動いています。サードパーティ Provider の新しいスレッドは Enhanced Codex が実行し、OpenAI 公式モデルはネイティブ Codex のままです。", "off": "Codex Desktop はネイティブ Codex で動いています。CODEX_CLI_PATH に Vellum は触れていません。", "wanted": "Vellum 側の設定は済んでいますが、Codex Desktop がまだ引き受けていないため、動いているのはネイティブ Codex のままです。", "working": "実行ファイルを検証し、CODEX_CLI_PATH を引き継ぎ、Codex Desktop を再起動しています。", "armed": "Codex Desktop を起動し直すと有効になります。"}, "blocked": {"proxyStopped": "Proxy が起動していません。Proxy が動いていない間、Vellum は起動パスを引き継ぎません —— そうしないと Codex Desktop が背後にデータプレーンのない bridge で起動してしまいます。先に Proxy を起動してください。", "stuck": "注入を要求しましたが、起動パスが引き継がれていません。どこで止まったかは下のターミナルにあります。スイッチをもう一度切り替えると再試行します。", "noCore": "この Vellum ビルドに Enhanced Codex core が含まれていません。設定の入れ忘れではなく、core はビルドに同梱されるものなので、無い場合はインストールが不完全です。Vellum を再インストールしてください。"}}, "term": {"idle": "まだ実行していません。上のスイッチを切り替えると、各ステップがここに表示されます。", "verify": "Enhanced Codex 実行ファイルを照合", "verifyOk": "ファイルの中身がこのバージョンの想定どおり", "verifyFailed": "照合に通りませんでした。何も変更していません", "restart": "CODEX_CLI_PATH を引き継ぎ、Codex Desktop を再起動", "restartBack": "Codex Desktop をネイティブ Runtime に戻して再起動", "restartRefused": "再起動しませんでした", "adopt": "Codex Desktop が bridge を引き受けたか確認", "injected": "注入済み · {{profile}}", "notInjected": "Codex Desktop が bridge を引き受けませんでした", "release": "CODEX_CLI_PATH を解放", "releasedOk": "解放しました。Codex Desktop はネイティブ Runtime に戻りました", "envUnset": "（未設定）", "preflight": "前提条件を確認", "proxyStopped": "Proxy が起動していないため、引き継ぎは解放されます。先に Proxy を起動してください。", "armed": "起動パスを引き継ぎました。次に Codex Desktop を起動したときから有効になります。", "alreadyInjected": "Codex Desktop はすでにこの bridge 上で動いています。再起動は不要です · {{profile}}", "missingHelper": "ヘルパー {{name}} がありません"}, "missingHelpers": "公式インストールにあるヘルパー実行ファイルが、この Enhanced core の隣にありません：{{names}}。Codex は実行時に自分の隣を探し、見つからないと Windows の「見つかりません」ダイアログになります。スレッドとルーティングには影響しません。壊れるのはそのヘルパーを使う機能だけです —— サンドボックスの shell コマンドには codex-windows-sandbox-setup.exe と codex-command-runner.exe が、code mode には codex-code-mode-host.exe が必要です。code mode は既定でオフで、オフのままなら影響はありません。", "enhancedBinaryHint": "この Vellum ビルドに同梱され、enhanced-runtime.lock.json のハッシュと 1 バイトずつ照合されます。別のファイルは検証に失敗するだけなので、選択肢としては提供しません。", "coreMissing": "このビルドには含まれていません"},
-      "updates": { "title": "ソフトウェア更新", "description": "デスクトップ、Remote パッケージ、Enhanced core は独立して更新できます。ダウンロード済みの更新は、適用条件を満たすまで待機します。", "liveDisabled": "リリース署名が設定されるまで、自動更新は無効です。", "actionFailed": "更新操作に失敗しました：{{error}}", "autoCheck": "更新を自動で確認", "autoDownload": "更新を自動でダウンロード", "channel": "チャンネル", "stable": "安定版", "preview": "プレビュー版", "current": "現在のバージョン", "available": "利用可能なバージョン", "none": "なし", "progress": "ダウンロードの進捗", "applyWhen": "適用条件", "notes": "リリースノート", "failure": "失敗理由", "check": "更新を確認", "download": "ダウンロード", "apply": "適用", "cancel": "ダウンロードを中止", "rollback": "ロールバック", "hosts": "ホスト", "idleAuto": "アイドル時に自動更新", "idleHandoff": "プレビュー：アイドル時に Enhanced core を適用（既定はオフ）", "layerDisabled": "このレイヤーの更新は、現在のビルドでは有効になっていません。", "layer": { "desktop": "Vellum 本体", "remote": "Remote パッケージ", "core": "Enhanced Codex core" }, "condition": { "restartVellum": "準備完了。Vellum を再起動すると適用されます。", "hostIdle": "ダウンロード済み。ホストがアイドルになるのを待っています。", "nextCoreStart": "ダウンロード済み。次回のコア起動時に適用します。", "download": "ダウンロードして待機させます。", "failed": "失敗理由を確認してください。", "idle": "最新です。", "checking": "確認中…", "available": "更新があります。", "downloading": "ダウンロード中…", "verifying": "検証中…", "staged": "ステージ済み。", "waitingForIdle": "アイドル待ち。", "waitingForRestart": "再起動待ち。", "applying": "適用中…", "validating": "検証中…", "applied": "適用済み。", "blocked": "ブロック済み。", "rolledBack": "ロールバック済み。" }, "phase": { "idle": "待機", "checking": "確認中", "available": "利用可能", "downloading": "ダウンロード中", "verifying": "検証中", "staged": "ステージ済み", "waitingForIdle": "アイドル待ち", "waitingForRestart": "次回起動時に適用", "applying": "適用中", "validating": "検証中", "applied": "適用済み", "blocked": "ブロック済み", "failed": "失敗", "rolledBack": "ロールバック済み" } },
+      "updates": { "title": "ソフトウェア更新", "panelHint": "現在のページを切り替えずに開くグローバル更新パネルです。", "overall": "全体更新", "overallHint": "Vellum 本体、Remote パッケージ、Enhanced core を一括で確認して適用を予約します。", "checkAll": "すべて確認", "updateAll": "すべて更新", "updatingAll": "すべてのコンポーネントを更新中…", "experimentalParts": "試験運用：個別更新", "experimentalPartsHint": "個別コンポーネントのテスト、キャンセル、ロールバックが必要な場合のみ使用します。", "description": "デスクトップ、Remote パッケージ、Enhanced core は独立して更新できます。ダウンロード済みの更新は、適用条件を満たすまで待機します。", "liveDisabled": "リリース署名が設定されるまで、自動更新は無効です。", "actionFailed": "更新操作に失敗しました：{{error}}", "autoCheck": "更新を自動で確認", "autoDownload": "更新を自動でダウンロード", "channel": "チャンネル", "stable": "安定版", "preview": "プレビュー版", "current": "現在のバージョン", "available": "利用可能なバージョン", "none": "なし", "progress": "ダウンロードの進捗", "applyWhen": "適用条件", "notes": "リリースノート", "failure": "失敗理由", "check": "更新を確認", "download": "ダウンロード", "apply": "適用", "cancel": "ダウンロードを中止", "rollback": "ロールバック", "hosts": "ホスト", "idleAuto": "アイドル時に自動更新", "idleHandoff": "プレビュー：アイドル時に Enhanced core を適用（既定はオフ）", "layerDisabled": "このレイヤーの更新は、現在のビルドでは有効になっていません。", "layer": { "desktop": "Vellum 本体", "remote": "Remote パッケージ", "core": "Enhanced Codex core" }, "condition": { "restartVellum": "準備完了。Vellum を再起動すると適用されます。", "hostIdle": "ダウンロード済み。ホストがアイドルになるのを待っています。", "nextCoreStart": "ダウンロード済み。次回のコア起動時に適用します。", "download": "ダウンロードして待機させます。", "failed": "失敗理由を確認してください。", "idle": "最新です。", "checking": "確認中…", "available": "更新があります。", "downloading": "ダウンロード中…", "verifying": "検証中…", "staged": "ステージ済み。", "waitingForIdle": "アイドル待ち。", "waitingForRestart": "再起動待ち。", "applying": "適用中…", "validating": "検証中…", "applied": "適用済み。", "blocked": "ブロック済み。", "rolledBack": "ロールバック済み。" }, "phase": { "idle": "待機", "checking": "確認中", "available": "利用可能", "downloading": "ダウンロード中", "verifying": "検証中", "staged": "ステージ済み", "waitingForIdle": "アイドル待ち", "waitingForRestart": "次回起動時に適用", "applying": "適用中", "validating": "検証中", "applied": "適用済み", "blocked": "ブロック済み", "failed": "失敗", "rolledBack": "ロールバック済み" } },
       "advanced": { "title": "詳細設定", "description": "リクエストの受付停止、安全な Codex の再起動、モデルカタログのロールバックを、トラブルシューティングと保守向けに提供します。", "activeRequests": "実行中のリクエスト", "drainTitle": "新しいリクエストを受け付けない", "draining": "新しいリクエストを停止し、既存の完了を待機中", "accepting": "通常どおりリクエストを受付中", "drainHint": "実行中のリクエストは中断しません。有効中は手動で再開するまで新規リクエストを拒否します。", "resume": "リクエスト受付を再開", "stop": "新しいリクエストを停止", "catalogVersion": "現在のカタログバージョン", "notCreated": "未作成", "restartTitle": "Codex を再起動", "restartHint": "既存リクエストを安全に完了してから Codex を再起動します。", "restartAction": "Codex を再起動", "restartAnyway": "それでも再起動", "guideTitle": "初期設定ガイド", "guideHint": "現在の設定をリセットせずに、初回ガイドの再確認や Provider の追加を行います。", "guideAction": "設定ガイドを開く", "catalogHistory": "モデルカタログの履歴", "rollback": "復元", "noVersions": "復元可能なバージョンはありません。モデルカタログ更新時に自動保存されます。", "restartRequired": "再起動後に有効", "applied": "適用済み" },
       "logs": { "title": "診断ログ", "description": "Vellum、Proxy、Enhanced Runtime が保持するテキストログを ZIP に書き出します。キー、トークン、ユーザーパスは再度マスクされ、認証情報、設定、チャット履歴、データベースは含まれません。", "export": "全ログを ZIP で書き出す", "exporting": "書き出し中…", "exported": "{{path}} に書き出しました", "hint": "ZIP はダウンロードフォルダーに保存され、ファイル一覧と切り詰め記録が含まれます。" },
       "app": { "title": "アプリケーション操作", "exit": "Vellum を終了", "exitHint": "終了すると Proxy を停止して Codex の元の接続設定を復元します。チャットとプロジェクトには影響しません。" },
@@ -458,7 +462,10 @@ const ja: ResourceTree = {
       "chatgptActivate": "デスクトップで選択した ChatGPT アカウントを有効化",
       "chatgptPairRow": "ペアリング", "chatgptActivateRow": "使用", "chatgptPairAll": "デスクトップの ChatGPT アカウントをすべてペアリング",
       "chatgptPairSkip": "このアカウントをスキップ",
+      "chatgptAuthorize": "リモートで認証",
+      "chatgptReauthenticate": "再ログイン",
       "executionLogin": "Official 実行アカウントを追加",
+      "executionFollowControl": "モデル要求を Remote Control アカウントに追従",
       "executionSelect": "モデル要求に使用",
       "executionRemove": "実行アカウントを削除",
       "devicePair": "このスマートフォンをペアリング"
@@ -551,6 +558,7 @@ const ja: ResourceTree = {
       "nativeDaemonAppOwned": "Codex App がこのホストの app-server を直接使っているため、Vellum が引き継げません。",
       "noModelsSelected": "モデルが 1 つも選ばれていないため、同期するものがありません。",
       "officialAccountActivationRequired": "リモートの ChatGPT アカウントはペアリング済みですが、まだ有効化されていません。",
+      "officialAccountReauthenticationRequired": "リモートの ChatGPT 認証情報が期限切れです。再ログインしてください。",
       "officialAccountPairingRequired": "デスクトップで選択した ChatGPT アカウントが、リモートとまだペアリングされていません。",
       "proxyConfigurationMissing": "ホストにはまだ Proxy の設定がありません。",
       "proxyConfigurationSchemaTooNew": "ホスト上の Proxy 設定は、この Vellum が理解できるより新しい形式です。上書きを避けるためデプロイをブロックしています — 先に Vellum を更新してください。",
@@ -650,13 +658,17 @@ const ja: ResourceTree = {
       }
     },
     "account": {
-      "title": "アカウント",
+      "title": "ChatGPT アカウント",
+      "catalogHint": "Desktop のアカウントとこのホスト上の認証状態",
       "chatgptUnavailable": "読み取れません",
       "chatgpt": {
+        "ready": "リモート認証情報は使用可能",
         "synchronized": "同期済み",
         "pairingRequired": "ペアリングが必要",
         "pairingPending": "ペアリング中",
         "activationRequired": "有効化が必要",
+        "reauthenticationRequired": "認証情報が期限切れ",
+        "accountUnavailable": "リモートでアカウントが未選択",
         "desktopAccountUnavailable": "デスクトップ側でアカウント未選択"
       },
       "grokReady": "{{account}} でログイン済み、refresh timer 稼働中",
@@ -669,24 +681,35 @@ const ja: ResourceTree = {
       "pairingMissing": "このホストでは未ペアリング",
       "pairingUnknown": "読み取れません",
       "desktopDefault": "デスクトップの既定",
+      "desktopCurrent": "現在の Desktop Codex アカウント",
+      "credentialReady": "リモート認証情報は使用可能",
+      "credentialExpired": "リモート認証情報が期限切れ",
+      "credentialMissing": "リモートで未認証",
       "grokDeviceLogin": "Grok デバイスログイン：",
       "grokWaitingUrl": "URL を待っています…",
       "grokStarting": "Grok CLI を待機中…"
     },
     "control": {
       "title": "Remote コントロール",
-      "identity": "コントロールアカウント A",
+      "identity": "使用アカウント",
+      "status": "認証状態",
+      "choose": "Remote Control アカウントを選択",
+      "credentialExpired": "このアカウントのリモート認証情報は期限切れです。ID は一致していますが、モデル要求や Remote Control の認証に失敗する可能性があります。",
       "sameAccountHint": "Desktop とスマートフォンは同じ ChatGPT アカウントと workspace を使う必要があります。ペアリングしても、リモート daemon の ID は変わりません。",
       "deviceHint": "短時間だけ有効なデバイスペアリング情報：",
       "expiresAt": "{{when}} に失効"
     },
     "execution": {
-      "title": "Proxy 実行アカウント",
-      "independentHint": "Official 実行アカウント B はモデル要求だけに使用されます。選択しても Remote コントロールの状態は変わらず、切断もされません。",
+      "title": "公式モデル実行アカウント",
+      "identity": "モデル要求で使用",
+      "followControl": "Remote Control アカウントに追従",
+      "independentHint": "公式モデル要求に使うアカウントとクォータだけを選びます。Remote Control の ID は変わりません。",
+      "inheritedCredentialExpired": "現在は Remote Control アカウントに追従していますが、そのリモート認証情報は期限切れです。再ログインするか、独立したモデル実行アカウントを選択してください。",
       "empty": "Vellum 管理の Official 実行アカウントはありません。",
       "selected": "選択中",
       "select": "選択",
       "remove": "削除",
+      "removeSelected": "選択中の独立実行アカウントを削除",
       "namePlaceholder": "Official アカウントの表示名",
       "loginHint": "Official デバイスログインを完了："
     },

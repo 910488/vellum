@@ -29,6 +29,7 @@ const apiMocks = vi.hoisted(() => ({
   startRemoteOfficialExecutionAccountLogin: vi.fn(),
   pollRemoteOfficialExecutionAccountLogin: vi.fn(),
   selectRemoteOfficialExecutionAccount: vi.fn(),
+  clearRemoteOfficialExecutionAccountSelection: vi.fn(),
   removeRemoteOfficialExecutionAccount: vi.fn(),
   startRemoteControlPairing: vi.fn(),
   planRemoteDeployment: vi.fn(),
@@ -437,7 +438,7 @@ describe("Remote Manager operations UI", () => {
     expect(screen.getByRole("button", { name: "安全停止並重試" })).toBeTruthy();
   });
 
-  it("pairs the desktop-selected ChatGPT identity without exposing a token", async () => {
+  it("authorizes a selected Desktop account without exposing a token", async () => {
     const pairingStatus: RemoteHostStatus = {
       ...status,
       chatgpt: {
@@ -451,6 +452,13 @@ describe("Remote Manager operations UI", () => {
       },
     };
     apiMocks.inspectRemoteHost.mockResolvedValue(pairingStatus);
+    apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([
+      {
+        accountId: "acct-windows", email: "owner@example.com", workspaceName: "Personal",
+        isDesktopDefault: true, paired: false, active: false, credentialState: "missing",
+        expiresAt: null, detail: null,
+      },
+    ]);
     apiMocks.startRemoteCodexAccountLogin.mockResolvedValue({
       loginId: "login-1",
       verificationUrl: "https://auth.openai.com/device",
@@ -460,11 +468,9 @@ describe("Remote Manager operations UI", () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "配對桌面端選定的 ChatGPT 帳號" }));
-    // 單一帳號那條路不帶 account id：後端會落回 Desktop 目前的預設帳號，
-    // 這正是「保留原本一次配對一個」的意思。
+    fireEvent.click(await screen.findByRole("button", { name: "授權到遠端" }));
     await waitFor(() => expect(apiMocks.startRemoteCodexAccountLogin)
-      .toHaveBeenCalledWith("jetson", undefined));
+      .toHaveBeenCalledWith("jetson", "acct-windows"));
     expect(open).toHaveBeenCalledWith(
       "https://auth.openai.com/device",
       "_blank",
@@ -472,6 +478,54 @@ describe("Remote Manager operations UI", () => {
     );
     expect(await screen.findByText("ABCD-EFGH")).toBeTruthy();
     expect(screen.queryByText(/refresh_token|access_token/)).toBeNull();
+  });
+
+  it("marks an expired Remote Control credential and starts reauthentication for that account", async () => {
+    apiMocks.inspectRemoteHost.mockResolvedValue({
+      ...status,
+      chatgpt: {
+        ...status.chatgpt,
+        state: "reauthenticationRequired",
+        credentialState: "expired",
+        expiresAt: 1_786_656_000,
+      },
+    });
+    apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([
+      {
+        accountId: "acct-windows", email: "owner@example.com", workspaceName: "Personal",
+        isDesktopDefault: true, paired: true, active: true, credentialState: "expired",
+        expiresAt: 1_786_656_000, detail: null,
+      },
+    ]);
+    apiMocks.startRemoteCodexAccountLogin.mockResolvedValue({
+      loginId: "login-refresh",
+      verificationUrl: "https://auth.openai.com/device",
+      userCode: "REAUTH-1",
+      expectedAccountId: "acct-windows",
+    });
+    vi.spyOn(window, "open").mockImplementation(() => null);
+    renderRemote();
+
+    expect(await screen.findByText(/這個帳號的遠端憑證已過期/)).toBeTruthy();
+    fireEvent.click(screen.getAllByRole("button", { name: "重新登入" })[0]!);
+    await waitFor(() => expect(apiMocks.startRemoteCodexAccountLogin)
+      .toHaveBeenCalledWith("jetson", "acct-windows"));
+    expect(await screen.findByText("REAUTH-1")).toBeTruthy();
+  });
+
+  it("treats the active auth file as authorized even before a managed slot exists", async () => {
+    apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([
+      {
+        accountId: "acct-windows", email: "owner@example.com", workspaceName: "Personal",
+        isDesktopDefault: true, paired: false, active: true, credentialState: "valid",
+        expiresAt: 1_800_000_000, detail: null,
+      },
+    ]);
+    renderRemote();
+
+    expect(await screen.findByText("遠端憑證可用")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "授權到遠端" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "配對桌面端全部 ChatGPT 帳號" })).toBeNull();
   });
 
   /**
@@ -914,7 +968,19 @@ describe("Remote Manager operations UI", () => {
     expect(screen.getByText("Old Broker Box")).toBeTruthy();
   });
 
-  it("separates fixed Remote control A from selectable Official execution B", async () => {
+  it("exposes independent Remote Control and Official execution account selectors", async () => {
+    apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([
+      {
+        accountId: "acct-a", email: "control-a@example.com", workspaceName: "Personal",
+        isDesktopDefault: true, paired: true, active: true, credentialState: "valid",
+        expiresAt: 1_800_000_000, detail: null,
+      },
+      {
+        accountId: "acct-b", email: "control-b@example.com", workspaceName: "Team",
+        isDesktopDefault: false, paired: true, active: false, credentialState: "valid",
+        expiresAt: 1_800_000_000, detail: null,
+      },
+    ]);
     apiMocks.listRemoteOfficialExecutionAccounts.mockResolvedValue([
       { accountIdHash: "a".repeat(64), displayName: "Official B1", authenticatedAt: "2026-08-11T00:00:00Z", selected: true },
       { accountIdHash: "b".repeat(64), displayName: "Official B2", authenticatedAt: "2026-08-10T00:00:00Z", selected: false },
@@ -925,10 +991,16 @@ describe("Remote Manager operations UI", () => {
     expect(screen.getByText(/Desktop 與手機必須使用相同/)).toBeTruthy();
     expect(screen.getByText("Official B1")).toBeTruthy();
     expect(screen.getByText("Official B2")).toBeTruthy();
-    expect(screen.queryByText("配對新帳號")).toBeNull();
+    const controlSelector = await screen.findByDisplayValue("control-a@example.com · Personal");
+    fireEvent.change(controlSelector, { target: { value: "acct-b" } });
+    await waitFor(() => expect(apiMocks.activateRemoteCodexAccount).toHaveBeenCalledWith("jetson", "acct-b"));
 
-    fireEvent.click(screen.getByText("選用"));
+    const executionSelector = screen.getByDisplayValue("Official B1");
+    fireEvent.change(executionSelector, { target: { value: "b".repeat(64) } });
     await waitFor(() => expect(apiMocks.selectRemoteOfficialExecutionAccount).toHaveBeenCalledWith("jetson", "b".repeat(64)));
+
+    fireEvent.change(executionSelector, { target: { value: "control" } });
+    await waitFor(() => expect(apiMocks.clearRemoteOfficialExecutionAccountSelection).toHaveBeenCalledWith("jetson"));
   });
 
   it("starts an isolated Official execution login and polls by opaque login id", async () => {

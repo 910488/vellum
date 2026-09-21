@@ -52,6 +52,10 @@ function formatBytes(value: number | null | undefined, unknown: string): string 
   return `${current.toFixed(current >= 100 ? 0 : 1)} ${units[index]}`;
 }
 
+function matchesRemoteControlReady(state: string | null | undefined): boolean {
+  return state === "ready" || state === "synchronized";
+}
+
 /** 需要確認才動手的動作。每一個都對應一個固定三格事實的確認視窗。 */
 type PendingKind =
   | "bootstrap"
@@ -105,6 +109,7 @@ export function Remote({
      權威值放 ref：推進隊列的是輪詢 effect 裡的 callback，讀 state 會讀到建立
      那一輪的舊值。state 只負責畫「還剩幾個」。 */
   const pairQueue = useRef<string[]>([]);
+  const pairQueueRestoreAccount = useRef<string | null>(null);
   const [pairQueueLength, setPairQueueLength] = useState(0);
   const [resumeBootstrapAfterPairing, setResumeBootstrapAfterPairing] = useState(false);
   // Remote control identity A stays synchronized with Desktop. Official
@@ -401,6 +406,7 @@ export function Remote({
         }).catch((cause) => {
           setChatgptLogin(null);
           pairQueue.current = [];
+          pairQueueRestoreAccount.current = null;
           setPairQueueLength(0);
           setDiscoveryError(String(cause));
         });
@@ -449,12 +455,14 @@ export function Remote({
     ? "remote.act.bootstrap"
     : "remote.act.reconverge";
   // 只翻譯認得的狀態。後端多出一個新的值時顯示原碼，不假裝看得懂。
-  const CHATGPT_STATES = ["synchronized", "pairingRequired", "pairingPending", "activationRequired", "desktopAccountUnavailable"];
+  const CHATGPT_STATES = ["ready", "synchronized", "pairingRequired", "pairingPending", "activationRequired", "reauthenticationRequired", "accountUnavailable", "desktopAccountUnavailable"];
   const chatgptStateLabel = !chatgpt
     ? t("remote.account.chatgptUnavailable")
     : CHATGPT_STATES.includes(chatgpt.state)
       ? t(`remote.account.chatgpt.${chatgpt.state}`)
       : chatgpt.state;
+  const activeControlAccount = pairings.find((row) => row.active) ?? null;
+  const selectedExecutionAccount = executionAccounts.find((account) => account.selected) ?? null;
 
   async function run(actionKey: string, work: () => Promise<void>) {
     if (busyRef.current !== null) return;
@@ -598,8 +606,11 @@ export function Remote({
     }
   }
 
-  function pairChatGpt(accountId?: string) {
+  function pairChatGpt(accountId?: string, makeActive = true) {
     if (!selectedHostId) return;
+    pairQueueRestoreAccount.current = makeActive
+      ? accountId ?? pairings.find((row) => row.isDesktopDefault)?.accountId ?? null
+      : activeControlAccount?.accountId ?? null;
     void run("remote.act.chatgptPair", async () => {
       const login = await api.startRemoteCodexAccountLogin(selectedHostId, accountId);
       setResumeBootstrapAfterPairing(Boolean(operation?.message?.includes("officialAccount")));
@@ -618,8 +629,9 @@ export function Remote({
     const next = pairQueue.current.shift();
     setPairQueueLength(pairQueue.current.length);
     if (!next) {
-      const preferred = pairings.find((row) => row.isDesktopDefault);
-      if (preferred) await api.activateRemoteCodexAccount(hostId, preferred.accountId).catch(() => {});
+      const restoreAccount = pairQueueRestoreAccount.current;
+      pairQueueRestoreAccount.current = null;
+      if (restoreAccount) await api.activateRemoteCodexAccount(hostId, restoreAccount).catch(() => {});
       return false;
     }
     const login = await api.startRemoteCodexAccountLogin(hostId, next);
@@ -631,8 +643,11 @@ export function Remote({
   /** 把 Desktop 上尚未在這台主機配對的帳號排成一列，一次帶完。 */
   function pairAllChatGptAccounts() {
     if (!selectedHostId) return;
-    const pending = pairings.filter((row) => !row.paired && !row.detail).map((row) => row.accountId);
+    const pending = pairings
+      .filter((row) => ((!row.paired && !row.active) || row.credentialState === "expired") && !row.detail)
+      .map((row) => row.accountId);
     if (!pending.length) return;
+    pairQueueRestoreAccount.current = activeControlAccount?.accountId ?? null;
     pairQueue.current = pending;
     setPairQueueLength(pending.length);
     void run("remote.act.chatgptPairAll", async () => {
@@ -658,6 +673,16 @@ export function Remote({
     });
   }
 
+  function selectRemoteControlAccount(accountId: string) {
+    const account = pairings.find((row) => row.accountId === accountId);
+    if (!account || account.detail) return;
+    if ((!account.paired && !account.active) || account.credentialState === "expired") {
+      pairChatGpt(account.accountId, true);
+      return;
+    }
+    if (!account.active) activateChatGpt(account.accountId);
+  }
+
   function addOfficialExecutionAccount() {
     if (!selectedHostId) return;
     const name = executionDisplayName.trim();
@@ -676,6 +701,18 @@ export function Remote({
       await api.selectRemoteOfficialExecutionAccount(selectedHostId, accountIdHash);
       await loadExecutionAccounts(selectedHostId);
     });
+  }
+
+  function selectOfficialExecutionRoute(value: string) {
+    if (!selectedHostId) return;
+    if (value === "control") {
+      void run("remote.act.executionFollowControl", async () => {
+        await api.clearRemoteOfficialExecutionAccountSelection(selectedHostId);
+        await loadExecutionAccounts(selectedHostId);
+      });
+      return;
+    }
+    selectOfficialExecutionAccount(value);
   }
 
   function removeOfficialExecutionAccount(accountIdHash: string) {
@@ -1016,16 +1053,11 @@ export function Remote({
               )}
             </div>
 
-            {/* ---------- 帳號 ----------
-                ChatGPT 與 Grok 是同一類事（誰來付這次 turn 的帳），
-                所以擺在一起。上一版把「部署 Grok 登入」跟「Restart native」
-                排在同一排 —— 一個是帳號設定，一個是重啟服務程序。 */}
+            {/* ---------- ChatGPT account catalog ---------- */}
             <Card>
               <div className="rowline">
                 <Cap>{t("remote.account.title")}</Cap>
-                {/* 一句整體結論。逐一列出每個帳號之後，「ChatGPT: 已同步」
-                    這一列就不再是資訊而是重複，所以它退成標題旁的註記。 */}
-                <span className="rows__hint">{chatgptStateLabel}</span>
+                <span className="rows__hint">{t("remote.account.catalogHint")}</span>
               </div>
               {chatgptLogin ? (
                 <Notice
@@ -1041,46 +1073,36 @@ export function Remote({
                   {pairQueueLength ? <> · {t("remote.account.pairingRemaining", { remaining: pairQueueLength })}</> : null}
                 </Notice>
               ) : null}
-              {/* 每個 Desktop 帳號一列。`paired` 講的是「這台主機自己有沒有那個
-                  帳號的 grant」——不是 Desktop 有沒有。兩邊各持一份是刻意的，
-                  一份 grant 沒辦法給兩個客戶端共用。 */}
               {pairings.length ? (
                 <div className="accounts">
                   {pairings.map((row) => (
-                    <div className={`accounts__row${row.active ? " accounts__row--active" : ""}`} key={row.accountId}>
+                    <div className="accounts__row" key={row.accountId}>
                       <span className="accounts__who">
                         <b>{row.email ?? row.accountId}</b>
                         {row.workspaceName ? (
                           <small className="rows__hint">{row.workspaceName}</small>
                         ) : null}
-                        {/* 桌面端預設刻意不做成 pill —— 它不是狀態，是「Vellum
-                            UI 切帳號時會推的是這一個」。跟狀態長得一樣就會被
-                            當成第二種狀態讀。 */}
                         {row.isDesktopDefault ? (
-                          <small className="rows__hint">{t("remote.account.desktopDefault")}</small>
+                          <small className="rows__hint">{t("remote.account.desktopCurrent")}</small>
                         ) : null}
                         {row.detail ? <small className="accounts__why">{row.detail}</small> : null}
                       </span>
                       <State
-                        tone={row.detail ? "quiet" : row.active ? "ok" : row.paired ? "warn" : "quiet"}
+                        tone={row.detail ? "quiet" : row.credentialState === "expired" ? "warn" : row.paired || row.active ? "ok" : "quiet"}
                         label={row.detail
                           ? t("remote.account.pairingUnknown")
-                          : row.active
-                            ? t("remote.account.pairingActive")
-                            : row.paired
-                              ? t("remote.account.pairingPaired")
-                              : t("remote.account.pairingMissing")}
+                          : row.credentialState === "expired"
+                            ? t("remote.account.credentialExpired")
+                            : row.paired || row.active
+                              ? t("remote.account.credentialReady")
+                              : t("remote.account.credentialMissing")}
                       />
-                      {/* 動作欄永遠在，沒有動作時是空的 —— 不然有按鈕的那幾列
-                          會把狀態往左推，整批就對不齊了。 */}
                       <span className="accounts__act">
-                        {row.detail || row.active ? null : row.paired ? (
-                          <Btn mini soft onClick={() => activateChatGpt(row.accountId)} disabled={busy !== null}>
-                            {t("remote.act.chatgptActivateRow")}
-                          </Btn>
-                        ) : (
-                          <Btn mini soft onClick={() => pairChatGpt(row.accountId)} disabled={busy !== null || Boolean(chatgptLogin)}>
-                            {t("remote.act.chatgptPairRow")}
+                        {row.detail || ((row.paired || row.active) && row.credentialState !== "expired") ? null : (
+                          <Btn mini soft onClick={() => pairChatGpt(row.accountId, false)} disabled={busy !== null || Boolean(chatgptLogin)}>
+                            {row.credentialState === "expired"
+                              ? t("remote.act.chatgptReauthenticate")
+                              : t("remote.act.chatgptAuthorize")}
                           </Btn>
                         )}
                       </span>
@@ -1088,61 +1110,49 @@ export function Remote({
                   ))}
                 </div>
               ) : null}
-              {/* Grok 是另一家的帳號，跟上面那批 ChatGPT 不同類，所以它自己
-                  一列，不混進登記簿裡。 */}
-              <Rows>
-                <Row label="Grok">
-                  {grok?.detachedQualified
-                    ? t("remote.account.grokReady", { account: grok.account ?? "" })
-                    : grok?.configured
-                      ? t("remote.account.grokPartial")
-                      : t("remote.account.grokAbsent")}
-                </Row>
-              </Rows>
-              {grok?.loginPending ? (
-                <Notice>
-                  {t("remote.account.grokDeviceLogin")}
-                  {" "}
-                  {grok.verificationUri
-                    ? <a href={grok.verificationUri} target="_blank" rel="noreferrer">{grok.verificationUri}</a>
-                    : t("remote.account.grokWaitingUrl")}
-                  {grok.userCode ? <> · <strong>{grok.userCode}</strong></> : null}
-                </Notice>
-              ) : null}
               <div className="remote-actions">
-                {pairings.some((row) => !row.paired && !row.detail) ? (
+                {pairings.some((row) => ((!row.paired && !row.active) || row.credentialState === "expired") && !row.detail) ? (
                   <Btn soft onClick={pairAllChatGptAccounts} disabled={busy !== null || Boolean(chatgptLogin)}>
                     {t("remote.act.chatgptPairAll")}
                   </Btn>
                 ) : null}
-                {chatgpt?.state === "pairingRequired" || chatgpt?.state === "pairingPending" ? (
-                  <Btn soft onClick={() => pairChatGpt()} disabled={busy !== null || Boolean(chatgptLogin)}>{t("remote.act.chatgptPair")}</Btn>
-                ) : null}
-                {chatgpt?.state === "activationRequired" ? (
-                  <Btn soft onClick={() => activateChatGpt()} disabled={busy !== null}>{t("remote.act.chatgptActivate")}</Btn>
-                ) : null}
-                {grok?.loginPending ? (
-                  <Btn soft onClick={() => selectedHostId && void run("remote.act.grokCancel", async () => { await api.cancelRemoteGrokLogin(selectedHostId); await load(); })} disabled={busy !== null}>{t("remote.act.grokCancel")}</Btn>
-                ) : (
-                  <Btn soft onClick={() => selectedHostId && void run("remote.act.grokLogin", async () => { await api.startRemoteGrokLogin(selectedHostId); await load(); })} disabled={!selectedHostId || busy !== null}>
-                    {busy === "remote.act.grokLogin" ? (
-                      <><span className="remote-login-spinner" aria-hidden="true" />{t("remote.account.grokStarting")}</>
-                    ) : t("remote.act.grokLogin")}
-                  </Btn>
-                )}
-                {grok?.configured ? (
-                  <Btn soft onClick={() => selectedHostId && void run("remote.act.grokRefresh", async () => { await api.refreshRemoteGrokLogin(selectedHostId); await load(); })} disabled={busy !== null}>{t("remote.act.grokRefresh")}</Btn>
-                ) : null}
               </div>
             </Card>
 
-            {/* ---------- Remote control identity A ---------- */}
+            {/* ---------- Remote control role binding ---------- */}
             <Card>
               <Cap>{t("remote.control.title")}</Cap>
               <p className="remote-mobile-empty">{t("remote.control.sameAccountHint")}</p>
               <Rows>
-                <Row label={t("remote.control.identity")}>{chatgptStateLabel}</Row>
+                <Row label={t("remote.control.identity")}>
+                  <select
+                    className="input"
+                    value={activeControlAccount?.accountId ?? ""}
+                    onChange={(event) => selectRemoteControlAccount(event.target.value)}
+                    disabled={busy !== null || Boolean(chatgptLogin) || !pairings.length}
+                  >
+                    <option value="" disabled>{t("remote.control.choose")}</option>
+                    {pairings.map((account) => (
+                      <option key={account.accountId} value={account.accountId}>
+                        {account.email ?? account.accountId}
+                        {account.workspaceName ? ` · ${account.workspaceName}` : ""}
+                        {account.credentialState === "expired" ? ` · ${t("remote.account.credentialExpired")}` : ""}
+                        {!account.paired && !account.active ? ` · ${t("remote.account.credentialMissing")}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </Row>
+                <Row label={t("remote.control.status")}>{chatgptStateLabel}</Row>
               </Rows>
+              {chatgpt?.state === "reauthenticationRequired" ? (
+                <Notice tone="warn" acts={activeControlAccount ? (
+                  <Btn mini soft onClick={() => pairChatGpt(activeControlAccount.accountId)} disabled={busy !== null || Boolean(chatgptLogin)}>
+                    {t("remote.act.chatgptReauthenticate")}
+                  </Btn>
+                ) : null}>
+                  {t("remote.control.credentialExpired")}
+                </Notice>
+              ) : null}
               {devicePairing ? (
                 <Notice>
                   {t("remote.control.deviceHint")}
@@ -1161,31 +1171,32 @@ export function Remote({
                 </Notice>
               ) : null}
               <div className="remote-actions">
-                <Btn soft onClick={pairMobileDevice} disabled={busy !== null || chatgpt?.state !== "synchronized"}>{t("remote.act.devicePair")}</Btn>
+                <Btn soft onClick={pairMobileDevice} disabled={busy !== null || !matchesRemoteControlReady(chatgpt?.state)}>{t("remote.act.devicePair")}</Btn>
               </div>
             </Card>
 
-            {/* ---------- Proxy execution identity B ---------- */}
+            {/* ---------- Official model execution role binding ---------- */}
             <Card>
               <Cap>{t("remote.execution.title")}</Cap>
               <p className="remote-mobile-empty">{t("remote.execution.independentHint")}</p>
-              {executionAccounts.length ? (
-                <Rows>
-                  {executionAccounts.map((account) => (
-                    <Row key={account.accountIdHash} label={account.displayName}>
-                      <code>{account.accountIdHash.slice(0, 12)}</code>
-                      {account.selected ? (
-                        <> · {t("remote.execution.selected")}</>
-                      ) : (
-                        <> · <Btn mini soft onClick={() => selectOfficialExecutionAccount(account.accountIdHash)} disabled={busy !== null}>{t("remote.execution.select")}</Btn></>
-                      )}
-                      <> · <Btn mini soft onClick={() => removeOfficialExecutionAccount(account.accountIdHash)} disabled={busy !== null}>{t("remote.execution.remove")}</Btn></>
-                    </Row>
-                  ))}
-                </Rows>
-              ) : (
-                <p className="remote-mobile-empty">{t("remote.execution.empty")}</p>
-              )}
+              <Rows>
+                <Row label={t("remote.execution.identity")}>
+                  <select
+                    className="input"
+                    value={selectedExecutionAccount?.accountIdHash ?? "control"}
+                    onChange={(event) => selectOfficialExecutionRoute(event.target.value)}
+                    disabled={busy !== null}
+                  >
+                    <option value="control">{t("remote.execution.followControl")}</option>
+                    {executionAccounts.map((account) => (
+                      <option key={account.accountIdHash} value={account.accountIdHash}>{account.displayName}</option>
+                    ))}
+                  </select>
+                </Row>
+              </Rows>
+              {!selectedExecutionAccount && chatgpt?.credentialState === "expired" ? (
+                <Notice tone="warn">{t("remote.execution.inheritedCredentialExpired")}</Notice>
+              ) : null}
               {executionLogin ? (
                 <Notice>
                   {t("remote.execution.loginHint")}
@@ -1207,6 +1218,44 @@ export function Remote({
                 <Btn soft onClick={addOfficialExecutionAccount} disabled={busy !== null || Boolean(executionLogin) || !executionDisplayName.trim()}>
                   {t("remote.act.executionLogin")}
                 </Btn>
+                {selectedExecutionAccount ? (
+                  <Btn soft onClick={() => removeOfficialExecutionAccount(selectedExecutionAccount.accountIdHash)} disabled={busy !== null}>
+                    {t("remote.execution.removeSelected")}
+                  </Btn>
+                ) : null}
+              </div>
+            </Card>
+
+            <Card>
+              <Cap>Grok</Cap>
+              <Rows>
+                <Row label={t("remote.execution.identity")}>
+                  {grok?.detachedQualified
+                    ? t("remote.account.grokReady", { account: grok.account ?? "" })
+                    : grok?.configured
+                      ? t("remote.account.grokPartial")
+                      : t("remote.account.grokAbsent")}
+                </Row>
+              </Rows>
+              {grok?.loginPending ? (
+                <Notice>
+                  {t("remote.account.grokDeviceLogin")} {grok.verificationUri
+                    ? <a href={grok.verificationUri} target="_blank" rel="noreferrer">{grok.verificationUri}</a>
+                    : t("remote.account.grokWaitingUrl")}
+                  {grok.userCode ? <> · <strong>{grok.userCode}</strong></> : null}
+                </Notice>
+              ) : null}
+              <div className="remote-actions">
+                {grok?.loginPending ? (
+                  <Btn soft onClick={() => selectedHostId && void run("remote.act.grokCancel", async () => { await api.cancelRemoteGrokLogin(selectedHostId); await load(); })} disabled={busy !== null}>{t("remote.act.grokCancel")}</Btn>
+                ) : (
+                  <Btn soft onClick={() => selectedHostId && void run("remote.act.grokLogin", async () => { await api.startRemoteGrokLogin(selectedHostId); await load(); })} disabled={!selectedHostId || busy !== null}>
+                    {busy === "remote.act.grokLogin" ? <><span className="remote-login-spinner" aria-hidden="true" />{t("remote.account.grokStarting")}</> : t("remote.act.grokLogin")}
+                  </Btn>
+                )}
+                {grok?.configured ? (
+                  <Btn soft onClick={() => selectedHostId && void run("remote.act.grokRefresh", async () => { await api.refreshRemoteGrokLogin(selectedHostId); await load(); })} disabled={busy !== null}>{t("remote.act.grokRefresh")}</Btn>
+                ) : null}
               </div>
             </Card>
 

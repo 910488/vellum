@@ -8,11 +8,15 @@ import { SCREENS } from "@/screens/registry";
 export function Rail({
   active,
   onNavigate,
+  onOpenUpdates,
   attention,
+  updateAttention,
 }: {
   active: ScreenId;
   onNavigate: (id: ScreenId) => void;
+  onOpenUpdates: () => void;
   attention: Partial<Record<ScreenId, number>>;
+  updateAttention: boolean;
 }) {
   const { t } = useTranslation();
   return (
@@ -43,6 +47,22 @@ export function Rail({
           </button>
         );
       })}
+      <button
+        type="button"
+        className="navitem navitem--action"
+        aria-haspopup="dialog"
+        onClick={onOpenUpdates}
+      >
+        <span className="navitem__top">
+          <span className="navitem__label">{t("navigation.updates.label")}</span>
+          {updateAttention ? (
+            <span className="navitem__badge">
+              1<span className="sr-only"> {t("common.itemsNeedAttention", { count: 1 })}</span>
+            </span>
+          ) : null}
+        </span>
+        <span className="navitem__blurb">{t("navigation.updates.blurb")}</span>
+      </button>
     </nav>
   );
 }

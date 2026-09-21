@@ -11,6 +11,7 @@ import { EMPTY_STATUS, attention, type SystemStatus } from "@/lib/status";
 import { Btn, Notice } from "@/components/ui";
 import { Rail } from "@/components/Rail";
 import { StatusBar } from "@/components/StatusBar";
+import { UpdatePanel } from "@/components/UpdateCards";
 import { Context } from "@/screens/Context";
 import { Log } from "@/screens/Log";
 import { Models } from "@/screens/Models";
@@ -54,6 +55,7 @@ export function App() {
   const [dismissedAlerts, setDismissedAlerts] = useState<string[]>([]);
   const [status, setStatus] = useState<SystemStatus>(EMPTY_STATUS);
   const [refreshing, setRefreshing] = useState(false);
+  const [updatesOpen, setUpdatesOpen] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [refreshVersions, setRefreshVersions] = useState<Partial<Record<ScreenId, number>>>({});
   const refreshSequence = useRef(0);
@@ -483,7 +485,13 @@ export function App() {
           onRefresh={() => void manualRefresh()}
         />
 
-        <Rail active={screen} onNavigate={navigate} attention={attention(status)} />
+        <Rail
+          active={screen}
+          onNavigate={navigate}
+          onOpenUpdates={() => setUpdatesOpen(true)}
+          attention={attention(status)}
+          updateAttention={(status.updates?.attention ?? "none") !== "none"}
+        />
 
         <main className="canvas">
           {mountedScreens.has("enhanced") ? <div className="screen-slot" hidden={screen !== "enhanced"}><EnhancedCore status={status.enhancedRuntime ?? null} refreshVersion={refreshVersions.enhanced ?? 0} onRefreshComplete={pageRefreshComplete} /></div> : null}
@@ -553,6 +561,13 @@ export function App() {
             </div>
           ) : null}
         </main>
+
+        <UpdatePanel
+          open={updatesOpen}
+          snapshot={status.updates ?? null}
+          onChanged={(updates) => setStatus((current) => ({ ...current, updates }))}
+          onClose={() => setUpdatesOpen(false)}
+        />
 
         {liveAlerts.length ? (
           <div className="alerts" role="region" aria-label={t("runtime.alerts.label")}>
