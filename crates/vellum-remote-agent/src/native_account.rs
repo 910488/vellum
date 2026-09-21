@@ -11,6 +11,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,6 +38,13 @@ pub struct NativeAccountStatus {
     pub active: bool,
     pub login_pending: bool,
     pub login_id: Option<String>,
+    /// Whether the grant selected for this account can still authorize a
+    /// model request. Account identity and credential health are deliberately
+    /// separate: an expired JWT still identifies its owner correctly.
+    pub credential_state: String,
+    /// JWT expiry as Unix seconds. `None` keeps compatibility with older or
+    /// non-JWT auth files whose identity can still be read.
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,14 +69,29 @@ pub fn status(
     expected: Option<&str>,
 ) -> Result<NativeAccountStatus, String> {
     let lease = read_lease(paths)?;
-    let account_id = read_account_id(&codex_home.join("auth.json"))?;
+    let active_auth = codex_home.join("auth.json");
+    let account_id = read_account_id(&active_auth)?;
     let paired = expected.is_some_and(|id| slot_path(paths, id).is_file());
     let active = expected.is_some_and(|id| account_id.as_deref() == Some(id));
+    let credential_path = if active || (expected.is_none() && account_id.is_some()) {
+        Some(active_auth.clone())
+    } else {
+        expected.filter(|_| paired).map(|id| slot_path(paths, id))
+    };
+    let (credential_state, expires_at) = credential_path
+        .as_deref()
+        .map(read_credential_health)
+        .transpose()?
+        .unwrap_or_else(|| ("missing".into(), None));
+    let credential_expired = credential_state == "expired";
     let state = match expected {
-        None => "desktopAccountUnavailable",
+        None if account_id.is_none() => "accountUnavailable",
+        None if credential_expired => "reauthenticationRequired",
+        None => "ready",
+        Some(_) if lease.pending_account_id.as_deref() == expected => "pairingPending",
+        Some(_) if (active || paired) && credential_expired => "reauthenticationRequired",
         Some(_) if active => "synchronized",
         Some(_) if paired => "activationRequired",
-        Some(_) if lease.pending_account_id.as_deref() == expected => "pairingPending",
         Some(_) => "pairingRequired",
     };
     Ok(NativeAccountStatus {
@@ -79,6 +102,8 @@ pub fn status(
         active,
         login_pending: lease.pending_account_id.is_some(),
         login_id: lease.pending_login_id,
+        credential_state,
+        expires_at,
     })
 }
 
@@ -161,8 +186,13 @@ pub fn poll_login(paths: &AgentPaths, codex_home: &Path) -> Result<NativeAccount
         .clone()
         .ok_or_else(|| "NativeAccountPairingNotPending".to_string())?;
     let observed = read_account_id(&codex_home.join("auth.json"))?;
+    let changed = pending_auth_changed(paths, codex_home)?;
     match observed.as_deref() {
-        Some(account_id) if account_id == expected => {
+        // Re-authenticating the account already active on this host keeps the
+        // same identity. Require the auth bytes to change before calling the
+        // flow complete, otherwise the first poll accepts the expired grant
+        // that was present before device login began.
+        Some(account_id) if account_id == expected && changed => {
             copy_private(&codex_home.join("auth.json"), &slot_path(paths, &expected))?;
             lease.active_account_id = Some(expected.clone());
             lease.pending_account_id = None;
@@ -171,7 +201,7 @@ pub fn poll_login(paths: &AgentPaths, codex_home: &Path) -> Result<NativeAccount
             remove_if_exists(&pending_auth_path(paths))?;
             status(paths, codex_home, Some(&expected))
         }
-        Some(account_id) if pending_auth_changed(paths, codex_home)? => {
+        Some(account_id) if changed => {
             restore_pending_auth(paths, codex_home)?;
             lease.pending_account_id = None;
             lease.pending_login_id = None;
@@ -302,6 +332,39 @@ fn read_account_id(path: &Path) -> Result<Option<String>, String> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         }))
+}
+
+fn read_credential_health(path: &Path) -> Result<(String, Option<i64>), String> {
+    if !path.is_file() {
+        return Ok(("missing".into(), None));
+    }
+    let raw = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let value: Value = serde_json::from_slice(&raw)
+        .map_err(|error| format!("invalid Codex auth.json: {error}"))?;
+    let Some(token) = value
+        .pointer("/tokens/access_token")
+        .and_then(Value::as_str)
+    else {
+        return Ok(("unknown".into(), None));
+    };
+    let Some(payload) = token.split('.').nth(1) else {
+        return Ok(("unknown".into(), None));
+    };
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(payload) else {
+        return Ok(("unknown".into(), None));
+    };
+    let Ok(claims) = serde_json::from_slice::<Value>(&decoded) else {
+        return Ok(("unknown".into(), None));
+    };
+    let Some(expires_at) = claims.get("exp").and_then(Value::as_i64) else {
+        return Ok(("unknown".into(), None));
+    };
+    let state = if expires_at <= chrono::Utc::now().timestamp() {
+        "expired"
+    } else {
+        "valid"
+    };
+    Ok((state.into(), Some(expires_at)))
 }
 
 fn capture_original(
@@ -483,7 +546,6 @@ fn restore_optional(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use tempfile::tempdir;
 
     fn auth(account: &str, secret: &str) -> Vec<u8> {
@@ -494,16 +556,26 @@ mod tests {
     }
 
     fn real_auth(user: &str, workspace: &str, secret: &str) -> Vec<u8> {
-        let claims = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({
-                "sub": user,
-                "https://api.openai.com/auth": {
-                    "chatgpt_account_id": workspace,
-                    "chatgpt_user_id": user
-                }
-            })
-            .to_string(),
-        );
+        real_auth_with_exp(user, workspace, secret, None)
+    }
+
+    fn real_auth_with_exp(
+        user: &str,
+        workspace: &str,
+        secret: &str,
+        expires_at: Option<i64>,
+    ) -> Vec<u8> {
+        let mut claims = serde_json::json!({
+            "sub": user,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": workspace,
+                "chatgpt_user_id": user
+            }
+        });
+        if let Some(expires_at) = expires_at {
+            claims["exp"] = serde_json::json!(expires_at);
+        }
+        let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
         serde_json::to_vec(&serde_json::json!({
             "tokens": {
                 "account_id": workspace,
@@ -539,6 +611,63 @@ mod tests {
         assert!(encoded.contains("acct-1"));
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("refresh_token"));
+    }
+
+    #[test]
+    fn expired_active_identity_requires_reauthentication() {
+        let temp = tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        paths.ensure().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(&home).unwrap();
+        let auth = real_auth_with_exp("user", "workspace", "refresh", Some(1));
+        atomic_private_write(&home.join("auth.json"), &auth).unwrap();
+        let account = read_account_id(&home.join("auth.json")).unwrap().unwrap();
+
+        let status = status(&paths, &home, Some(&account)).unwrap();
+        assert_eq!(status.state, "reauthenticationRequired");
+        assert_eq!(status.credential_state, "expired");
+        assert_eq!(status.expires_at, Some(1));
+        assert!(status.active);
+    }
+
+    #[test]
+    fn same_account_reauthentication_waits_for_new_auth_bytes() {
+        let temp = tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        paths.ensure().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(&home).unwrap();
+        atomic_private_write(
+            &home.join("auth.json"),
+            &real_auth_with_exp("user", "workspace", "old", Some(1)),
+        )
+        .unwrap();
+        let account = read_account_id(&home.join("auth.json")).unwrap().unwrap();
+        snapshot_pending_auth(&paths, &home).unwrap();
+        write_lease(
+            &paths,
+            &AccountLease {
+                pending_account_id: Some(account.clone()),
+                pending_login_id: Some("login-1".into()),
+                ..AccountLease::default()
+            },
+        )
+        .unwrap();
+
+        let pending = poll_login(&paths, &home).unwrap();
+        assert_eq!(pending.state, "pairingPending");
+        assert!(pending.login_pending);
+
+        atomic_private_write(
+            &home.join("auth.json"),
+            &real_auth_with_exp("user", "workspace", "new", Some(i64::MAX)),
+        )
+        .unwrap();
+        let completed = poll_login(&paths, &home).unwrap();
+        assert_eq!(completed.state, "synchronized");
+        assert_eq!(completed.credential_state, "valid");
+        assert!(!completed.login_pending);
     }
 
     #[test]

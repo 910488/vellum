@@ -1285,11 +1285,13 @@ export interface RemoteGrokStatus {
 export interface RemoteChatGptAccountStatus {
   accountId: string | null;
   expectedAccountId: string | null;
-  state: "synchronized" | "pairingRequired" | "pairingPending" | "activationRequired" | "desktopAccountUnavailable" | string;
+  state: "ready" | "synchronized" | "pairingRequired" | "pairingPending" | "activationRequired" | "reauthenticationRequired" | "accountUnavailable" | "desktopAccountUnavailable" | string;
   paired: boolean;
   active: boolean;
   loginPending: boolean;
   loginId: string | null;
+  credentialState?: "valid" | "expired" | "missing" | "unknown" | string;
+  expiresAt?: number | null;
 }
 
 export interface RemoteChatGptAccountLogin {
@@ -1314,6 +1316,8 @@ export interface RemoteChatGptAccountPairing {
   isDesktopDefault: boolean;
   paired: boolean;
   active: boolean;
+  credentialState?: "valid" | "expired" | "missing" | "unknown" | string;
+  expiresAt?: number | null;
   detail: string | null;
 }
 

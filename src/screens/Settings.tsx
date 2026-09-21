@@ -19,7 +19,6 @@ import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
 import { Btn, Cap, Card, Confirm, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
-import { UpdateCards } from "@/components/UpdateCards";
 import {
   REVIEW_POLICIES,
   fallbackShare,
@@ -51,7 +50,6 @@ import type {
   ReviewStats,
   Route,
   RuntimeStatus,
-  UpdateStatusSnapshot,
   SubagentMode,
   SubagentCapability,
   SubagentSettings,
@@ -81,7 +79,6 @@ export function Settings({
   const [routes, setRoutes] = useState<Route[]>([]);
   const [models, setModels] = useState<ModelRoute[]>([]);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
-  const [updates, setUpdates] = useState<UpdateStatusSnapshot | null>(null);
   const [codexRestarting, setCodexRestarting] = useState(false);
   const [versions, setVersions] = useState<CatalogVersion[]>([]);
   const [dashboardRouteIds, setDashboardRouteIds] = useState<string[]>([]);
@@ -176,7 +173,6 @@ export function Settings({
       const optional = [
         apply(api.getSubagentCapability(), setSubagentCapability),
         apply(api.getCodexOAuthStatus(), setOauth),
-        apply(api.getUpdateStatus(), setUpdates),
       ];
       const results = await Promise.allSettled([...required, ...optional]);
       if (!alive) return;
@@ -1359,8 +1355,6 @@ export function Settings({
           ))}
         </Rows>
       </Card>
-
-      <UpdateCards snapshot={updates} onChanged={setUpdates} />
 
       <Card>
         <Cap>{t("settings.page.restore.title")}</Cap>

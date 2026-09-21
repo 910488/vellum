@@ -159,8 +159,6 @@ impl RemoteHostManager {
         };
         let target = ResolvedAgentTarget::from_cached_host(&host);
         let client = RemoteAgentClient::new(target);
-        let expected_account_id = super::desktop_control_account_id(state);
-
         // M35: prefer the single-round-trip snapshot — one SSH process for
         // status + inventory + account together, instead of the three
         // sequential ones below. Older agents that predate
@@ -168,7 +166,7 @@ impl RemoteHostManager {
         // back to the original sequential RPCs so this keeps working
         // against an older/unpinned remote agent.
         let snapshot = state.remote().host_manager_snapshot(host_id, || {
-            client.host_manager_snapshot(expected_account_id.as_deref(), None)
+            client.host_manager_snapshot(None, None)
         });
         match snapshot {
             Ok((snapshot, _generation)) => {
@@ -197,9 +195,7 @@ impl RemoteHostManager {
             Ok(agent) => {
                 // Older agents reject `host.inventoryV2`; fall back silently.
                 let inventory = client.host_inventory_v2().ok();
-                let chatgpt = client
-                    .codex_account_status(expected_account_id.as_deref())
-                    .ok();
+                let chatgpt = client.codex_account_status(None).ok();
                 Ok(Self::compose_status(
                     host,
                     cached_host,
@@ -408,8 +404,14 @@ impl RemoteHostManager {
                     Some("activationRequired") => {
                         blocked_reasons.push("officialAccountActivationRequired".into())
                     }
+                    Some("reauthenticationRequired") => {
+                        blocked_reasons.push("officialAccountReauthenticationRequired".into())
+                    }
                     Some("desktopAccountUnavailable") => {
                         blocked_reasons.push("desktopOfficialAccountMissing".into())
+                    }
+                    Some("accountUnavailable") => {
+                        blocked_reasons.push("officialAccountPairingRequired".into())
                     }
                     _ => {}
                 }
@@ -715,9 +717,9 @@ mod tests {
 
         let status = RemoteHostManager::compose_status(
             host.clone(),
-            Some(host),
-            agent,
-            Some(inventory),
+            Some(host.clone()),
+            agent.clone(),
+            Some(inventory.clone()),
             Some(chatgpt),
         );
 
@@ -727,6 +729,17 @@ mod tests {
             .contains(&"officialAccountPairingRequired".to_string()));
         assert!(status.agent_error.is_none());
         assert!(status.agent.is_some());
+
+        let expired = RemoteHostManager::compose_status(
+            host.clone(),
+            Some(host),
+            agent,
+            Some(inventory),
+            Some(json!({"state": "reauthenticationRequired"})),
+        );
+        assert!(expired
+            .blocked_reasons
+            .contains(&"officialAccountReauthenticationRequired".to_string()));
     }
 
     #[test]

@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "@/lib/api";
-import { Btn, Cap, Card, Row, Rows, Segment, Toggle } from "@/components/ui";
+import { Btn, Cap, Card, Meter, Row, Rows, Segment, Toggle } from "@/components/ui";
 import type {
   LayerStatus,
   UpdateChannel,
@@ -10,22 +10,83 @@ import type {
 } from "@/types";
 
 const CHANNELS: UpdateChannel[] = ["stable", "preview"];
+const COMPONENTS: UpdateComponent[] = ["desktop", "remote", "core"];
+const APPLYABLE_PHASES = new Set(["staged", "waitingForIdle", "waitingForRestart"]);
+
+function layerProgress(layer: LayerStatus): number {
+  if (layer.phase === "downloading") {
+    return layer.downloadTotal > 0
+      ? Math.min(90, Math.round((layer.downloadBytes / layer.downloadTotal) * 90))
+      : 5;
+  }
+  if (layer.phase === "checking") return 5;
+  if (layer.phase === "available") return 10;
+  if (layer.phase === "verifying") return 92;
+  if (layer.phase === "applying") return 94;
+  if (layer.phase === "validating") return 97;
+  if (["staged", "waitingForIdle", "waitingForRestart", "applied", "idle"].includes(layer.phase)) return 100;
+  return 0;
+}
+
+export function UpdatePanel({
+  open,
+  snapshot,
+  onChanged,
+  onClose,
+}: {
+  open: boolean;
+  snapshot: UpdateStatusSnapshot | null;
+  onChanged: (next: UpdateStatusSnapshot) => void;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const ref = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
+
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    if (!open && dialog.open) dialog.close();
+  }, [open]);
+
+  return (
+    <dialog ref={ref} className="dialog update-panel" aria-labelledby={titleId} onCancel={onClose}>
+      <div className="update-panel__body">
+        <div className="update-panel__head">
+          <div>
+            <h2 className="dialog__title" id={titleId}>{t("settings.page.updates.title")}</h2>
+            <p className="note">{t("settings.page.updates.panelHint")}</p>
+          </div>
+          <Btn soft onClick={onClose}>{t("common.close")}</Btn>
+        </div>
+        {snapshot ? (
+          <UpdateCards snapshot={snapshot} onChanged={onChanged} />
+        ) : (
+          <p className="note">{t("common.loading")}</p>
+        )}
+      </div>
+    </dialog>
+  );
+}
 
 export function UpdateCards({
   snapshot,
   onChanged,
 }: {
-  snapshot: UpdateStatusSnapshot | null;
+  snapshot: UpdateStatusSnapshot;
   onChanged: (next: UpdateStatusSnapshot) => void;
 }) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState<string | null>(null);
+  const busyRef = useRef<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expandedRemote, setExpandedRemote] = useState(false);
-
-  if (!snapshot) return null;
+  const [operationProgress, setOperationProgress] = useState(0);
 
   async function run(label: string, work: () => Promise<void>) {
+    if (busyRef.current) return;
+    busyRef.current = label;
     setBusy(label);
     setError(null);
     try {
@@ -33,16 +94,104 @@ export function UpdateCards({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      busyRef.current = null;
       setBusy(null);
     }
   }
 
+  useEffect(() => {
+    if (!busy) return;
+    let alive = true;
+    const refresh = () => {
+      void api.getUpdateStatus().then((next) => {
+        if (alive) onChanged(next);
+      }).catch(() => undefined);
+    };
+    const timer = window.setInterval(refresh, 500);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [busy, onChanged]);
+
+  const computedProgress = Math.round(
+    COMPONENTS.reduce((sum, component) => sum + layerProgress(snapshot[component]), 0) /
+      COMPONENTS.length,
+  );
+  const overallProgress = busy === "all"
+    ? Math.max(computedProgress, operationProgress)
+    : computedProgress;
+
+  function updateAll() {
+    void run("all", async () => {
+      const failures: string[] = [];
+      setOperationProgress(3);
+      let next = await api.checkUpdates();
+      onChanged(next);
+      setOperationProgress(10);
+
+      for (const [index, component] of COMPONENTS.entries()) {
+        try {
+          let layer = next[component];
+          if (!layer.liveAutoUpdate) continue;
+          if (layer.phase === "available") {
+            setOperationProgress(12 + index * 25);
+            await api.downloadUpdate(component);
+            next = await api.getUpdateStatus();
+            onChanged(next);
+            layer = next[component];
+          }
+          if (APPLYABLE_PHASES.has(layer.phase)) {
+            if (component === "remote") {
+              for (const host of layer.hosts) {
+                await api.applyUpdate(component, host.hostId);
+              }
+            } else {
+              await api.applyUpdate(component);
+            }
+            next = await api.getUpdateStatus();
+            onChanged(next);
+          }
+        } catch (cause) {
+          failures.push(`${component}: ${cause instanceof Error ? cause.message : String(cause)}`);
+          next = await api.getUpdateStatus().catch(() => next);
+          onChanged(next);
+        }
+        setOperationProgress(35 + index * 30);
+      }
+
+      onChanged(await api.getUpdateStatus());
+      setOperationProgress(100);
+      if (failures.length) throw new Error(failures.join("; "));
+    });
+  }
+
   return (
-    <Card data-testid="update-cards">
-      <Cap>{t("settings.page.updates.title")}</Cap>
-      <p className="note" style={{ marginTop: 10 }}>
-        {t("settings.page.updates.description")}
-      </p>
+    <Card data-testid="update-cards" className="update-card">
+      <div className="update-summary">
+        <div>
+          <Cap>{t("settings.page.updates.overall")}</Cap>
+          <p className="note" style={{ marginTop: 8 }}>
+            {busy === "all"
+              ? t("settings.page.updates.updatingAll")
+              : t("settings.page.updates.overallHint")}
+          </p>
+        </div>
+        <strong className="update-summary__percent">{overallProgress}%</strong>
+      </div>
+      <Meter percent={overallProgress} tone={error ? "coral" : "honey"} />
+      <div className="update-primary-actions">
+        <Btn
+          soft
+          disabled={busy !== null || !snapshot.liveAutoUpdate}
+          onClick={() => void run("check-all", async () => onChanged(await api.checkUpdates()))}
+        >
+          {t("settings.page.updates.checkAll")}
+        </Btn>
+        <Btn disabled={busy !== null || !snapshot.liveAutoUpdate} onClick={updateAll}>
+          {busy === "all" ? t("settings.page.updates.updatingAll") : t("settings.page.updates.updateAll")}
+        </Btn>
+      </div>
       {!snapshot.liveAutoUpdate ? (
         <p className="note" data-testid="update-live-disabled">
           {t("settings.page.updates.liveDisabled")}
@@ -106,7 +255,10 @@ export function UpdateCards({
           />
         </Row>
       </Rows>
-      <LayerCard
+      <details className="update-experimental">
+        <summary>{t("settings.page.updates.experimentalParts")}</summary>
+        <p className="note">{t("settings.page.updates.experimentalPartsHint")}</p>
+        <LayerCard
         layer={snapshot.desktop}
         busy={busy}
         onCheck={() =>
@@ -138,8 +290,8 @@ export function UpdateCards({
             onChanged(await api.getUpdateStatus());
           })
         }
-      />
-      <LayerCard
+        />
+        <LayerCard
         layer={snapshot.remote}
         busy={busy}
         expandable
@@ -180,8 +332,8 @@ export function UpdateCards({
             onChanged(await api.getUpdateStatus());
           })
         }
-      />
-      <LayerCard
+        />
+        <LayerCard
         layer={snapshot.core}
         busy={busy}
         onCheck={() =>
@@ -213,7 +365,8 @@ export function UpdateCards({
             onChanged(await api.getUpdateStatus());
           })
         }
-      />
+        />
+      </details>
     </Card>
   );
 }

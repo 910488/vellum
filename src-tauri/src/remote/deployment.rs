@@ -654,27 +654,21 @@ pub fn plan(
         .iter()
         .any(|route| route.provider_kind == ProviderKind::Official);
     if official_selected {
-        match super::desktop_control_account_id(state) {
-            None => blocked.push("desktopOfficialAccountMissing".into()),
-            Some(account_id) => {
-                if let Ok(target) = RemoteHostManager::resolve_target(state, host_id) {
-                    match RemoteAgentClient::new(target).codex_account_status(Some(&account_id)) {
-                        Ok(status)
-                            if status.get("state").and_then(Value::as_str)
-                                == Some("synchronized") => {}
-                        Ok(status) => blocked.push(format!(
-                            "officialAccount{}:{}",
-                            match status.get("state").and_then(Value::as_str) {
-                                Some("activationRequired") => "ActivationRequired",
-                                _ => "PairingRequired",
-                            },
-                            account_id
-                        )),
-                        Err(error) => {
-                            blocked.push(format!("officialAccountStatusUnavailable:{error}"))
-                        }
+        if let Ok(target) = RemoteHostManager::resolve_target(state, host_id) {
+            match RemoteAgentClient::new(target).codex_account_status(None) {
+                Ok(status)
+                    if matches!(
+                        status.get("state").and_then(Value::as_str),
+                        Some("ready" | "synchronized")
+                    ) => {}
+                Ok(status) => blocked.push(format!(
+                    "officialAccount{}",
+                    match status.get("state").and_then(Value::as_str) {
+                        Some("reauthenticationRequired") => "ReauthenticationRequired",
+                        _ => "PairingRequired",
                     }
-                }
+                )),
+                Err(error) => blocked.push(format!("officialAccountStatusUnavailable:{error}")),
             }
         }
     }

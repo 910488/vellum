@@ -225,40 +225,9 @@ pub async fn set_default_codex_oauth_account(
             "officialAccountSwitchNativePlane",
         ));
     }
-    // The switch follows one host: the one Remote Manager is showing. Fanning
-    // out to the whole inventory meant every machine in it silently changed
-    // identity on a Desktop click, and a host that was asleep, unreachable, or
-    // had never paired this account just failed into a discarded Result. One
-    // host is a change the user can see, on the screen where they can see it;
-    // the rest are reconciled from Remote Manager, which reports drift against
-    // Desktop and offers to align.
-    //
-    // Still off the calling path, because a switch must not wait on SSH. That
-    // is also why the outcome becomes a notice rather than an error: this
-    // Desktop-side selection has already been verified and committed by the
-    // time we get here, and a remote that could not follow does not undo it.
-    let owned = state.inner().clone();
-    let sync_account_id = account_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let Ok(Some(host_id)) = owned.remote().active_host() else {
-            return;
-        };
-        let outcome =
-            crate::remote::RemoteHostManager::resolve_target(&owned, &host_id).and_then(|target| {
-                crate::remote::RemoteAgentClient::new(target).codex_account_activate(
-                    &format!("account-switch-{}", ulid::Ulid::new()),
-                    &sync_account_id,
-                )
-            });
-        match outcome {
-            Ok(_) => owned.remote().invalidate_snapshot(&host_id),
-            Err(error) => owned.record_live_applied(
-                crate::model::RuntimeNotice::new("remoteOfficialAccountSwitchNotFollowed")
-                    .with("host", host_id)
-                    .with("detail", error.to_string()),
-            ),
-        }
-    });
+    // Remote Control identity is a per-host role binding. Changing the local
+    // model-routing default must not silently change a remote daemon's login;
+    // Remote Manager exposes that choice explicitly.
     Ok(selected)
 }
 

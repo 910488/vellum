@@ -343,6 +343,7 @@ pub fn run() {
             remote::commands::start_remote_official_execution_account_login,
             remote::commands::poll_remote_official_execution_account_login,
             remote::commands::select_remote_official_execution_account,
+            remote::commands::clear_remote_official_execution_account_selection,
             remote::commands::remove_remote_official_execution_account,
             remote::commands::remote_agent_host_status,
             remote::commands::remote_host_aggregate_status,

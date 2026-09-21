@@ -249,6 +249,14 @@
 .navitem[aria-current="page"] .navitem__label {
   transform: translateX(3px);
 }
+.navitem--action {
+  margin-top: 12px;
+  padding-top: 14px;
+  border-top: 1px solid var(--edge);
+}
+.navitem--action .navitem__blurb {
+  display: block;
+}
 
 /* 實心訊號色 + 固定深墨。導覽底下沒有卡片，而暗色主題的 --warn-ink 就等於
    --warn，同色系 wash 當底又當字，alpha 拉再高也沒有對比度（量到 3.35:1）。 */
@@ -492,6 +500,73 @@ html[data-performance="low"] .card {
 .dialog__gate input:focus-visible {
   outline: 2px solid var(--lavender);
   outline-offset: 1px;
+}
+
+/* ---------- 更新面板 ---------- */
+.update-panel {
+  width: min(760px, calc(100vw - 48px));
+}
+.update-panel__body {
+  display: grid;
+  gap: 18px;
+  padding: 26px 28px 28px;
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+}
+.update-panel__head,
+.update-summary,
+.update-primary-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.update-panel__head .note {
+  margin-top: 6px;
+}
+.update-card {
+  display: grid;
+  gap: 16px;
+}
+.update-summary__percent {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.update-primary-actions {
+  justify-content: flex-end;
+  align-items: center;
+}
+.update-experimental {
+  margin-top: 2px;
+  padding-top: 14px;
+  border-top: 1px solid var(--edge);
+}
+.update-experimental > summary {
+  cursor: pointer;
+  color: var(--ink-soft);
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+}
+.update-experimental > .note {
+  margin-top: 8px;
+}
+@media (max-width: 720px) {
+  .update-panel__body {
+    padding: 20px;
+  }
+  .update-panel__head,
+  .update-summary,
+  .update-primary-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .update-primary-actions .btn {
+    width: 100%;
+  }
 }
 
 /* ---------- Remote Manager ---------- */

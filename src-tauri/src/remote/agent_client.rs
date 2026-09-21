@@ -327,6 +327,13 @@ impl RemoteAgentClient {
         }))
     }
 
+    pub fn proxy_official_account_clear_selection(&self, operation_id: &str) -> AppResult<Value> {
+        self.rpc(json!({
+            "method": "proxy.officialAccountClearSelection",
+            "operationId": operation_id,
+        }))
+    }
+
     pub fn proxy_official_account_remove(
         &self,
         operation_id: &str,

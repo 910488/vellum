@@ -353,6 +353,16 @@ pub fn select(
     list(paths)
 }
 
+/// Return Official model requests to the control account carried by native
+/// Codex. The managed grants remain available for a later selection.
+pub fn clear_selection(paths: &AgentPaths) -> Result<Vec<OfficialAccountView>, String> {
+    let _selection_guard = selection_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remove_if_exists(&selected_path(paths))?;
+    list(paths)
+}
+
 fn selection_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -678,6 +688,46 @@ mod tests {
         assert_eq!(selected_state["selectionRevision"], 1);
 
         assert!(remove(&paths, &hash).unwrap().is_empty());
+        assert!(!selected_path(&paths).exists());
+    }
+
+    #[test]
+    fn clear_selection_keeps_managed_grant_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        paths.ensure().unwrap();
+        let account_id = "acct-managed";
+        let hash = hash_account_id(account_id);
+        let grant = grant_path(&paths, &hash);
+        write_grant_atomic(
+            &grant,
+            &FileOfficialGrant {
+                credential_id: None,
+                account_id: account_id.into(),
+                access_token: jwt_for_account(account_id),
+                refresh_token: "fixture".into(),
+                expires_at_ms: i64::MAX,
+            },
+        )
+        .unwrap();
+        write_catalog(
+            &paths,
+            &Catalog {
+                entries: vec![CatalogEntry {
+                    account_id_hash: hash.clone(),
+                    display_name: "Execution B".into(),
+                    authenticated_at: "now".into(),
+                }],
+            },
+        )
+        .unwrap();
+
+        assert!(select(&paths, &hash).unwrap()[0].selected);
+        let accounts = clear_selection(&paths).unwrap();
+
+        assert_eq!(accounts.len(), 1);
+        assert!(!accounts[0].selected);
+        assert!(grant.exists());
         assert!(!selected_path(&paths).exists());
     }
 

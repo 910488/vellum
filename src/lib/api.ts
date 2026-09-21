@@ -375,6 +375,11 @@ export const api = {
     return call("select_remote_official_execution_account", { hostId, accountIdHash });
   },
 
+  clearRemoteOfficialExecutionAccountSelection(hostId: string): Promise<unknown> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("clear_remote_official_execution_account_selection", { hostId });
+  },
+
   removeRemoteOfficialExecutionAccount(hostId: string, accountIdHash: string): Promise<unknown> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call("remove_remote_official_execution_account", { hostId, accountIdHash });

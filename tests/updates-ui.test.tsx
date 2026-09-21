@@ -3,11 +3,13 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import i18n from "i18next";
 import "@/i18n";
 import { UpdateCards } from "@/components/UpdateCards";
+import { Rail } from "@/components/Rail";
 import { api } from "@/lib/api";
 import { attention, headline, type SystemStatus } from "@/lib/status";
 import type { LayerStatus, Overview, ProxyStatus, RuntimeStatus, UpdateStatusSnapshot } from "@/types";
 import statusBarSource from "../src/components/StatusBar.tsx?raw";
 import settingsSource from "../src/screens/Settings.tsx?raw";
+import appSource from "../src/App.tsx?raw";
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -22,7 +24,10 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 const layer = (component: LayerStatus["component"], patch: Partial<LayerStatus> = {}): LayerStatus => ({
   component,
@@ -94,19 +99,100 @@ const status = (patch: Partial<SystemStatus> = {}): SystemStatus => ({
 });
 
 describe("update settings cards", () => {
-  it("renders three layer cards with current, available, and apply condition", async () => {
+  it("renders one primary update action and keeps component controls experimental", async () => {
     await i18n.changeLanguage("en");
     render(<UpdateCards snapshot={snapshot()} onChanged={() => undefined} />);
     expect(screen.getByTestId("update-layer-desktop")).toBeTruthy();
     expect(screen.getByTestId("update-layer-remote")).toBeTruthy();
     expect(screen.getByTestId("update-layer-core")).toBeTruthy();
     expect(screen.getByTestId("update-live-disabled").textContent).toMatch(/signing/i);
+    expect(screen.getByRole("progressbar")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Update all" })).toBeTruthy();
+    expect(screen.getByText("Experimental: component updates")).toBeTruthy();
+    expect((screen.getByText("Experimental: component updates").closest("details") as HTMLDetailsElement).open).toBe(false);
     expect(screen.getByTestId("update-layer-desktop").textContent).toContain("0.2.9");
     expect(screen.getByTestId("update-layer-desktop").textContent).toContain("0.3.0");
   });
 
-  it("is mounted from Settings", () => {
-    expect(settingsSource).toMatch(/UpdateCards/);
+  it("is mounted globally instead of becoming a Settings card or real screen", () => {
+    expect(settingsSource).not.toMatch(/UpdateCards/);
+    expect(appSource).toMatch(/<UpdatePanel/);
+    expect(appSource).toMatch(/onOpenUpdates/);
+  });
+
+  it("checks, downloads, and schedules every live component from Update all", async () => {
+    await i18n.changeLanguage("en");
+    let current = snapshot({
+      liveAutoUpdate: true,
+      desktop: layer("desktop", { liveAutoUpdate: true }),
+      remote: layer("remote", { liveAutoUpdate: true }),
+      core: layer("core", { liveAutoUpdate: true, phase: "available" }),
+    });
+    vi.mocked(api.checkUpdates).mockImplementation(async () => current);
+    vi.mocked(api.getUpdateStatus).mockImplementation(async () => current);
+    vi.mocked(api.downloadUpdate).mockImplementation(async (component) => {
+      current = { ...current, [component]: { ...current[component], phase: "staged" } };
+      return { operationId: `download-${component}`, component, phase: "staged", targetVersion: "0.3.0" };
+    });
+    vi.mocked(api.applyUpdate).mockImplementation(async (component) => {
+      current = { ...current, [component]: { ...current[component], phase: "applied" } };
+      return { operationId: `apply-${component}`, component, phase: "applied", targetVersion: "0.3.0" };
+    });
+
+    render(<UpdateCards snapshot={current} onChanged={(next) => { current = next; }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Update all" }));
+
+    await waitFor(() => expect(api.downloadUpdate).toHaveBeenCalledTimes(3));
+    expect(api.applyUpdate).toHaveBeenCalledWith("desktop");
+    expect(api.applyUpdate).toHaveBeenCalledWith("remote", "host-1");
+    expect(api.applyUpdate).toHaveBeenCalledWith("core");
+  });
+
+  it("continues the remaining components when one update fails", async () => {
+    await i18n.changeLanguage("en");
+    let current = snapshot({
+      liveAutoUpdate: true,
+      desktop: layer("desktop", { liveAutoUpdate: true }),
+      remote: layer("remote", { liveAutoUpdate: true }),
+      core: layer("core", { liveAutoUpdate: true, phase: "available" }),
+    });
+    vi.mocked(api.checkUpdates).mockImplementation(async () => current);
+    vi.mocked(api.getUpdateStatus).mockImplementation(async () => current);
+    vi.mocked(api.downloadUpdate).mockImplementation(async (component) => {
+      if (component === "desktop") throw new Error("desktop mirror unavailable");
+      current = { ...current, [component]: { ...current[component], phase: "staged" } };
+      return { operationId: `download-${component}`, component, phase: "staged", targetVersion: "0.3.0" };
+    });
+    vi.mocked(api.applyUpdate).mockImplementation(async (component) => ({
+      operationId: `apply-${component}`, component, phase: "applied", targetVersion: "0.3.0",
+    }));
+
+    render(<UpdateCards snapshot={current} onChanged={(next) => { current = next; }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Update all" }));
+
+    await waitFor(() => expect(api.downloadUpdate).toHaveBeenCalledTimes(3));
+    expect(api.applyUpdate).toHaveBeenCalledWith("remote", "host-1");
+    expect(api.applyUpdate).toHaveBeenCalledWith("core");
+    expect((await screen.findByRole("alert")).textContent).toContain("desktop mirror unavailable");
+  });
+
+  it("opens updates from a tab-like rail action without navigating", async () => {
+    await i18n.changeLanguage("en");
+    const navigate = vi.fn();
+    const openUpdates = vi.fn();
+    render(
+      <Rail
+        active="today"
+        onNavigate={navigate}
+        onOpenUpdates={openUpdates}
+        attention={{}}
+        updateAttention
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Updates/ }));
+    expect(openUpdates).toHaveBeenCalledTimes(1);
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("shows command failures instead of leaving an unhandled rejection", async () => {
@@ -138,7 +224,7 @@ describe("update attention vs models badge", () => {
       updates: snapshot({ attention: "waitingRestart" }),
     });
     expect(attention(withUpdates).models).toBeUndefined();
-    expect(attention(withUpdates).settings).toBe(1);
+    expect(attention(withUpdates).settings).toBeUndefined();
   });
 
   it("still badges models for catalog/runtime apply reasons", () => {
