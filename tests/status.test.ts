@@ -206,7 +206,9 @@ describe("attention", () => {
       updates: { attention: "available" } as SystemStatus["updates"],
     });
     expect(attention(updateReady).models).toBeUndefined();
-    expect(attention(updateReady).settings).toBe(1);
+    // Updates now own a global rail action and dialog; they no longer borrow
+    // the Settings screen badge.
+    expect(attention(updateReady).settings).toBeUndefined();
   });
 
   it("待重啟但沒給原因時仍然要顯示一個紅點", () => {
