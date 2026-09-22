@@ -4363,6 +4363,10 @@ impl ProxyRuntime {
         // code cannot be tempted to treat the full route as dispatchable.
         let mut adapter_route = ProfileAdapterRoute::from(route);
         if self.reasoning_replay_required(route) {
+            // Runtime evidence also corrects a false-negative reasoning flag;
+            // otherwise request preparation would discard the readable item
+            // before the learned replay capability can use it.
+            adapter_route.reasoning = true;
             adapter_route.chat_capabilities.reasoning_replay = ReasoningReplay::ToolCallBound;
         }
         let prepared_result = prepare_upstream_request_details(
@@ -7889,13 +7893,18 @@ fn prepare_reasoning_replay_retry_body(
     strip_openai_fields: bool,
 ) -> Result<Option<Vec<u8>>, RuntimeError> {
     if route.wire != RuntimeWireFormat::Chat
-        || !route.reasoning
         || route.chat_capabilities.reasoning_replay == ReasoningReplay::ToolCallBound
     {
         return Ok(None);
     }
 
     let mut retry_route = route.clone();
+    // A provider's deterministic missing-reasoning rejection is stronger
+    // evidence than a stale/false-negative discovery flag. Without lifting
+    // this flag for the candidate build, request preparation strips the
+    // readable reasoning item before the Chat projector can bind it back to
+    // its tool call, leaving no possible recovery body.
+    retry_route.reasoning = true;
     retry_route.chat_capabilities.reasoning_replay = ReasoningReplay::ToolCallBound;
     let mut retry = prepare_upstream_request_details(
         original,
@@ -12065,7 +12074,11 @@ mod tests {
         let mut route = sample_route(None);
         route.auth_kind = RuntimeAuthKind::None;
         route.wire = RuntimeWireFormat::Chat;
-        route.reasoning = true;
+        // Reproduce a stale/false-negative capability snapshot: the provider
+        // emitted readable thinking in the prior turn, but route discovery did
+        // not mark the model as reasoning-capable. Runtime evidence must still
+        // be allowed to repair the continuation.
+        route.reasoning = false;
         route.chat_capabilities = crate::route::RuntimeChatCapabilities::default();
         let runtime = ProxyRuntime::new(
             Arc::new(FixedCatalog {

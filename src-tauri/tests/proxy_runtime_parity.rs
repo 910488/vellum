@@ -156,6 +156,15 @@ fn sse_events(body: &str) -> Vec<(String, Value)> {
     events
 }
 
+fn assistant_tool_call_message(request: &Value) -> &Value {
+    request["messages"]
+        .as_array()
+        .expect("Chat request messages")
+        .iter()
+        .find(|message| message.get("tool_calls").is_some())
+        .expect("assistant tool-call message")
+}
+
 /// M5 streaming differential: the shared runtime must reproduce the exact
 /// client-visible SSE event sequence Desktop produced (after `normalize()`),
 /// including tool-call argument deltas and reasoning summary retention. The
@@ -231,6 +240,14 @@ impl Fixture {
 }
 
 async fn setup(wire: WireFormat, script: Vec<ScriptedTurn>) -> Fixture {
+    setup_with_reasoning(wire, script, true).await
+}
+
+async fn setup_with_reasoning(
+    wire: WireFormat,
+    script: Vec<ScriptedTurn>,
+    reasoning: bool,
+) -> Fixture {
     let upstream = FakeUpstream::start(script.clone()).await;
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::with_data_dir(temp.path().to_path_buf());
@@ -242,7 +259,7 @@ async fn setup(wire: WireFormat, script: Vec<ScriptedTurn>) -> Fixture {
             model: "test-model".into(),
             wire,
             streaming: true,
-            reasoning: true,
+            reasoning,
             server_side_resume: false,
             provider_kind: Some(ProviderKind::OpenAiCompatible),
             api_key: None,
@@ -934,6 +951,79 @@ async fn chat_to_responses() {
         "chat_to_responses",
     )
     .await;
+    fixture.teardown().await;
+}
+
+/// Full Desktop HTTP regression for the OpenCode Go / DeepSeek failure seen in
+/// production. The saved capability snapshot can say `reasoning = false`
+/// even though an earlier provider turn emitted readable thinking. When the
+/// provider authoritatively rejects the continuation, the running proxy must
+/// rebuild it with tool-bound `reasoning_content`, retry once, and finish the
+/// same client stream without exposing the intermediate 400.
+#[tokio::test]
+async fn chat_stream_recovers_reasoning_replay_after_false_negative_probe() {
+    let success = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices": [{"delta": {"content": "Recovered."}, "finish_reason": null}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    );
+    let fixture = setup_with_reasoning(
+        WireFormat::Chat,
+        vec![
+            ScriptedTurn::Status(
+                400,
+                json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "The reasoning_content in the thinking mode must be passed back to the API."
+                    }
+                }),
+            ),
+            ScriptedTurn::Sse(vec![success]),
+        ],
+        false,
+    )
+    .await;
+
+    let response = boundary_client()
+        .post(fixture.url("/v1/responses"))
+        .json(&json!({
+            "model": fixture.catalog_id,
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }],
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect the workspace"},
+                {"type": "reasoning", "summary": [{
+                    "type": "summary_text",
+                    "text": "I need to inspect it first."
+                }]},
+                {"type": "function_call", "call_id": "call_inspect", "name": "shell", "arguments": "{\"cmd\":\"dir\"}"},
+                {"type": "function_call_output", "call_id": "call_inspect", "output": "ok"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let stream = response.text().await.unwrap();
+    assert!(status.is_success(), "unexpected status {status}: {stream}");
+    assert!(stream.contains("Recovered."), "{stream}");
+    assert_eq!(fixture.upstream.call_count(), 2);
+
+    let requests = fixture.upstream.captured_requests();
+    assert!(assistant_tool_call_message(&requests[0])
+        .get("reasoning_content")
+        .is_none());
+    assert_eq!(
+        assistant_tool_call_message(&requests[1])["reasoning_content"],
+        "I need to inspect it first."
+    );
+
     fixture.teardown().await;
 }
 
