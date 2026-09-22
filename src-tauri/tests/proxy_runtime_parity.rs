@@ -2276,19 +2276,28 @@ async fn search_disabled() {
 /// the same upstream request.
 #[tokio::test]
 async fn guardian_basic() {
-    let script = vec![ScriptedTurn::Json(json!({
-        "id": "resp_review_1",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "id": "msg_review_1",
-            "role": "assistant",
+    let script = vec![
+        ScriptedTurn::Json(json!({
+            "id": "resp_parent_1",
+            "object": "response",
             "status": "completed",
-            "content": [{"type": "output_text", "text": "{\"outcome\":\"allow\"}", "annotations": []}]
-        }],
-        "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
-    }))];
+            "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+        })),
+        ScriptedTurn::Json(json!({
+            "id": "resp_review_1",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_review_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "{\"outcome\":\"allow\"}", "annotations": []}]
+            }],
+            "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+        })),
+    ];
 
     // Desktop authority: a main route plus an active reviewer route, with the
     // review policy pinned to the reviewer.
@@ -2353,6 +2362,12 @@ async fn guardian_basic() {
         }
     }
     state.activate_proxy_routes();
+    let desktop_parent_catalog = state
+        .active_model_routes()
+        .into_iter()
+        .find(|model| model.upstream_model == "test-model")
+        .unwrap()
+        .catalog_id;
     state
         .set_review_settings(ReviewSettings {
             on_edit: false,
@@ -2380,10 +2395,35 @@ async fn guardian_basic() {
         .unwrap();
     });
 
+    let session_id = "0195328e-8765-7123-9876-0123456789ab";
+    let parent_metadata = format!(
+        "{{\"session_id\":\"{session_id}\",\"thread_id\":\"parent\",\"turn_id\":\"parent-turn\"}}"
+    );
+    let child_metadata = format!(
+        "{{\"session_id\":\"{session_id}\",\"thread_id\":\"review-child\",\"turn_id\":\"review-turn\",\"parent_thread_id\":\"parent\",\"parent_turn_id\":\"parent-turn\"}}"
+    );
+    let parent_response = boundary_client()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .json(&json!({
+            "model": desktop_parent_catalog,
+            "input": [{"role": "user", "content": "Prepare a protected action"}],
+            "stream": false,
+            "client_metadata": {"x-codex-turn-metadata": parent_metadata}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        parent_response.status().is_success(),
+        "Desktop parent request failed before guardian E2E: {}",
+        parent_response.status()
+    );
+
     let desktop_request = json!({
         "model": vellum_proxy_runtime::review::AUTO_REVIEW_MODEL,
         "input": [{"role": "user", "content": "Review this action"}],
-        "stream": false
+        "stream": false,
+        "client_metadata": {"x-codex-turn-metadata": child_metadata}
     });
     let response = boundary_client()
         .post(format!("http://{proxy_address}/v1/responses"))
@@ -2485,12 +2525,29 @@ async fn guardian_basic() {
     let server = tokio::spawn(async move {
         let _ = serve_proxy(server_state, listener, runtime_policy, runtime_shutdown_rx).await;
     });
+    let runtime_parent_response = boundary_client()
+        .post(format!("http://{runtime_address}/v1/responses"))
+        .json(&json!({
+            "model": RUNTIME_CATALOG_ID,
+            "input": [{"role": "user", "content": "Prepare a protected action"}],
+            "stream": false,
+            "client_metadata": {"x-codex-turn-metadata": parent_metadata}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        runtime_parent_response.status().is_success(),
+        "Runtime parent request failed before guardian E2E: {}",
+        runtime_parent_response.status()
+    );
     let runtime_response = boundary_client()
         .post(format!("http://{runtime_address}/v1/responses"))
         .json(&json!({
             "model": vellum_proxy_runtime::review::AUTO_REVIEW_MODEL,
             "input": [{"role": "user", "content": "Review this action"}],
-            "stream": false
+            "stream": false,
+            "client_metadata": {"x-codex-turn-metadata": child_metadata}
         }))
         .send()
         .await
@@ -2515,8 +2572,8 @@ async fn guardian_basic() {
     );
     // Upstream parity: both sides forwarded to the reviewer with the same
     // upstream model and body.
-    let mut desktop_upstream_body = desktop_upstream[0].clone();
-    let mut runtime_upstream_body = runtime_upstream.captured_requests()[0].clone();
+    let mut desktop_upstream_body = desktop_upstream[1].clone();
+    let mut runtime_upstream_body = runtime_upstream.captured_requests()[1].clone();
     normalize(&mut desktop_upstream_body);
     normalize(&mut runtime_upstream_body);
     assert_eq!(

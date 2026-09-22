@@ -514,6 +514,10 @@ from the review-usage display. Historical records remain stored.
 Guardian is orchestration around actual reviews. It must not turn provider,
 authentication, quota, protocol, or parsing failures into a successful empty
 review. Retry and fallback are explicit policy decisions and remain bounded.
+Guardian is not a child-agent continuation even when Codex carries the parent
+task's typed thread metadata into the approval request. Its reviewer route is
+selected independently by Auto Review policy and is exempt from child route
+inheritance; ordinary child-agent traffic must still inherit the parent route.
 Each reviewer leg is projected against that reviewer's own context window.
 When inherited task history would overflow a smaller fallback route, preserve
 the Guardian policy and planned-action boundaries, replace inherited history

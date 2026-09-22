@@ -61,6 +61,11 @@ pub struct RequestMetadata {
     /// instead of collapsing them into whichever ran last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_role: Option<String>,
+    /// Proxy-internal marker for a request already projected as one Guardian
+    /// reviewer leg. This is distinct from `review_role`: inner attempt usage
+    /// deliberately leaves attribution unset until the winning leg is known.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guardian_dispatch: bool,
     /// A short, human-readable reason the primary reviewer was unavailable,
     /// set only on the fallback leg of a guardian dispatch. Deliberately
     /// bounded (a route name plus a status/category, never the raw upstream
@@ -181,6 +186,7 @@ mod tests {
                 received_at_ms: 1_700_000_000_000,
                 review_run_id: None,
                 review_role: None,
+                guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
                 codex_identity: None,
@@ -212,6 +218,7 @@ mod tests {
             received_at_ms: 1_700_000_000_000,
             review_run_id: None,
             review_role: None,
+            guardian_dispatch: false,
             primary_failure_reason: None,
             connection_id: None,
             codex_identity: Some(identity),
