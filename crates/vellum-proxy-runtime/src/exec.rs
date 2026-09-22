@@ -1892,6 +1892,15 @@ impl ProxyRuntime {
         request: &RuntimeRequest,
         requested_route_id: &str,
     ) -> Result<(), RuntimeError> {
+        // Guardian is an isolated approval assessment selected by the saved
+        // Auto Review policy, not a child-agent continuation. Codex carries
+        // the parent task's typed thread metadata into this request so the
+        // assessment can see its context, but the reviewer route is expected
+        // to differ from the task route. Applying child-route inheritance here
+        // would reject every cross-provider Auto Review before dispatch.
+        if request.metadata.guardian_dispatch || is_guardian_request(&request.body) {
+            return Ok(());
+        }
         let Some(identity) = request.metadata.codex_identity.as_ref() else {
             return Ok(());
         };
@@ -2937,6 +2946,7 @@ impl ProxyRuntime {
             metadata: RequestMetadata {
                 review_run_id: None,
                 review_role: None,
+                guardian_dispatch: true,
                 // Auto Review's own billing identity. Set on both legs so a
                 // failover onto a second Official reviewer bills the same
                 // account as the primary; unset on every non-guardian
@@ -3090,6 +3100,7 @@ impl ProxyRuntime {
             metadata: RequestMetadata {
                 review_run_id: None,
                 review_role: None,
+                guardian_dispatch: true,
                 primary_failure_reason: Some(reason),
                 // Auto Review's own billing identity. Set on both legs so a
                 // failover onto a second Official reviewer bills the same
@@ -9394,7 +9405,7 @@ mod tests {
         conflict.metadata.request_id = "req_conflict".into();
         conflict.metadata.codex_identity = Some(identity(
             "conflicted",
-            Some("other_parent"),
+            None,
             None,
             CodexIdentityTrust::Conflict,
         ));
@@ -16621,6 +16632,26 @@ mod tests {
             runtime.ensure_subagent_route_inherited(&child, "official-route"),
             Err(RuntimeError::InvalidRequest(message))
                 if message.contains("subagent route switch forbidden")
+        ));
+
+        let mut guardian = child.clone();
+        guardian.body["model"] = Value::String(crate::review::AUTO_REVIEW_MODEL.into());
+        assert!(runtime
+            .ensure_subagent_route_inherited(&guardian, "official-route")
+            .is_ok());
+
+        let mut projected_guardian = child.clone();
+        projected_guardian.metadata.guardian_dispatch = true;
+        assert!(runtime
+            .ensure_subagent_route_inherited(&projected_guardian, "official-route")
+            .is_ok());
+
+        child.metadata.codex_identity.as_mut().unwrap().trust =
+            crate::codex_metadata::CodexIdentityTrust::Conflict;
+        assert!(matches!(
+            runtime.ensure_subagent_route_inherited(&child, "third-party-route"),
+            Err(RuntimeError::InvalidRequest(message))
+                if message.contains("conflicting thread metadata")
         ));
     }
 

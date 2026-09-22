@@ -406,6 +406,7 @@ pub(crate) fn build_request_metadata(
         received_at_ms: now_ms(),
         review_run_id: None,
         review_role: None,
+        guardian_dispatch: false,
         primary_failure_reason: None,
         connection_id,
         codex_identity,
