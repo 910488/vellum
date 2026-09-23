@@ -62,6 +62,55 @@ fn state(temp: &tempfile::TempDir) -> BridgeState {
     )
 }
 
+#[test]
+fn desktop_rate_limit_snapshot_does_not_block_provider_turns() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = state(&temp);
+    assert_eq!(
+        bridge
+            .on_client_line(r#"{"id":7,"method":"account/rateLimits/read","params":{}}"#)
+            .unwrap(),
+        vec![BridgeAction::ToClient(json!({
+            "id": 7,
+            "result": {"rateLimits": {}}
+        }))]
+    );
+    assert!(bridge
+        .on_child_line(
+            ExecutionPlane::OfficialCodex,
+            r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"secondary":{"usedPercent":100}}}}"#,
+        )
+        .unwrap()
+        .is_empty());
+
+    let actions = bridge
+        .on_client_line(
+            r#"{"id":8,"method":"thread/start","params":{"modelProvider":"qwen","model":"qwen3-coder"}}"#,
+        )
+        .unwrap();
+    assert!(matches!(
+        &actions[0],
+        BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, _)
+    ));
+
+    let actions = bridge
+        .on_client_line(
+            r#"{"id":9,"method":"thread/start","params":{"modelProvider":"openai","model":"gpt-5"}}"#,
+        )
+        .unwrap();
+    assert!(matches!(
+        &actions[0],
+        BridgeAction::ToChild(ExecutionPlane::OfficialCodex, _)
+    ));
+    let upstream_error = json!({"id": 9, "error": {"code": 429, "message": "quota exceeded"}});
+    assert_eq!(
+        bridge
+            .on_child_line(ExecutionPlane::OfficialCodex, &upstream_error.to_string())
+            .unwrap(),
+        vec![BridgeAction::ToClient(upstream_error)]
+    );
+}
+
 fn start_enhanced_thread(state: &mut BridgeState, provider: &str, model: &str, thread: &str) {
     let request =
         json!({"id": 1, "method": "thread/start", "params": {"modelProvider": provider, "model": model}})

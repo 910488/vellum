@@ -279,6 +279,15 @@ It must not be forwarded to third-party providers.
 
 ### Managed ChatGPT quota pool
 
+Codex Desktop receives an empty `account/rateLimits/read` snapshot from the
+Vellum App Server bridge, and the bridge does not forward global
+`account/rateLimits/updated` notifications. Desktop otherwise disables its
+composer for every model when its native ChatGPT login reaches a weekly limit,
+including third-party models routed through Vellum. This display-only bridge
+behavior leaves Vellum's own quota readings, account selection, pool gates,
+and upstream quota errors intact. A sent Official request can still fail when
+the provider has no remaining allowance.
+
 Desktop may opt managed ChatGPT credentials into an automatic quota pool. The
 pool is disabled by default; while disabled, the verified manual account
 selection remains authoritative. Pool membership, pause state, member order,

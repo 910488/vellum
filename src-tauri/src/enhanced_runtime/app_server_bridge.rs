@@ -694,6 +694,20 @@ impl BridgeState {
                 BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, value),
             ]);
         }
+        // Desktop uses this global Official-account snapshot to disable the
+        // composer, even for threads routed to a third-party provider. Keep
+        // the actual quota in Vellum and let each attempted turn reach its
+        // provider, which can still return a real quota error.
+        if method == "account/rateLimits/read" {
+            let id = value
+                .get("id")
+                .cloned()
+                .ok_or_else(|| BridgeError::Protocol("rate limits request has no id".into()))?;
+            return Ok(vec![BridgeAction::ToClient(json!({
+                "id": id,
+                "result": {"rateLimits": {}}
+            }))]);
+        }
         if method == "initialize" {
             let Some(id) = value.get("id").cloned() else {
                 return Err(BridgeError::Protocol("initialize request has no id".into()));
@@ -914,6 +928,9 @@ impl BridgeState {
         }
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             let method = method.to_string();
+            if method == "account/rateLimits/updated" {
+                return Ok(Vec::new());
+            }
             if method.starts_with("vellum/") {
                 return Ok(self.absorb_vellum_notification(plane, &method, &value));
             }
