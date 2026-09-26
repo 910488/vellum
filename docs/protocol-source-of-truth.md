@@ -314,8 +314,16 @@ reading. No in-flight request is replayed automatically after a quota error.
 Each managed credential is a distinct pool member. Multiple user seats in the
 same workspace may be pooled because upstream quota windows can be scoped to
 the authenticated user; their access tokens, quota caches, gates, and rotation
-state remain separate. A configuration change during selection rejects that
-selection so the caller can retry with the new settings.
+state remain separate. The pool also accepts credentials from different users
+and workspaces when explicitly enrolled. Reauthenticating a legacy workspace-id
+credential retains its pool membership under the new user-and-workspace id.
+A configuration change during selection rejects that selection so the caller
+can retry with the new settings.
+
+Each pool routing attempt writes correlated app-log entries for skipped
+members, retries, the selected member, or exhaustion. Entries include an
+opaque selection id, member order, a short credential hash, and a fixed reason
+code. They never include tokens, email addresses, or raw account/workspace ids.
 
 Opt-in local validation: `cargo test -p vellum --lib live_quota_pool_routing
 -- --ignored --nocapture`. It refreshes existing managed grants, reads real
