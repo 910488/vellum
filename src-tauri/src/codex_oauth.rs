@@ -464,6 +464,15 @@ impl CodexOAuthManager {
                 .map_err(|error| OAuthError::Storage(error.to_string()))?;
             self.accounts.write().await.remove(legacy_account_id);
             self.access_tokens.write().await.remove(legacy_account_id);
+            {
+                let mut pool = self.quota_pool.write().await;
+                migrate_quota_pool_member(&mut pool, legacy_account_id, &account_id);
+            }
+            if self.active_pool_account_id.read().await.as_deref()
+                == Some(legacy_account_id.as_str())
+            {
+                *self.active_pool_account_id.write().await = Some(account_id.clone());
+            }
             let mut default = self.default_account_id.write().await;
             if default.as_deref() == Some(legacy_account_id.as_str()) {
                 *default = Some(account_id.clone());
@@ -696,22 +705,46 @@ impl CodexOAuthManager {
     /// Resolve one account for a new ordinary Official request. An empty pool
     /// intentionally falls back to the manual selection; once the user adds a
     /// member, exhaustion fails closed instead of silently charging a pool-external
-    /// account. Auto Review calls `valid_auth_for` and remains explicitly billed.
+    /// account. Every enrolled credential is eligible, including other users and
+    /// workspaces; quota and member settings determine whether it can be used.
+    /// Auto Review calls `valid_auth_for` and remains explicitly billed.
     pub async fn valid_routing_auth(&self) -> Result<Option<AppliedOAuth>, OAuthError> {
         let settings = self.quota_pool.read().await.clone();
+        let selection_id = ulid::Ulid::new();
         if !settings.enabled || !settings.members.iter().any(|member| member.in_pool) {
+            log::info!(
+                "[QuotaPool] selection={selection_id} event=bypass reason={}",
+                if settings.enabled {
+                    "empty_pool"
+                } else {
+                    "disabled"
+                }
+            );
             *self.active_pool_account_id.write().await = None;
             return self.valid_default_auth().await;
         }
 
         let mut failures = Vec::new();
+        let mut rank = 0;
         for member in &settings.members {
-            if !member.in_pool || member.paused {
+            if !member.in_pool {
+                continue;
+            }
+            rank += 1;
+            if member.paused {
+                log_pool_decision(selection_id, "skip", &member.account_id, rank, "paused");
                 continue;
             }
             let mut auth = match self.valid_auth_for(&member.account_id).await {
                 Ok(auth) => auth,
                 Err(error) => {
+                    log_pool_decision(
+                        selection_id,
+                        "skip",
+                        &member.account_id,
+                        rank,
+                        "auth_unavailable",
+                    );
                     failures.push(format!("{}: {error}", member.account_id));
                     continue;
                 }
@@ -727,12 +760,26 @@ impl CodexOAuthManager {
             {
                 Ok(windows) => windows,
                 Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
+                    log_pool_decision(
+                        selection_id,
+                        "retry",
+                        &member.account_id,
+                        rank,
+                        "quota_unauthorized",
+                    );
                     auth = match self
                         .refresh_after_rejection(&auth.credential_id, &auth.access_token)
                         .await
                     {
                         Ok(refreshed) => refreshed,
                         Err(error) => {
+                            log_pool_decision(
+                                selection_id,
+                                "skip",
+                                &member.account_id,
+                                rank,
+                                "refresh_failed",
+                            );
                             failures.push(format!("{}: {error}", member.account_id));
                             continue;
                         }
@@ -747,12 +794,26 @@ impl CodexOAuthManager {
                     {
                         Ok(windows) => windows,
                         Err(error) => {
+                            log_pool_decision(
+                                selection_id,
+                                "skip",
+                                &member.account_id,
+                                rank,
+                                "quota_query_failed",
+                            );
                             failures.push(format!("{}: {error}", member.account_id));
                             continue;
                         }
                     }
                 }
                 Err(error) => {
+                    log_pool_decision(
+                        selection_id,
+                        "skip",
+                        &member.account_id,
+                        rank,
+                        "quota_query_failed",
+                    );
                     failures.push(format!("{}: {error}", member.account_id));
                     continue;
                 }
@@ -760,14 +821,42 @@ impl CodexOAuthManager {
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
                 if observation.usable {
                     if *self.quota_pool.read().await != settings {
+                        log_pool_decision(
+                            selection_id,
+                            "reject",
+                            &member.account_id,
+                            rank,
+                            "settings_changed",
+                        );
                         return Err(OAuthError::AuthenticationFailed(
                             "quota pool changed during account selection; retry the request".into(),
                         ));
                     }
                     *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
+                    log_pool_decision(
+                        selection_id,
+                        "selected",
+                        &auth.credential_id,
+                        rank,
+                        "usable",
+                    );
                     return Ok(Some(auth));
                 }
+                log_pool_decision(
+                    selection_id,
+                    "skip",
+                    &member.account_id,
+                    rank,
+                    observation.skip_reason.unwrap_or("quota_unavailable"),
+                );
             } else {
+                log_pool_decision(
+                    selection_id,
+                    "skip",
+                    &member.account_id,
+                    rank,
+                    "missing_quota_windows",
+                );
                 failures.push(format!(
                     "{}: required 5-hour/weekly windows are missing",
                     member.account_id
@@ -776,6 +865,7 @@ impl CodexOAuthManager {
         }
 
         *self.active_pool_account_id.write().await = None;
+        log::info!("[QuotaPool] selection={selection_id} event=exhausted reason=no_usable_member");
         let detail = if failures.is_empty() {
             "all members are paused, throttled, or at their weekly gate".to_string()
         } else {
@@ -891,25 +981,23 @@ impl CodexOAuthManager {
         account_or_workspace_id: &str,
         rejected_token: &str,
     ) -> Result<String, OAuthError> {
-        if self
-            .accounts
-            .read()
-            .await
-            .contains_key(account_or_workspace_id)
-        {
-            return Ok(account_or_workspace_id.to_string());
-        }
         let tokens = self.access_tokens.read().await;
         let accounts = self.accounts.read().await;
+        if let Some((credential_id, _)) = accounts.iter().find(|(credential_id, account)| {
+            (credential_id.as_str() == account_or_workspace_id
+                || account.chatgpt_account_id.as_deref() == Some(account_or_workspace_id))
+                && tokens
+                    .get(*credential_id)
+                    .is_some_and(|cached| cached.access_token == rejected_token)
+        }) {
+            return Ok(credential_id.clone());
+        }
+        // The direct selector remains useful when this process has no cached
+        // token, but an exact token match wins if a legacy row's key equals
+        // another user's workspace id.
         accounts
-            .iter()
-            .find(|(credential_id, account)| {
-                account.chatgpt_account_id.as_deref() == Some(account_or_workspace_id)
-                    && tokens
-                        .get(*credential_id)
-                        .is_some_and(|cached| cached.access_token == rejected_token)
-            })
-            .map(|(credential_id, _)| credential_id.clone())
+            .contains_key(account_or_workspace_id)
+            .then(|| account_or_workspace_id.to_string())
             .ok_or_else(|| OAuthError::AccountNotFound(account_or_workspace_id.into()))
     }
 
@@ -1068,6 +1156,34 @@ impl CodexOAuthManager {
 #[derive(Debug, Clone, Copy)]
 struct QuotaPoolObservation {
     usable: bool,
+    skip_reason: Option<&'static str>,
+}
+
+fn log_pool_decision(
+    selection_id: ulid::Ulid,
+    event: &'static str,
+    account_id: &str,
+    rank: usize,
+    reason: &'static str,
+) {
+    log::info!(
+        "{}",
+        pool_decision_message(selection_id, event, account_id, rank, reason)
+    );
+}
+
+fn pool_decision_message(
+    selection_id: ulid::Ulid,
+    event: &'static str,
+    account_id: &str,
+    rank: usize,
+    reason: &'static str,
+) -> String {
+    let digest = format!("{:x}", Sha256::digest(account_id.as_bytes()));
+    format!(
+        "[QuotaPool] selection={selection_id} event={event} account={} rank={rank} reason={reason}",
+        &digest[..12]
+    )
 }
 
 /// Leave enough headroom for the request being admitted now. The upstream
@@ -1088,8 +1204,16 @@ fn quota_pool_observation(
     let weekly_remaining = 100.0 - weekly.used_percent.clamp(0.0, 100.0);
     let five_hour_remaining = 100.0 - five_hour.used_percent.clamp(0.0, 100.0);
     let burnable = (weekly_remaining - f64::from(weekly_floor)).max(0.0);
+    let skip_reason = if burnable <= 0.0 {
+        Some("weekly_floor")
+    } else if five_hour_remaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT {
+        Some("five_hour_reserve")
+    } else {
+        None
+    };
     Some(QuotaPoolObservation {
-        usable: burnable > 0.0 && five_hour_remaining > FIVE_HOUR_ROUTING_RESERVE_PERCENT,
+        usable: skip_reason.is_none(),
+        skip_reason,
     })
 }
 
@@ -1212,6 +1336,34 @@ fn matching_legacy_account(
                 .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(email)))
         .then(|| account.account_id.clone())
     })
+}
+
+fn migrate_quota_pool_member(settings: &mut QuotaPoolSettings, old_id: &str, new_id: &str) {
+    let Some(old_index) = settings
+        .members
+        .iter()
+        .position(|member| member.account_id == old_id)
+    else {
+        return;
+    };
+    let mut old = settings.members.remove(old_index);
+    if let Some(existing) = settings
+        .members
+        .iter_mut()
+        .find(|member| member.account_id == new_id)
+    {
+        // An already configured new row keeps its order. Preserve an active
+        // legacy membership if that new row has not joined the pool yet.
+        if old.in_pool && !existing.in_pool {
+            existing.in_pool = true;
+            existing.paused = old.paused;
+            existing.weekly_floor = old.weekly_floor;
+        }
+        existing.maintain_five_hour_window |= old.maintain_five_hour_window;
+    } else {
+        old.account_id = new_id.to_string();
+        settings.members.insert(old_index, old);
+    }
 }
 
 fn credential_key(account_id: &str) -> String {
@@ -1374,12 +1526,15 @@ mod tests {
 
         let gated = quota_pool_observation(&windows, 59).unwrap();
         assert!(!gated.usable);
+        assert_eq!(gated.skip_reason, Some("weekly_floor"));
 
         let throttled = vec![
             quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 100.0, None),
             windows[1].clone(),
         ];
-        assert!(!quota_pool_observation(&throttled, 0).unwrap().usable);
+        let throttled = quota_pool_observation(&throttled, 0).unwrap();
+        assert!(!throttled.usable);
+        assert_eq!(throttled.skip_reason, Some("five_hour_reserve"));
 
         let inside_request_reserve = vec![
             quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 96.0, None),
@@ -1399,6 +1554,21 @@ mod tests {
             quota_pool_observation(&outside_request_reserve, 0)
                 .unwrap()
                 .usable
+        );
+    }
+
+    #[test]
+    fn quota_pool_log_uses_a_stable_account_hash_and_reason() {
+        let selection = ulid::Ulid::new();
+        let message =
+            pool_decision_message(selection, "skip", "private-account-id", 2, "weekly_floor");
+        assert!(message.contains(&format!("selection={selection}")));
+        assert!(message.contains("event=skip"));
+        assert!(message.contains("rank=2 reason=weekly_floor"));
+        assert!(!message.contains("private-account-id"));
+        assert_eq!(
+            message,
+            pool_decision_message(selection, "skip", "private-account-id", 2, "weekly_floor")
         );
     }
 
@@ -1567,6 +1737,83 @@ mod tests {
     }
 
     #[test]
+    fn legacy_login_keeps_its_pool_membership() {
+        let mut settings = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Rank,
+            members: vec![QuotaPoolMember {
+                account_id: "old-workspace-id".into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 35,
+                maintain_five_hour_window: true,
+            }],
+        };
+        migrate_quota_pool_member(&mut settings, "old-workspace-id", "new-credential-id");
+        assert_eq!(settings.members.len(), 1);
+        assert_eq!(settings.members[0].account_id, "new-credential-id");
+        assert!(settings.members[0].in_pool);
+        assert_eq!(settings.members[0].weekly_floor, 35);
+        assert!(settings.members[0].maintain_five_hour_window);
+
+        settings.members.insert(
+            0,
+            QuotaPoolMember {
+                account_id: "old-workspace-id".into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 42,
+                maintain_five_hour_window: false,
+            },
+        );
+        settings.members[1].in_pool = false;
+        migrate_quota_pool_member(&mut settings, "old-workspace-id", "new-credential-id");
+        assert_eq!(settings.members.len(), 1);
+        assert!(settings.members[0].in_pool);
+        assert_eq!(settings.members[0].weekly_floor, 42);
+    }
+
+    #[tokio::test]
+    async fn workspace_refresh_chooses_the_rejected_users_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        for (credential, token, workspace) in [
+            ("shared-workspace", "legacy-token", None),
+            (
+                "new-user-credential",
+                "new-user-token",
+                Some("shared-workspace"),
+            ),
+        ] {
+            manager.accounts.write().await.insert(
+                credential.into(),
+                AccountMetadata {
+                    account_id: credential.into(),
+                    chatgpt_account_id: workspace.map(str::to_string),
+                    workspace_name: None,
+                    plan_type: None,
+                    email: None,
+                    authenticated_at: 1,
+                },
+            );
+            manager.access_tokens.write().await.insert(
+                credential.into(),
+                CachedToken {
+                    access_token: token.into(),
+                    expires_at_ms: i64::MAX,
+                },
+            );
+        }
+        assert_eq!(
+            manager
+                .resolve_credential_selector("shared-workspace", "new-user-token")
+                .await
+                .unwrap(),
+            "new-user-credential"
+        );
+    }
+
+    #[test]
     fn refresh_identity_must_match_expected_account() {
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::json!({
@@ -1601,18 +1848,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_pool_routes_distinct_credentials_in_one_workspace() {
+    async fn quota_pool_routes_across_users_and_workspaces() {
         let temp = tempfile::tempdir().unwrap();
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         let mut members = Vec::new();
-        for (id, used) in [("pool-a", 70.0), ("pool-b", 20.0)] {
+        for (id, user, workspace, plan, used, weekly_floor) in [
+            ("pool-a", "user-one", "personal-a", "plus", 70.0, 0),
+            ("pool-b", "user-one", "business-b", "business", 20.0, 0),
+            ("pool-c", "user-two", "business-b", "business", 10.0, 100),
+        ] {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "sub": user,
+                    "chatgpt_account_id": workspace,
+                    "chatgpt_plan_type": plan,
+                })
+                .to_string(),
+            );
+            let token = format!("header.{payload}.signature");
             manager.accounts.write().await.insert(
                 id.into(),
                 AccountMetadata {
                     account_id: id.into(),
-                    chatgpt_account_id: Some("shared-workspace".into()),
+                    chatgpt_account_id: Some(workspace.into()),
                     workspace_name: None,
-                    plan_type: None,
+                    plan_type: Some(plan.into()),
                     email: Some(format!("{id}@example.test")),
                     authenticated_at: 1,
                 },
@@ -1620,13 +1880,13 @@ mod tests {
             manager.access_tokens.write().await.insert(
                 id.into(),
                 CachedToken {
-                    access_token: id.into(),
+                    access_token: token.clone(),
                     expires_at_ms: i64::MAX,
                 },
             );
             crate::codex_quota::seed_test_quota(
-                id,
-                "shared-workspace",
+                &token,
+                workspace,
                 vec![
                     quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 10.0, None),
                     quota_window(crate::model::QuotaPeriodUnit::Week, None, used, None),
@@ -1637,7 +1897,7 @@ mod tests {
                 account_id: id.into(),
                 in_pool: true,
                 paused: false,
-                weekly_floor: 0,
+                weekly_floor,
                 maintain_five_hour_window: false,
             });
         }
@@ -1688,7 +1948,7 @@ mod tests {
         manager.set_quota_pool(settings.clone()).await.unwrap();
         assert!(manager.valid_routing_auth().await.is_err());
         settings.enabled = false;
-        manager.set_quota_pool(settings).await.unwrap();
+        manager.set_quota_pool(settings.clone()).await.unwrap();
         assert_eq!(
             manager
                 .valid_routing_auth()
@@ -1697,6 +1957,18 @@ mod tests {
                 .unwrap()
                 .credential_id,
             "pool-a"
+        );
+        settings.enabled = true;
+        settings.members[2].weekly_floor = 0;
+        manager.set_quota_pool(settings).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "pool-c"
         );
     }
 
