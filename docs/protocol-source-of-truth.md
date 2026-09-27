@@ -299,18 +299,20 @@ pooled, unpaused account whose 5-hour window is non-zero and whose weekly
 remaining percentage is above its configured floor. Rotation follows the
 explicit member order and skips members that are currently unavailable without
 reordering the others. Legacy `most` and `soonest` settings deserialize as
-`rank` and serialize back as `rank`. Missing quota data fails that member
-closed. An enabled pool with no members keeps the manual selection until the
-user adds one; once at least one member is configured, having no usable member
-must not cross a weekly floor, consume a Reset credit, or silently use a
-pool-external account. Auto Review's explicitly selected billing account
-bypasses this ordinary-request policy.
+`rank` and serialize back as `rank`. Missing quota data skips that member for
+automatic rotation. An enabled pool with no members keeps the manual selection.
+When no member passes the automatic quota checks, a valid manually selected
+account (even outside the pool) is used; if it is paused, the first unpaused
+member with valid credentials is used instead. This fallback can cross a weekly
+floor, but never consumes a Reset credit. The request reaches upstream so its
+actual usage-limit response determines whether it can proceed. Auto Review's
+explicitly selected billing account bypasses this ordinary-request policy.
 
 Quota readings are cached for at most 30 seconds per token and workspace;
-force-refresh invalidates the previous reading. Gates control admission of new
-requests, not the final cost of an already admitted turn. Usage by other
-clients and in-flight turns can therefore cross a floor before the next
-reading. No in-flight request is replayed automatically after a quota error.
+force-refresh invalidates the previous reading. Gates control automatic
+rotation, not whether a request can be sent. Usage by other clients and
+in-flight turns can cross a floor before the next reading. No in-flight request
+is replayed automatically after a quota error.
 Each managed credential is a distinct pool member. Multiple user seats in the
 same workspace may be pooled because upstream quota windows can be scoped to
 the authenticated user; their access tokens, quota caches, gates, and rotation
