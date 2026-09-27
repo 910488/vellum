@@ -704,9 +704,9 @@ impl CodexOAuthManager {
 
     /// Resolve one account for a new ordinary Official request. An empty pool
     /// intentionally falls back to the manual selection; once the user adds a
-    /// member, exhaustion fails closed instead of silently charging a pool-external
-    /// account. Every enrolled credential is eligible, including other users and
-    /// workspaces; quota and member settings determine whether it can be used.
+    /// member, quota readings choose the automatic rotation order. When no
+    /// account passes those readings, an explicit manual selection can still
+    /// reach upstream and receive its actual usage-limit response.
     /// Auto Review calls `valid_auth_for` and remains explicitly billed.
     pub async fn valid_routing_auth(&self) -> Result<Option<AppliedOAuth>, OAuthError> {
         let settings = self.quota_pool.read().await.clone();
@@ -726,6 +726,7 @@ impl CodexOAuthManager {
 
         let mut failures = Vec::new();
         let mut rank = 0;
+        let mut fallback_auth = None;
         for member in &settings.members {
             if !member.in_pool {
                 continue;
@@ -749,6 +750,9 @@ impl CodexOAuthManager {
                     continue;
                 }
             };
+            if fallback_auth.is_none() {
+                fallback_auth = Some(auth.clone());
+            }
             let windows = match crate::codex_quota::query_with_cache_ttl(
                 &auth.access_token,
                 &auth.account_id,
@@ -784,6 +788,14 @@ impl CodexOAuthManager {
                             continue;
                         }
                     };
+                    if fallback_auth
+                        .as_ref()
+                        .is_some_and(|fallback: &AppliedOAuth| {
+                            fallback.credential_id == auth.credential_id
+                        })
+                    {
+                        fallback_auth = Some(auth.clone());
+                    }
                     match crate::codex_quota::query(
                         &auth.access_token,
                         &auth.account_id,
@@ -864,15 +876,64 @@ impl CodexOAuthManager {
             }
         }
 
+        // The usage endpoint is advisory. A depleted or unreadable snapshot
+        // must not prevent a valid credential from reaching the provider.
+        // Prefer the user's manual selection, including an account outside the
+        // pool, but do not override an explicit pause on a pooled member.
+        let manual = self.resolve_default().await;
+        let manual_paused = manual.as_ref().is_some_and(|account_id| {
+            settings
+                .members
+                .iter()
+                .any(|member| member.account_id == *account_id && member.in_pool && member.paused)
+        });
+        let fallback = if manual_paused {
+            fallback_auth
+        } else if let Some(account_id) = manual {
+            match self.valid_auth_for(&account_id).await {
+                Ok(auth) => Some(auth),
+                Err(error) => {
+                    failures.push(format!("{account_id}: {error}"));
+                    fallback_auth
+                }
+            }
+        } else {
+            fallback_auth
+        };
+        if let Some(auth) = fallback {
+            if *self.quota_pool.read().await != settings {
+                return Err(OAuthError::AuthenticationFailed(
+                    "quota pool changed during account selection; retry the request".into(),
+                ));
+            }
+            *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
+            let fallback_rank = settings
+                .members
+                .iter()
+                .filter(|member| member.in_pool)
+                .position(|member| member.account_id == auth.credential_id)
+                .map_or(0, |index| index + 1);
+            log_pool_decision(
+                selection_id,
+                "selected",
+                &auth.credential_id,
+                fallback_rank,
+                "manual_fallback",
+            );
+            return Ok(Some(auth));
+        }
+
         *self.active_pool_account_id.write().await = None;
-        log::info!("[QuotaPool] selection={selection_id} event=exhausted reason=no_usable_member");
+        log::info!(
+            "[QuotaPool] selection={selection_id} event=exhausted reason=no_valid_credential"
+        );
         let detail = if failures.is_empty() {
-            "all members are paused, throttled, or at their weekly gate".to_string()
+            "all members are paused or have no valid credential".to_string()
         } else {
             failures.join("; ")
         };
         Err(OAuthError::AuthenticationFailed(format!(
-            "quota pool has no usable ChatGPT account: {detail}"
+            "quota pool has no available ChatGPT credential: {detail}"
         )))
     }
 
@@ -1946,7 +2007,17 @@ mod tests {
         );
         settings.members[1].paused = true;
         manager.set_quota_pool(settings.clone()).await.unwrap();
-        assert!(manager.valid_routing_auth().await.is_err());
+        // The manual account is paused, so the remaining valid pool member
+        // can still attempt a request even below its automatic gate.
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "pool-b"
+        );
         settings.enabled = false;
         manager.set_quota_pool(settings.clone()).await.unwrap();
         assert_eq!(
@@ -1969,6 +2040,80 @@ mod tests {
                 .unwrap()
                 .credential_id,
             "pool-c"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_shared_workspace_allows_manually_selected_seat_to_send() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let mut members = Vec::new();
+        for (id, user) in [("seat-a", "user-a"), ("seat-b", "user-b")] {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "sub": user,
+                    "chatgpt_account_id": "shared-business",
+                    "chatgpt_plan_type": "business",
+                })
+                .to_string(),
+            );
+            let token = format!("header.{payload}.signature");
+            manager.accounts.write().await.insert(
+                id.into(),
+                AccountMetadata {
+                    account_id: id.into(),
+                    chatgpt_account_id: Some("shared-business".into()),
+                    workspace_name: None,
+                    plan_type: Some("business".into()),
+                    email: Some(format!("{user}@example.test")),
+                    authenticated_at: 1,
+                },
+            );
+            manager.access_tokens.write().await.insert(
+                id.into(),
+                CachedToken {
+                    access_token: token.clone(),
+                    expires_at_ms: i64::MAX,
+                },
+            );
+            crate::codex_quota::seed_test_quota(
+                &token,
+                "shared-business",
+                vec![
+                    quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 100.0, None),
+                    quota_window(crate::model::QuotaPeriodUnit::Week, None, 100.0, None),
+                ],
+            )
+            .await;
+            members.push(QuotaPoolMember {
+                account_id: id.into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 0,
+                maintain_five_hour_window: false,
+            });
+        }
+        *manager.default_account_id.write().await = Some("seat-a".into());
+        manager
+            .set_quota_pool(QuotaPoolSettings {
+                enabled: true,
+                strategy: QuotaPoolStrategy::Rank,
+                members,
+            })
+            .await
+            .unwrap();
+
+        manager.set_default("seat-b").await.unwrap();
+        let selected = manager.valid_routing_auth().await.unwrap().unwrap();
+        assert_eq!(selected.credential_id, "seat-b");
+        assert_eq!(selected.account_id, "shared-business");
+        assert_eq!(
+            manager
+                .quota_pool_status()
+                .await
+                .active_account_id
+                .as_deref(),
+            Some("seat-b")
         );
     }
 
@@ -2079,7 +2224,7 @@ mod tests {
             member.weekly_floor = 100;
         }
         manager.set_quota_pool(settings).await.unwrap();
-        assert!(manager.valid_routing_auth().await.is_err());
+        assert!(manager.valid_routing_auth().await.unwrap().is_some());
         // Exercise the real Desktop authorization adapter and proxy HTTP path,
         // selecting a different live account on each of two tiny turns.
         let manager = Arc::new(manager);
