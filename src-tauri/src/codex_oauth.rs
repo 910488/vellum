@@ -870,7 +870,7 @@ impl CodexOAuthManager {
                     "missing_quota_windows",
                 );
                 failures.push(format!(
-                    "{}: required 5-hour/weekly windows are missing",
+                    "{}: required weekly window is missing",
                     member.account_id
                 ));
             }
@@ -1261,13 +1261,15 @@ fn quota_pool_observation(
         .find(|window| window.period.unit == crate::model::QuotaPeriodUnit::Week)?;
     let five_hour = windows.iter().find(|window| {
         window.period.unit == crate::model::QuotaPeriodUnit::Hour && window.period.amount == Some(5)
-    })?;
+    });
     let weekly_remaining = 100.0 - weekly.used_percent.clamp(0.0, 100.0);
-    let five_hour_remaining = 100.0 - five_hour.used_percent.clamp(0.0, 100.0);
+    let five_hour_remaining = five_hour.map(|window| 100.0 - window.used_percent.clamp(0.0, 100.0));
     let burnable = (weekly_remaining - f64::from(weekly_floor)).max(0.0);
     let skip_reason = if burnable <= 0.0 {
         Some("weekly_floor")
-    } else if five_hour_remaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT {
+    } else if five_hour_remaining
+        .is_some_and(|remaining| remaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT)
+    {
         Some("five_hour_reserve")
     } else {
         None
@@ -1635,14 +1637,31 @@ mod tests {
     }
 
     #[test]
-    fn quota_pool_requires_both_authoritative_windows() {
+    fn quota_pool_accepts_weekly_only_and_still_enforces_weekly_floor() {
         let weekly_only = vec![quota_window(
             crate::model::QuotaPeriodUnit::Week,
             None,
             10.0,
             None,
         )];
-        assert!(quota_pool_observation(&weekly_only, 0).is_none());
+        assert!(quota_pool_observation(&weekly_only, 0).unwrap().usable);
+        assert_eq!(
+            quota_pool_observation(&weekly_only, 90)
+                .unwrap()
+                .skip_reason,
+            Some("weekly_floor")
+        );
+        assert!(quota_pool_observation(&[], 0).is_none());
+        assert!(quota_pool_observation(
+            &[quota_window(
+                crate::model::QuotaPeriodUnit::Hour,
+                Some(5),
+                0.0,
+                None
+            )],
+            0
+        )
+        .is_none());
     }
 
     #[test]

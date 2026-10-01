@@ -2348,6 +2348,12 @@ html[data-performance="low"] .card {
 .acct__actions {
   display: contents;
 }
+.acct > .state {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
 .acct .btn,
 .acct .pill {
   justify-content: center;
@@ -2395,6 +2401,8 @@ html[data-performance="low"] .card {
 /* 不釘 nowrap：視窗長度加重置時刻，換成英文或日文就是一整句，
    釘住不折行的結果是它長到欄位外面去。 */
 .acct__quota small {
+  text-align: left;
+  overflow-wrap: anywhere;
   font-family: var(--font-display);
   font-size: 11px;
   line-height: 1.35;
@@ -2520,6 +2528,9 @@ html[data-performance="low"] .card {
     gap: 8px;
     justify-content: flex-end;
     flex-wrap: wrap;
+  }
+  .acct__actions > .acct__quota {
+    flex: 1 1 15em;
   }
 }
 

@@ -30,6 +30,16 @@ function quota(unit: "week" | "hour", usedPercent: number): QuotaSnapshot {
 }
 
 describe("quota pool", () => {
+  it("admits weekly-only accounts, preserves rank, and enforces their weekly floor", () => {
+    const entries = quotaPoolAccounts(settings, accounts, {
+      a: [quota("week", 0)], b: [quota("hour", 10), quota("week", 20)],
+    });
+    expect(entries[0]).toMatchObject({ fiveHour: null, fiveHourRemaining: null, burnable: 70, usable: true, reason: null });
+    expect(quotaPoolRotation(entries).map((entry) => entry.account.accountId)).toEqual(["a", "b"]);
+    expect(quotaPoolAccounts(settings, accounts, { a: [quota("week", 70)] })[0]).toMatchObject({ usable: false, reason: "weeklyGate" });
+    expect(quotaPoolAccounts(settings, accounts, { a: [quota("hour", 0)] })[0]).toMatchObject({ usable: false, reason: "missingQuota" });
+    expect(quotaPoolAccounts(settings, accounts, {})[0]).toMatchObject({ usable: false, reason: "missingQuota" });
+  });
   it("keeps fractional remaining quota consistent with backend gate decisions", () => {
     const entries = quotaPoolAccounts(settings, accounts, {
       a: [quota("hour", 90), quota("week", 69.8)],

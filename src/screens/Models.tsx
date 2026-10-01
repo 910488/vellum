@@ -18,6 +18,7 @@ import { providerNameFromEndpoint } from "@/lib/providerName";
 import {
   accountQuotaWindows,
   accountQuotaWindowLabel,
+  isFiveHourQuota,
   isWeeklyQuota,
   type AccountQuotaPresentation,
   type Translate,
@@ -263,8 +264,8 @@ function AccountQuota({
             <small>
               {accountQuotaWindowLabel(window, t)}
               {window.resetAt ? ` · ${resetLabel(window.resetAt)}` : ""}
-              {gated ? ` · ${gated.read}` : ""}
             </small>
+            {gated ? <small>{gated.read}</small> : null}
           </span>
         );
       })}
@@ -1713,6 +1714,7 @@ export function Models({
                           </Pill>
                         )}
                         <span className="acct__resets">
+                          {entry.fiveHour ? (
                           <Btn
                             soft
                             mini
@@ -1731,6 +1733,7 @@ export function Models({
                                 : "models.ui.fiveHour.autoOff",
                             )}
                           </Btn>
+                          ) : null}
                           {resetError || !credits ? (
                             <Pill tone={resetError ? "warn" : "quiet"}>
                               {resetError ? t("models.ui.reset.failed") : t("models.ui.reset.loading")}
@@ -1866,6 +1869,7 @@ export function Models({
                           個按不動的把手。重試接在同一格，不另外占一欄：那顆
                           按鈕只在出錯時存在，常設欄位會讓整列平常空一格。 */}
                       <span className="acct__resets">
+                        {quotaWindows.some(isFiveHourQuota) ? (
                         <Btn
                           soft
                           mini
@@ -1884,6 +1888,7 @@ export function Models({
                               : "models.ui.fiveHour.autoOff",
                           )}
                         </Btn>
+                        ) : null}
                         {resetError || !credits ? (
                           <Pill tone={resetError ? "warn" : "quiet"}>
                             {resetError

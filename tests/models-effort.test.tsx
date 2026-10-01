@@ -206,6 +206,24 @@ describe("Models screen Effort probe status", () => {
     expect(apiMocks.setCodexQuotaPool.mock.calls[1]![0].members[0].accountId).toBe("b");
   });
 
+  it("shows a weekly-only pool account as usable without a five-hour automation control", async () => {
+    apiMocks.getCodexOAuthStatus.mockResolvedValue({ authenticated: true, defaultAccountId: "pro", accounts: [
+      { accountId: "pro", email: "pro@example.test", planType: "pro", authenticatedAt: 1, isDefault: true },
+    ] });
+    apiMocks.getCodexQuotaPool.mockResolvedValue({ enabled: true, strategy: "rank", activeAccountId: "pro", members: [
+      { accountId: "pro", inPool: true, paused: false, weeklyFloor: 0, maintainFiveHourWindow: true },
+    ] });
+    apiMocks.getCodexOAuthAccountQuota.mockResolvedValue([
+      { usedPercent: 0, period: { unit: "week", amount: null }, resetAt: null },
+    ]);
+    apiMocks.getCodexOAuthResetCredits.mockResolvedValue({ credits: [], availableCount: 0 });
+    renderModels();
+    await screen.findByRole("slider");
+    expect(screen.queryByText(t("models.ui.pool.reason.missingQuota"))).toBeNull();
+    expect(screen.queryByTitle(t("models.ui.fiveHour.autoHint"))).toBeNull();
+    expect(screen.getAllByRole("progressbar").some((meter) => meter.getAttribute("aria-valuenow") === "100")).toBe(true);
+  });
+
   // The Effort label lives alongside sibling text nodes inside one
   // `.menu__caps` span (not its own wrapped element), so `getByText`'s exact
   // whole-element matching cannot find it directly — check the row's
