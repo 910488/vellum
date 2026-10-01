@@ -67,6 +67,11 @@ export interface AccountQuotaPresentation {
   remaining: number;
   period: QuotaPeriod;
   resetAt: string | null;
+  lunaReserve?: boolean;
+}
+
+export function accountQuotaWindowLabel(window: AccountQuotaPresentation, t: Translate): string {
+  return window.lunaReserve ? t("quota.lunaReserve") : quotaPeriodLabel(window.period, t);
 }
 
 /**
@@ -103,11 +108,17 @@ export function accountQuotaWindows(
   windows: QuotaSnapshot[],
 ): AccountQuotaPresentation[] {
   return windows
-    .map((window) => ({
-      remaining: Math.round(100 - Math.max(0, Math.min(100, window.usedPercent))),
-      period: window.period,
-      resetAt: window.resetAt,
-    }))
+    .map((window) => {
+      const reserve = isFiveHourQuota(window) && !window.stale && window.lunaReserve?.active
+        && Number.isFinite(window.lunaReserve.usedPercent) ? window.lunaReserve : null;
+      return {
+        remaining: Math.round(100 - Math.max(0, Math.min(100, reserve?.usedPercent ?? window.usedPercent))),
+        // Preserve the 5h slot/order; the visible label and reset use Reserve.
+        period: window.period,
+        resetAt: reserve ? reserve.resetAt : window.resetAt,
+        ...(reserve ? { lunaReserve: true } : {}),
+      };
+    })
     .sort((left, right) => periodSeconds(left.period) - periodSeconds(right.period));
 }
 
@@ -143,7 +154,7 @@ export function accountQuotaLabel(
   const presentation = accountQuotaPresentation(windows);
   if (!presentation) return null;
   return t("quota.remainingLabel", {
-    period: quotaPeriodLabel(presentation.period, t),
+    period: accountQuotaWindowLabel(presentation, t),
     remaining: presentation.remaining,
   });
 }

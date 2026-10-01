@@ -80,6 +80,7 @@ const en: ResourceTree = {
     }
   },
   "quota": {
+    "lunaReserve": "Luna Reserve",
     "period": {
       "week": "Weekly quota",
       "month": "Monthly quota",

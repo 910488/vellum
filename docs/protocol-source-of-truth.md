@@ -279,11 +279,33 @@ It must not be forwarded to third-party providers.
 
 ### Managed ChatGPT quota pool
 
+Account quota rows replace the 5-hour display with Luna Reserve only when the
+same usage response identifies the queried account, denies ordinary usage,
+offers a `luna_reserve` banner, and allows the `gpt-reserve` bucket. The display
+uses Reserve's limiting window and reset time; weekly quota remains visible.
+This mirrors Desktop's fallback indicator, not proof that a Vellum request
+used Reserve. Merely having a Reserve bucket does not activate the display.
+Reserve is optional display metadata on the ordinary 5-hour snapshot, never
+an extra routing window. Pool gates and cadence continue to use ordinary quota.
+Passive usage queries do not opt into Reserve capability or switch models.
+
 Codex Desktop receives an empty `account/rateLimits/read` snapshot from the
 Vellum App Server bridge, and the bridge does not forward global
 `account/rateLimits/updated` notifications. Desktop otherwise disables its
 composer for every model when its native ChatGPT login reaches a weekly limit,
-including third-party models routed through Vellum. This display-only bridge
+including third-party models routed through Vellum. Newer native Desktop
+builds also read `/wham/usage` directly: empty App Server snapshots alone no
+longer release the composer quota gate. The automatic Windows repair copy in
+`scripts/codex-steer-repair.mjs` only releases that composer gate, retaining
+its atom subscription and the native usage display. See `BUILDING.md` for
+the pinned version, integrity changes, and activation limits. Vellum's native
+managed restart automatically prepares and selects this copy while the proxy
+and quota pool are enabled, without a separate setting. Disabling the pool or
+proxy restores the original executable on the next managed restart. Running
+turns retain the existing restart guard. Unsupported builds remain unchanged.
+A repaired
+bridge parent must pass the pinned copy hashes to count as Desktop adoption.
+This display-only bridge
 behavior leaves Vellum's own quota readings, account selection, pool gates,
 and upstream quota errors intact. A sent Official request can still fail when
 the provider has no remaining allowance.

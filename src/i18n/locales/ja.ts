@@ -80,6 +80,7 @@ const ja: ResourceTree = {
     }
   },
   "quota": {
+    "lunaReserve": "Luna Reserve",
     "period": {
       "week": "週次クォータ",
       "month": "月次クォータ",

@@ -1,4 +1,4 @@
-use crate::model::{QuotaPeriod, QuotaPeriodUnit, QuotaSnapshot};
+use crate::model::{LunaReserveQuota, QuotaPeriod, QuotaPeriodUnit, QuotaSnapshot};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -123,7 +123,13 @@ pub async fn query_with_cache_ttl(
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| CodexQuotaError::Parse(error.to_string()))?;
-    let windows = parse_quota_windows(route_id, &value)?;
+    let mut windows = parse_quota_windows(route_id, &value)?;
+    // Only associate fallback with the explicitly identified requested account.
+    if value.get("account_id").and_then(Value::as_str) != Some(account_id) {
+        for window in &mut windows {
+            window.luna_reserve = None;
+        }
+    }
     let mut cache = quota_cache().write().await;
     cache.retain(|_, entry| entry.fetched_at.elapsed() < QUOTA_CACHE_TTL);
     cache.insert(
@@ -165,6 +171,7 @@ pub fn parse_quota_windows(
             reset_at,
             tier: None,
             stale: false,
+            luna_reserve: None,
         });
     }
     if windows.is_empty() {
@@ -172,7 +179,52 @@ pub fn parse_quota_windows(
             "rate_limit contains no usable windows".into(),
         ));
     }
+    // Keep Reserve out of the ordinary windows used by pool routing/cadence.
+    if let Some(reserve) = parse_luna_reserve(value) {
+        if let Some(five_hour) = windows.iter_mut().find(|window| {
+            window.period.unit == QuotaPeriodUnit::Hour && window.period.amount == Some(5)
+        }) {
+            five_hour.luna_reserve = Some(reserve);
+        }
+    }
     Ok(windows)
+}
+
+fn parse_luna_reserve(value: &Value) -> Option<LunaReserveQuota> {
+    let reserve = value
+        .get("additional_rate_limits")?
+        .as_array()?
+        .iter()
+        .find(|limit| limit.get("limit_name").and_then(Value::as_str) == Some("gpt-reserve"))?
+        .get("rate_limit")?;
+    // Reserve can have multiple windows. Show the one currently limiting it.
+    let window = ["primary_window", "secondary_window"]
+        .into_iter()
+        .filter_map(|key| {
+            let window = reserve.get(key)?;
+            let used = window.get("used_percent")?.as_f64()?;
+            used.is_finite().then_some((used.clamp(0.0, 100.0), window))
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))?;
+    let active = value
+        .pointer("/rate_limit/allowed")
+        .and_then(Value::as_bool)
+        == Some(false)
+        && value
+            .pointer("/rate_limit_upsell/banner_type")
+            .and_then(Value::as_str)
+            == Some("luna_reserve")
+        && reserve.get("allowed").and_then(Value::as_bool) == Some(true);
+    Some(LunaReserveQuota {
+        active,
+        used_percent: window.0,
+        reset_at: window
+            .1
+            .get("reset_at")
+            .and_then(Value::as_i64)
+            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+            .map(|reset| reset.to_rfc3339()),
+    })
 }
 
 /// 視窗長度只做成結構，句子交給前端組。604800 秒就是「一週」，不是
@@ -207,6 +259,65 @@ pub(crate) async fn seed_test_quota(token: &str, account: &str, windows: Vec<Quo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reserve_usage() -> Value {
+        json!({
+            "rate_limit": { "allowed": false,
+                "primary_window": { "used_percent": 100, "limit_window_seconds": 18000 },
+                "secondary_window": { "used_percent": 80, "limit_window_seconds": 604800 }
+            },
+            "rate_limit_upsell": { "banner_type": "luna_reserve" },
+            "additional_rate_limits": [{ "limit_name": "gpt-reserve", "rate_limit": {
+                "allowed": true,
+                "primary_window": { "used_percent": 20, "reset_at": 1788000000 },
+                "secondary_window": { "used_percent": 40, "reset_at": 1788500000 }
+            }}]
+        })
+    }
+
+    #[test]
+    fn reserve_is_display_metadata_without_replacing_pool_routing_windows() {
+        let windows = parse_quota_windows("account", &reserve_usage()).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].used_percent, 100.0);
+        assert_eq!(windows[1].used_percent, 80.0);
+        assert!(windows[1].luna_reserve.is_none());
+        let reserve = windows[0].luna_reserve.as_ref().unwrap();
+        assert!(reserve.active);
+        assert_eq!(reserve.used_percent, 40.0);
+        assert_eq!(
+            reserve.reset_at.as_deref(),
+            chrono::DateTime::from_timestamp(1788500000, 0)
+                .map(|reset| reset.to_rfc3339())
+                .as_deref()
+        );
+    }
+
+    #[test]
+    fn reserve_requires_explicit_native_fallback_signals() {
+        for (pointer, replacement) in [
+            ("/rate_limit/allowed", json!(true)),
+            ("/rate_limit/allowed", Value::Null),
+            ("/rate_limit_upsell/banner_type", json!("usage_limit")),
+            ("/additional_rate_limits/0/rate_limit/allowed", json!(false)),
+            ("/additional_rate_limits/0/rate_limit/allowed", Value::Null),
+        ] {
+            let mut value = reserve_usage();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            let windows = parse_quota_windows("account", &value).unwrap();
+            assert!(!windows[0].luna_reserve.as_ref().unwrap().active);
+        }
+        let mut value = reserve_usage();
+        value["additional_rate_limits"] = json!([]);
+        assert!(parse_quota_windows("account", &value).unwrap()[0]
+            .luna_reserve
+            .is_none());
+        value = reserve_usage();
+        value["additional_rate_limits"][0]["rate_limit"] = json!({ "allowed": true });
+        assert!(parse_quota_windows("account", &value).unwrap()[0]
+            .luna_reserve
+            .is_none());
+    }
 
     #[test]
     fn request_routing_expires_quota_reads_before_the_display_cache() {

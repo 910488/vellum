@@ -1568,6 +1568,7 @@ mod tests {
             reset_at: reset_at.map(str::to_owned),
             tier: None,
             stale: false,
+            luna_reserve: None,
         }
     }
 

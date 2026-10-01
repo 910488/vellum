@@ -169,6 +169,7 @@ fn optional_fields_serialize_as_null_not_missing() {
         reset_at: None,
         tier: None,
         stale: false,
+        luna_reserve: None,
     };
     let json = serde_json::to_value(&quota).unwrap();
     assert!(json.get("resetAt").is_some_and(serde_json::Value::is_null));

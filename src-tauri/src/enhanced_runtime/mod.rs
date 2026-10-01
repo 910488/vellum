@@ -23,6 +23,7 @@ pub mod qualification;
 mod registry;
 mod router;
 mod schema_contract;
+pub mod steer_repair;
 
 pub use attestation::{
     AttestationError, AttestationWriter, BridgeAttestationV1, BridgeLifecycle, ChildAttestation,

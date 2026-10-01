@@ -476,6 +476,45 @@ pub(crate) async fn restart_codex_managed(
     };
     let previous_identity = launch_target_identity(&target);
 
+    // Prepare and verify before changing launch leases or stopping the app.
+    // Keep the original target/PID for the stop; only alter the next launch.
+    #[cfg(target_os = "windows")]
+    let next_target = {
+        let root = state.data_root();
+        let current = target.executable.clone();
+        let managed_pool = state.proxy_status().running
+            && state
+                .codex_oauth()
+                .quota_pool_status()
+                .await
+                .settings
+                .enabled;
+        let next = match off_main_thread(move || {
+            crate::enhanced_runtime::steer_repair::launch_executable(&root, &current, managed_pool)
+        })
+        .await
+        {
+            Ok(Ok(executable)) => executable,
+            Ok(Err(error)) => {
+                state.set_draining(false);
+                return Err(AppError::Message(error.to_string()));
+            }
+            Err(error) => {
+                state.set_draining(false);
+                return Err(error);
+            }
+        };
+        CodexLaunchTarget {
+            pid: target.pid,
+            executable: next,
+            app_id: target.app_id.clone(),
+        }
+    };
+    #[cfg(target_os = "windows")]
+    let launch_target = &next_target;
+    #[cfg(not(target_os = "windows"))]
+    let launch_target = &target;
+
     // The launch lease is a Proxy transaction, not a restart side-effect.
     // Preparing it here while the Proxy is stopped would leave CODEX_CLI_PATH
     // armed for the next Desktop launch with no data plane behind it.
@@ -515,7 +554,7 @@ pub(crate) async fn restart_codex_managed(
         )));
     }
 
-    if let Err(error) = launch_codex(&target, launch.as_ref()) {
+    if let Err(error) = launch_codex(launch_target, launch.as_ref()) {
         state.set_draining(false);
         return Err(AppError::Message(format!("無法重新啟動 Codex：{error}")));
     }
@@ -666,7 +705,9 @@ fn is_codex_desktop_executable(path: &std::path::Path) -> bool {
         .to_ascii_lowercase();
     let known_install = normalized.contains("\\windowsapps\\openai.codex_")
         || normalized.contains("\\programs\\openai\\codex\\");
-    known_install && (normalized.ends_with("\\chatgpt.exe") || normalized.ends_with("\\codex.exe"))
+    (known_install
+        && (normalized.ends_with("\\chatgpt.exe") || normalized.ends_with("\\codex.exe")))
+        || crate::enhanced_runtime::steer_repair::is_verified_copy(path)
 }
 
 #[cfg(target_os = "windows")]
