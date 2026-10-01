@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   accountQuotaPresentation,
   accountQuotaWindows,
+  accountQuotaWindowLabel,
   accountQuotaLabel,
   findTightestWeeklyQuota,
   isFiveHourQuota,
@@ -30,6 +31,41 @@ const THIRTY_DAYS: QuotaPeriod = { unit: "day", amount: 30 };
 /** i18next 的替身：回傳鍵與參數，斷言看得出組出來的是哪一句。 */
 const t = (key: string, values?: Record<string, unknown>) =>
   values ? `${key}(${JSON.stringify(values)})` : key;
+
+describe("Luna Reserve quota presentation", () => {
+  const reserve = { active: true, usedPercent: 23, resetAt: "2026-10-02T00:00:00Z" };
+
+  it("replaces the 5h slot with Reserve usage and its reset, retaining the weekly slot", () => {
+    const fiveHour = { ...quota(FIVE_HOURS, 100), lunaReserve: reserve };
+    const weekly = quota(WEEK, 70);
+    const windows = accountQuotaWindows([weekly, fiveHour]);
+    expect(windows).toEqual([
+      { remaining: 77, period: FIVE_HOURS, resetAt: reserve.resetAt, lunaReserve: true },
+      { remaining: 30, period: WEEK, resetAt: null },
+    ]);
+    expect(accountQuotaWindowLabel(windows[0]!, t)).toBe("quota.lunaReserve");
+    expect(accountQuotaWindowLabel(windows[1]!, t)).toBe(quotaPeriodLabel(WEEK, t));
+    expect(fiveHour.usedPercent).toBe(100);
+  });
+
+  it("keeps 5h for merely available, stale, or invalid Reserve metadata", () => {
+    for (const fiveHour of [
+      { ...quota(FIVE_HOURS, 100), lunaReserve: { ...reserve, active: false } },
+      { ...quota(FIVE_HOURS, 100), lunaReserve: reserve, stale: true },
+      { ...quota(FIVE_HOURS, 100), lunaReserve: { ...reserve, usedPercent: NaN } },
+    ]) {
+      expect(accountQuotaWindows([fiveHour])).toEqual([
+        { remaining: 0, period: FIVE_HOURS, resetAt: null },
+      ]);
+    }
+  });
+
+  it("does not replace weekly quota and restores 5h when fallback ends", () => {
+    expect(accountQuotaWindows([{ ...quota(WEEK, 90), lunaReserve: reserve }])[0]?.lunaReserve).toBeUndefined();
+    const fiveHour = { ...quota(FIVE_HOURS, 10), lunaReserve: { ...reserve, active: false } };
+    expect(accountQuotaWindows([fiveHour])[0]).toEqual({ remaining: 90, period: FIVE_HOURS, resetAt: null });
+  });
+});
 
 function provider(
   name: string,

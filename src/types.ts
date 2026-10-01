@@ -476,6 +476,12 @@ export interface QuotaSnapshot {
   tier: string | null;
   /** 取自快取而非即時查詢 */
   stale: boolean;
+  /** 上游 Reserve 模式提示；僅供顯示，不參與額度池選帳號。 */
+  lunaReserve?: {
+    active: boolean;
+    usedPercent: number;
+    resetAt: string | null;
+  } | null;
 }
 
 export interface ContextUsage {

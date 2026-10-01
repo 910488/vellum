@@ -80,6 +80,7 @@ const zhCN: ResourceTree = {
     }
   },
   "quota": {
+    "lunaReserve": "Luna Reserve",
     "period": {
       "week": "周额度",
       "month": "月额度",

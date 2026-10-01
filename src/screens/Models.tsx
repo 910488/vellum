@@ -17,8 +17,8 @@ import { codexAccountLabel, codexPoolSegmentLabel } from "@/lib/codexAccount";
 import { providerNameFromEndpoint } from "@/lib/providerName";
 import {
   accountQuotaWindows,
+  accountQuotaWindowLabel,
   isWeeklyQuota,
-  quotaPeriodLabel,
   type AccountQuotaPresentation,
   type Translate,
 } from "@/lib/quota";
@@ -261,7 +261,7 @@ function AccountQuota({
               )}
             </span>
             <small>
-              {quotaPeriodLabel(window.period, t)}
+              {accountQuotaWindowLabel(window, t)}
               {window.resetAt ? ` · ${resetLabel(window.resetAt)}` : ""}
               {gated ? ` · ${gated.read}` : ""}
             </small>

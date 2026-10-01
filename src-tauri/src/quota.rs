@@ -64,6 +64,7 @@ impl BillingSnapshot {
             reset_at: self.period_end.clone(),
             tier: self.subscription_tier.clone(),
             stale: self.stale,
+            luna_reserve: None,
         }
     }
 }

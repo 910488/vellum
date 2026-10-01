@@ -676,6 +676,18 @@ pub struct QuotaSnapshot {
     pub reset_at: Option<String>,
     pub tier: Option<String>,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luna_reserve: Option<LunaReserveQuota>,
+}
+
+/// Display metadata from the same usage snapshot, never a pool routing window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LunaReserveQuota {
+    /// Native Desktop's fallback indicator, not confirmation of a Vellum request.
+    pub active: bool,
+    pub used_percent: f64,
+    pub reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

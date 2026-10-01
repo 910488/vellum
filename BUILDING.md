@@ -448,3 +448,69 @@ pnpm run test:build-remote
 That script is the fail-closed gate for missing, stale, and mismatched
 remote payloads. It also asserts `build:main` stages the payload before
 `pnpm run build`.
+
+### Automatic Windows Codex Desktop Steer repair
+
+Vellum implements this repair natively in
+`src-tauri/src/enhanced_runtime/steer_repair.rs`. It is part of the quota pool,
+with no separate repair setting or Node requirement. When the proxy and quota
+pool are enabled, the existing managed restart automatically prepares and
+selects the verified repair copy. Pool changes flag a running Desktop for the
+existing safe restart; running turns are never interrupted to apply the repair.
+Disabling the pool or proxy selects the original executable on the next managed
+restart. Legacy repair preferences are ignored.
+
+Copies are staged in an owned temporary directory and published only after
+exact executable, archive header, and renderer hashes verify. An existing
+invalid copy is not overwritten, and preparation errors stop the restart before
+leases change or Desktop is stopped. Unsupported versions retain the original
+executable rather than blocking the normal restart. Process discovery and
+bridge-parent verification recognize a repaired copy by its pinned hashes.
+The command-line scripts below remain diagnostic tools.
+
+Codex Desktop 26.928.2636 can disable its composer based on the native login's
+`/wham/usage`, even while Vellum's quota pool can continue a running turn.
+The public Codex repository does not contain this Desktop composer.
+
+`scripts/codex-steer-repair.mjs` creates a separate local copy of this exact
+Desktop build. It changes only the composer's native-login and Luna Reserve
+quota-disable expressions,
+retains the reactive subscription, and updates the ASAR entry integrity and
+the native executable's embedded ASAR header hash. Account authentication,
+quota banners, other send restrictions, provider routing, and Vellum pool
+gates are unchanged. This does not grant upstream quota.
+
+The copied executable loses its original Authenticode signature. The installed
+MSIX is untouched. Unsupported versions, asset hashes, and existing output
+directories are rejected. This is a local workaround, not an officially
+signed Desktop update; app updates require a newly verified patch.
+
+Prepare the copy, adjusting the installed version path if necessary (an
+unsupported build will fail before copying):
+
+```powershell
+node scripts/codex-steer-repair.mjs `
+  'C:/Program Files/WindowsApps/OpenAI.Codex_26.928.2636.0_x64__2p2nqsd0c76g0/app' `
+  "$env:LOCALAPPDATA/vellum/codex-steer-repair/26.928.2636-native"
+node --test scripts/codex-steer-repair.test.mjs
+```
+
+Enable Vellum's proxy and quota pool. Finish running Desktop turns, then close
+Codex Desktop and launch the copy:
+
+```powershell
+pwsh -NoProfile -File scripts/launch-codex-steer-repair.ps1 `
+  -RepairDirectory "$env:LOCALAPPDATA/vellum/codex-steer-repair/26.928.2636-native"
+```
+
+The launcher verifies the patched archive and native executable, enabled pool,
+and current bridge lease / launch manifest. It refuses to start while Desktop
+is running and never stops a process. Bridge readiness is not required before
+launch: Desktop starts its bridge child. It inherits the verified
+`CODEX_CLI_PATH` only for this launch and uses the default Desktop profile.
+`-CheckOnly` checks prerequisites without opening the application.
+
+To revert, close the copy and launch the original Desktop shortcut. No account
+or profile restoration is needed. Isolated startup and source-level tests do
+not establish an authenticated, exhausted-account Steer round trip; verify
+that scenario after activating the copy.
