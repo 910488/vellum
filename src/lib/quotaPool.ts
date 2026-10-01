@@ -71,11 +71,11 @@ export function quotaPoolAccounts(
       ? null
       : member.paused
         ? "paused"
-        : weeklyRemaining === null || fiveHourRemaining === null
+        : weeklyRemaining === null
           ? "missingQuota"
           : burnable <= 0
             ? "weeklyGate"
-            : fiveHourRemaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT
+            : fiveHourRemaining !== null && fiveHourRemaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT
               ? "fiveHour"
               : null;
     return [{

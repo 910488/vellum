@@ -316,9 +316,12 @@ selection remains authoritative. Pool membership, pause state, member order,
 and each account's weekly remaining-floor are persisted locally.
 
 For each new ordinary Official request, the Desktop authorization boundary
-reads current 5-hour and weekly quota windows and selects only an explicitly
-pooled, unpaused account whose 5-hour window is non-zero and whose weekly
-remaining percentage is above its configured floor. Rotation follows the
+reads current quota windows and selects only an explicitly pooled, unpaused
+account whose weekly remaining percentage is above its configured floor.
+When a 5-hour window is present, its remaining percentage must also exceed
+the routing reserve. A valid weekly-only response does not imply missing
+quota or a depleted 5-hour allowance; no synthetic 5-hour window is created.
+Rotation follows the
 explicit member order and skips members that are currently unavailable without
 reordering the others. Legacy `most` and `soonest` settings deserialize as
 `rank` and serialize back as `rank`. Missing quota data skips that member for
