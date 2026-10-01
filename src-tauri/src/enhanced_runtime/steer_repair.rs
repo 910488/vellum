@@ -121,6 +121,14 @@ fn validate_original(executable: &Path) -> io::Result<Archive> {
 }
 
 pub fn is_verified_copy(executable: &Path) -> bool {
+    // Only the native Desktop entry can be a repair copy. In particular, do
+    // not hash every CLI worker named Codex.exe during process discovery.
+    if !executable
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("ChatGPT.exe"))
+    {
+        return false;
+    }
     let result = (|| -> io::Result<bool> {
         if digest(&fs::read(executable)?) != REPAIRED_EXE {
             return Ok(false);
