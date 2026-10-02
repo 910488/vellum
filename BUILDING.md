@@ -463,13 +463,23 @@ when the selected account has no allowance.
 
 Copies are staged in an owned temporary directory and published only after
 exact executable, archive header, and renderer hashes verify. An existing
-invalid copy is not overwritten, and preparation errors stop the restart before
-leases change or Desktop is stopped. Unsupported versions retain the original
-executable rather than blocking the normal restart. Process discovery and
-bridge-parent verification recognize a repaired copy by its pinned hashes.
+invalid copy is not overwritten. The repair never blocks a restart: preparation
+errors (disk full, a corrupt existing copy) and unsupported versions launch the
+unmodified installed app instead. When Desktop is running from a copy whose
+original app was removed by an update, the restart relaunches that copy.
+Process discovery and bridge-parent verification recognize a repaired copy by
+its pinned hashes; the verdict is cached per file size and mtime, because
+status polling sees every ChatGPT.exe process.
+
+A copy runs without MSIX package identity, so it would not see the Store app's
+virtualized `%APPDATA%\Codex`. When the copy came from a Store install, the
+launch sets `CODEX_ELECTRON_USER_DATA_PATH` to
+`%LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Codex`, the profile the
+installed app actually uses.
 The command-line scripts below remain diagnostic tools.
 
-The audited Windows profiles are 26.928.2636 and 26.928.4866. Each has separate
+The audited Windows profiles are 26.928.2636, 26.928.4866, and 26.930.2377.
+Each has separate
 original/repaired executable, renderer, and archive-header pins and its own
 copy directory. An app update therefore cannot accidentally reuse an older
 renderer patch. These builds can disable the composer based on the native login's

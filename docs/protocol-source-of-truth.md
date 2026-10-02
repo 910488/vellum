@@ -313,7 +313,8 @@ ordinary new messages, not only in-flight follow-ups. Switching a pool or proxy
 off does not restore the login quota lock. Without a bridge, repaired copies
 still launch directly so MSIX activation cannot reopen the unmodified app.
 Running turns retain the existing restart guard. Unsupported builds remain
-unchanged; verified profiles currently cover 26.928.2636 and 26.928.4866.
+unchanged; verified profiles currently cover 26.928.2636, 26.928.4866, and
+26.930.2377.
 A repaired
 bridge parent must pass the pinned copy hashes to count as Desktop adoption.
 This display-only bridge

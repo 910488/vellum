@@ -487,11 +487,7 @@ pub(crate) async fn restart_codex_managed(
         })
         .await
         {
-            Ok(Ok(executable)) => executable,
-            Ok(Err(error)) => {
-                state.set_draining(false);
-                return Err(AppError::Message(error.to_string()));
-            }
+            Ok(executable) => executable,
             Err(error) => {
                 state.set_draining(false);
                 return Err(error);
@@ -857,6 +853,11 @@ fn launch_codex(
     command.args(args);
     if let Some(bridge) = bridge {
         command.env(crate::enhanced_runtime::env_lease::CODEX_CLI_PATH, bridge);
+    }
+    if let Some(profile) =
+        crate::enhanced_runtime::steer_repair::user_data_override(&target.executable)
+    {
+        command.env("CODEX_ELECTRON_USER_DATA_PATH", profile);
     }
     command.spawn()?;
     Ok(())
