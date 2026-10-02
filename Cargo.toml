@@ -75,6 +75,11 @@ lto = true
 opt-level = "s"
 strip = true
 
+# Native helpers allow ten seconds for startup, including hashing Codex's
+# large executable. Keep artifact verification fast in development builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Daily check/test profile. Official release stays full LTO / codegen-units=1.
 [profile.fast-check]
 inherits = "dev"

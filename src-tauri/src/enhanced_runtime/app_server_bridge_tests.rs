@@ -1,6 +1,60 @@
 use super::*;
 
 #[test]
+fn native_computer_use_helpers_bypass_the_desktop_relay() {
+    for name in [
+        "codex-computer-use.exe",
+        "codex-computer-use-arm64.exe",
+        "codex-computer-use",
+        "CODEX-COMPUTER-USE.EXE",
+    ] {
+        assert!(is_computer_use_helper(Some(
+            &PathBuf::from("runtime").join(name)
+        )));
+    }
+    for name in [
+        "ChatGPT.exe",
+        "node.exe",
+        "codex.exe",
+        "codex-computer-use-fake.exe",
+    ] {
+        assert!(!is_computer_use_helper(Some(Path::new(name))));
+    }
+    assert!(!is_computer_use_helper(None));
+}
+
+#[test]
+fn computer_use_delegation_preserves_native_auth_and_policy_without_remote_ownership() {
+    let official = RuntimeBinaryIdentity {
+        executable: PathBuf::from("official-codex"),
+        codex_home: PathBuf::from("shared-codex-home"),
+        artifact_sha256: "sha256:official".into(),
+        runtime_digest: "official-digest".into(),
+    };
+    let args = vec![
+        "app-server".into(),
+        "-c".into(),
+        "features.code_mode_host=true".into(),
+    ];
+    let command = computer_use_app_server_command(&official, &args);
+    assert_eq!(command.get_program(), official.executable.as_os_str());
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+    );
+    let overrides = command.get_envs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        overrides[std::ffi::OsStr::new("CODEX_HOME")],
+        Some(official.codex_home.as_os_str())
+    );
+    assert_eq!(
+        overrides[std::ffi::OsStr::new(REMOTE_CONTROL_DISABLED_ENV)],
+        Some(std::ffi::OsStr::new("1"))
+    );
+    assert_eq!(overrides[std::ffi::OsStr::new("CODEX_CLI_PATH")], None);
+}
+
+#[test]
 fn desktop_feature_flags_map_to_the_session_loader_profile() {
     for profile in [
         AblationProfile::E0,
