@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use vellum_enhanced_codex::{AblationProfile, EnhancedEventKind, EnhancedRuntimeFeatures};
 
 use super::attestation::{AttestationWriter, BridgeAttestationV1, ChildAttestation};
-use super::launch_manifest::{LaunchManifestError, LaunchManifestV1};
+use super::launch_manifest::{LaunchManifestError, LaunchManifestV1, RuntimeBinaryIdentity};
 use super::observations::RuntimeObservations;
 use super::qualification::{
     parse_enhanced_event, parse_enhanced_identity, QualificationJournal,
@@ -163,16 +163,60 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     if !child_args.iter().any(|arg| arg == "app-server") {
         return delegate_non_app_server(&manifest_path, child_args);
     }
+    let parent_executable = super::process_info::parent_pid(std::process::id())
+        .and_then(super::process_info::executable_of);
+    if is_computer_use_helper(parent_executable.as_deref()) {
+        let manifest = LaunchManifestV1::read(&manifest_path)?;
+        manifest.official.verify_on_disk("official")?;
+        return wait_for_delegated_command(computer_use_app_server_command(
+            &manifest.official,
+            &child_args,
+        ));
+    }
     run(BridgeConfig::load(&manifest_path, child_args)?)
+}
+
+fn is_computer_use_helper(parent: Option<&Path>) -> bool {
+    let name = parent
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "codex-computer-use.exe" | "codex-computer-use-arm64.exe" | "codex-computer-use"
+    )
+}
+
+fn computer_use_app_server_command(official: &RuntimeBinaryIdentity, args: &[String]) -> Command {
+    // The native helper uses CODEX_CLI_PATH for auth and policy reads. It is
+    // not a Desktop execution client and must not acquire the relay owner lock
+    // or write Desktop attestations. Keep its native protocol and shared home.
+    let mut command = Command::new(&official.executable);
+    command
+        .args(args)
+        .env("CODEX_HOME", &official.codex_home)
+        .env(REMOTE_CONTROL_DISABLED_ENV, "1")
+        .env_remove("CODEX_CLI_PATH");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
 }
 
 /// Codex Desktop also runs `CODEX_CLI_PATH` for one-shot commands. Those are
 /// unmodified Official Codex behavior and must stay that way.
 fn delegate_non_app_server(manifest_path: &Path, args: Vec<String>) -> Result<(), BridgeError> {
     let manifest = LaunchManifestV1::read(manifest_path)?;
-    let status = Command::new(&manifest.official.executable)
-        .args(args)
-        .status()?;
+    let mut command = Command::new(&manifest.official.executable);
+    command.args(args);
+    wait_for_delegated_command(command)
+}
+
+fn wait_for_delegated_command(mut command: Command) -> Result<(), BridgeError> {
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {

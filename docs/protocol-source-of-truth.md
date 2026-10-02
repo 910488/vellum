@@ -129,6 +129,13 @@ The relay uses the same `Codex Desktop` persistence identity as the native
 stdio App Server so an Enhanced bridge restart reconnects the existing mobile
 environment rather than creating a second empty-key enrollment.
 
+Native Computer Use helpers also launch `CODEX_CLI_PATH app-server` for
+authentication and policy reads. The bridge identifies these helpers from
+their parent executable and delegates to the verified Official Codex binary
+with the shared Codex home and Remote Control disabled. These temporary
+servers must neither acquire the Desktop relay owner lock nor overwrite its
+attestation; Desktop execution clients retain normal provider-bound routing.
+
 ### Tool continuations
 
 When Vellum executes a provider-requested tool locally, the continuation must

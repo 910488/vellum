@@ -39,6 +39,20 @@ pub struct RuntimeBinaryIdentity {
     pub codex_home: PathBuf,
 }
 
+impl RuntimeBinaryIdentity {
+    pub fn verify_on_disk(&self, name: &'static str) -> Result<(), LaunchManifestError> {
+        let actual = sha256_file(&self.executable)?;
+        if actual != self.artifact_sha256 {
+            return Err(LaunchManifestError::ArtifactMismatch {
+                name,
+                expected: self.artifact_sha256.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchManifestV1 {
@@ -164,14 +178,7 @@ impl LaunchManifestV1 {
             }
         }
         for (name, identity) in [("official", &self.official), ("enhanced", &self.enhanced)] {
-            let actual = sha256_file(&identity.executable)?;
-            if actual != identity.artifact_sha256 {
-                return Err(LaunchManifestError::ArtifactMismatch {
-                    name,
-                    expected: identity.artifact_sha256.clone(),
-                    actual,
-                });
-            }
+            identity.verify_on_disk(name)?;
         }
         let map = sha256_file(&self.model_provider_map_path)?;
         if map != self.model_provider_map_sha256 {
@@ -334,6 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn official_helper_verification_is_independent_of_unused_enhanced_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = fixture(temp.path());
+        fs::remove_file(&manifest.enhanced.executable).unwrap();
+        fs::remove_file(&manifest.model_provider_map_path).unwrap();
+        manifest.official.verify_on_disk("official").unwrap();
+        assert!(manifest.verify_on_disk().is_err());
+        fs::write(&manifest.official.executable, b"tampered official").unwrap();
+        assert!(matches!(
+            manifest.official.verify_on_disk("official"),
+            Err(LaunchManifestError::ArtifactMismatch {
+                name: "official",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn round_trips_and_verifies_hashes_on_disk() {
         let temp = tempfile::tempdir().unwrap();
         let manifest = fixture(temp.path());
@@ -344,6 +369,11 @@ mod tests {
         loaded.verify_on_disk().unwrap();
 
         fs::write(&loaded.enhanced.executable, b"tampered").unwrap();
+        assert!(
+            super::super::app_server_bridge::BridgeConfig::load(&path, vec!["app-server".into()])
+                .is_err(),
+            "Desktop bridge must reject a tampered Enhanced binary"
+        );
         assert!(matches!(
             loaded.verify_on_disk(),
             Err(LaunchManifestError::ArtifactMismatch {
