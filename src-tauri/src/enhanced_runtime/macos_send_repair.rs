@@ -9,11 +9,9 @@ use std::process::Command;
 const VERSION: &str = "26.930.21537-arm64";
 const ASSET: &str = "app-primary-c9f7ac16cee9.js";
 const ORIGINAL_EXE: &str = "ac53f00ea78b96fd4e4aaca08f3acffce2657007c97965b86ef6ac28203c6665";
-const REPAIRED_EXE: &str = "2cdedf0aa83957ed2893fb0182e463654045cff29334888093118f332102f242";
 const FRAMEWORK: &str =
     "Contents/Frameworks/Codex Framework.framework/Versions/Current/Codex Framework";
 const ORIGINAL_FRAMEWORK: &str = "9ad6b60505129bd1a866ca8e1d8882a0787c5e3a86f86b30e03487e31062ac70";
-const REPAIRED_FRAMEWORK: &str = "c658821e6a4232ae8542dc272380fccf795b50b9d0d5b052e219b71100367477";
 const INTEGRITY_SENTINEL: &[u8] = b"AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A";
 const ORIGINAL_HEADER: &str = "3db6024d6e1e2f6248f55e46b91be74b23cad2bc1f5406d4646ddafe11db3aef";
 const ORIGINAL_RENDERER: &str = "ddd19cf4305f13cc6df9c2b3d83c7fd5c898f893e18c89d56ed7b064dd8835da";
@@ -105,26 +103,47 @@ fn patched_renderer(source: &[u8]) -> io::Result<Vec<u8>> {
     Ok(result)
 }
 
-// The ad-hoc signature is deterministic for this audited bundle. Verify the
-// pinned signed executable, resource seal and exact renderer, not provenance alone.
+// Ad-hoc signature bytes are not reproducible across `codesign` tool versions,
+// so the signed executable/framework hashes cannot be pinned. Verify the
+// deterministic content instead: the resource seal, the exact patched renderer,
+// the framework integrity digest, and a valid deep signature.
 fn verify_copy(executable: &Path) -> bool {
     let result = (|| -> io::Result<bool> {
         let bundle = bundle_path(executable).ok_or_else(|| invalid("Invalid copy path"))?;
         let marker: Value =
             serde_json::from_slice(&fs::read(marker_path(bundle))?).map_err(invalid)?;
-        if marker["version"] != VERSION
-            || digest(&fs::read(executable)?) != REPAIRED_EXE
-            || digest(&fs::read(bundle.join(FRAMEWORK))?) != REPAIRED_FRAMEWORK
-            || plist_hash(bundle)? != REPAIRED_HEADER
-        {
+        if marker["version"] != VERSION || plist_hash(bundle)? != REPAIRED_HEADER {
             return Ok(false);
         }
         signed_bundle(bundle)?;
+        if !framework_integrity_is_repaired(&bundle.join(FRAMEWORK))? {
+            return Ok(false);
+        }
         let data = archive_at(&bundle.join("Contents/Resources/app.asar"), ASSET)?;
         Ok(digest(&data.raw_header) == REPAIRED_HEADER
             && digest(&data.renderer) == REPAIRED_RENDERER)
     })();
     result.unwrap_or(false)
+}
+
+// The framework embeds a SHA-256 digest of the asar header at a fixed sentinel.
+// Checking that digest is portable: it depends only on the patched content, not
+// on the ad-hoc signature bytes produced by the local `codesign` tool.
+fn framework_integrity_is_repaired(framework: &Path) -> io::Result<bool> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(framework)?;
+    let matches: Vec<_> = bytes
+        .windows(INTEGRITY_SENTINEL.len())
+        .enumerate()
+        .filter_map(|(offset, value)| (value == INTEGRITY_SENTINEL).then_some(offset))
+        .collect();
+    if matches.len() != 1 {
+        return Ok(false);
+    }
+    let offset = matches[0] + INTEGRITY_SENTINEL.len();
+    let expected = Sha256::digest(format!("Resources/app.asarSHA256{REPAIRED_HEADER}").as_bytes());
+    Ok(bytes.get(offset..offset + 2) == Some(&[1, 1])
+        && bytes.get(offset + 2..offset + 34) == Some(expected.as_slice()))
 }
 
 pub fn is_verified_copy(executable: &Path) -> bool {
@@ -234,14 +253,8 @@ pub fn prepare(root: &Path, executable: &Path) -> io::Result<PathBuf> {
             .arg(&bundle),
     )?;
     signed_bundle(&bundle)?;
-    if digest(&fs::read(bundle.join("Contents/MacOS/ChatGPT"))?) != REPAIRED_EXE
-        || digest(&fs::read(bundle.join(FRAMEWORK))?) != REPAIRED_FRAMEWORK
-    {
-        return Err(invalid(format!(
-            "macOS signed copy mismatch: executable={}, framework={}",
-            digest(&fs::read(bundle.join("Contents/MacOS/ChatGPT"))?),
-            digest(&fs::read(bundle.join(FRAMEWORK))?)
-        )));
+    if !framework_integrity_is_repaired(&bundle.join(FRAMEWORK))? {
+        return Err(invalid("macOS framework integrity digest mismatch"));
     }
     let marker = serde_json::json!({"version":VERSION,"sourceApp":source,
         "executableHash":digest(&fs::read(bundle.join("Contents/MacOS/ChatGPT"))?),
