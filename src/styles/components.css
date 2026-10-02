@@ -2339,8 +2339,9 @@ html[data-performance="low"] .card {
 .acct {
   display: grid;
   /* 「使用 Reset」那一欄沒有了 —— 動作回到每一張券自己那一列。Reset 那格
-     改成 minmax：出錯時裡面會多一顆重試按鈕，釘死寬度會把它擠出去。 */
-  grid-template-columns: 5.6em minmax(13em, 16em) minmax(6.8em, auto) 8.2em 5.4em;
+     改成 minmax：出錯時裡面會多一顆重試按鈕，釘死寬度會把它擠出去。
+     狀態欄原本 5.6em，「每週窗到閘門」六個字放不下會折成兩行。 */
+  grid-template-columns: 7.6em minmax(13em, 16em) minmax(6.8em, auto) 8.2em 5.4em;
   gap: 12px;
   align-items: center;
   justify-content: end;
@@ -2366,9 +2367,13 @@ html[data-performance="low"] .card {
   gap: 10px;
   min-width: 0;
 }
+/* 數字一欄、量條一欄，說明字掛在量條那一欄：讀數的左緣對齊量條的左緣，
+   不從百分比底下開始 —— 數字靠右貼著量條，說明字要是從欄位最左邊起頭，
+   三樣東西就有兩條不同的左緣。 */
 .acct__quota-window {
   display: grid;
-  gap: 4px;
+  grid-template-columns: 3.2em minmax(0, 1fr);
+  gap: 4px 9px;
   min-width: 0;
 }
 /* 位置固定，份量跟著實情走：剩最少的那一條是現在擋著你的，其餘退一階。
@@ -2382,10 +2387,10 @@ html[data-performance="low"] .card {
   opacity: 0.72;
 }
 .acct__quota-line {
+  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: 3.2em minmax(0, 1fr);
+  grid-template-columns: subgrid;
   align-items: center;
-  gap: 9px;
 }
 .acct__quota-line strong {
   font-family: var(--font-display);
@@ -2401,6 +2406,7 @@ html[data-performance="low"] .card {
 /* 不釘 nowrap：視窗長度加重置時刻，換成英文或日文就是一整句，
    釘住不折行的結果是它長到欄位外面去。 */
 .acct__quota small {
+  grid-column: 2;
   text-align: left;
   overflow-wrap: anywhere;
   font-family: var(--font-display);
@@ -2520,7 +2526,7 @@ html[data-performance="low"] .card {
 }
 @media (max-width: 1120px) {
   .acct {
-    grid-template-columns: 5.6em minmax(0, 1fr);
+    grid-template-columns: 7.6em minmax(0, 1fr);
   }
   .acct__actions {
     display: flex;

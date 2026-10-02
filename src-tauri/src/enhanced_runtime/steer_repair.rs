@@ -59,6 +59,22 @@ const PROFILES: &[RepairProfile] = &[
         disable: "Un=je||xt||nt&&rt||_t||Dt||tn?.isLoading===!0||Ct||dn",
         reserve_gate: "||Ct",
     },
+    RepairProfile {
+        version: "26.930.2377",
+        asset: "app-primary-85e5c56f1696.js",
+        original_renderer: "f9f2825579ca55161694bd6e6aa7b84800fa39813de93b6caab74fa73d6ff98a",
+        repaired_renderer: "3786ba570864f9e64d8274a370a256f1d25630252eba806e1707bef7469005f4",
+        original_header: "cc672940d88b7bf98e0b72497cbe2389330b3832f0cb49536ef23041e21a33e3",
+        repaired_header: "9a61219c3013cde90d710deacf016eb5ecfda5f8abe37edd051826b12615c3f0",
+        original_exe: "27d4a13c2557cfb9b5d3360b0977828103b774b87295198abc7b901d4c223325",
+        repaired_exe: "8ccc70db766e02540d1956766eca6fa031b9aac16e0ea532ee754e07846304ee",
+        // fn: native login quota gate (mP requires rate_limit.allowed===false).
+        // wt: the gpt-reserve atom's hardBlocked. Same roles as 26.928.
+        gate: "fn=X(mP)&&bt===`local`",
+        repaired_gate: "fn=(X(mP),!1)",
+        disable: "Wn=Ae||St||rt&&it||vt||Ot||rn?.isLoading===!0||wt||fn",
+        reserve_gate: "||wt",
+    },
 ];
 
 fn invalid(message: impl ToString) -> io::Error {
@@ -180,6 +196,25 @@ fn validate_original(executable: &Path) -> io::Result<(Archive, &'static RepairP
     Ok((source, profile))
 }
 
+/// Size and mtime of the executable and its archive. Electron runs a dozen
+/// ChatGPT.exe processes and status polling discovers them all, so a verdict
+/// is reused until either file changes instead of re-hashing ~20MB each time.
+type CopyStamp = [(u64, std::time::SystemTime); 2];
+static VERIFIED_COPIES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (CopyStamp, bool)>>,
+> = std::sync::OnceLock::new();
+
+fn copy_stamp(executable: &Path) -> Option<CopyStamp> {
+    let stamp = |path: &Path| {
+        let metadata = fs::metadata(path).ok()?;
+        Some((metadata.len(), metadata.modified().ok()?))
+    };
+    Some([
+        stamp(executable)?,
+        stamp(&executable.parent()?.join("resources/app.asar"))?,
+    ])
+}
+
 pub fn is_verified_copy(executable: &Path) -> bool {
     // Only the native Desktop entry can be a repair copy. In particular, do
     // not hash every CLI worker named Codex.exe during process discovery.
@@ -189,6 +224,24 @@ pub fn is_verified_copy(executable: &Path) -> bool {
     {
         return false;
     }
+    let Some(stamp) = copy_stamp(executable) else {
+        return false;
+    };
+    let cache = VERIFIED_COPIES.get_or_init(Default::default);
+    if let Some((cached, verdict)) = cache.lock().unwrap().get(executable) {
+        if *cached == stamp {
+            return *verdict;
+        }
+    }
+    let verdict = verify_copy(executable);
+    cache
+        .lock()
+        .unwrap()
+        .insert(executable.to_path_buf(), (stamp, verdict));
+    verdict
+}
+
+fn verify_copy(executable: &Path) -> bool {
     let result = (|| -> io::Result<bool> {
         let hash = digest(&fs::read(executable)?);
         let Some(profile) = PROFILES.iter().find(|profile| profile.repaired_exe == hash) else {
@@ -207,6 +260,38 @@ pub fn is_verified_copy(executable: &Path) -> bool {
     result.unwrap_or(false)
 }
 
+/// Where the installed Store app keeps its Electron profile.
+///
+/// MSIX virtualizes the packaged app's %APPDATA% writes into the package's
+/// LocalCache. A copy runs without package identity and would otherwise start
+/// on an empty %APPDATA%\Codex. Desktop honours CODEX_ELECTRON_USER_DATA_PATH,
+/// so point the copy back at the installed app's profile.
+pub fn user_data_override(executable: &Path) -> Option<PathBuf> {
+    if !is_verified_copy(executable) {
+        return None;
+    }
+    let marker = fs::read(executable.parent()?.join("vellum-steer-repair.json")).ok()?;
+    let metadata: Value = serde_json::from_slice(&marker).ok()?;
+    let family = package_family(Path::new(metadata["sourceApp"].as_str()?))?;
+    let profile = dirs::data_local_dir()?
+        .join("Packages")
+        .join(family)
+        .join("LocalCache/Roaming/Codex");
+    profile.is_dir().then_some(profile)
+}
+
+/// `…\WindowsApps\OpenAI.Codex_26.930.2377.0_x64__2p2nqsd0c76g0\app` →
+/// `OpenAI.Codex_2p2nqsd0c76g0`. Non-Store installs have no package family.
+fn package_family(source_app: &Path) -> Option<String> {
+    source_app.components().find_map(|component| {
+        let name = component.as_os_str().to_str()?;
+        let (full_name, publisher) = name.split_once("__")?;
+        let (package, _) = full_name.split_once('_')?;
+        (package.eq_ignore_ascii_case("OpenAI.Codex") && !publisher.is_empty())
+            .then(|| format!("{package}_{publisher}"))
+    })
+}
+
 fn original_executable(current: &Path) -> io::Result<PathBuf> {
     if is_verified_copy(current) {
         let marker = current.parent().unwrap().join("vellum-steer-repair.json");
@@ -216,7 +301,11 @@ fn original_executable(current: &Path) -> io::Result<PathBuf> {
             .map(PathBuf::from)
             .ok_or_else(|| invalid("Repair copy has no original app location"))?
             .join("ChatGPT.exe");
-        validate_original(&source)?;
+        // An in-place update leaves an unsupported build at the same path; it
+        // still launches, unrepaired. A removed install (Store update) errors.
+        if !source.is_file() {
+            return Err(invalid("Repair copy's original app is no longer installed"));
+        }
         return Ok(source);
     }
     if current.exists() {
@@ -322,15 +411,31 @@ pub fn prepare(root: &Path, source_executable: &Path) -> io::Result<PathBuf> {
 }
 
 /// Resolve before stopping Desktop, so incompatibility cannot strand the user.
-pub fn launch_executable(root: &Path, current: &Path) -> io::Result<PathBuf> {
-    let source = original_executable(current)?;
-    if cfg!(target_os = "windows") && validate_original(&source).is_ok() {
-        prepare(root, &source)
-    } else {
-        if cfg!(target_os = "windows") {
-            log::warn!("[CodexSendRepair] unsupported Desktop build: general-send quota gates were not repaired");
+///
+/// The repair is optional: it never fails a restart. Any problem falls back
+/// to the unmodified app, or to the running copy when the app it came from
+/// is gone, since that copy is verified and still runs.
+pub fn launch_executable(root: &Path, current: &Path) -> PathBuf {
+    let source = match original_executable(current) {
+        Ok(source) => source,
+        Err(error) => {
+            log::warn!("[CodexSendRepair] keeping the current Desktop executable: {error}");
+            return current.to_path_buf();
         }
-        Ok(source)
+    };
+    if !cfg!(target_os = "windows") {
+        return source;
+    }
+    if validate_original(&source).is_err() {
+        log::warn!("[CodexSendRepair] unsupported Desktop build: general-send quota gates were not repaired");
+        return source;
+    }
+    match prepare(root, &source) {
+        Ok(repaired) => repaired,
+        Err(error) => {
+            log::warn!("[CodexSendRepair] repair copy unavailable, launching the unmodified app: {error}");
+            source
+        }
     }
 }
 
@@ -368,7 +473,52 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("ChatGPT.exe");
         fs::write(&source, "unknown build").unwrap();
-        assert_eq!(launch_executable(root.path(), &source).unwrap(), source);
+        assert_eq!(launch_executable(root.path(), &source), source);
+        assert!(!root.path().join("enhanced-runtime/steer-repair").exists());
+    }
+
+    #[test]
+    fn package_family_comes_from_the_store_install_directory() {
+        assert_eq!(
+            package_family(Path::new(
+                r"\\?\C:\Program Files\WindowsApps\OpenAI.Codex_26.930.2377.0_x64__2p2nqsd0c76g0\app"
+            ))
+            .as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0")
+        );
+        assert_eq!(
+            package_family(Path::new(r"C:\Users\a\AppData\Local\Programs\OpenAI\Codex")),
+            None
+        );
+    }
+
+    #[test]
+    fn verification_is_reused_until_the_files_change() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("ChatGPT.exe");
+        fs::create_dir_all(root.path().join("resources")).unwrap();
+        fs::write(&executable, "unknown").unwrap();
+        fs::write(root.path().join("resources/app.asar"), "x").unwrap();
+        assert!(!is_verified_copy(&executable));
+        // Seed a different verdict: the next call must come from the cache.
+        let stamp = copy_stamp(&executable).unwrap();
+        VERIFIED_COPIES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .insert(executable.clone(), (stamp, true));
+        assert!(is_verified_copy(&executable));
+        fs::write(&executable, "changed size").unwrap();
+        assert!(!is_verified_copy(&executable));
+        assert!(user_data_override(&executable).is_none());
+    }
+
+    #[test]
+    fn a_missing_executable_never_fails_the_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("gone/ChatGPT.exe");
+        assert_eq!(launch_executable(root.path(), &missing), missing);
         assert!(!root.path().join("enhanced-runtime/steer-repair").exists());
     }
 
@@ -379,7 +529,7 @@ mod tests {
             std::env::var("VELLUM_STEER_REPAIR_SOURCE").expect("set VELLUM_STEER_REPAIR_SOURCE");
         let root = tempfile::tempdir().unwrap();
         let source = fs::canonicalize(PathBuf::from(source).join("ChatGPT.exe")).unwrap();
-        let repaired = launch_executable(root.path(), &source).unwrap();
+        let repaired = launch_executable(root.path(), &source);
         assert!(is_verified_copy(&repaired));
         assert_eq!(prepare(root.path(), &source).unwrap(), repaired);
         // No pool/proxy settings or bridge are needed to preserve general send.
@@ -395,8 +545,8 @@ mod tests {
             r#"{"enabled":false}"#,
         )
         .unwrap();
-        assert_eq!(launch_executable(root.path(), &source).unwrap(), repaired);
-        assert_eq!(launch_executable(root.path(), &repaired).unwrap(), repaired);
+        assert_eq!(launch_executable(root.path(), &source), repaired);
+        assert_eq!(launch_executable(root.path(), &repaired), repaired);
         assert!(validate_original(&source).is_ok());
         if let Ok(path) = std::env::var("VELLUM_SEND_REPAIR_RENDERER_OUTPUT") {
             let (_, profile) = validate_original(&source).unwrap();
@@ -415,6 +565,7 @@ mod tests {
         }
         fs::write(repaired, "corrupt").unwrap();
         assert!(prepare(root.path(), &source).is_err());
-        assert!(launch_executable(root.path(), &source).is_err());
+        // A corrupt copy is left alone, and the restart falls back to the app.
+        assert_eq!(launch_executable(root.path(), &source), source);
     }
 }
