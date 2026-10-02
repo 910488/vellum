@@ -317,6 +317,12 @@ unchanged; verified profiles currently cover 26.928.2636, 26.928.4866, and
 26.930.2377.
 A repaired
 bridge parent must pass the pinned copy hashes to count as Desktop adoption.
+macOS arm64 26.930.21537 uses the same quota-only composer change in a verified
+ad-hoc signed bundle copy. It updates the ASAR header, plist integrity hash and
+Framework's embedded integrity-dictionary digest, preserving integrity checks.
+Managed launch targets the copy by bundle path instead of bundle ID; existing
+bridge environment and safe restart guard remain in effect. See `BUILDING.md`
+for local signing and native-keychain limitations.
 This display-only bridge
 behavior leaves Vellum's own quota readings, account selection, pool gates,
 and upstream quota errors intact. A sent Official request can still fail when

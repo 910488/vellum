@@ -14,6 +14,17 @@ test("ordinary new-message Send remains clickable when login or Reserve quota is
   const original = fs.readFileSync(originalPath, "utf8");
   const repaired = fs.readFileSync(repairedPath, "utf8");
   function submitDisabled(source, exhausted, reserveBlocked, callerDisabled = false) {
+    if (source.includes("Wn=Ae||St||rt&&it||vt||Ot||rn?.isLoading===!0")) {
+      const gate = source.match(/fn=(?:X\(mP\)&&bt===`local`|\(X\(mP\),!1\))/)?.[0];
+      const disable = source.match(/Wn=Ae\|\|St\|\|rt&&it\|\|vt\|\|Ot\|\|rn\?\.isLoading===!0(?:\|\|wt| {4})\|\|fn/)?.[0];
+      assert(gate && disable, "audited macOS general-send gate must be found");
+      let subscriptions = 0;
+      const context = { X: () => { subscriptions++; return exhausted; }, mP: {}, bt: "local",
+        Ae: callerDisabled, St: false, rt: false, it: false, vt: false, Ot: false, rn: null, wt: reserveBlocked };
+      const disabled = vm.runInNewContext(`let ${gate}; let ${disable}; Wn`, context);
+      assert.equal(subscriptions, 1, "macOS quota subscription must remain intact");
+      return disabled;
+    }
     const gate = source.match(/dn=(?:Y\(lP\)&&yt===`local`|\(Y\(lP\),!1\))/)?.[0];
     const disable = source.match(/Un=je\|\|xt\|\|nt&&rt\|\|_t\|\|Dt\|\|tn\?\.isLoading===!0(?:\|\|Ct| {4})\|\|dn/)?.[0];
     assert(gate && disable, "current native general-send gate must be found");

@@ -843,9 +843,22 @@ fn is_known_codex_desktop_executable_for(path: &Path, home: Option<&Path>) -> bo
         && (normalized.ends_with("\\codex.exe") || normalized.ends_with("\\chatgpt.exe"));
     windows_install
         || (cfg!(target_os = "windows") && super::steer_repair::is_verified_copy(path))
+        || is_macos_repair_copy(path)
         || crate::install_paths::macos_codex_desktop_executable_candidates(home)
             .iter()
             .any(|candidate| normalize(candidate) == normalized)
+}
+
+fn is_macos_repair_copy(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos_send_repair::is_verified_copy(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 struct VerifiedIdentity {

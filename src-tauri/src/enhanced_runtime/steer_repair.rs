@@ -81,7 +81,7 @@ fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(super) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -90,14 +90,18 @@ fn copy_directory(root: &Path, profile: &RepairProfile) -> PathBuf {
         .join(profile.version)
 }
 
-struct Archive {
-    header: Value,
-    raw_header: Vec<u8>,
-    renderer: Vec<u8>,
-    offset: u64,
+pub(super) struct Archive {
+    pub(super) header: Value,
+    pub(super) raw_header: Vec<u8>,
+    pub(super) renderer: Vec<u8>,
+    pub(super) offset: u64,
 }
 
 fn archive(path: &Path, profile: &RepairProfile) -> io::Result<Archive> {
+    archive_at(path, profile.asset)
+}
+
+pub(super) fn archive_at(path: &Path, asset: &str) -> io::Result<Archive> {
     let mut file = fs::File::open(path)?;
     let mut pre = [0_u8; 16];
     file.read_exact(&mut pre)?;
@@ -108,7 +112,7 @@ fn archive(path: &Path, profile: &RepairProfile) -> io::Result<Archive> {
     let mut raw_header = vec![0; header_size];
     file.read_exact(&mut raw_header)?;
     let header: Value = serde_json::from_slice(&raw_header).map_err(invalid)?;
-    let entry = &header["files"]["webview"]["files"]["assets"]["files"][profile.asset];
+    let entry = &header["files"]["webview"]["files"]["assets"]["files"][asset];
     let size = entry["size"]
         .as_u64()
         .filter(|size| *size <= 16 * 1024 * 1024)
@@ -134,7 +138,7 @@ fn archive(path: &Path, profile: &RepairProfile) -> io::Result<Archive> {
     })
 }
 
-fn replace_once(bytes: &[u8], original: &str, replacement: &str) -> io::Result<Vec<u8>> {
+pub(super) fn replace_once(bytes: &[u8], original: &str, replacement: &str) -> io::Result<Vec<u8>> {
     if original.len() != replacement.len() {
         return Err(invalid("Desktop patch must preserve file offsets"));
     }

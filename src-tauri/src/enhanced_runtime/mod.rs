@@ -24,6 +24,8 @@ mod registry;
 mod router;
 mod schema_contract;
 pub mod steer_repair;
+#[cfg(any(target_os = "macos", test))]
+pub mod macos_send_repair;
 
 pub use attestation::{
     AttestationError, AttestationWriter, BridgeAttestationV1, BridgeLifecycle, ChildAttestation,

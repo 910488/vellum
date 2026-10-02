@@ -449,7 +449,7 @@ That script is the fail-closed gate for missing, stale, and mismatched
 remote payloads. It also asserts `build:main` stages the payload before
 `pnpm run build`.
 
-### Automatic Windows Codex Desktop send-button repair
+### Automatic Codex Desktop send-button repair
 
 Vellum implements this repair natively in
 `src-tauri/src/enhanced_runtime/steer_repair.rs` (the historical module name).
@@ -504,7 +504,29 @@ those files. It verifies an idle composer's Send button remains clickable when
 either login or Reserve quota is exhausted, without removing caller disable
 conditions. Without the artifacts this installed-app test is skipped.
 
-The copied executable loses its original Authenticode signature. The installed
+On macOS, `src-tauri/src/enhanced_runtime/macos_send_repair.rs` handles the
+audited arm64 build 26.930.21537. The managed restart prepares a separate
+`enhanced-runtime/send-repair-macos/<version>/ChatGPT.app` copy and launches
+that exact bundle using `open -a`, with the existing bridge environment and
+restart guard. Process discovery and bridge adoption recognize verified copies.
+`ditto` preserves framework symlinks and permissions. The repair updates the
+renderer, ASAR header, Info.plist hash, and Electron Framework's embedded
+integrity-dictionary digest; integrity enforcement remains enabled. Original
+and repaired executable/framework hashes, the app resource seal, and renderer
+hashes must all pass before publication. Unsupported or invalid copies fall
+back to the installed app without blocking a restart.
+
+The Mac copy uses local ad-hoc signing. Team-bound application groups, push
+and shared-keychain entitlements cannot be retained by that signer. Native
+keychain/notification integrations may therefore differ, and require live
+account validation before deployment. The installed notarized app stays
+untouched. Isolated startup validation uses a separate Electron profile and
+CODEX_HOME; it does not send real account requests or stop the user's app.
+The ignored native-copy test requires `VELLUM_MAC_SEND_TEST_ROOT` and can
+export renderer bytes through `VELLUM_SEND_REPAIR_RENDERER_OUTPUT` for the
+ordinary-send regression above.
+
+The Windows copied executable loses its original Authenticode signature. The installed
 MSIX is untouched. Unsupported versions, asset hashes, and existing output
 directories are rejected. This is a local workaround, not an officially
 signed Desktop update; app updates require a newly verified patch.
