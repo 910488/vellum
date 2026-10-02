@@ -140,29 +140,11 @@ pub async fn set_codex_quota_pool(
     settings: crate::codex_oauth::QuotaPoolSettings,
     state: State<'_, AppState>,
 ) -> AppResult<crate::codex_oauth::QuotaPoolStatus> {
-    let previous = state
-        .codex_oauth()
-        .quota_pool_status()
-        .await
-        .settings
-        .enabled;
-    let result = state
+    state
         .codex_oauth()
         .set_quota_pool(settings)
         .await
-        .map_err(app_error)?;
-    if cfg!(target_os = "windows")
-        && previous != result.settings.enabled
-        && state.proxy_status().running
-    {
-        if let Some(identity) = super::runtime::codex_process_identity() {
-            state.mark_restart_required_for_process(
-                crate::model::RuntimeNotice::new("codexRunning"),
-                identity,
-            );
-        }
-    }
-    Ok(result)
+        .map_err(app_error)
 }
 
 #[tauri::command]

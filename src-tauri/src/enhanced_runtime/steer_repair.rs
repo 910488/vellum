@@ -1,4 +1,4 @@
-//! Automatic pinned Windows Desktop composer repair for the quota pool.
+//! Automatic pinned Windows Desktop send-button repair for managed launches.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -15,6 +15,52 @@ const REPAIRED_EXE: &str = "f91440bd7826e8ec1400fc4fd10b91a6a2effcf36aa5eef1810c
 const GATE: &str = "fn=q(rP)&&bt===`local`";
 const DISABLE: &str = "Gn=je||St||rt&&it||vt||Ot||rn?.isLoading===!0||wt||fn";
 
+struct RepairProfile {
+    version: &'static str,
+    asset: &'static str,
+    original_renderer: &'static str,
+    repaired_renderer: &'static str,
+    original_header: &'static str,
+    repaired_header: &'static str,
+    original_exe: &'static str,
+    repaired_exe: &'static str,
+    gate: &'static str,
+    repaired_gate: &'static str,
+    disable: &'static str,
+    reserve_gate: &'static str,
+}
+
+const PROFILES: &[RepairProfile] = &[
+    RepairProfile {
+        version: "26.928.2636",
+        asset: ASSET,
+        original_renderer: ORIGINAL_RENDERER,
+        repaired_renderer: REPAIRED_RENDERER,
+        original_header: ORIGINAL_HEADER,
+        repaired_header: REPAIRED_HEADER,
+        original_exe: ORIGINAL_EXE,
+        repaired_exe: REPAIRED_EXE,
+        gate: GATE,
+        repaired_gate: "fn=(q(rP),!1)",
+        disable: DISABLE,
+        reserve_gate: "||wt",
+    },
+    RepairProfile {
+        version: "26.928.4866",
+        asset: "app-primary-2b539a729a98.js",
+        original_renderer: "2c5259d8c72b2b7f3c437c372bdbad340357156036ca02d6e92caa5c08e55b29",
+        repaired_renderer: "ac000108ac31d987767b119f67ad95ddee7689fdbf98e5f9ecc740972cab76c9",
+        original_header: "1e596e41423edb250a8a489763865064cff2d59a96a636758acd0df9fc63d0ba",
+        repaired_header: "1d25de483c53f80708f3447c6c3c455aa04dbe1d24fcb06f877d83a6f8f69dbb",
+        original_exe: "c11cdd4ed0e0f25eddc1d54035e7b87932f07ac6b011ced04d424e368fedb9a0",
+        repaired_exe: "f287488cfa8b455cbf13a89ee520808eb863b2dfad8f9dc03081ef6561c9de10",
+        gate: "dn=Y(lP)&&yt===`local`",
+        repaired_gate: "dn=(Y(lP),!1)",
+        disable: "Un=je||xt||nt&&rt||_t||Dt||tn?.isLoading===!0||Ct||dn",
+        reserve_gate: "||Ct",
+    },
+];
+
 fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
@@ -23,8 +69,9 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn copy_directory(root: &Path) -> PathBuf {
-    root.join("enhanced-runtime/steer-repair/26.928.2636")
+fn copy_directory(root: &Path, profile: &RepairProfile) -> PathBuf {
+    root.join("enhanced-runtime/steer-repair")
+        .join(profile.version)
 }
 
 struct Archive {
@@ -34,7 +81,7 @@ struct Archive {
     offset: u64,
 }
 
-fn archive(path: &Path) -> io::Result<Archive> {
+fn archive(path: &Path, profile: &RepairProfile) -> io::Result<Archive> {
     let mut file = fs::File::open(path)?;
     let mut pre = [0_u8; 16];
     file.read_exact(&mut pre)?;
@@ -45,7 +92,7 @@ fn archive(path: &Path) -> io::Result<Archive> {
     let mut raw_header = vec![0; header_size];
     file.read_exact(&mut raw_header)?;
     let header: Value = serde_json::from_slice(&raw_header).map_err(invalid)?;
-    let entry = &header["files"]["webview"]["files"]["assets"]["files"][ASSET];
+    let entry = &header["files"]["webview"]["files"]["assets"]["files"][profile.asset];
     let size = entry["size"]
         .as_u64()
         .filter(|size| *size <= 16 * 1024 * 1024)
@@ -88,36 +135,49 @@ fn replace_once(bytes: &[u8], original: &str, replacement: &str) -> io::Result<V
     Ok(result)
 }
 
-fn patch_renderer(bytes: &[u8], expected_hash: &str) -> io::Result<Vec<u8>> {
+fn patch_renderer(
+    bytes: &[u8],
+    expected_hash: &str,
+    profile: &RepairProfile,
+) -> io::Result<Vec<u8>> {
     if digest(bytes) != expected_hash {
         return Err(invalid(
-            "This Codex Desktop version does not support Steer repair",
+            "This Codex Desktop version does not support send-button repair",
         ));
     }
     // Both hooks still run; only their composer quota-disable results change.
-    let repaired_gate = format!("{:<width$}", "fn=(q(rP),!1)", width = GATE.len());
-    let renderer = replace_once(bytes, GATE, &repaired_gate)?;
-    replace_once(&renderer, DISABLE, &DISABLE.replace("||wt", "    "))
+    let repaired_gate = format!(
+        "{:<width$}",
+        profile.repaired_gate,
+        width = profile.gate.len()
+    );
+    let renderer = replace_once(bytes, profile.gate, &repaired_gate)?;
+    replace_once(
+        &renderer,
+        profile.disable,
+        &profile.disable.replace(profile.reserve_gate, "    "),
+    )
 }
 
-fn validate_original(executable: &Path) -> io::Result<Archive> {
-    if digest(&fs::read(executable)?) != ORIGINAL_EXE {
-        return Err(invalid(
-            "This Codex Desktop version does not support Steer repair",
-        ));
-    }
+fn validate_original(executable: &Path) -> io::Result<(Archive, &'static RepairProfile)> {
+    let hash = digest(&fs::read(executable)?);
+    let profile = PROFILES
+        .iter()
+        .find(|profile| profile.original_exe == hash)
+        .ok_or_else(|| invalid("This Codex Desktop version does not support send-button repair"))?;
     let source = archive(
         &executable
             .parent()
             .ok_or_else(|| invalid("Missing app directory"))?
             .join("resources/app.asar"),
+        profile,
     )?;
-    if digest(&source.raw_header) != ORIGINAL_HEADER
-        || digest(&source.renderer) != ORIGINAL_RENDERER
+    if digest(&source.raw_header) != profile.original_header
+        || digest(&source.renderer) != profile.original_renderer
     {
         return Err(invalid("Unsupported Codex Desktop resources"));
     }
-    Ok(source)
+    Ok((source, profile))
 }
 
 pub fn is_verified_copy(executable: &Path) -> bool {
@@ -130,17 +190,19 @@ pub fn is_verified_copy(executable: &Path) -> bool {
         return false;
     }
     let result = (|| -> io::Result<bool> {
-        if digest(&fs::read(executable)?) != REPAIRED_EXE {
+        let hash = digest(&fs::read(executable)?);
+        let Some(profile) = PROFILES.iter().find(|profile| profile.repaired_exe == hash) else {
             return Ok(false);
-        }
+        };
         let data = archive(
             &executable
                 .parent()
                 .ok_or_else(|| invalid("Missing app directory"))?
                 .join("resources/app.asar"),
+            profile,
         )?;
-        Ok(digest(&data.raw_header) == REPAIRED_HEADER
-            && digest(&data.renderer) == REPAIRED_RENDERER)
+        Ok(digest(&data.raw_header) == profile.repaired_header
+            && digest(&data.renderer) == profile.repaired_renderer)
     })();
     result.unwrap_or(false)
 }
@@ -192,15 +254,16 @@ fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 pub fn prepare(root: &Path, source_executable: &Path) -> io::Result<PathBuf> {
-    let mut data = validate_original(source_executable)?;
-    let destination = copy_directory(root);
+    let (mut data, profile) = validate_original(source_executable)?;
+    let destination = copy_directory(root, profile);
     let executable = destination.join("ChatGPT.exe");
     if destination.exists() {
-        if is_verified_copy(&executable) {
+        if is_verified_copy(&executable) && digest(&fs::read(&executable)?) == profile.repaired_exe
+        {
             return Ok(executable);
         }
         return Err(invalid(
-            "Existing Steer repair copy failed verification; it was not overwritten",
+            "Existing send-button repair copy failed verification; it was not overwritten",
         ));
     }
     let source = fs::canonicalize(source_executable.parent().unwrap())?;
@@ -217,15 +280,15 @@ pub fn prepare(root: &Path, source_executable: &Path) -> io::Result<PathBuf> {
         return Err(invalid("Invalid staging location"));
     }
     copy_tree(&source, temporary.path())?;
-    let renderer = patch_renderer(&data.renderer, ORIGINAL_RENDERER)?;
-    if digest(&renderer) != REPAIRED_RENDERER {
+    let renderer = patch_renderer(&data.renderer, profile.original_renderer, profile)?;
+    if digest(&renderer) != profile.repaired_renderer {
         return Err(invalid("Renderer patch verification failed"));
     }
-    let entry = &mut data.header["files"]["webview"]["files"]["assets"]["files"][ASSET];
-    entry["integrity"]["hash"] = Value::String(REPAIRED_RENDERER.into());
-    entry["integrity"]["blocks"] = serde_json::json!([REPAIRED_RENDERER]);
+    let entry = &mut data.header["files"]["webview"]["files"]["assets"]["files"][profile.asset];
+    entry["integrity"]["hash"] = Value::String(profile.repaired_renderer.into());
+    entry["integrity"]["blocks"] = serde_json::json!([profile.repaired_renderer]);
     let header = serde_json::to_vec(&data.header).map_err(invalid)?;
-    if header.len() != data.raw_header.len() || digest(&header) != REPAIRED_HEADER {
+    if header.len() != data.raw_header.len() || digest(&header) != profile.repaired_header {
         return Err(invalid("Archive header patch verification failed"));
     }
     let mut file = fs::OpenOptions::new()
@@ -239,10 +302,10 @@ pub fn prepare(root: &Path, source_executable: &Path) -> io::Result<PathBuf> {
     drop(file);
     let binary = replace_once(
         &fs::read(source_executable)?,
-        ORIGINAL_HEADER,
-        REPAIRED_HEADER,
+        profile.original_header,
+        profile.repaired_header,
     )?;
-    if digest(&binary) != REPAIRED_EXE {
+    if digest(&binary) != profile.repaired_exe {
         return Err(invalid("Executable patch verification failed"));
     }
     fs::write(temporary.path().join("ChatGPT.exe"), binary)?;
@@ -252,18 +315,21 @@ pub fn prepare(root: &Path, source_executable: &Path) -> io::Result<PathBuf> {
         &serde_json::to_vec(&marker).map_err(invalid)?,
     )?;
     if !is_verified_copy(&temporary.path().join("ChatGPT.exe")) {
-        return Err(invalid("Steer repair copy failed verification"));
+        return Err(invalid("Send-button repair copy failed verification"));
     }
     fs::rename(temporary.path(), &destination)?;
     Ok(executable)
 }
 
 /// Resolve before stopping Desktop, so incompatibility cannot strand the user.
-pub fn launch_executable(root: &Path, current: &Path, managed_pool: bool) -> io::Result<PathBuf> {
+pub fn launch_executable(root: &Path, current: &Path) -> io::Result<PathBuf> {
     let source = original_executable(current)?;
-    if cfg!(target_os = "windows") && managed_pool && validate_original(&source).is_ok() {
+    if cfg!(target_os = "windows") && validate_original(&source).is_ok() {
         prepare(root, &source)
     } else {
+        if cfg!(target_os = "windows") {
+            log::warn!("[CodexSendRepair] unsupported Desktop build: general-send quota gates were not repaired");
+        }
         Ok(source)
     }
 }
@@ -274,13 +340,16 @@ mod tests {
 
     #[test]
     fn both_composer_gates_change_without_moving_bytes_or_removing_hooks() {
-        let source = format!("before;{GATE};let {DISABLE};after");
-        let repaired = patch_renderer(source.as_bytes(), &digest(source.as_bytes())).unwrap();
-        assert_eq!(repaired.len(), source.len());
-        let repaired = String::from_utf8(repaired).unwrap();
-        assert!(repaired.contains("fn=(q(rP),!1)"));
-        assert!(repaired.contains("Gn=je||St||rt&&it||vt||Ot||rn?.isLoading===!0    ||fn"));
-        assert!(patch_renderer(source.as_bytes(), ORIGINAL_RENDERER).is_err());
+        for profile in PROFILES {
+            let source = format!("before;{};let {};after", profile.gate, profile.disable);
+            let repaired =
+                patch_renderer(source.as_bytes(), &digest(source.as_bytes()), profile).unwrap();
+            assert_eq!(repaired.len(), source.len());
+            let repaired = String::from_utf8(repaired).unwrap();
+            assert!(repaired.contains(profile.repaired_gate));
+            assert!(repaired.contains(&profile.disable.replace(profile.reserve_gate, "    ")));
+            assert!(patch_renderer(source.as_bytes(), profile.original_renderer, profile).is_err());
+        }
     }
 
     #[test]
@@ -291,7 +360,7 @@ mod tests {
         fs::write(root.path().join("ChatGPT.exe"), "unknown").unwrap();
         assert!(!is_verified_copy(&root.path().join("ChatGPT.exe")));
         assert!(prepare(root.path(), &root.path().join("ChatGPT.exe")).is_err());
-        assert!(!copy_directory(root.path()).exists());
+        assert!(!root.path().join("enhanced-runtime/steer-repair").exists());
     }
 
     #[test]
@@ -299,44 +368,53 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("ChatGPT.exe");
         fs::write(&source, "unknown build").unwrap();
-        assert_eq!(
-            launch_executable(root.path(), &source, true).unwrap(),
-            source
-        );
-        assert!(!copy_directory(root.path()).exists());
+        assert_eq!(launch_executable(root.path(), &source).unwrap(), source);
+        assert!(!root.path().join("enhanced-runtime/steer-repair").exists());
     }
 
     #[test]
     #[ignore = "requires the pinned installed Windows Codex app"]
-    fn installed_source_matches_script_and_native_copy_round_trips() {
+    fn installed_source_general_send_repair_is_independent_of_pool_and_proxy() {
         let source =
             std::env::var("VELLUM_STEER_REPAIR_SOURCE").expect("set VELLUM_STEER_REPAIR_SOURCE");
         let root = tempfile::tempdir().unwrap();
         let source = fs::canonicalize(PathBuf::from(source).join("ChatGPT.exe")).unwrap();
-        let repaired = launch_executable(root.path(), &source, true).unwrap();
+        let repaired = launch_executable(root.path(), &source).unwrap();
         assert!(is_verified_copy(&repaired));
         assert_eq!(prepare(root.path(), &source).unwrap(), repaired);
-        // Legacy disabled preferences cannot disable the default pool repair.
+        // No pool/proxy settings or bridge are needed to preserve general send.
+        assert!(crate::commands::runtime::use_direct_desktop_launch(
+            &repaired, false
+        ));
+        assert!(!crate::commands::runtime::use_direct_desktop_launch(
+            &source, false
+        ));
+        // Legacy disabled preferences cannot disable the default send repair.
         fs::write(
             root.path().join("enhanced-runtime/steer-repair.json"),
             r#"{"enabled":false}"#,
         )
         .unwrap();
-        assert_eq!(
-            launch_executable(root.path(), &source, true).unwrap(),
-            repaired
-        );
-        assert_eq!(
-            launch_executable(root.path(), &repaired, false).unwrap(),
-            source
-        );
-        assert_eq!(
-            launch_executable(root.path(), &repaired, true).unwrap(),
-            repaired
-        );
+        assert_eq!(launch_executable(root.path(), &source).unwrap(), repaired);
+        assert_eq!(launch_executable(root.path(), &repaired).unwrap(), repaired);
         assert!(validate_original(&source).is_ok());
+        if let Ok(path) = std::env::var("VELLUM_SEND_REPAIR_RENDERER_OUTPUT") {
+            let (_, profile) = validate_original(&source).unwrap();
+            let data = archive(
+                &repaired.parent().unwrap().join("resources/app.asar"),
+                profile,
+            )
+            .unwrap();
+            // Export only static renderer bytes for the ordinary-send DOM regression.
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            output.write_all(&data.renderer).unwrap();
+        }
         fs::write(repaired, "corrupt").unwrap();
         assert!(prepare(root.path(), &source).is_err());
-        assert!(launch_executable(root.path(), &source, true).is_err());
+        assert!(launch_executable(root.path(), &source).is_err());
     }
 }

@@ -482,15 +482,8 @@ pub(crate) async fn restart_codex_managed(
     let next_target = {
         let root = state.data_root();
         let current = target.executable.clone();
-        let managed_pool = state.proxy_status().running
-            && state
-                .codex_oauth()
-                .quota_pool_status()
-                .await
-                .settings
-                .enabled;
         let next = match off_main_thread(move || {
-            crate::enhanced_runtime::steer_repair::launch_executable(&root, &current, managed_pool)
+            crate::enhanced_runtime::steer_repair::launch_executable(&root, &current)
         })
         .await
         {
@@ -874,16 +867,21 @@ fn windows_launch_spec(
     target: &CodexLaunchTarget,
     launch: Option<&DesktopRuntimeLaunch>,
 ) -> (PathBuf, Vec<String>, Option<PathBuf>) {
-    if let Some(launch) = launch {
+    if use_direct_desktop_launch(&target.executable, launch.is_some()) {
         return (
             target.executable.clone(),
             Vec::new(),
-            Some(launch.bridge_executable.clone()),
+            launch.map(|launch| launch.bridge_executable.clone()),
         );
     }
     let (program, args) =
         crate::runtime::codex_launch_spec(target.app_id.as_deref(), &target.executable);
     (program, args, None)
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn use_direct_desktop_launch(executable: &std::path::Path, has_bridge: bool) -> bool {
+    has_bridge || crate::enhanced_runtime::steer_repair::is_verified_copy(executable)
 }
 
 #[cfg(target_os = "macos")]

@@ -299,10 +299,14 @@ longer release the composer quota gate. The automatic Windows repair copy in
 `scripts/codex-steer-repair.mjs` only releases that composer gate, retaining
 its atom subscription and the native usage display. See `BUILDING.md` for
 the pinned version, integrity changes, and activation limits. Vellum's native
-managed restart automatically prepares and selects this copy while the proxy
-and quota pool are enabled, without a separate setting. Disabling the pool or
-proxy restores the original executable on the next managed restart. Running
-turns retain the existing restart guard. Unsupported builds remain unchanged.
+managed restart automatically prepares and selects this copy independently of
+the proxy and quota-pool settings, without a separate setting. Its quota gates
+feed the normal composer's `submitDisabled` property, so the repair covers
+ordinary new messages, not only in-flight follow-ups. Switching a pool or proxy
+off does not restore the login quota lock. Without a bridge, repaired copies
+still launch directly so MSIX activation cannot reopen the unmodified app.
+Running turns retain the existing restart guard. Unsupported builds remain
+unchanged; verified profiles currently cover 26.928.2636 and 26.928.4866.
 A repaired
 bridge parent must pass the pinned copy hashes to count as Desktop adoption.
 This display-only bridge
