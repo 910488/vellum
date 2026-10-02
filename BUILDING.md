@@ -449,16 +449,17 @@ That script is the fail-closed gate for missing, stale, and mismatched
 remote payloads. It also asserts `build:main` stages the payload before
 `pnpm run build`.
 
-### Automatic Windows Codex Desktop Steer repair
+### Automatic Windows Codex Desktop send-button repair
 
 Vellum implements this repair natively in
-`src-tauri/src/enhanced_runtime/steer_repair.rs`. It is part of the quota pool,
-with no separate repair setting or Node requirement. When the proxy and quota
-pool are enabled, the existing managed restart automatically prepares and
-selects the verified repair copy. Pool changes flag a running Desktop for the
-existing safe restart; running turns are never interrupted to apply the repair.
-Disabling the pool or proxy selects the original executable on the next managed
-restart. Legacy repair preferences are ignored.
+`src-tauri/src/enhanced_runtime/steer_repair.rs` (the historical module name).
+It repairs general new-message submission, with no separate setting or Node
+requirement. Vellum's managed restart automatically prepares and selects the
+verified repair copy, independently of Proxy and quota-pool settings. A copy
+is launched directly even without a bridge; MSIX activation would reopen the
+unmodified installed app. Running turns retain the existing safe restart guard.
+Legacy repair preferences are ignored. Upstream errors remain authoritative
+when the selected account has no allowance.
 
 Copies are staged in an owned temporary directory and published only after
 exact executable, archive header, and renderer hashes verify. An existing
@@ -468,17 +469,30 @@ executable rather than blocking the normal restart. Process discovery and
 bridge-parent verification recognize a repaired copy by its pinned hashes.
 The command-line scripts below remain diagnostic tools.
 
-Codex Desktop 26.928.2636 can disable its composer based on the native login's
+The audited Windows profiles are 26.928.2636 and 26.928.4866. Each has separate
+original/repaired executable, renderer, and archive-header pins and its own
+copy directory. An app update therefore cannot accidentally reuse an older
+renderer patch. These builds can disable the composer based on the native login's
 `/wham/usage`, even while Vellum's quota pool can continue a running turn.
 The public Codex repository does not contain this Desktop composer.
 
-`scripts/codex-steer-repair.mjs` creates a separate local copy of this exact
-Desktop build. It changes only the composer's native-login and Luna Reserve
+`scripts/codex-steer-repair.mjs` remains a diagnostic copier for the older
+26.928.2636 profile. The native repair handles both audited profiles and changes
+only the composer's native-login and Luna Reserve
 quota-disable expressions,
 retains the reactive subscription, and updates the ASAR entry integrity and
 the native executable's embedded ASAR header hash. Account authentication,
 quota banners, other send restrictions, provider routing, and Vellum pool
 gates are unchanged. This does not grant upstream quota.
+
+The current-profile ordinary-send regression uses original renderer bytes and
+the renderer exported by the ignored Rust native-copy integration test via
+`VELLUM_SEND_REPAIR_RENDERER_OUTPUT` (a new output file). Run
+`node --test scripts/codex-send-repair.test.mjs` with
+`VELLUM_SEND_ORIGINAL_RENDERER` and `VELLUM_SEND_REPAIRED_RENDERER` pointing to
+those files. It verifies an idle composer's Send button remains clickable when
+either login or Reserve quota is exhausted, without removing caller disable
+conditions. Without the artifacts this installed-app test is skipped.
 
 The copied executable loses its original Authenticode signature. The installed
 MSIX is untouched. Unsupported versions, asset hashes, and existing output
