@@ -501,7 +501,31 @@ pub(crate) async fn restart_codex_managed(
     };
     #[cfg(target_os = "windows")]
     let launch_target = &next_target;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let next_target = {
+        let root = state.data_root();
+        let current = target.executable.clone();
+        let next = match off_main_thread(move || {
+            crate::enhanced_runtime::macos_send_repair::launch_executable(&root, &current)
+        })
+        .await
+        {
+            Ok(executable) => executable,
+            Err(error) => {
+                state.set_draining(false);
+                return Err(error);
+            }
+        };
+        CodexLaunchTarget {
+            pid: target.pid,
+            started_at: target.started_at.clone(),
+            executable: next,
+            app_id: target.app_id.clone(),
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let launch_target = &next_target;
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let launch_target = &target;
 
     // The launch lease is a Proxy transaction, not a restart side-effect.
@@ -890,7 +914,13 @@ fn launch_codex(
     target: &CodexLaunchTarget,
     launch: Option<&DesktopRuntimeLaunch>,
 ) -> std::io::Result<()> {
-    if let Some(app_id) = target.app_id.as_deref() {
+    if crate::enhanced_runtime::macos_send_repair::is_verified_copy(&target.executable) {
+        let bundle = crate::enhanced_runtime::macos_send_repair::bundle_path(&target.executable)
+            .expect("verified macOS repair bundle");
+        std::process::Command::new("open")
+            .args(macos_repaired_open_args(bundle, launch))
+            .spawn()?;
+    } else if let Some(app_id) = target.app_id.as_deref() {
         std::process::Command::new("open")
             .args(macos_open_args(app_id, launch))
             .spawn()?;
@@ -919,6 +949,26 @@ fn launch_codex(
 #[cfg(any(target_os = "macos", test))]
 fn macos_open_args(app_id: &str, launch: Option<&DesktopRuntimeLaunch>) -> Vec<std::ffi::OsString> {
     let mut args = vec!["-b".into(), app_id.into()];
+    if let Some(launch) = launch {
+        args.push("--env".into());
+        args.push(
+            format!(
+                "{}={}",
+                crate::enhanced_runtime::env_lease::CODEX_CLI_PATH,
+                launch.bridge_executable.display()
+            )
+            .into(),
+        );
+    }
+    args
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_repaired_open_args(
+    bundle: &std::path::Path,
+    launch: Option<&DesktopRuntimeLaunch>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["-a".into(), bundle.as_os_str().to_owned()];
     if let Some(launch) = launch {
         args.push("--env".into());
         args.push(
@@ -1320,6 +1370,14 @@ mod restart_guard_tests {
                 ),
             ]
         );
+        let bundle = std::path::Path::new("/tmp/repair with spaces/ChatGPT.app");
+        let repaired = macos_repaired_open_args(bundle, Some(&launch));
+        assert_eq!(
+            &repaired[..2],
+            &[std::ffi::OsString::from("-a"), bundle.as_os_str().to_owned()]
+        );
+        assert_eq!(&repaired[2..], &args[2..]);
+        assert_eq!(macos_repaired_open_args(bundle, None), repaired[..2]);
     }
 
     #[test]
