@@ -133,6 +133,15 @@ const ja: ResourceTree = {
       },
       "applied": "言語を適用しました"
     },
+    "theme": {
+      "title": "外観",
+      "blurb": "ライトまたはダーク。「システムに従う」は OS の設定を追跡します。",
+      "option": {
+        "system": "システムに従う",
+        "light": "ライト",
+        "dark": "ダーク"
+      }
+    },
     "title": "設定",
     "page": {
       "subagent": { "title": "サブエージェントの既定値", "description": "既定では、サブエージェントはそれを生成した会話のモデルと推論強度をそのまま使います。ここで固定の既定値に変えられます。タスクでモデルや Effort が明示された場合は、その指定が優先されます。", "desktopReady": "Codex Desktop は準備完了", "desktopUnavailable": "Codex Desktop にこの設定を適用できません", "desktopVersion": "Desktop バージョン {{version}} · ネイティブのサブエージェント既定値を利用可能", "defaultsTitle": "未指定時に使うモデル", "mode": { "inherit": "Desktop の現在の設定を維持", "custom": "Vellum で既定値を指定" }, "effort": "推論強度", "autoEffort": "自動（モデル既定）", "effortNotProbed": "このモデルの推論強度は未検証です。Models ページで先に機能を確認してください。", "modelEmpty": "この Provider には選択できるモデルがありません。", "hint": "これらはデフォルトに過ぎません。エージェントはタスクに応じて他の有効なモデルと Effort を明示的に指定できます。", "unavailable": "選択した Provider またはモデルは現在利用できません。このデフォルトに依存するサブエージェントは、設定が更新されるまで明示的に失敗します。", "unsupported": "Codex Desktop のネイティブサブエージェント設定を確認できません：{{detail}}" },

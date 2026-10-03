@@ -133,6 +133,15 @@ const zhTW: ResourceTree = {
       },
       "applied": "語言已套用"
     },
+    "theme": {
+      "title": "外觀",
+      "blurb": "淺色或深色。選「跟隨系統」會照 Windows／macOS 的設定。",
+      "option": {
+        "system": "跟隨系統",
+        "light": "淺色",
+        "dark": "深色"
+      }
+    },
     "title": "設定",
     "page": {
       "subagent": { "title": "子代理預設", "description": "預設情況下，子代理使用發起它那次對話的模型與推理強度。這裡可以改成固定的預設值；任務若明確指定模型或推理強度，仍以任務指定為優先。", "desktopReady": "Codex Desktop 已就緒", "desktopUnavailable": "Codex Desktop 無法套用此設定", "desktopVersion": "Desktop 版本 {{version}} · 原生子代理預設可用", "defaultsTitle": "未指定時使用的模型", "mode": { "inherit": "保留 Desktop 現有設定", "custom": "由 Vellum 指定預設" }, "effort": "推理強度", "autoEffort": "自動（模型預設）", "effortNotProbed": "此模型的推理強度尚未驗證；請先到「模型」頁偵測能力。", "modelEmpty": "此 Provider 目前沒有可選的模型。", "hint": "這些只是預設值；代理可依任務明確指定其他已啟用的模型與推理強度。", "unavailable": "所選的 Provider 或模型目前已不可用。依賴此預設建立的子代理會明確失敗，直到更新設定。", "unsupported": "無法驗證 Codex Desktop 的原生子代理設定：{{detail}}" },

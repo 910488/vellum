@@ -133,6 +133,15 @@ const en: ResourceTree = {
       },
       "applied": "Language applied"
     },
+    "theme": {
+      "title": "Appearance",
+      "blurb": "Light or dark. Follow system tracks the OS setting.",
+      "option": {
+        "system": "Follow system",
+        "light": "Light",
+        "dark": "Dark"
+      }
+    },
     "title": "Settings",
     "page": {
       "subagent": { "title": "Sub-agent defaults", "description": "By default a sub-agent runs on the model and reasoning effort of the conversation that spawned it. Pick a fixed default here instead; an explicit model or effort on the task still takes priority.", "desktopReady": "Codex Desktop is ready", "desktopUnavailable": "Codex Desktop cannot apply this setting", "desktopVersion": "Desktop version {{version}} · native sub-agent defaults available", "defaultsTitle": "Model used when unspecified", "mode": { "inherit": "Keep Desktop settings", "custom": "Set default with Vellum" }, "effort": "Reasoning effort", "autoEffort": "Automatic (model default)", "effortNotProbed": "This model's reasoning efforts have not been verified; probe its capabilities from the Models page first.", "modelEmpty": "This Provider has no catalog models to pick from.", "hint": "These are only defaults: an agent may explicitly name another enabled model and effort for a task.", "unavailable": "The selected Provider or model is no longer available. Sub-agent spawns that rely on this default will fail explicitly until the selection is updated.", "unsupported": "Could not verify native sub-agent settings in Codex Desktop: {{detail}}" },

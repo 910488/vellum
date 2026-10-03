@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { I18N_LANGUAGE_SELECTOR_ENABLED, type LocalePreference } from "@/i18n/locale";
+import { readThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
 import { api } from "@/lib/api";
 import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
@@ -75,6 +76,7 @@ export function Settings({
   const { t } = useTranslation();
   const { sinceLabel } = useLocaleFormat();
   const [localePreference, setLocalePreferenceState] = useState<LocalePreference>(getLocalePreference());
+  const [themePreference, setThemePreferenceState] = useState<ThemePreference>(readThemePreference);
   const [settings, setSettings] = useState<ReviewSettings | null>(null);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [models, setModels] = useState<ModelRoute[]>([]);
@@ -726,10 +728,12 @@ export function Settings({
 
       {error ? <p className="note">{error}</p> : null}
 
-      {/* 語言是頁面級偏好，只有一個下拉。放進 grid2 會讓它吃掉 1.35fr 的主欄，
-          把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成一條橫幅。 */}
+      {/* 語言與外觀是頁面級偏好，各只有一個控制項。放進 grid2 會讓它們吃掉 1.35fr
+          的主欄，把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成同一張
+          卡裡的兩條橫幅。 */}
+      <Card quiet className="prefstrips">
       {I18N_LANGUAGE_SELECTOR_ENABLED ? (
-        <Card quiet className="prefstrip">
+        <div className="prefstrip">
           <div className="prefstrip__copy">
             <Cap>{t("settings.language.title")}</Cap>
             <p className="note">{t("settings.language.blurb")}</p>
@@ -750,8 +754,26 @@ export function Settings({
             <option value="en">{t("settings.language.option.en")}</option>
             <option value="ja">{t("settings.language.option.ja")}</option>
           </select>
-        </Card>
+        </div>
       ) : null}
+        <div className="prefstrip">
+          <div className="prefstrip__copy">
+            <Cap>{t("settings.theme.title")}</Cap>
+            <p className="note">{t("settings.theme.blurb")}</p>
+          </div>
+          <Segment<ThemePreference>
+            options={(["system", "light", "dark"] as const).map((value) => ({
+              value,
+              label: t(`settings.theme.option.${value}`),
+            }))}
+            value={themePreference}
+            onChange={(next) => {
+              setThemePreferenceState(next);
+              setThemePreference(next);
+            }}
+          />
+        </div>
+      </Card>
 
       <div className="grid2">
         <Card>
