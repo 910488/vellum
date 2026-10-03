@@ -89,6 +89,9 @@ fn shutdown_proxy_and_restore(app: &tauri::AppHandle, apply_desktop_update: bool
         if let Err(error) = crate::commands::proxy::stop_proxy_gracefully(&state).await {
             log::error!("[Codex] 結束前還原 Proxy/Enhanced 啟動接管失敗：{error}");
         }
+        // The lease is back, but Codex Desktop still runs the bridge and the
+        // Enhanced core it started; closing Vellum has to end those too.
+        crate::commands::proxy::stop_enhanced_sidecars();
         // Hiding the main window leaves this process alive, so an installer
         // may only start for the tray's explicit process exit.
         if apply_desktop_update {

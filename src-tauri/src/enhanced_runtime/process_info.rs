@@ -86,14 +86,86 @@ pub fn format_process_images(images: &[ProcessImage]) -> String {
         .join("; ")
 }
 
+/// Sidecars this install ships. Codex Desktop, not Vellum, is their parent:
+/// it runs the bridge through `CODEX_CLI_PATH`, and the bridge starts the
+/// Enhanced core and relay. Nothing about Vellum exiting reaches them.
+const BUNDLED_SIDECAR_STEMS: [&str; 3] = [
+    super::desktop_manager::BRIDGE_EXECUTABLE_STEM,
+    "vellum-enhanced-codex",
+    "vellum-codex-relay",
+];
+
+pub fn is_bundled_sidecar_executable(path: &std::path::Path) -> bool {
+    let name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    BUNDLED_SIDECAR_STEMS.contains(&name.as_str())
+}
+
+/// Sidecar processes running from this install's own files. Another install
+/// (a dev build, a second copy) keeps its own sidecars.
+pub fn bundled_sidecars() -> Vec<ProcessImage> {
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+    let roots = crate::install_paths::resource_roots_for(&exe_dir)
+        .iter()
+        .map(|root| canonical(root))
+        .collect::<Vec<_>>();
+    let self_pid = std::process::id();
+    process_images_matching(is_bundled_sidecar_executable)
+        .into_iter()
+        .filter(|image| {
+            image.pid != self_pid && {
+                let executable = canonical(&image.executable);
+                roots.iter().any(|root| executable.starts_with(root))
+            }
+        })
+        .collect()
+}
+
+/// Stops every sidecar of this install, children included, so an exited
+/// Vellum leaves no Enhanced core holding its files open (the installer cannot
+/// overwrite a running `vellum-enhanced-codex.exe`). Returns what it stopped.
+pub fn terminate_bundled_sidecars() -> Vec<ProcessImage> {
+    let sidecars = bundled_sidecars();
+    for image in &sidecars {
+        #[cfg(target_os = "windows")]
+        let result = crate::process::background_command("taskkill")
+            .args(["/PID", &image.pid.to_string(), "/T", "/F"])
+            .output();
+        #[cfg(not(target_os = "windows"))]
+        let result = crate::process::background_command("kill")
+            .args(["-TERM", &image.pid.to_string()])
+            .output();
+        if let Err(error) = result {
+            log::warn!(
+                "[Enhanced] cannot stop sidecar pid {} ({}): {error}",
+                image.pid,
+                image.executable.display()
+            );
+        }
+    }
+    sidecars
+}
+
 fn process_images() -> Vec<ProcessImage> {
+    process_images_matching(is_vellum_host_executable)
+}
+
+fn process_images_matching(matches: fn(&std::path::Path) -> bool) -> Vec<ProcessImage> {
     #[cfg(target_os = "windows")]
     {
-        windows::process_images()
+        windows::process_images(matches)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        unix::process_images()
+        unix::process_images(matches)
     }
 }
 
@@ -168,7 +240,9 @@ mod windows {
         }
     }
 
-    pub fn process_images() -> Vec<super::ProcessImage> {
+    pub fn process_images(
+        matches: fn(&std::path::Path) -> bool,
+    ) -> Vec<super::ProcessImage> {
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
             return Vec::new();
@@ -185,7 +259,7 @@ mod windows {
                         .position(|&unit| unit == 0)
                         .unwrap_or(entry.szExeFile.len());
                     let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
-                    if super::is_vellum_host_executable(std::path::Path::new(&name)) {
+                    if matches(std::path::Path::new(&name)) {
                         if let Some(executable) = executable_of(entry.th32ProcessID) {
                             images.push(super::ProcessImage {
                                 pid: entry.th32ProcessID,
@@ -242,7 +316,9 @@ mod unix {
             .filter(|value| !value.is_empty())
     }
 
-    pub fn process_images() -> Vec<super::ProcessImage> {
+    pub fn process_images(
+        matches: fn(&std::path::Path) -> bool,
+    ) -> Vec<super::ProcessImage> {
         let output = std::process::Command::new("ps")
             .args(["-axo", "pid=,comm="])
             .output()
@@ -258,7 +334,7 @@ mod unix {
                 let pid = pid.parse::<u32>().ok()?;
                 let comm = rest.trim();
                 let named = std::path::PathBuf::from(comm);
-                if !super::is_vellum_host_executable(&named) {
+                if !matches(&named) {
                     return None;
                 }
                 Some(super::ProcessImage {
@@ -278,6 +354,20 @@ mod tests {
     fn current_process_is_alive_and_pid_zero_is_not() {
         assert!(pid_is_alive(std::process::id()));
         assert!(!pid_is_alive(0));
+    }
+
+    #[test]
+    fn bundled_sidecar_names_cover_the_bridge_core_and_relay_only() {
+        for name in [
+            "vellum-codex-app-server.exe",
+            "vellum-enhanced-codex.exe",
+            "vellum-codex-relay",
+        ] {
+            assert!(is_bundled_sidecar_executable(std::path::Path::new(name)), "{name}");
+        }
+        for name in ["vellum-proxy-desktop.exe", "vellum.exe", "codex.exe", "ChatGPT.exe"] {
+            assert!(!is_bundled_sidecar_executable(std::path::Path::new(name)), "{name}");
+        }
     }
 
     #[test]
