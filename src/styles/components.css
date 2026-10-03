@@ -1390,9 +1390,18 @@ html[data-performance="low"] .card {
    它待在原地；文字長的語言只會讓左邊那欄多折一行。 */
 .prefstrip {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(9.5em, 13em);
+  /* 第二欄讓控制項自己決定寬度：三段的日文「システムに従う」塞不進固定 13em。 */
+  grid-template-columns: minmax(0, 1fr) minmax(13em, max-content);
   align-items: center;
   gap: 10px 24px;
+}
+.prefstrip > .segment {
+  justify-self: end;
+}
+.prefstrip + .prefstrip {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--edge);
 }
 .prefstrip__copy {
   min-width: 0;
@@ -1407,7 +1416,8 @@ html[data-performance="low"] .card {
   .prefstrip {
     grid-template-columns: minmax(0, 1fr);
   }
-  .prefstrip > .input {
+  .prefstrip > .input,
+  .prefstrip > .segment {
     justify-self: start;
     min-width: 13em;
   }

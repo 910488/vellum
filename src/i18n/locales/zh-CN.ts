@@ -133,6 +133,15 @@ const zhCN: ResourceTree = {
       },
       "applied": "语言已应用"
     },
+    "theme": {
+      "title": "外观",
+      "blurb": "浅色或深色。选「跟随系统」会按 Windows／macOS 的设置。",
+      "option": {
+        "system": "跟随系统",
+        "light": "浅色",
+        "dark": "深色"
+      }
+    },
     "title": "设置",
     "page": {
       "subagent": { "title": "子代理默认设置", "description": "默认情况下，子代理使用发起它那次对话的模型与推理强度。这里可以改成固定的默认值；任务若明确指定模型或推理强度，仍以任务指定为优先。", "desktopReady": "Codex Desktop 已就绪", "desktopUnavailable": "Codex Desktop 无法应用此设置", "desktopVersion": "Desktop 版本 {{version}} · 原生子代理默认设置可用", "defaultsTitle": "未指定时使用的模型", "mode": { "inherit": "保留 Desktop 现有设置", "custom": "由 Vellum 指定默认" }, "effort": "推理强度", "autoEffort": "自动（模型默认）", "effortNotProbed": "此模型的推理强度尚未验证；请先到「模型」页探测能力。", "modelEmpty": "此 Provider 目前没有可选的模型。", "hint": "这些只是默认值；代理可依任务明确指定其他已启用的模型与推理强度。", "unavailable": "所选的 Provider 或模型目前已不可用。依赖此默认值建立的子代理会明确失败，直到更新设置。", "unsupported": "无法验证 Codex Desktop 的原生子代理设置：{{detail}}" },
