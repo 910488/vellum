@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn guardian_deprecated_context_is_translated_only_for_enhanced_config() {
+    for method in ["thread/start", "thread/resume", "thread/fork"] {
+        for config in [
+            json!({"features.guardianv2": {"enabled": true, "thread_context": true, "review_threshold": 0.7}}),
+            json!({"features": {"guardianv2": {"enabled": true, "thread_context": false, "review_threshold": 0.7}}}),
+            json!({"features.guardianv2.enabled": true, "features.guardianv2.thread_context": true,
+                "features.guardianv2.review_threshold": 0.7}),
+        ] {
+            let original = json!({"id":1,"method":method,"params":{"config":config,"approvalPolicy":"on-request"}});
+            let mut official = original.clone();
+            normalize_enhanced_guardian_config(ExecutionPlane::OfficialCodex, &mut official);
+            assert_eq!(official, original);
+            let mut enhanced = original;
+            normalize_enhanced_guardian_config(ExecutionPlane::EnhancedCodex, &mut enhanced);
+            assert!(!enhanced.to_string().contains("thread_context"));
+            assert!(enhanced.to_string().contains("review_threshold"));
+            assert_eq!(enhanced["params"]["approvalPolicy"], "on-request");
+            assert!(enhanced.to_string().contains("true"));
+        }
+    }
+}
+
+#[test]
+fn guardian_active_settings_and_nonconfig_content_are_never_removed() {
+    for enabled in [true, false] {
+        let mut request = json!({"method":"thread/start","params":{
+            "config":{"features.guardianv2":{"enabled":enabled,"thread_context":true,
+                "review_scope":{"computer_use_only":false},"unknown_future_setting":42}},
+            "baseInstructions":"thread_context must remain literal text"}});
+        normalize_enhanced_guardian_config(ExecutionPlane::EnhancedCodex, &mut request);
+        assert_eq!(request["params"]["config"]["features.guardianv2"], json!({
+            "enabled":enabled,"review_scope":{"computer_use_only":false},"unknown_future_setting":42}));
+        assert_eq!(request["params"]["baseInstructions"], "thread_context must remain literal text");
+    }
+    let mut boolean = json!({"method":"thread/start","params":{"config":{"features.guardianv2":false}}});
+    let before = boolean.clone();
+    normalize_enhanced_guardian_config(ExecutionPlane::EnhancedCodex, &mut boolean);
+    assert_eq!(boolean, before);
+}
+
+#[test]
+fn guardian_config_is_normalized_on_the_real_third_party_route() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = state(&temp);
+    let guardian = json!({"enabled":true,"thread_context":true,"review_threshold":0.7});
+    let start = json!({"id":101,"method":"thread/start","params":{
+        "modelProvider":"qwen","model":"qwen3-coder","config":{"features.guardianv2":guardian}}});
+    let actions = bridge.on_client_line(&start.to_string()).unwrap();
+    let BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, forwarded) = &actions[0] else {
+        panic!("third-party thread must use Enhanced")
+    };
+    assert_eq!(forwarded["params"]["config"]["features.guardianv2"], json!({"enabled":true,"review_threshold":0.7}));
+    bridge.on_child_line(ExecutionPlane::EnhancedCodex,
+        &json!({"id":101,"result":{"thread":{"id":"guardian-thread"}}}).to_string()).unwrap();
+    for method in ["thread/resume", "thread/fork"] {
+        let request = json!({"id":102,"method":method,"params":{"threadId":"guardian-thread",
+            "config":{"features.guardianv2":{"enabled":true,"thread_context":true,"review_threshold":0.7}}}});
+        let actions = bridge.on_client_line(&request.to_string()).unwrap();
+        let BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, forwarded) = &actions[0] else {
+            panic!("bound third-party thread must stay on Enhanced")
+        };
+        assert!(forwarded.pointer("/params/config/features.guardianv2/thread_context").is_none());
+    }
+    let official = json!({"id":103,"method":"thread/start","params":{"modelProvider":"openai","model":"gpt-5",
+        "config":{"features.guardianv2":{"thread_context":true}}}});
+    let actions = bridge.on_client_line(&official.to_string()).unwrap();
+    let BridgeAction::ToChild(ExecutionPlane::OfficialCodex, forwarded) = &actions[0] else {
+        panic!("official thread must stay on Official")
+    };
+    assert_eq!(forwarded["params"]["config"], official["params"]["config"]);
+}
+
+#[test]
 fn native_computer_use_helpers_bypass_the_desktop_relay() {
     for name in [
         "codex-computer-use.exe",

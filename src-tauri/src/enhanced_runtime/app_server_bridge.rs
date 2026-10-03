@@ -776,6 +776,7 @@ impl BridgeState {
         if let Some(child_provider_id) = child_provider_id {
             value["params"]["modelProvider"] = Value::String(child_provider_id);
         }
+        normalize_enhanced_guardian_config(plane, &mut value);
         if let (Some(id), Some(pending)) = (id.as_ref(), pending) {
             self.pending_bindings.insert(id_key(id), pending);
         }
@@ -1291,6 +1292,41 @@ impl BridgeState {
                 .record_rejected(method, "not part of the enhanced notification contract"),
         }
         Vec::new()
+    }
+}
+
+/// Desktop now includes `thread_context`, which its Official core explicitly
+/// ignores. The pinned Enhanced core rejects that unknown field before loading
+/// any feature config. Translate only this deprecated field at the RPC boundary;
+/// do not disable Guardian or discard active/future review settings.
+fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value) {
+    if plane != ExecutionPlane::EnhancedCodex
+        || !matches!(
+            request.get("method").and_then(Value::as_str),
+            Some("thread/start" | "thread/resume" | "thread/fork")
+        )
+    {
+        return;
+    }
+    let Some(config) = request
+        .pointer_mut("/params/config")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    config.remove("features.guardianv2.thread_context");
+    if let Some(guardian) = config
+        .get_mut("features.guardianv2")
+        .and_then(Value::as_object_mut)
+    {
+        guardian.remove("thread_context");
+    }
+    if let Some(guardian) = config
+        .get_mut("features")
+        .and_then(|features| features.get_mut("guardianv2"))
+        .and_then(Value::as_object_mut)
+    {
+        guardian.remove("thread_context");
     }
 }
 
