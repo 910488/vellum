@@ -1743,10 +1743,18 @@ fn official_websocket_request_parts(
 
 /// Preserve end-to-end Codex/OpenAI metadata, including future `x-codex-*`
 /// fields, while refusing loopback, proxy and RFC hop-by-hop headers.
+///
+/// `session-id` is the backend's prompt-cache affinity key: without it a full
+/// `response.create` on a fresh socket lands on a cold cache shard even when
+/// the body (and `prompt_cache_key`) is byte-identical to the previous turn.
 fn should_forward_official_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name == "user-agent"
         || name == "openai-beta"
+        || name == "session-id"
+        || name == "thread-id"
+        || name == "x-client-request-id"
+        || name == "originator"
         || name == "traceparent"
         || name == "tracestate"
         || name == "baggage"
@@ -2493,6 +2501,10 @@ mod tests {
         assert!(should_forward_official_header("x-codex-installation-id"));
         assert!(should_forward_official_header("openai-beta"));
         assert!(should_forward_official_header("user-agent"));
+        assert!(should_forward_official_header("session-id"));
+        assert!(should_forward_official_header("thread-id"));
+        assert!(should_forward_official_header("x-client-request-id"));
+        assert!(should_forward_official_header("originator"));
         assert!(!should_forward_official_header("host"));
         assert!(!should_forward_official_header("sec-websocket-key"));
         assert!(!should_forward_official_header("cookie"));
@@ -2625,6 +2637,9 @@ mod tests {
             .insert("x-codex-turn-metadata", "native-metadata".parse().unwrap());
         request
             .headers_mut()
+            .insert("session-id", "native-session".parse().unwrap());
+        request
+            .headers_mut()
             .insert("cookie", "must-not-leak=1".parse().unwrap());
         let (mut client, _) = tokio_tungstenite::connect_async(request).await.unwrap();
 
@@ -2687,6 +2702,7 @@ mod tests {
             let headers = capture.headers.lock().unwrap();
             let headers = headers.as_ref().unwrap();
             assert_eq!(headers["x-codex-turn-metadata"], "native-metadata");
+            assert_eq!(headers["session-id"], "native-session");
             assert!(!headers.contains_key("cookie"));
         }
         let usage = runtime.usage_summary("official").unwrap();
