@@ -165,10 +165,10 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     }
     let parent_executable = super::process_info::parent_pid(std::process::id())
         .and_then(super::process_info::executable_of);
-    if is_computer_use_helper(parent_executable.as_deref()) {
+    if is_native_tool_helper(parent_executable.as_deref()) {
         let manifest = LaunchManifestV1::read(&manifest_path)?;
         manifest.official.verify_on_disk("official")?;
-        return wait_for_delegated_command(computer_use_app_server_command(
+        return wait_for_delegated_command(native_tool_app_server_command(
             &manifest.official,
             &child_args,
         ));
@@ -176,7 +176,7 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     run(BridgeConfig::load(&manifest_path, child_args)?)
 }
 
-fn is_computer_use_helper(parent: Option<&Path>) -> bool {
+fn is_native_tool_helper(parent: Option<&Path>) -> bool {
     let name = parent
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -184,13 +184,20 @@ fn is_computer_use_helper(parent: Option<&Path>) -> bool {
         .to_ascii_lowercase();
     matches!(
         name.as_str(),
-        "codex-computer-use.exe" | "codex-computer-use-arm64.exe" | "codex-computer-use"
+        "codex-computer-use.exe"
+            | "codex-computer-use-arm64.exe"
+            | "codex-computer-use"
+            // Browser Use reads configRequirements/read and config/read through
+            // an App Server spawned by the native Node REPL runtime. It shares
+            // CODEX_CLI_PATH but is not another Desktop relay owner.
+            | "node_repl.exe"
+            | "node_repl"
     )
 }
 
-fn computer_use_app_server_command(official: &RuntimeBinaryIdentity, args: &[String]) -> Command {
-    // The native helper uses CODEX_CLI_PATH for auth and policy reads. It is
-    // not a Desktop execution client and must not acquire the relay owner lock
+fn native_tool_app_server_command(official: &RuntimeBinaryIdentity, args: &[String]) -> Command {
+    // Native tool helpers use CODEX_CLI_PATH for auth and policy reads. They are
+    // not Desktop execution clients and must not acquire the relay owner lock
     // or write Desktop attestations. Keep its native protocol and shared home.
     let mut command = Command::new(&official.executable);
     command
