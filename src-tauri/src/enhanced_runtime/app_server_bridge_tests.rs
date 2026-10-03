@@ -81,7 +81,7 @@ fn native_computer_use_helpers_bypass_the_desktop_relay() {
         "codex-computer-use",
         "CODEX-COMPUTER-USE.EXE",
     ] {
-        assert!(is_computer_use_helper(Some(
+        assert!(is_native_tool_helper(Some(
             &PathBuf::from("runtime").join(name)
         )));
     }
@@ -91,13 +91,31 @@ fn native_computer_use_helpers_bypass_the_desktop_relay() {
         "codex.exe",
         "codex-computer-use-fake.exe",
     ] {
-        assert!(!is_computer_use_helper(Some(Path::new(name))));
+        assert!(!is_native_tool_helper(Some(Path::new(name))));
     }
-    assert!(!is_computer_use_helper(None));
+    assert!(!is_native_tool_helper(None));
 }
 
 #[test]
-fn computer_use_delegation_preserves_native_auth_and_policy_without_remote_ownership() {
+fn browser_use_node_repl_helpers_delegate_before_acquiring_the_desktop_relay() {
+    for name in ["node_repl.exe", "node_repl", "NODE_REPL.EXE"] {
+        assert!(is_native_tool_helper(Some(
+            &PathBuf::from("runtime").join(name)
+        )));
+    }
+    for name in [
+        "node.exe",
+        "node",
+        "node_repl-fake.exe",
+        "ChatGPT.exe",
+        "codex",
+    ] {
+        assert!(!is_native_tool_helper(Some(Path::new(name))));
+    }
+}
+
+#[test]
+fn native_tool_delegation_preserves_native_auth_and_policy_without_remote_ownership() {
     let official = RuntimeBinaryIdentity {
         executable: PathBuf::from("official-codex"),
         codex_home: PathBuf::from("shared-codex-home"),
@@ -109,7 +127,7 @@ fn computer_use_delegation_preserves_native_auth_and_policy_without_remote_owner
         "-c".into(),
         "features.code_mode_host=true".into(),
     ];
-    let command = computer_use_app_server_command(&official, &args);
+    let command = native_tool_app_server_command(&official, &args);
     assert_eq!(command.get_program(), official.executable.as_os_str());
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
@@ -125,6 +143,16 @@ fn computer_use_delegation_preserves_native_auth_and_policy_without_remote_owner
         Some(std::ffi::OsStr::new("1"))
     );
     assert_eq!(overrides[std::ffi::OsStr::new("CODEX_CLI_PATH")], None);
+
+    // Browser Use's separate stdio connection must keep its exact transport
+    // arguments and read the same native policy as Computer Use.
+    let browser_args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
+    let browser = native_tool_app_server_command(&official, &browser_args);
+    assert_eq!(
+        browser.get_args().collect::<Vec<_>>(),
+        browser_args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+    );
+    assert_eq!(browser.get_envs().collect::<HashMap<_, _>>(), overrides);
 }
 
 #[test]
