@@ -9,6 +9,7 @@ pub mod app_server_bridge;
 mod atomic;
 pub mod attestation;
 mod binding_store;
+mod child_reaper;
 pub mod contracts;
 pub(crate) mod desktop_manager;
 pub mod env_lease;

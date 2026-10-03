@@ -152,6 +152,7 @@ pub(super) fn run(config: BridgeConfig) -> Result<(), BridgeError> {
 
 struct Core {
     process: tokio::process::Child,
+    _group: super::super::child_reaper::ProcessGroupGuard,
     endpoint: String,
     bearer: String,
 }
@@ -217,7 +218,10 @@ impl Core {
         }
         #[cfg(windows)]
         command.creation_flags(0x08000000);
+        super::super::child_reaper::own_tokio_process_group(&mut command);
         let mut process = command.spawn()?;
+        let group =
+            super::super::child_reaper::ProcessGroupGuard::adopt(process.id().unwrap_or_default());
         let mut lines = tokio::io::BufReader::new(process.stderr.take().unwrap()).lines();
         let endpoint = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while let Some(line) = lines.next_line().await? {
@@ -241,6 +245,7 @@ impl Core {
         tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
         Ok(Self {
             process,
+            _group: group,
             endpoint,
             bearer,
         })
@@ -408,7 +413,10 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
+    super::super::child_reaper::own_tokio_process_group(&mut command);
     let mut relay = command.spawn()?;
+    let _relay_group =
+        super::super::child_reaper::ProcessGroupGuard::adopt(relay.id().unwrap_or_default());
     let mut relay_in = relay.stdin.take().unwrap();
     let mut relay_lines = tokio::io::BufReader::new(relay.stdout.take().unwrap()).lines();
     let mut remote_status = RemoteStatusBridge::new(&m.launch_id);

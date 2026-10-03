@@ -158,6 +158,7 @@ impl BridgeConfig {
 }
 
 pub fn run_from_env() -> Result<(), BridgeError> {
+    super::child_reaper::bind_children_to_this_process();
     let child_args = env::args().skip(1).collect::<Vec<_>>();
     let manifest_path = LaunchManifestV1::default_path();
     if !child_args.iter().any(|arg| arg == "app-server") {
@@ -269,7 +270,10 @@ fn delegate_non_app_server(manifest_path: &Path, args: Vec<String>) -> Result<()
 }
 
 fn wait_for_delegated_command(mut command: Command) -> Result<(), BridgeError> {
-    let status = command.status()?;
+    super::child_reaper::own_process_group(&mut command);
+    let mut child = command.spawn()?;
+    let _group = super::child_reaper::ProcessGroupGuard::adopt(child.id());
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -474,6 +478,7 @@ fn write_json(writer: &mut impl Write, value: &Value) -> Result<(), BridgeError>
 struct ChildProcess {
     child: Child,
     stdin: BufWriter<ChildStdin>,
+    _group: super::child_reaper::ProcessGroupGuard,
 }
 
 impl ChildProcess {
@@ -534,11 +539,13 @@ impl ChildProcess {
                 command.env(ABLATION_PROFILE_ENV, profile);
             }
         }
+        super::child_reaper::own_process_group(&mut command);
         let mut child = command.spawn().map_err(|source| BridgeError::Spawn {
             plane,
             path: identity.executable.clone(),
             source,
         })?;
+        let group = super::child_reaper::ProcessGroupGuard::adopt(child.id());
         let stdin = child.stdin.take().ok_or(BridgeError::MissingPipe(plane))?;
         let stdout = child.stdout.take().ok_or(BridgeError::MissingPipe(plane))?;
         thread::spawn(move || {
@@ -564,6 +571,7 @@ impl ChildProcess {
         Ok(Self {
             child,
             stdin: BufWriter::new(stdin),
+            _group: group,
         })
     }
 
@@ -578,6 +586,16 @@ impl ChildProcess {
     fn terminate(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// An error that returns out of `run` must not leave the core running: a
+/// dropped `std::process::Child` is detached, not killed.
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            self.terminate();
+        }
     }
 }
 
