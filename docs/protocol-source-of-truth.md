@@ -557,6 +557,15 @@ synthetic continuation as the current user query.
 
 ## Auto Review and Guardian
 
+The Desktop bridge translates the deprecated `features.guardianv2.thread_context`
+override only when forwarding thread start, resume and fork requests to the
+pinned Enhanced core. Current Official Codex ignores this setting; the pinned
+Enhanced `FeatureToml` rejects it as an unknown field. Nested and dotted RPC
+config overrides receive the same translation in both stdio and multiplex
+transports. Guardian enablement, thresholds, review scope, approval policy and
+unknown active settings remain unchanged; Official requests and persisted user
+config are untouched.
+
 Auto Review consumes the real task diff/context and calls the configured review
 provider through the production route. Tests must exercise the same adapter and
 streaming/data-flow path; a permissive mock is not evidence of provider
