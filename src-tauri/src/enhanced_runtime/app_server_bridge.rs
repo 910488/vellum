@@ -173,7 +173,53 @@ pub fn run_from_env() -> Result<(), BridgeError> {
             &child_args,
         ));
     }
+    if bridge_is_started_by_codex_desktop() && enhanced_lease_released() {
+        let manifest = LaunchManifestV1::read(&manifest_path)?;
+        manifest.official.verify_on_disk("official")?;
+        return wait_for_delegated_command(released_app_server_command(
+            &manifest.official,
+            &child_args,
+        ));
+    }
     run(BridgeConfig::load(&manifest_path, child_args)?)
+}
+
+/// True once Vellum has given `CODEX_CLI_PATH` back (it exited, or Enhanced
+/// was disabled). A Codex Desktop started while the lease was held keeps the
+/// bridge path in its own environment and respawns it whenever its App Server
+/// dies, including after Vellum stops the bridge on exit. Without this check
+/// that respawn would bring the Enhanced core straight back.
+fn enhanced_lease_released() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        match super::env_lease::read_user_environment(super::env_lease::CODEX_CLI_PATH) {
+            Ok(Some(value)) => !super::env_lease::names_vellum_bridge(&value),
+            Ok(None) => true,
+            // Unreadable is not evidence of release; keep serving Enhanced.
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Plain Official App Server for a Desktop whose Enhanced lease is gone. It
+/// stays the Desktop's App Server (remote control untouched), it just has no
+/// Enhanced plane, relay, or attestation.
+fn released_app_server_command(official: &RuntimeBinaryIdentity, args: &[String]) -> Command {
+    let mut command = Command::new(&official.executable);
+    command
+        .args(args)
+        .env("CODEX_HOME", &official.codex_home)
+        .env_remove("CODEX_CLI_PATH");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
 }
 
 fn is_native_tool_helper(parent: Option<&Path>) -> bool {

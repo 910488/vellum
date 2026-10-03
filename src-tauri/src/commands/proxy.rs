@@ -620,8 +620,22 @@ pub async fn repair_codex_config(state: State<'_, AppState>) -> AppResult<Restor
 #[tauri::command]
 pub async fn exit_vellum(app: tauri::AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let _ = stop_proxy_gracefully(&state).await;
+    stop_enhanced_sidecars();
     app.exit(0);
     Ok(())
+}
+
+/// Codex Desktop owns the bridge it launched through `CODEX_CLI_PATH`, so the
+/// Enhanced core outlives Vellum unless it is stopped here. Run this after the
+/// lease is released: a bridge Desktop respawns then serves Official only.
+pub(crate) fn stop_enhanced_sidecars() {
+    let stopped = crate::enhanced_runtime::process_info::terminate_bundled_sidecars();
+    if !stopped.is_empty() {
+        log::info!(
+            "[Enhanced] stopped sidecars on exit: {}",
+            crate::enhanced_runtime::process_info::format_process_images(&stopped)
+        );
+    }
 }
 
 #[cfg(test)]
