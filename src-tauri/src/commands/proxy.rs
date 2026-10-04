@@ -370,6 +370,11 @@ async fn start_proxy_transaction_on(
         None,
     );
     state.install_proxy_server_task(tauri::async_runtime::JoinHandle::Tokio(handle));
+    // Writing the user environment shells out; keep it off the start path.
+    let lease_state = (*state).clone();
+    tokio::task::spawn_blocking(move || {
+        lease_desktop_backend_relay(&lease_state, generation, bound_port);
+    });
     if !prepared.schema_ok {
         state.record_live_applied(
             crate::model::RuntimeNotice::new("enhancedDesktopRuntimeNotArmed").with(
@@ -470,6 +475,29 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     }
 }
 
+/// Sends Codex Desktop's own backend requests through the proxy, so its usage
+/// check sees the account Vellum routes turns to rather than the signed-in one
+/// alone. Desktop reads the variable at launch, so this takes effect on its
+/// next start. Failure leaves Desktop talking to ChatGPT directly, which is
+/// how it ran before; it is logged, not fatal.
+fn lease_desktop_backend_relay(state: &AppState, generation: u64, port: u16) {
+    // The lease writes the real per-user environment, not the test data root.
+    if cfg!(test) {
+        return;
+    }
+    let Ok(_guard) = enhanced_commit_guard(state, generation) else {
+        return;
+    };
+    let value = vellum_proxy_runtime::desktop_backend::desktop_backend_base_url(port);
+    if let Err(error) = crate::enhanced_runtime::env_lease::acquire_backend_base_url(
+        &state.data_root(),
+        &value,
+        &generation.to_string(),
+    ) {
+        log::warn!("[Proxy] Desktop backend relay not leased: {error}");
+    }
+}
+
 fn leftover_vellum_host_detail() -> Option<String> {
     let peers = crate::enhanced_runtime::process_info::leftover_vellum_hosts();
     if peers.is_empty() {
@@ -553,6 +581,11 @@ async fn stop_proxy_locked(state: &AppState) -> AppResult<()> {
     // user's native Codex daemon is not killed.
     let restore_result = restore_proxy_config(&paths);
     let bridge_release = crate::enhanced_runtime::release_desktop_launch(&state.data_root());
+    if let Err(error) =
+        crate::enhanced_runtime::env_lease::release_backend_base_url(&state.data_root())
+    {
+        log::warn!("[Proxy] Desktop backend relay lease not released: {error}");
+    }
     let result = match (restore_result, bridge_release) {
         (Ok(_), Ok(_)) => Ok(()),
         (Err(config), Ok(_)) => Err(config),
@@ -641,6 +674,12 @@ pub(crate) fn stop_enhanced_sidecars() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_leased_backend_url_is_one_the_lease_recognises_as_ours() {
+        let url = vellum_proxy_runtime::desktop_backend::desktop_backend_base_url(15721);
+        assert!(crate::enhanced_runtime::env_lease::names_vellum_backend_relay(&url));
+    }
 
     #[test]
     fn restart_is_only_required_when_codex_was_already_running() {

@@ -110,6 +110,9 @@ where
         .route("/responses/compact", post(compact::<S>))
         .route("/v1/alpha/search", post(search::<S>))
         .with_state(state)
+        .merge(crate::desktop_backend::router(Arc::new(
+            crate::desktop_backend::DesktopBackendRelay::production(),
+        )))
         // Applied after `with_state` so it covers every route uniformly:
         // HTTP, SSE, the WebSocket upgrade, health, diagnostics, models,
         // search and compact all pass through the same guard.
@@ -141,7 +144,16 @@ async fn inbound_guard(
     mut request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Err(error) = policy.check(request.headers(), request.uri()) {
+    // Desktop's own backend traffic cannot carry the key; the relay adds no
+    // Vellum credential to it, so Host and Origin are enough there.
+    let checked =
+        if crate::desktop_backend::is_keyless_desktop_route(request.method(), request.uri().path())
+        {
+            policy.check_keyless(request.headers(), request.uri())
+        } else {
+            policy.check(request.headers(), request.uri())
+        };
+    if let Err(error) = checked {
         return error.into_error_response();
     }
     request.headers_mut().remove(BOUNDARY_KEY_HEADER);
@@ -159,7 +171,11 @@ async fn resource_admission(
     next: axum::middleware::Next,
 ) -> Response {
     let path = request.uri().path();
-    let is_probe = path == "/health" || path == "/readyz";
+    // Desktop backend relay requests are Desktop's own traffic, not model
+    // turns; a long `wham/usage/stream` must not hold a turn's slot.
+    let is_probe = path == "/health"
+        || path == "/readyz"
+        || crate::desktop_backend::is_keyless_desktop_route(request.method(), path);
     let is_official_ws =
         request.method() == Method::GET && (path == "/v1/responses" || path == "/responses");
     let _slot = if is_probe {
@@ -1139,6 +1155,112 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (address, bodies)
+    }
+
+    fn guarded(port: u16) -> InboundAccessPolicy {
+        let key = crate::inbound::BoundaryKey::parse(&"a1".repeat(32)).unwrap();
+        InboundAccessPolicy::authenticated("test-key", key, port)
+    }
+
+    #[tokio::test]
+    async fn desktop_backend_relay_is_keyless_but_still_host_and_origin_bound() {
+        let app = build_headless_router(sample_state(), guarded(4000));
+        let send = |host: &str, origin: Option<&str>, path: &str| {
+            let mut builder = Request::builder().uri(path).header("host", host);
+            if let Some(origin) = origin {
+                builder = builder.header("origin", origin);
+            }
+            app.clone().oneshot(builder.body(Body::empty()).unwrap())
+        };
+        // No key on a model route: refused.
+        let response = send("127.0.0.1:4000", None, "/v1/models").await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Browser page or DNS-rebound host: refused on the relay too.
+        let relay = "/desktop-backend/backend-api/wham/usage";
+        let response = send("127.0.0.1:4000", Some("https://evil.example"), relay)
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error(), "{}", response.status());
+        let response = send("evil.example:4000", None, relay).await.unwrap();
+        assert!(response.status().is_client_error(), "{}", response.status());
+    }
+
+    #[tokio::test]
+    async fn desktop_backend_relay_forwards_desktop_identity_and_reports_unlimited() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(
+            String,
+            Option<String>,
+            Option<String>,
+        )>::new()));
+        let upstream = axum::Router::new().route(
+            "/backend-api/{*rest}",
+            axum::routing::any({
+                let seen = seen.clone();
+                move |request: axum::extract::Request| {
+                    let seen = seen.clone();
+                    async move {
+                        let header = |name: &str| {
+                            request
+                                .headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string)
+                        };
+                        seen.lock().unwrap().push((
+                            request.uri().to_string(),
+                            header("authorization"),
+                            header(crate::inbound::BOUNDARY_KEY_HEADER),
+                        ));
+                        axum::Json(json!({
+                            "rate_limit_reached_type": {"type": "workspace_owner_credits_depleted"},
+                            "rate_limit": {"allowed": false, "limit_reached": true}
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let relay = crate::desktop_backend::router(Arc::new(
+            crate::desktop_backend::DesktopBackendRelay::with_upstreams(
+                format!("http://{address}/backend-api"),
+                format!("http://{address}/appcast"),
+            ),
+        ));
+        for (path, unlimited) in [
+            ("/desktop-backend/backend-api/wham/usage", true),
+            (
+                "/desktop-backend/backend-api/wham/tasks/list?limit=5",
+                false,
+            ),
+        ] {
+            let response = relay
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", "Bearer desktop-login")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["rate_limit"]["limit_reached"], !unlimited, "{path}");
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "/backend-api/wham/usage");
+        assert_eq!(seen[1].0, "/backend-api/wham/tasks/list?limit=5");
+        assert!(seen.iter().all(
+            |(_, auth, key)| auth.as_deref() == Some("Bearer desktop-login") && key.is_none()
+        ));
     }
 
     #[tokio::test]
