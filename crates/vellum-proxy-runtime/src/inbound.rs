@@ -178,6 +178,36 @@ impl InboundAccessPolicy {
     /// port gets a shape error rather than a signal about key validity, and so
     /// the reason surfaced to the user names the actual problem.
     pub fn check(&self, headers: &HeaderMap, uri: &Uri) -> Result<(), RuntimeError> {
+        let Some(key) = self.check_caller_shape(headers, uri)? else {
+            return Ok(());
+        };
+        let presented = headers
+            .get(BOUNDARY_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !key.verify(presented) {
+            return Err(RuntimeError::AuthenticationFailed(
+                "missing or invalid Vellum proxy boundary key".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit a request to a route that holds no Vellum credential and so needs
+    /// no key: the Desktop backend relay forwards only what the caller already
+    /// sent. Host and Origin still apply, which is what keeps a browser page
+    /// (and DNS rebinding) out.
+    pub fn check_keyless(&self, headers: &HeaderMap, uri: &Uri) -> Result<(), RuntimeError> {
+        self.check_caller_shape(headers, uri).map(|_| ())
+    }
+
+    /// Host and Origin checks. Returns the key still to verify, or `None` when
+    /// inbound authentication is disabled.
+    fn check_caller_shape(
+        &self,
+        headers: &HeaderMap,
+        uri: &Uri,
+    ) -> Result<Option<&BoundaryKey>, RuntimeError> {
         // Exhaustive under both cfgs. In a production build `Authenticated` is
         // the only variant, which is the point: there is nothing else to match.
         let (key, allowed_hosts, reject_origin) = match self {
@@ -188,7 +218,7 @@ impl InboundAccessPolicy {
                 ..
             } => (key, allowed_hosts, reject_origin),
             #[cfg(any(test, feature = "testkit"))]
-            Self::TestOnlyDisabled => return Ok(()),
+            Self::TestOnlyDisabled => return Ok(None),
         };
 
         if *reject_origin && headers.contains_key(ORIGIN) {
@@ -217,17 +247,7 @@ impl InboundAccessPolicy {
                 "requests must address this proxy by its loopback host".into(),
             ));
         }
-
-        let presented = headers
-            .get(BOUNDARY_KEY_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !key.verify(presented) {
-            return Err(RuntimeError::AuthenticationFailed(
-                "missing or invalid Vellum proxy boundary key".into(),
-            ));
-        }
-        Ok(())
+        Ok(Some(key))
     }
 }
 
