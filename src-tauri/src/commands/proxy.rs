@@ -280,8 +280,12 @@ async fn start_proxy_transaction_on(
 
     state.set_draining(false);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    // Held by the server task: the Desktop backend relay stops when it ends,
+    // however it ends.
+    let (relay_stop_tx, relay_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let owned = (*state).clone();
     let handle = tokio::spawn(async move {
+        let _relay_stop = relay_stop_tx;
         if let Err(error) =
             serve_local_proxy(owned.clone(), listener, boundary_key, shutdown_rx).await
         {
@@ -370,11 +374,16 @@ async fn start_proxy_transaction_on(
         None,
     );
     state.install_proxy_server_task(tauri::async_runtime::JoinHandle::Tokio(handle));
-    // Writing the user environment shells out; keep it off the start path.
-    let lease_state = (*state).clone();
-    tokio::task::spawn_blocking(move || {
-        lease_desktop_backend_relay(&lease_state, generation, bound_port);
-    });
+    // Binding probes ports and the lease shells out; keep both off the start
+    // path. Tests never take the real localhost ports or user environment.
+    if !cfg!(test) {
+        let relay_state = (*state).clone();
+        tokio::spawn(run_desktop_backend_relay(
+            relay_state,
+            generation,
+            relay_stop_rx,
+        ));
+    }
     if !prepared.schema_ok {
         state.record_live_applied(
             crate::model::RuntimeNotice::new("enhancedDesktopRuntimeNotArmed").with(
@@ -480,22 +489,49 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
 /// alone. Desktop reads the variable at launch, so this takes effect on its
 /// next start. Failure leaves Desktop talking to ChatGPT directly, which is
 /// how it ran before; it is logged, not fatal.
-fn lease_desktop_backend_relay(state: &AppState, generation: u64, port: u16) {
-    // The lease writes the real per-user environment, not the test data root.
-    if cfg!(test) {
-        return;
-    }
-    let Ok(_guard) = enhanced_commit_guard(state, generation) else {
+async fn run_desktop_backend_relay(
+    state: AppState,
+    generation: u64,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    use vellum_proxy_runtime::desktop_backend::{DesktopBackendRelay, DesktopRelayListener};
+
+    let Some(listener) = DesktopRelayListener::bind().await else {
+        log::warn!(
+            "[Proxy] Desktop backend relay not started: neither localhost:80 nor localhost:8000 is free"
+        );
         return;
     };
-    let value = vellum_proxy_runtime::desktop_backend::desktop_backend_base_url(port);
-    if let Err(error) = crate::enhanced_runtime::env_lease::acquire_backend_base_url(
-        &state.data_root(),
-        &value,
-        &generation.to_string(),
-    ) {
-        log::warn!("[Proxy] Desktop backend relay not leased: {error}");
+    let value = listener.base_url();
+    let lease_state = state.clone();
+    let leased = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = enhanced_commit_guard(&lease_state, generation) else {
+            return false;
+        };
+        match crate::enhanced_runtime::env_lease::acquire_backend_base_url(
+            &lease_state.data_root(),
+            &value,
+            &generation.to_string(),
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                log::warn!("[Proxy] Desktop backend relay not leased: {error}");
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !leased {
+        return;
     }
+    log::info!(
+        "[Proxy] Desktop backend relay on localhost:{}",
+        listener.port()
+    );
+    listener
+        .serve(std::sync::Arc::new(DesktopBackendRelay::production()), stop)
+        .await;
 }
 
 fn leftover_vellum_host_detail() -> Option<String> {
@@ -677,8 +713,10 @@ mod tests {
 
     #[test]
     fn the_leased_backend_url_is_one_the_lease_recognises_as_ours() {
-        let url = vellum_proxy_runtime::desktop_backend::desktop_backend_base_url(15721);
-        assert!(crate::enhanced_runtime::env_lease::names_vellum_backend_relay(&url));
+        for port in vellum_proxy_runtime::desktop_backend::DESKTOP_RELAY_PORTS {
+            let url = vellum_proxy_runtime::desktop_backend::desktop_backend_base_url(port);
+            assert!(crate::enhanced_runtime::env_lease::names_vellum_backend_relay(&url));
+        }
     }
 
     #[test]

@@ -11,29 +11,37 @@
 //! identity, so the phone and Desktop stay on the same account.
 //!
 //! The relay adds no Vellum credential to anything it forwards, which is why
-//! it needs no boundary key (Desktop cannot send one). Host and Origin checks
-//! still apply.
+//! it needs no boundary key (Desktop cannot send one).
+//!
+//! It listens on its own port, not the proxy's: Desktop attaches its login
+//! only to OpenAI hosts and to exactly `localhost` or `localhost:8000`, so
+//! the relay takes port 80 where the OS allows it and 8000 otherwise. Any
+//! other loopback address makes every authenticated call fail before it is
+//! sent, and Desktop reloads in a loop.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Path, Request, State};
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::net::TcpListener;
 
-/// Path prefix of the relay. Desktop's base URL is
-/// `http://127.0.0.1:<port>/desktop-backend/backend-api`.
-pub const DESKTOP_BACKEND_PREFIX: &str = "/desktop-backend/";
 pub const DESKTOP_BACKEND_BASE_PATH: &str = "/desktop-backend/backend-api";
 
 /// Desktop rewrites its update feed to this path whenever the backend base URL
 /// is a loopback host.
 pub const DESKTOP_APPCAST_PATH: &str = "/api/codex/app/appcast";
+
+/// The only loopback ports Desktop will send its login to, in preference
+/// order. macOS refuses port 80 to an unprivileged process.
+pub const DESKTOP_RELAY_PORTS: [u16; 2] = [80, 8000];
 
 const PRODUCTION_BACKEND: &str = "https://chatgpt.com/backend-api";
 const PRODUCTION_APPCAST: &str = "https://updates.oaistatic.com/codex/app/appcast";
@@ -42,13 +50,135 @@ const MAX_RELAY_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The value Vellum leases into `CODEX_API_BASE_URL`.
 pub fn desktop_backend_base_url(port: u16) -> String {
-    format!("http://127.0.0.1:{port}{DESKTOP_BACKEND_BASE_PATH}")
+    match port {
+        80 => format!("http://localhost{DESKTOP_BACKEND_BASE_PATH}"),
+        port => format!("http://localhost:{port}{DESKTOP_BACKEND_BASE_PATH}"),
+    }
 }
 
-/// Whether a request is for the keyless relay surface.
-pub fn is_keyless_desktop_route(method: &Method, path: &str) -> bool {
-    path.starts_with(DESKTOP_BACKEND_PREFIX)
-        || (method == Method::GET && path == DESKTOP_APPCAST_PATH)
+/// The relay's listening sockets, bound but not yet serving.
+pub struct DesktopRelayListener {
+    port: u16,
+    listeners: Vec<TcpListener>,
+}
+
+impl DesktopRelayListener {
+    /// Binds the first usable port in [`DESKTOP_RELAY_PORTS`].
+    ///
+    /// `localhost` may resolve to either loopback family, so both are bound.
+    /// IPv4 is required; IPv6 is skipped only when the host has no IPv6
+    /// loopback, never when something else already owns that port there —
+    /// half of Desktop's requests would reach the other program.
+    pub async fn bind() -> Option<Self> {
+        for port in DESKTOP_RELAY_PORTS {
+            match Self::bind_port(port).await {
+                Ok(listener) => return Some(listener),
+                Err(error) => {
+                    log::info!("[DesktopBackend] localhost:{port} unavailable: {error}")
+                }
+            }
+        }
+        None
+    }
+
+    async fn bind_port(port: u16) -> std::io::Result<Self> {
+        // Windows and BSD let a loopback bind succeed beside another program's
+        // wildcard listener, which would quietly take its localhost traffic.
+        for address in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let probe = tokio::net::TcpStream::connect(SocketAddr::new(address, port));
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(std::time::Duration::from_millis(300), probe).await
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("another program is listening on {address}:{port}"),
+                ));
+            }
+        }
+        let v4 = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).await?;
+        let mut listeners = vec![v4];
+        match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)).await {
+            Ok(v6) => listeners.push(v6),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Err(error),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(error)
+            }
+            Err(_) => {}
+        }
+        Ok(Self { port, listeners })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn base_url(&self) -> String {
+        desktop_backend_base_url(self.port)
+    }
+
+    /// Serves until `stop` resolves or is dropped.
+    pub async fn serve(
+        self,
+        relay: Arc<DesktopBackendRelay>,
+        stop: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let app = guarded_router(relay, self.port);
+        let servers = futures_util::future::join_all(self.listeners.into_iter().map(|listener| {
+            let app = app.clone();
+            async move { axum::serve(listener, app).await }
+        }));
+        tokio::select! {
+            _ = servers => {}
+            _ = stop => {}
+        }
+    }
+}
+
+/// A page on the web, as opposed to Desktop's own `app://` or `null`.
+fn is_web_page_origin(origin: &axum::http::HeaderValue) -> bool {
+    let origin = origin.to_str().unwrap_or("http:").to_ascii_lowercase();
+    origin.starts_with("http:") || origin.starts_with("https:")
+}
+
+/// Host values a browser or Electron sends for `localhost` on `port`.
+fn accepted_hosts(port: u16) -> Vec<String> {
+    let mut hosts = vec![format!("localhost:{port}")];
+    if port == 80 {
+        hosts.push("localhost".into());
+    }
+    hosts
+}
+
+/// The relay surface behind its caller checks: a page in a browser carries a
+/// web `Origin`, and a DNS-rebound name carries a foreign `Host`.
+pub fn guarded_router(relay: Arc<DesktopBackendRelay>, port: u16) -> Router {
+    let hosts = Arc::new(accepted_hosts(port));
+    router(relay).layer(axum::middleware::from_fn(
+        move |request: Request, next: axum::middleware::Next| {
+            let hosts = hosts.clone();
+            async move {
+                if request
+                    .headers()
+                    .get(axum::http::header::ORIGIN)
+                    .is_some_and(is_web_page_origin)
+                {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+                let host = request
+                    .headers()
+                    .get(axum::http::header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_ascii_lowercase);
+                if !host.is_some_and(|host| hosts.contains(&host)) {
+                    return StatusCode::MISDIRECTED_REQUEST.into_response();
+                }
+                next.run(request).await
+            }
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -617,21 +747,147 @@ mod tests {
         assert!(usage_shape("wham/tasks/list").is_none());
     }
 
+    /// Desktop's own allowlist: exact host `localhost` or `localhost:8000`.
     #[test]
-    fn base_url_and_keyless_routes() {
+    fn base_urls_are_ones_desktop_will_send_its_login_to() {
         assert_eq!(
-            desktop_backend_base_url(15721),
-            "http://127.0.0.1:15721/desktop-backend/backend-api"
+            desktop_backend_base_url(80),
+            "http://localhost/desktop-backend/backend-api"
         );
-        assert!(is_keyless_desktop_route(
-            &Method::POST,
-            "/desktop-backend/backend-api/wham/tasks"
+        assert_eq!(
+            desktop_backend_base_url(8000),
+            "http://localhost:8000/desktop-backend/backend-api"
+        );
+        for port in DESKTOP_RELAY_PORTS {
+            let url = url::Url::parse(&desktop_backend_base_url(port)).unwrap();
+            let host = match url.port() {
+                Some(port) => format!("{}:{port}", url.host_str().unwrap()),
+                None => url.host_str().unwrap().to_string(),
+            };
+            assert!(host == "localhost" || host == "localhost:8000", "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_occupied_port_is_not_taken_over() {
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = other.local_addr().unwrap().port();
+        let error = DesktopRelayListener::bind_port(port).await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn browser_pages_and_foreign_hosts_are_refused() {
+        use tower::ServiceExt;
+        let relay = Arc::new(DesktopBackendRelay::with_upstreams(
+            "http://127.0.0.1:9/backend-api",
+            "http://127.0.0.1:9/appcast",
         ));
-        assert!(is_keyless_desktop_route(&Method::GET, DESKTOP_APPCAST_PATH));
-        assert!(!is_keyless_desktop_route(
-            &Method::POST,
-            DESKTOP_APPCAST_PATH
-        ));
-        assert!(!is_keyless_desktop_route(&Method::POST, "/v1/responses"));
+        let send = |port: u16, host: &str, origin: Option<&str>| {
+            let mut builder = axum::http::Request::builder()
+                .uri("/desktop-backend/backend-api/wham/usage")
+                .header("host", host);
+            if let Some(origin) = origin {
+                builder = builder.header("origin", origin);
+            }
+            guarded_router(relay.clone(), port).oneshot(builder.body(Body::empty()).unwrap())
+        };
+        let status = |response: Response| response.status();
+        assert_eq!(
+            status(
+                send(80, "localhost", Some("https://evil.example"))
+                    .await
+                    .unwrap()
+            ),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(send(80, "localhost", Some("app://-")).await.unwrap()),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(send(80, "evil.example", None).await.unwrap()),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        assert_eq!(
+            status(send(8000, "localhost", None).await.unwrap()),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        // Admitted: reaches the (closed) upstream and reports it.
+        assert_eq!(
+            status(send(80, "localhost", None).await.unwrap()),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(send(8000, "localhost:8000", None).await.unwrap()),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_requests_keep_desktop_identity_and_usage_reads_unlimited() {
+        use tower::ServiceExt;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let upstream = Router::new().route(
+            "/backend-api/{*rest}",
+            any({
+                let seen = seen.clone();
+                move |request: Request| {
+                    let seen = seen.clone();
+                    async move {
+                        let auth = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        seen.lock().unwrap().push((request.uri().to_string(), auth));
+                        axum::Json(json!({
+                            "rate_limit_reached_type": {"type": "workspace_owner_credits_depleted"},
+                            "rate_limit": {"allowed": false, "limit_reached": true}
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let relay = router(Arc::new(DesktopBackendRelay::with_upstreams(
+            format!("http://{address}/backend-api"),
+            format!("http://{address}/appcast"),
+        )));
+        for (path, unlimited) in [
+            ("/desktop-backend/backend-api/wham/usage", true),
+            (
+                "/desktop-backend/backend-api/wham/tasks/list?limit=5",
+                false,
+            ),
+        ] {
+            let response = relay
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header("authorization", "Bearer desktop-login")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["rate_limit"]["limit_reached"], !unlimited, "{path}");
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "/backend-api/wham/usage");
+        assert_eq!(seen[1].0, "/backend-api/wham/tasks/list?limit=5");
+        assert!(seen
+            .iter()
+            .all(|(_, auth)| auth.as_deref() == Some("Bearer desktop-login")));
     }
 }
