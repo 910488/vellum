@@ -502,12 +502,22 @@ async fn run_desktop_backend_relay(
     let data_root = state.data_root();
     // Releases leave a value someone else set alone, so this is safe to run
     // every time; it undoes what the previous relay design leased.
-    let lease_root = data_root.clone();
+    // A Vellum that died while serving left its advertisement behind, and the
+    // bridge's port check cannot tell this run's listener, still waiting on
+    // the trust prompt, or another program from a serving relay. Nothing
+    // below may return early with it still in place.
+    let cleanup_state = state.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        let lease_root = cleanup_state.data_root();
         if let Err(error) =
             crate::enhanced_runtime::env_lease::release_backend_base_url(&lease_root)
         {
             log::warn!("[Proxy] earlier Desktop backend lease not released: {error}");
+        }
+        if let Ok(_guard) = enhanced_commit_guard(&cleanup_state, generation) {
+            if let Err(error) = crate::enhanced_runtime::backend_relay::withdraw(&lease_root) {
+                log::warn!("[Proxy] earlier Desktop backend relay not withdrawn: {error}");
+            }
         }
     })
     .await;
