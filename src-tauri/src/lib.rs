@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod continuation;
 pub mod credentials;
 pub mod crypto;
+pub mod desktop_backend_trust;
 pub mod diagnostics_store;
 pub mod enhanced_runtime;
 pub mod error;

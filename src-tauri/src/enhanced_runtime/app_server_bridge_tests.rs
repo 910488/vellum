@@ -184,6 +184,7 @@ fn desktop_feature_flags_map_to_the_session_loader_profile() {
     );
 }
 use crate::enhanced_runtime::qualification::{JournalEntry, ENHANCED_EVENT_NOTIFICATION};
+use crate::enhanced_runtime::backend_relay;
 use crate::enhanced_runtime::ModelProviderRoute;
 
 fn state(temp: &tempfile::TempDir) -> BridgeState {
@@ -1232,5 +1233,59 @@ fn a_dead_child_takes_only_its_own_turns_with_it() {
         state.attestation.snapshot().open_turns,
         1,
         "the Official turn is still running"
+    );
+}
+
+#[test]
+fn account_read_names_the_live_relay_as_desktops_backend() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = state(&temp);
+    let account = |id: u64| {
+        json!({"id": id, "result": {
+            "account": {"type": "chatgpt"},
+            "workspaceRouting": {"chatgptAccountId": "acct", "backendOrigin": "https://chatgpt.com"}
+        }})
+    };
+    let read = |bridge: &mut BridgeState, id: u64| {
+        bridge
+            .on_client_line(&json!({"id": id, "method": "account/read", "params": {}}).to_string())
+            .unwrap();
+        let actions = bridge
+            .on_child_line(ExecutionPlane::OfficialCodex, &account(id).to_string())
+            .unwrap();
+        let BridgeAction::ToClient(response) = &actions[0] else {
+            panic!("account/read answers Desktop")
+        };
+        response["result"]["workspaceRouting"]["backendOrigin"].clone()
+    };
+
+    // Not adopted by Desktop, or nothing advertised: untouched.
+    assert_eq!(read(&mut bridge, 1), "https://chatgpt.com");
+    let advertisement = backend_relay::advertisement_path(temp.path());
+    bridge.backend_relay = Some(advertisement.clone());
+    assert_eq!(read(&mut bridge, 2), "https://chatgpt.com");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    backend_relay::advertise(
+        temp.path(),
+        &backend_relay::RelayAdvertisement {
+            origin: "https://localhost:8000".into(),
+            port: listener.local_addr().unwrap().port(),
+            certificate_sha256: "00".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(read(&mut bridge, 3), "https://localhost:8000");
+
+    // Only account/read responses are rewritten.
+    let actions = bridge
+        .on_child_line(ExecutionPlane::OfficialCodex, &account(4).to_string())
+        .unwrap();
+    let BridgeAction::ToClient(response) = &actions[0] else {
+        panic!("response passes through")
+    };
+    assert_eq!(
+        response["result"]["workspaceRouting"]["backendOrigin"],
+        "https://chatgpt.com"
     );
 }

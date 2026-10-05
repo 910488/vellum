@@ -486,53 +486,125 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
 
 /// Sends Codex Desktop's own backend requests through the proxy, so its usage
 /// check sees the account Vellum routes turns to rather than the signed-in one
-/// alone. Desktop reads the variable at launch, so this takes effect on its
-/// next start. Failure leaves Desktop talking to ChatGPT directly, which is
-/// how it ran before; it is logged, not fatal.
+/// alone. The relay serves `https://localhost` under a certificate the user
+/// trusts once; the Enhanced bridge then names it as Desktop's backend origin
+/// in `account/read`, which Desktop reads at launch and on account changes.
+/// Any failure leaves Desktop talking to ChatGPT directly, which is how it ran
+/// before; it is logged, not fatal.
 async fn run_desktop_backend_relay(
     state: AppState,
     generation: u64,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) {
     use vellum_proxy_runtime::desktop_backend::{DesktopBackendRelay, DesktopRelayListener};
+    use vellum_proxy_runtime::desktop_backend_tls::LocalhostCertificate;
 
+    let data_root = state.data_root();
+    // Releases leave a value someone else set alone, so this is safe to run
+    // every time; it undoes what the previous relay design leased.
+    // A Vellum that died while serving left its advertisement behind, and the
+    // bridge's port check cannot tell this run's listener, still waiting on
+    // the trust prompt, or another program from a serving relay. Nothing
+    // below may return early with it still in place.
+    let cleanup_state = state.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let lease_root = cleanup_state.data_root();
+        if let Err(error) =
+            crate::enhanced_runtime::env_lease::release_backend_base_url(&lease_root)
+        {
+            log::warn!("[Proxy] earlier Desktop backend lease not released: {error}");
+        }
+        if let Ok(_guard) = enhanced_commit_guard(&cleanup_state, generation) {
+            if let Err(error) = crate::enhanced_runtime::backend_relay::withdraw(&lease_root) {
+                log::warn!("[Proxy] earlier Desktop backend relay not withdrawn: {error}");
+            }
+        }
+    })
+    .await;
+
+    let cert_dir = data_root.join(DESKTOP_BACKEND_TLS_DIR);
+    let certificate = match LocalhostCertificate::load_or_create(&cert_dir) {
+        Ok(certificate) => certificate,
+        Err(error) => {
+            log::warn!("[Proxy] Desktop backend relay not started: {error}");
+            return;
+        }
+    };
+    let tls = match certificate.server_config() {
+        Ok(tls) => tls,
+        Err(error) => {
+            log::warn!("[Proxy] Desktop backend relay not started: {error}");
+            return;
+        }
+    };
     let Some(listener) = DesktopRelayListener::bind().await else {
         log::warn!(
-            "[Proxy] Desktop backend relay not started: neither localhost:80 nor localhost:8000 is free"
+            "[Proxy] Desktop backend relay not started: neither localhost:443 nor localhost:8000 is free"
         );
         return;
     };
-    let value = listener.base_url();
-    let lease_state = state.clone();
-    let leased = tokio::task::spawn_blocking(move || {
-        let Ok(_guard) = enhanced_commit_guard(&lease_state, generation) else {
+
+    // Trusting may wait on the user's answer to an OS prompt.
+    let cert_path = certificate.cert_path().to_path_buf();
+    let identity = certificate.identity().clone();
+    let trust_dir = cert_dir.clone();
+    let trust = tokio::task::spawn_blocking(move || {
+        crate::desktop_backend_trust::ensure_trusted(&trust_dir, &cert_path, &identity)
+    })
+    .await
+    .unwrap_or(crate::desktop_backend_trust::TrustOutcome::Unavailable);
+    if trust != crate::desktop_backend_trust::TrustOutcome::Trusted {
+        log::info!("[Proxy] Desktop backend relay not started: certificate is {trust:?}");
+        return;
+    }
+
+    let advertisement = crate::enhanced_runtime::backend_relay::RelayAdvertisement {
+        origin: listener.origin(),
+        port: listener.port(),
+        certificate_sha256: certificate.identity().sha256.clone(),
+    };
+    let advertise_state = state.clone();
+    let advertised = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = enhanced_commit_guard(&advertise_state, generation) else {
             return false;
         };
-        match crate::enhanced_runtime::env_lease::acquire_backend_base_url(
-            &lease_state.data_root(),
-            &value,
-            &generation.to_string(),
+        match crate::enhanced_runtime::backend_relay::advertise(
+            &advertise_state.data_root(),
+            &advertisement,
         ) {
-            Ok(_) => true,
+            Ok(()) => true,
             Err(error) => {
-                log::warn!("[Proxy] Desktop backend relay not leased: {error}");
+                log::warn!("[Proxy] Desktop backend relay not advertised: {error}");
                 false
             }
         }
     })
     .await
     .unwrap_or(false);
-    if !leased {
+    if !advertised {
         return;
     }
-    log::info!(
-        "[Proxy] Desktop backend relay on localhost:{}",
-        listener.port()
-    );
+    log::info!("[Proxy] Desktop backend relay on {}", listener.origin());
     listener
-        .serve(std::sync::Arc::new(DesktopBackendRelay::production()), stop)
+        .serve(
+            std::sync::Arc::new(DesktopBackendRelay::production()),
+            tls,
+            stop,
+        )
         .await;
+    // Stop withdraws too; this covers the relay ending on its own. A newer
+    // start may have advertised by now, and its file must stay.
+    let withdraw_state = state.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(_guard) = enhanced_commit_guard(&withdraw_state, generation) {
+            let _ = crate::enhanced_runtime::backend_relay::withdraw(&withdraw_state.data_root());
+        }
+    })
+    .await;
 }
+
+/// The relay's certificate, kept per data root so it is trusted once.
+const DESKTOP_BACKEND_TLS_DIR: &str = "desktop-backend-tls";
 
 fn leftover_vellum_host_detail() -> Option<String> {
     let peers = crate::enhanced_runtime::process_info::leftover_vellum_hosts();
@@ -617,6 +689,9 @@ async fn stop_proxy_locked(state: &AppState) -> AppResult<()> {
     // user's native Codex daemon is not killed.
     let restore_result = restore_proxy_config(&paths);
     let bridge_release = crate::enhanced_runtime::release_desktop_launch(&state.data_root());
+    if let Err(error) = crate::enhanced_runtime::backend_relay::withdraw(&state.data_root()) {
+        log::warn!("[Proxy] Desktop backend relay not withdrawn: {error}");
+    }
     if let Err(error) =
         crate::enhanced_runtime::env_lease::release_backend_base_url(&state.data_root())
     {
@@ -710,14 +785,6 @@ pub(crate) fn stop_enhanced_sidecars() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_leased_backend_url_is_one_the_lease_recognises_as_ours() {
-        for port in vellum_proxy_runtime::desktop_backend::DESKTOP_RELAY_PORTS {
-            let url = vellum_proxy_runtime::desktop_backend::desktop_backend_base_url(port);
-            assert!(crate::enhanced_runtime::env_lease::names_vellum_backend_relay(&url));
-        }
-    }
 
     #[test]
     fn restart_is_only_required_when_codex_was_already_running() {
