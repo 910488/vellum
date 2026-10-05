@@ -1,7 +1,9 @@
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::model::UPDATES_PROGRESS_EVENT;
 use crate::state::AppState;
-use crate::updates::{UpdateComponent, UpdateOperation, UpdatePreferences, UpdateStatusSnapshot};
+use crate::updates::{
+    UpdateComponent, UpdateOperation, UpdatePhase, UpdatePreferences, UpdateStatusSnapshot,
+};
 use tauri::{Emitter, State};
 
 fn emit_progress(app: &tauri::AppHandle, op: &UpdateOperation) {
@@ -75,6 +77,67 @@ pub fn apply_update(
     let op = crate::updates::apply_update(&state, component, host_id)?;
     emit_progress(&app, &op);
     Ok(op)
+}
+
+/// Installs the staged Desktop update now: the same teardown as the tray's
+/// Exit, then the installer, then this process exits. The installer relaunches
+/// Vellum, and that launch confirms the new version.
+///
+/// Refused while a request or Codex turn is in flight, because the teardown
+/// stops the proxy under it. If the installer cannot be started, a proxy that
+/// was running is started again and Vellum stays open.
+#[tauri::command]
+pub async fn restart_to_apply_desktop_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<UpdateOperation> {
+    let state = (*state).clone();
+    let desktop = crate::updates::get_status(&state).desktop;
+    if !matches!(
+        desktop.phase,
+        UpdatePhase::Staged | UpdatePhase::WaitingForRestart
+    ) {
+        return Err(AppError::Message("nothingStaged".into()));
+    }
+    let activity = crate::updates::desktop_apply_input(&state, false);
+    if activity.proxy_active_requests > 0 {
+        return Err(AppError::Message("proxyBusy".into()));
+    }
+    if activity.core_in_progress {
+        return Err(AppError::Message("coreBusy".into()));
+    }
+
+    let proxy_was_running = state.proxy_status().running;
+    let applied = crate::shutdown_for_exit(&state, true).await;
+    if let Some(Ok(op)) = &applied {
+        if op.phase == UpdatePhase::Applying {
+            emit_progress(&app, op);
+            // Let the reply reach the window before the process goes away.
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                handle.exit(0);
+            });
+            return Ok(op.clone());
+        }
+    }
+
+    if proxy_was_running {
+        if let Err(error) = crate::commands::proxy::start_proxy_inner(&state).await {
+            log::warn!("[Updates] proxy did not restart after a failed desktop apply: {error}");
+        }
+    }
+    match applied {
+        Some(Err(error)) => Err(error),
+        _ => {
+            let desktop = crate::updates::get_status(&state).desktop;
+            Err(AppError::Message(
+                desktop
+                    .failure_reason
+                    .unwrap_or_else(|| desktop.phase.as_str().to_string()),
+            ))
+        }
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]

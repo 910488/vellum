@@ -11,7 +11,25 @@ import type {
 
 const CHANNELS: UpdateChannel[] = ["stable", "preview"];
 const COMPONENTS: UpdateComponent[] = ["desktop", "remote", "core"];
+/** Desktop goes last: installing it restarts Vellum. "Update all" only stages it. */
+const UPDATE_ALL_ORDER: UpdateComponent[] = ["remote", "core", "desktop"];
 const APPLYABLE_PHASES = new Set(["staged", "waitingForIdle", "waitingForRestart"]);
+const DESKTOP_READY_PHASES = new Set(["staged", "waitingForRestart"]);
+
+/** Backend reasons arrive as codes such as `proxyBusy`; anything else is shown as is. */
+function describeReason(t: (key: string, options?: Record<string, unknown>) => string, raw: string): string {
+  return /^[A-Za-z]+$/.test(raw)
+    ? t(`settings.page.updates.reason.${raw}`, { defaultValue: raw })
+    : raw;
+}
+
+/** Remote packages are per host platform, so each host downloads its own before applying. */
+async function updateRemoteHosts(layer: LayerStatus) {
+  for (const host of layer.hosts) {
+    await api.downloadUpdate("remote", host.hostId);
+    await api.applyUpdate("remote", host.hostId);
+  }
+}
 
 function layerProgress(layer: LayerStatus): number {
   if (layer.phase === "downloading") {
@@ -92,7 +110,7 @@ export function UpdateCards({
     try {
       await work();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeReason(t, cause instanceof Error ? cause.message : String(cause)));
     } finally {
       busyRef.current = null;
       setBusy(null);
@@ -130,30 +148,34 @@ export function UpdateCards({
       onChanged(next);
       setOperationProgress(10);
 
-      for (const [index, component] of COMPONENTS.entries()) {
+      for (const [index, component] of UPDATE_ALL_ORDER.entries()) {
         try {
           let layer = next[component];
           if (!layer.liveAutoUpdate) continue;
-          if (layer.phase === "available") {
-            setOperationProgress(12 + index * 25);
-            await api.downloadUpdate(component);
-            next = await api.getUpdateStatus();
-            onChanged(next);
-            layer = next[component];
-          }
-          if (APPLYABLE_PHASES.has(layer.phase)) {
-            if (component === "remote") {
-              for (const host of layer.hosts) {
-                await api.applyUpdate(component, host.hostId);
-              }
-            } else {
-              await api.applyUpdate(component);
+          setOperationProgress(12 + index * 25);
+          if (component === "remote") {
+            if (layer.phase === "available" || APPLYABLE_PHASES.has(layer.phase)) {
+              await updateRemoteHosts(layer);
+              next = await api.getUpdateStatus();
+              onChanged(next);
             }
-            next = await api.getUpdateStatus();
-            onChanged(next);
+          } else {
+            if (layer.phase === "available") {
+              await api.downloadUpdate(component);
+              next = await api.getUpdateStatus();
+              onChanged(next);
+              layer = next[component];
+            }
+            // A staged Desktop waits for the explicit restart action below.
+            if (component === "core" && APPLYABLE_PHASES.has(layer.phase)) {
+              await api.applyUpdate(component);
+              next = await api.getUpdateStatus();
+              onChanged(next);
+            }
           }
         } catch (cause) {
-          failures.push(`${component}: ${cause instanceof Error ? cause.message : String(cause)}`);
+          const message = cause instanceof Error ? cause.message : String(cause);
+          failures.push(`${component}: ${describeReason(t, message)}`);
           next = await api.getUpdateStatus().catch(() => next);
           onChanged(next);
         }
@@ -165,6 +187,16 @@ export function UpdateCards({
       if (failures.length) throw new Error(failures.join("; "));
     });
   }
+
+  function restartToUpdate() {
+    // On success the backend exits this process; the busy state stays until then.
+    void run("restart", async () => {
+      await api.restartToApplyDesktopUpdate();
+    });
+  }
+
+  const desktopReady =
+    snapshot.desktop.liveAutoUpdate && DESKTOP_READY_PHASES.has(snapshot.desktop.phase);
 
   return (
     <Card data-testid="update-cards" className="update-card">
@@ -192,6 +224,20 @@ export function UpdateCards({
           {busy === "all" ? t("settings.page.updates.updatingAll") : t("settings.page.updates.updateAll")}
         </Btn>
       </div>
+      {desktopReady ? (
+        <div data-testid="update-restart" style={{ marginTop: 12 }}>
+          <p className="note">
+            {t("settings.page.updates.restartHint", {
+              version: snapshot.desktop.stagedVersion ?? snapshot.desktop.targetVersion ?? "",
+            })}
+          </p>
+          <Btn disabled={busy !== null} onClick={restartToUpdate}>
+            {busy === "restart"
+              ? t("settings.page.updates.restarting")
+              : t("settings.page.updates.restartToUpdate")}
+          </Btn>
+        </div>
+      ) : null}
       {!snapshot.liveAutoUpdate ? (
         <p className="note" data-testid="update-live-disabled">
           {t("settings.page.updates.liveDisabled")}
@@ -272,12 +318,7 @@ export function UpdateCards({
             onChanged(await api.getUpdateStatus());
           })
         }
-        onApply={() =>
-          void run("apply-desktop", async () => {
-            await api.applyUpdate("desktop");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
+        onApply={restartToUpdate}
         onCancel={() =>
           void run("cancel-desktop", async () => {
             await api.cancelUpdateDownload("desktop");
@@ -304,13 +345,14 @@ export function UpdateCards({
         }
         onDownload={() =>
           void run("dl-remote", async () => {
-            await api.downloadUpdate("remote");
+            // Without a host the backend answers remoteHostRequired.
+            await api.downloadUpdate("remote", snapshot.remote.hosts[0]?.hostId);
             onChanged(await api.getUpdateStatus());
           })
         }
         onApply={() =>
           void run("apply-remote", async () => {
-            await api.applyUpdate("remote");
+            await updateRemoteHosts(snapshot.remote);
             onChanged(await api.getUpdateStatus());
           })
         }
@@ -426,7 +468,7 @@ function LayerCard({
           <Row label={t("settings.page.updates.notes")}>{layer.releaseNotes}</Row>
         ) : null}
         {layer.failureReason ? (
-          <Row label={t("settings.page.updates.failure")}>{layer.failureReason}</Row>
+          <Row label={t("settings.page.updates.failure")}>{describeReason(t, layer.failureReason)}</Row>
         ) : null}
       </Rows>
       <div className="rowline" style={{ marginTop: 12 }}>

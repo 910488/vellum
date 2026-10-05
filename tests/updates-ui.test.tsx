@@ -18,6 +18,7 @@ vi.mock("@/lib/api", () => ({
     checkUpdates: vi.fn(),
     downloadUpdate: vi.fn(),
     applyUpdate: vi.fn(),
+    restartToApplyDesktopUpdate: vi.fn(),
     cancelUpdateDownload: vi.fn(),
     rollbackUpdate: vi.fn(),
     setRemoteUpdatePolicy: vi.fn(),
@@ -120,7 +121,7 @@ describe("update settings cards", () => {
     expect(appSource).toMatch(/onOpenUpdates/);
   });
 
-  it("checks, downloads, and schedules every live component from Update all", async () => {
+  it("updates remote per host and core, and only stages desktop from Update all", async () => {
     await i18n.changeLanguage("en");
     let current = snapshot({
       liveAutoUpdate: true,
@@ -143,9 +144,14 @@ describe("update settings cards", () => {
     fireEvent.click(screen.getByRole("button", { name: "Update all" }));
 
     await waitFor(() => expect(api.downloadUpdate).toHaveBeenCalledTimes(3));
-    expect(api.applyUpdate).toHaveBeenCalledWith("desktop");
+    expect(api.downloadUpdate).toHaveBeenCalledWith("remote", "host-1");
+    expect(api.downloadUpdate).toHaveBeenCalledWith("core");
+    expect(api.downloadUpdate).toHaveBeenCalledWith("desktop");
     expect(api.applyUpdate).toHaveBeenCalledWith("remote", "host-1");
     expect(api.applyUpdate).toHaveBeenCalledWith("core");
+    // Installing Vellum restarts it; that stays a separate, explicit action.
+    expect(api.applyUpdate).not.toHaveBeenCalledWith("desktop");
+    expect(api.restartToApplyDesktopUpdate).not.toHaveBeenCalled();
   });
 
   it("continues the remaining components when one update fails", async () => {
@@ -174,6 +180,46 @@ describe("update settings cards", () => {
     expect(api.applyUpdate).toHaveBeenCalledWith("remote", "host-1");
     expect(api.applyUpdate).toHaveBeenCalledWith("core");
     expect((await screen.findByRole("alert")).textContent).toContain("desktop mirror unavailable");
+  });
+
+  it("offers a restart once the desktop update is staged", async () => {
+    await i18n.changeLanguage("en");
+    const staged = snapshot({
+      liveAutoUpdate: true,
+      desktop: layer("desktop", { liveAutoUpdate: true, phase: "waitingForRestart", stagedVersion: "0.3.0" }),
+    });
+    vi.mocked(api.restartToApplyDesktopUpdate).mockResolvedValue({
+      operationId: "op", component: "desktop", phase: "applying", targetVersion: "0.3.0",
+    });
+    render(<UpdateCards snapshot={staged} onChanged={() => undefined} />);
+
+    expect(screen.getByTestId("update-restart").textContent).toContain("0.3.0");
+    fireEvent.click(screen.getByRole("button", { name: "Restart Vellum to update" }));
+    await waitFor(() => expect(api.restartToApplyDesktopUpdate).toHaveBeenCalledTimes(1));
+  });
+
+  it("hides the restart action until the desktop update is staged", async () => {
+    await i18n.changeLanguage("en");
+    render(<UpdateCards snapshot={snapshot({ liveAutoUpdate: true, desktop: layer("desktop", { liveAutoUpdate: true }) })} onChanged={() => undefined} />);
+    expect(screen.queryByTestId("update-restart")).toBeNull();
+  });
+
+  it("explains a refused restart instead of showing the reason code", async () => {
+    await i18n.changeLanguage("en");
+    vi.mocked(api.restartToApplyDesktopUpdate).mockRejectedValueOnce(new Error("coreBusy"));
+    render(
+      <UpdateCards
+        snapshot={snapshot({
+          liveAutoUpdate: true,
+          desktop: layer("desktop", { liveAutoUpdate: true, phase: "staged", stagedVersion: "0.3.0" }),
+        })}
+        onChanged={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Restart Vellum to update" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("A Codex task is still running");
+    expect(alert.textContent).not.toContain("coreBusy");
   });
 
   it("opens updates from a tab-like rail action without navigating", async () => {
