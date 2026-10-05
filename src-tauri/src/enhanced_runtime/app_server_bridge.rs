@@ -363,6 +363,12 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         attestation,
         journal,
     );
+    // Only the bridge Desktop itself started speaks for Desktop's backend; a
+    // gate or test run of the bridge leaves `account/read` alone.
+    if adopted_by_desktop {
+        state.backend_relay =
+            super::backend_relay::advertisement_path_beside(&manifest.attestation_path);
+    }
     // Desktop builds currently ship without the optional relay sidecar, so
     // this is the production bridge path. Keep the same launch-scoped
     // observation file the relay path writes; otherwise the Enhanced Core tab
@@ -672,6 +678,11 @@ struct BridgeState {
     turn_requests: HashMap<String, TurnRequest>,
     shadow_requests: HashSet<String>,
     initialize_requests: HashSet<String>,
+    /// `account/read` requests still awaiting Official's answer.
+    account_reads: HashSet<String>,
+    /// Where Vellum advertises Desktop's backend relay, if this bridge may
+    /// point Desktop at it (see `backend_relay`).
+    backend_relay: Option<PathBuf>,
     server_requests: HashMap<String, (ExecutionPlane, Value)>,
     next_server_request: u64,
     official_exited: bool,
@@ -710,6 +721,8 @@ impl BridgeState {
             turn_requests: HashMap::new(),
             shadow_requests: HashSet::new(),
             initialize_requests: HashSet::new(),
+            account_reads: HashSet::new(),
+            backend_relay: None,
             server_requests: HashMap::new(),
             next_server_request: 1,
             official_exited: false,
@@ -840,6 +853,11 @@ impl BridgeState {
             ]);
         }
         let id = value.get("id").cloned();
+        if method == "account/read" {
+            if let Some(id) = id.as_ref() {
+                self.account_reads.insert(id_key(id));
+            }
+        }
         let params = value.get("params").unwrap_or(&Value::Null);
         let (plane, pending, child_provider_id) = self.route_method(method, params)?;
         self.ensure_plane_available(plane)?;
@@ -1101,6 +1119,9 @@ impl BridgeState {
                 self.attestation.mark_initialized(plane);
                 let _ = self.attestation.flush();
             }
+            if self.account_reads.remove(&key) {
+                self.route_desktop_backend_to_relay(&mut value);
+            }
             if let Some(turn) = self.turn_requests.remove(&key) {
                 // A refused `turn/start` never became a turn, so it closes on
                 // the error even though a successful one waits for the
@@ -1144,6 +1165,20 @@ impl BridgeState {
             }
         }
         Ok(vec![BridgeAction::ToClient(value)])
+    }
+
+    /// Desktop takes its backend origin from this response; while Vellum's
+    /// relay is up, that origin is the relay.
+    fn route_desktop_backend_to_relay(&self, response: &mut Value) {
+        let Some(path) = self.backend_relay.as_deref() else {
+            return;
+        };
+        let Some(result) = response.get_mut("result") else {
+            return;
+        };
+        if let Some(origin) = super::backend_relay::live_relay_origin(path) {
+            super::backend_relay::route_workspace_to_relay(result, &origin);
+        }
     }
 
     fn bind_spawned_agent_threads(

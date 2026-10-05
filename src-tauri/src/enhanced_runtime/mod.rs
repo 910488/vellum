@@ -8,6 +8,7 @@
 pub mod app_server_bridge;
 mod atomic;
 pub mod attestation;
+pub mod backend_relay;
 mod binding_store;
 mod child_reaper;
 pub mod contracts;
