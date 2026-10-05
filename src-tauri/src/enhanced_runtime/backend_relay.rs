@@ -142,22 +142,27 @@ mod tests {
         assert_eq!(live_relay_origin(&path), None);
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        advertise(
-            root.path(),
-            &RelayAdvertisement {
-                origin: "https://localhost:8000".into(),
-                port,
-                certificate_sha256: "00".into(),
-            },
-        )
-        .unwrap();
+        let advertise_port = |port| {
+            advertise(
+                root.path(),
+                &RelayAdvertisement {
+                    origin: "https://localhost:8000".into(),
+                    port,
+                    certificate_sha256: "00".into(),
+                },
+            )
+            .unwrap()
+        };
+        advertise_port(listener.local_addr().unwrap().port());
         assert_eq!(
             live_relay_origin(&path).as_deref(),
             Some("https://localhost:8000")
         );
 
+        // A dead relay. Not the port just closed: tests run in parallel, and
+        // another one may take it; port 0 never accepts a connection.
         drop(listener);
+        advertise_port(0);
         assert_eq!(live_relay_origin(&path), None);
 
         withdraw(root.path()).unwrap();
