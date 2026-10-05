@@ -69,7 +69,7 @@ impl EvalTokenBudget {
 
     fn try_reserve(&self, projected: u64) -> Result<(), (u64, u64)> {
         let mut spent = self.cumulative_input_tokens.load(Ordering::SeqCst);
-        let result = self.reserved_input_tokens.fetch_update(
+        let result = self.reserved_input_tokens.try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |reserved| {
@@ -916,7 +916,7 @@ async fn forward(State(state): State<Arc<GatewayState>>, request: Request) -> Re
             });
         if is_official_turn {
             if let Some(cap) = state.run_official_turn_cap {
-                let update_res = state.run_official_turns_spent.fetch_update(
+                let update_res = state.run_official_turns_spent.try_update(
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                     |curr| {

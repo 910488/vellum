@@ -551,6 +551,39 @@ impl RemoteHostOps for SshRemoteHostOps {
     }
 }
 
+/// Which Remote package `host_id` can run, asked of the host itself so a
+/// stale inventory cannot pick the wrong one.
+pub fn host_asset_target(
+    state: &AppState,
+    host_id: &str,
+) -> Result<super::manifest::AssetTarget, String> {
+    let target = crate::remote::RemoteHostManager::resolve_target(state, host_id)
+        .map_err(|error| error.to_string())?;
+    let destination = target
+        .ssh_destination
+        .ok_or_else(|| "remote update requires an SSH destination".to_string())?;
+    let uname = ssh_sh(&destination, "uname -s; uname -m")?;
+    asset_target_from_uname(&uname)
+}
+
+fn asset_target_from_uname(uname: &str) -> Result<super::manifest::AssetTarget, String> {
+    use crate::remote::platform::RemotePlatform;
+    let mut lines = uname.lines().map(str::trim).filter(|line| !line.is_empty());
+    let os = lines.next().unwrap_or_default();
+    let arch = lines.next().unwrap_or_default();
+    let (platform, arch) = match RemotePlatform::from_os_arch(os, arch)
+        .map_err(|unsupported| unsupported.code.to_string())?
+    {
+        RemotePlatform::LinuxAmd64 => ("linux", "x64"),
+        RemotePlatform::LinuxArm64 => ("linux", "arm64"),
+        RemotePlatform::DarwinArm64 => ("macos", "arm64"),
+    };
+    Ok(super::manifest::AssetTarget {
+        platform: platform.into(),
+        arch: arch.into(),
+    })
+}
+
 pub fn observe_remote_host(state: &AppState, host_id: &str) -> IdleEvidence {
     match SshRemoteHostOps::from_state(state, host_id, "observe") {
         Ok(ops) => match ops.observe_host() {
@@ -619,6 +652,25 @@ mod tests {
     use super::super::journal::Journal;
     use super::super::remote_helper::{apply_remote_package, RemoteApplyPlan};
     use super::*;
+
+    #[test]
+    fn uname_maps_each_supported_host_to_its_package_platform() {
+        let pick = |uname: &str| {
+            asset_target_from_uname(uname).map(|target| (target.platform, target.arch))
+        };
+        assert_eq!(pick("Linux\nx86_64\n"), Ok(("linux".into(), "x64".into())));
+        assert_eq!(
+            pick("Linux\naarch64\n"),
+            Ok(("linux".into(), "arm64".into()))
+        );
+        assert_eq!(
+            pick("Darwin\narm64\n"),
+            Ok(("macos".into(), "arm64".into()))
+        );
+        assert_eq!(pick("Darwin\nx86_64\n"), Err("intelMacUnsupported".into()));
+        assert!(pick("FreeBSD\namd64\n").is_err());
+        assert!(pick("").is_err());
+    }
 
     #[derive(Default)]
     struct RecordingHostOps {
@@ -987,6 +1039,55 @@ mod tests {
             !steps.lines().any(|line| line.trim() == "stage"),
             "stage must not be journaled after a zip-slip reject: {steps}"
         );
+    }
+
+    #[test]
+    fn package_for_another_platform_fails_before_the_set_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("op");
+        std::fs::create_dir_all(root.join("stage")).unwrap();
+        let pkg = root.join("package.tar.gz");
+        {
+            // No host reports plan9-sparc, so this mismatches on every runner.
+            let file = std::fs::File::create(&pkg).unwrap();
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let payload = b"#!/bin/sh\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "plan9-sparc/vellum-remote-agent", &payload[..])
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let digest = hex::encode(Sha256::digest(std::fs::read(&pkg).unwrap()));
+        std::fs::write(root.join("sha256"), digest.as_bytes()).unwrap();
+        let helper = dir.path().join("host_helper.sh");
+        std::fs::write(&helper, HOST_HELPER_SH.replace("\r\n", "\n")).unwrap();
+
+        let output = std::process::Command::new(unix_shell())
+            .arg(to_msys_path(&helper))
+            .arg(to_msys_path(&root))
+            .arg("apply")
+            .output()
+            .expect("execute shipped host_helper.sh");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "stderr={stderr}");
+        assert!(
+            stderr.contains("platformMismatch: package is for plan9-sparc"),
+            "helper must name both platforms; stderr={stderr}"
+        );
+        assert!(
+            std::fs::read_dir(root.join("stage"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "nothing may be extracted for another platform"
+        );
+        let steps = std::fs::read_to_string(root.join("steps")).unwrap_or_default();
+        assert!(steps.trim().is_empty(), "no step may run: {steps}");
     }
 
     #[test]

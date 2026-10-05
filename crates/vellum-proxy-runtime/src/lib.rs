@@ -30,6 +30,7 @@ pub mod context_projection;
 pub mod continuation;
 pub mod credentials;
 pub mod desktop_backend;
+pub mod desktop_backend_tls;
 pub mod diagnostics;
 pub mod environment;
 pub mod error;

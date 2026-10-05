@@ -36,7 +36,8 @@ pub use core_slots::{
 };
 pub use engine::{
     apply_staged_on_exit, apply_update, cancel_download, check_updates, download_update,
-    get_status, progress_from, rollback_update, set_preferences, set_remote_policy, UpdateEngine,
+    get_status, progress_from, reconcile_desktop_after_restart, rollback_update, set_preferences,
+    set_remote_policy, UpdateEngine,
 };
 pub use github::{
     parse_github_releases, GithubAsset, GithubRelease, ListedReleases, MemorySource, ReleaseSource,
@@ -264,7 +265,12 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
                                 UpdateComponent::Remote => &snapshot.remote,
                                 UpdateComponent::Core => &snapshot.core,
                             };
-                            if layer.live_auto_update && layer.phase == UpdatePhase::Available {
+                            // Remote packages are per host; they are fetched
+                            // when a host is updated, not in the background.
+                            if component != UpdateComponent::Remote
+                                && layer.live_auto_update
+                                && layer.phase == UpdatePhase::Available
+                            {
                                 let _ = download_update(&state, component, None).await;
                             }
                         }

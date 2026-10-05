@@ -16,7 +16,8 @@ use super::github::{matching_tags, SharedSource};
 use super::journal::{Journal, JournalEntry};
 use super::machine::{transition, UpdateEvent, UpdatePhase, WaitKind};
 use super::manifest::{
-    current_arch, current_platform, verify_signed_manifest, AssetRef, UpdateManifest,
+    current_arch, current_platform, select_asset, verify_signed_manifest, AssetTarget,
+    UpdateManifest,
 };
 use super::select::{select_compatible, ReleaseCandidate, SelectContext};
 use super::trust::TrustStore;
@@ -62,6 +63,10 @@ struct LayerRecord {
     signed_manifest_path: Option<PathBuf>,
     #[serde(default)]
     signed_signature_path: Option<PathBuf>,
+    /// Platform the staged asset was picked for. Remote stages one host's
+    /// package, so another host must not be given it.
+    #[serde(default)]
+    staged_target: Option<AssetTarget>,
 }
 
 impl LayerRecord {
@@ -81,6 +86,7 @@ impl LayerRecord {
             manifest: None,
             signed_manifest_path: None,
             signed_signature_path: None,
+            staged_target: None,
         }
     }
 }
@@ -91,6 +97,9 @@ pub struct RemoteDeployRequest<'a> {
     pub version: &'a str,
     pub sha256: &'a str,
     pub staged: &'a Path,
+    /// Platform the staged package was built for; `None` for state written
+    /// before targets were recorded, which the executor must not deploy.
+    pub staged_target: Option<&'a AssetTarget>,
     pub policy_enabled: bool,
     pub evidence: &'a crate::updates::IdleEvidence,
 }
@@ -487,16 +496,31 @@ impl UpdateEngine {
         Ok(op)
     }
 
+    /// Downloads the asset for this machine (Desktop, Core).
     pub async fn download(
         &self,
         component: UpdateComponent,
         currents: Currents<'_>,
         restart_reasons: Vec<String>,
     ) -> AppResult<UpdateOperation> {
+        self.download_for(component, currents, restart_reasons, AssetTarget::local())
+            .await
+    }
+
+    /// Downloads the asset for `target`. Remote passes the SSH host's
+    /// platform; using this machine's would stage, say, the macOS package for
+    /// a Linux host.
+    pub async fn download_for(
+        &self,
+        component: UpdateComponent,
+        currents: Currents<'_>,
+        restart_reasons: Vec<String>,
+        target: AssetTarget,
+    ) -> AppResult<UpdateOperation> {
         let key = format!("download:{}", component.as_str());
         self.single_flight(
             key,
-            self.download_inner(component, currents, restart_reasons),
+            self.download_inner(component, currents, restart_reasons, target),
         )
         .await
     }
@@ -506,6 +530,7 @@ impl UpdateEngine {
         component: UpdateComponent,
         currents: Currents<'_>,
         restart_reasons: Vec<String>,
+        target: AssetTarget,
     ) -> AppResult<UpdateOperation> {
         tokio::task::yield_now().await;
         let op = new_operation(component, UpdatePhase::Downloading);
@@ -526,7 +551,7 @@ impl UpdateEngine {
             self.save(&state)?;
             return Ok(op);
         };
-        let asset = pick_asset(&manifest).cloned();
+        let asset = select_asset(&manifest, component, &target).cloned();
         if asset.is_none() {
             record.phase = UpdatePhase::Failed;
             record.failure_reason = Some("missingAsset".into());
@@ -622,6 +647,7 @@ impl UpdateEngine {
                 }
                 record.staged_asset = Some(path.clone());
                 record.staged_version = Some(manifest.version.clone());
+                record.staged_target = Some(target.clone());
                 let wait = wait_kind_for(component);
                 record.phase =
                     transition(record.phase, &UpdateEvent::Staged { wait }).unwrap_or(match wait {
@@ -686,6 +712,55 @@ impl UpdateEngine {
         Ok(policy)
     }
 
+    /// Settles a Desktop update the previous process handed to the installer.
+    /// Only the relaunched build can tell whether the install happened, so
+    /// Applied is decided here by the running version, never at launch time.
+    pub fn reconcile_desktop_after_restart(&self, running: &str) -> AppResult<Option<UpdatePhase>> {
+        let mut state = self.load();
+        let Some(record) = state.layers.get_mut(UpdateComponent::Desktop.as_str()) else {
+            return Ok(None);
+        };
+        if record.phase != UpdatePhase::Applying {
+            return Ok(None);
+        }
+        let target = record
+            .target_version
+            .clone()
+            .or_else(|| record.staged_version.clone());
+        let reached = target
+            .as_deref()
+            .and_then(super::manifest::parse_version)
+            .zip(super::manifest::parse_version(running))
+            .is_some_and(|(target, running)| running >= target);
+        if reached {
+            record.phase = UpdatePhase::Applied;
+            record.current_version = running.to_string();
+            record.available_version = None;
+            record.staged_asset = None;
+            record.staged_version = None;
+            record.staged_target = None;
+            record.failure_reason = None;
+        } else {
+            // The staged installer stays, so downloading again reuses it.
+            record.phase = UpdatePhase::Failed;
+            record.failure_reason = Some("desktopInstallDidNotComplete".into());
+        }
+        let phase = record.phase;
+        let reason = record.failure_reason.clone();
+        let op = UpdateOperation {
+            operation_id: record
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| ulid::Ulid::new().to_string()),
+            component: UpdateComponent::Desktop,
+            phase,
+            target_version: target,
+        };
+        self.save(&state)?;
+        self.record_journal(&op, phase, reason)?;
+        Ok(Some(phase))
+    }
+
     pub fn apply(
         &self,
         component: UpdateComponent,
@@ -720,12 +795,22 @@ impl UpdateEngine {
                     .staged_version
                     .clone()
                     .unwrap_or_else(|| current.clone());
+                let staged_name = staged
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str());
                 let sha = record
                     .manifest
                     .as_ref()
-                    .and_then(pick_asset)
+                    .and_then(|manifest| {
+                        manifest
+                            .assets
+                            .iter()
+                            .find(|asset| Some(asset.name.as_str()) == staged_name)
+                    })
                     .map(|asset| asset.sha256.clone())
                     .unwrap_or_default();
+                let staged_target = record.staged_target.clone();
                 let Some(staged) = staged else {
                     record.phase = UpdatePhase::Failed;
                     record.failure_reason = Some("nothingStaged".into());
@@ -743,6 +828,7 @@ impl UpdateEngine {
                         version: &version,
                         sha256: &sha,
                         staged: &staged,
+                        staged_target: staged_target.as_ref(),
                         policy_enabled: true,
                         evidence: evidence.ok_or_else(|| {
                             AppError::Message("remote apply requires live idle evidence".into())
@@ -758,6 +844,11 @@ impl UpdateEngine {
                             // waiting-for-restart until that observation exists.
                             super::arm_core_pending_apply();
                             record.phase = UpdatePhase::WaitingForRestart;
+                        } else if component == UpdateComponent::Desktop {
+                            // The installer has only been started; this process
+                            // is about to exit. The relaunched build settles the
+                            // outcome in `reconcile_desktop_after_restart`.
+                            record.phase = UpdatePhase::Applying;
                         } else {
                             record.phase = transition(record.phase, &UpdateEvent::StartValidate)
                                 .unwrap_or(UpdatePhase::Validating);
@@ -885,13 +976,6 @@ fn load_checked_manifest(
     Ok((raw, signature))
 }
 
-fn pick_asset(manifest: &UpdateManifest) -> Option<&AssetRef> {
-    manifest
-        .assets
-        .iter()
-        .find(|asset| asset.platform == current_platform() && asset.arch == current_arch())
-}
-
 fn apply_condition(component: UpdateComponent, phase: UpdatePhase) -> String {
     match (component, phase) {
         (UpdateComponent::Desktop, UpdatePhase::WaitingForRestart | UpdatePhase::Staged) => {
@@ -974,8 +1058,23 @@ pub async fn check_updates(
 pub async fn download_update(
     state: &AppState,
     component: UpdateComponent,
-    _host_id: Option<String>,
+    host_id: Option<String>,
 ) -> AppResult<UpdateOperation> {
+    let target = match component {
+        UpdateComponent::Remote => {
+            let host_id = host_id
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| AppError::Message("remoteHostRequired".into()))?;
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                super::remote_host::host_asset_target(&state, &host_id)
+            })
+            .await
+            .map_err(|error| AppError::Message(error.to_string()))?
+            .map_err(AppError::Message)?
+        }
+        UpdateComponent::Desktop | UpdateComponent::Core => AssetTarget::local(),
+    };
     let engine = super::engine(&state.data_root());
     let core_version = current_core_version(state);
     let currents = current_versions(&core_version);
@@ -985,7 +1084,15 @@ pub async fn download_update(
         .iter()
         .map(|notice| notice.code.clone())
         .collect();
-    engine.download(component, currents, reasons).await
+    engine
+        .download_for(component, currents, reasons, target)
+        .await
+}
+
+/// Startup half of a Desktop update: see
+/// [`UpdateEngine::reconcile_desktop_after_restart`].
+pub fn reconcile_desktop_after_restart(state: &AppState) -> AppResult<Option<UpdatePhase>> {
+    super::engine(&state.data_root()).reconcile_desktop_after_restart(env!("CARGO_PKG_VERSION"))
 }
 
 pub fn cancel_download(state: &AppState, component: UpdateComponent) -> AppResult<UpdateOperation> {
@@ -1103,6 +1210,14 @@ impl ApplyExecutor for AppApplyExecutor {
         } else {
             request.host_id
         };
+        // The Remote layer stages one package for every host, so a package
+        // downloaded for a Linux host must not reach a Mac (and vice versa).
+        let host_target = super::remote_host::host_asset_target(&self.state, host)?;
+        match request.staged_target {
+            Some(staged) if *staged == host_target => {}
+            Some(_) => return Err("stagedForDifferentHost".into()),
+            None => return Err("stagedTargetUnknown".into()),
+        }
         let expected =
             super::remote_host::expected_identity_from_staged(request.staged, request.version);
         let mut ops = super::remote_host::SshRemoteHostOps::from_state(
@@ -1192,6 +1307,16 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    /// A name each layer's asset rules accept on the platform running the test.
+    fn fixture_asset_name(component: UpdateComponent) -> &'static str {
+        match component {
+            UpdateComponent::Core => "payload.zip",
+            UpdateComponent::Remote => "vellum-remote-fixture.tar.gz",
+            UpdateComponent::Desktop if cfg!(target_os = "macos") => "Vellum.app.tar.gz",
+            UpdateComponent::Desktop => "Vellum_x64-setup.exe",
+        }
+    }
+
     fn signed_fixture(
         signing: &SigningKey,
         component: UpdateComponent,
@@ -1252,11 +1377,7 @@ mod tests {
             assets: vec![AssetRef {
                 platform: current_platform().into(),
                 arch: current_arch().into(),
-                name: if component == UpdateComponent::Core {
-                    "payload.zip".into()
-                } else {
-                    "payload.bin".into()
-                },
+                name: fixture_asset_name(component).into(),
                 size: bytes.len() as u64,
                 sha256: hash,
             }],
@@ -1408,7 +1529,10 @@ mod tests {
         let mut releases = HashMap::new();
         releases.insert("https://example/manifest".into(), raw);
         releases.insert("https://example/sig".into(), sig);
-        releases.insert("asset://payload.bin".into(), payload.to_vec());
+        releases.insert(
+            format!("asset://{}", fixture_asset_name(UpdateComponent::Desktop)),
+            payload.to_vec(),
+        );
         let listed = ListedReleases {
             etag: None,
             not_modified: false,
@@ -1528,12 +1652,10 @@ mod tests {
         let mut releases = HashMap::new();
         releases.insert("https://example/manifest".into(), raw);
         releases.insert("https://example/sig".into(), sig);
-        let asset_name = if component == UpdateComponent::Core {
-            "payload.zip"
-        } else {
-            "payload.bin"
-        };
-        releases.insert(format!("asset://{asset_name}"), payload.to_vec());
+        releases.insert(
+            format!("asset://{}", fixture_asset_name(component)),
+            payload.to_vec(),
+        );
         let listed = ListedReleases {
             etag: None,
             not_modified: false,
@@ -1617,15 +1739,98 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(applied.phase, UpdatePhase::Applied);
+        // Launching the installer is not success: this process still runs
+        // the old build until it exits.
+        assert_eq!(applied.phase, UpdatePhase::Applying);
         assert!(
             !recorder.desktop.lock().unwrap().is_empty(),
             "Allow must invoke install_desktop; a phase-only flip is a bug"
         );
+        assert_eq!(
+            engine.snapshot("0.2.9", "0.2.9", "bundled").desktop.phase,
+            UpdatePhase::Applying
+        );
+
+        assert_eq!(
+            engine.reconcile_desktop_after_restart("0.3.1").unwrap(),
+            Some(UpdatePhase::Applied)
+        );
         let snap = engine.snapshot("0.3.1", "0.2.9", "bundled");
         assert_eq!(snap.desktop.phase, UpdatePhase::Applied);
         assert_eq!(snap.desktop.current_version, "0.3.1");
+        assert_eq!(snap.desktop.staged_version, None);
+        assert_eq!(
+            engine.reconcile_desktop_after_restart("0.3.1").unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_restart_on_the_old_version_reports_the_install_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingExecutor::default());
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Desktop,
+            "0.3.1",
+            b"desk-payload",
+            recorder,
+        );
+        engine
+            .check(Some(UpdateComponent::Desktop), currents)
+            .await
+            .unwrap();
+        engine
+            .download(UpdateComponent::Desktop, currents, Vec::new())
+            .await
+            .unwrap();
+        engine
+            .apply(
+                UpdateComponent::Desktop,
+                ApplyDecision::Allow,
+                currents,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // The installer was cancelled or failed; the old build came back.
+        assert_eq!(
+            engine.reconcile_desktop_after_restart("0.2.9").unwrap(),
+            Some(UpdatePhase::Failed)
+        );
+        let snap = engine.snapshot("0.2.9", "0.2.9", "bundled");
+        assert_eq!(snap.desktop.phase, UpdatePhase::Failed);
+        assert_eq!(
+            snap.desktop.failure_reason.as_deref(),
+            Some("desktopInstallDidNotComplete")
+        );
+        assert_eq!(snap.desktop.current_version, "0.2.9");
         assert_eq!(snap.desktop.staged_version.as_deref(), Some("0.3.1"));
+    }
+
+    #[test]
+    fn reconcile_ignores_a_desktop_layer_that_was_not_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = SigningKey::from_bytes(&[6u8; 32]);
+        let engine = UpdateEngine::open(
+            dir.path(),
+            TrustStore::from_key("test-key", signing.verifying_key()),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        );
+        assert_eq!(
+            engine.reconcile_desktop_after_restart("0.3.1").unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1694,14 +1899,23 @@ mod tests {
                     .push((program.to_path_buf(), args.to_vec()));
                 Ok(11)
             }
-            fn extract_tar_gz(&self, _archive: &Path, _dest_app: &Path) -> Result<(), String> {
-                Err("unexpected mac extract".into())
-            }
         }
         let signing = SigningKey::from_bytes(&[9u8; 32]);
         let trust = TrustStore::from_key("test-key", signing.verifying_key());
         let payload = b"nsis-bytes";
         let hash = hex::encode(Sha256::digest(payload));
+        // Each platform only installs its own kind of Desktop asset.
+        let (installer_name, current_exe) = if cfg!(target_os = "macos") {
+            (
+                "Vellum-macos-arm64.app.tar.gz",
+                "/Applications/Vellum.app/Contents/MacOS/vellum-proxy-desktop",
+            )
+        } else {
+            (
+                "Vellum_0.5.0_x64-setup.exe",
+                "C:/Program Files/Vellum/vellum-proxy-desktop.exe",
+            )
+        };
         let manifest = UpdateManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             component: UpdateComponent::Desktop,
@@ -1719,7 +1933,7 @@ mod tests {
             assets: vec![AssetRef {
                 platform: current_platform().into(),
                 arch: current_arch().into(),
-                name: "Vellum_0.5.0_x64-setup.exe".into(),
+                name: installer_name.into(),
                 size: payload.len() as u64,
                 sha256: hash,
             }],
@@ -1730,10 +1944,7 @@ mod tests {
         let mut releases = HashMap::new();
         releases.insert("https://example/manifest".into(), raw);
         releases.insert("https://example/sig".into(), sig);
-        releases.insert(
-            "asset://Vellum_0.5.0_x64-setup.exe".into(),
-            payload.to_vec(),
-        );
+        releases.insert(format!("asset://{installer_name}"), payload.to_vec());
         let listed = ListedReleases {
             etag: None,
             not_modified: false,
@@ -1767,7 +1978,7 @@ mod tests {
                 desktop_runner: Arc::new(SpawnRecorder {
                     inner: spawns.clone(),
                 }),
-                current_exe: PathBuf::from("C:/Program Files/Vellum/vellum-proxy-desktop.exe"),
+                current_exe: PathBuf::from(current_exe),
             }),
         );
         let currents = Currents {
@@ -1808,10 +2019,16 @@ mod tests {
         assert_eq!(
             launched.len(),
             1,
-            "close/restart apply must exec NSIS, not only copy the staged file"
+            "close/restart apply must launch the installer, not only copy the staged file"
         );
-        assert!(launched[0].1.iter().any(|arg| arg == "/S"));
-        assert!(launched[0].1.iter().any(|arg| arg == "/UPDATE"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(launched[0].0, PathBuf::from("/bin/sh"));
+            assert_eq!(launched[0].1[5], "/Applications/Vellum.app");
+        } else {
+            assert!(launched[0].1.iter().any(|arg| arg == "/S"));
+            assert!(launched[0].1.iter().any(|arg| arg == "/UPDATE"));
+            assert!(launched[0].1.iter().any(|arg| arg == "/R"));
+        }
     }
 
     #[tokio::test]
@@ -1937,6 +2154,7 @@ mod tests {
                 manifest: None,
                 signed_manifest_path: None,
                 signed_signature_path: None,
+                staged_target: None,
             },
         );
         engine.save(&state).unwrap();

@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::{parse_version, UpdateManifest};
+use super::manifest::{
+    has_remote_package, parse_version, select_asset, AssetTarget, UpdateManifest,
+};
 use super::UpdateComponent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,15 +93,18 @@ pub fn select_compatible(
         if candidate.manifest.data_format.irreversible_migration {
             continue;
         }
-        let Some(asset) = candidate
-            .manifest
-            .assets
-            .iter()
-            .find(|asset| asset.platform == ctx.platform && asset.arch == ctx.arch)
-        else {
-            continue;
+        let installable = if ctx.component == UpdateComponent::Remote {
+            has_remote_package(&candidate.manifest)
+        } else {
+            let target = AssetTarget {
+                platform: ctx.platform.into(),
+                arch: ctx.arch.into(),
+            };
+            select_asset(&candidate.manifest, ctx.component, &target).is_some()
         };
-        let _ = asset;
+        if !installable {
+            continue;
+        }
         let Some(version) = parse_version(&candidate.manifest.version) else {
             continue;
         };
@@ -147,7 +152,7 @@ mod tests {
             assets: vec![AssetRef {
                 platform: "windows".into(),
                 arch: "x64".into(),
-                name: format!("{version}.bin"),
+                name: format!("Vellum_{version}_x64-setup.exe"),
                 size: 1,
                 sha256: "aa".into(),
             }],
@@ -223,6 +228,43 @@ mod tests {
             published_at: None,
         }];
         assert!(select_compatible(&candidates, &ctx(Channel::Stable, "0.2.9")).is_none());
+    }
+
+    #[test]
+    fn a_release_with_only_another_layers_file_is_skipped() {
+        let mut m = manifest(UpdateComponent::Desktop, "1.0.0", false);
+        m.assets[0].name = "enhanced-codex-core-x86_64-pc-windows-msvc.zip".into();
+        let candidates = [ReleaseCandidate {
+            manifest: m,
+            github_prerelease: false,
+            published_at: None,
+        }];
+        assert!(select_compatible(&candidates, &ctx(Channel::Stable, "0.2.9")).is_none());
+    }
+
+    #[test]
+    fn remote_is_selected_for_any_host_platform_package() {
+        let mut m = manifest(UpdateComponent::Remote, "1.0.0", false);
+        m.assets[0] = AssetRef {
+            platform: "linux".into(),
+            arch: "arm64".into(),
+            name: "vellum-remote-linux-arm64.tar.gz".into(),
+            size: 1,
+            sha256: "aa".into(),
+        };
+        let candidates = [ReleaseCandidate {
+            manifest: m,
+            github_prerelease: false,
+            published_at: None,
+        }];
+        let ctx = SelectContext {
+            component: UpdateComponent::Remote,
+            ..ctx(Channel::Stable, "0.2.9")
+        };
+        assert_eq!(
+            select_compatible(&candidates, &ctx).unwrap().version,
+            "1.0.0"
+        );
     }
 
     #[test]

@@ -26,13 +26,10 @@ use super::atomic::write_atomic;
 pub const CODEX_CLI_PATH: &str = "CODEX_CLI_PATH";
 const LEASE_FILE: &str = "enhanced-runtime/env-lease.json";
 
-/// Desktop's ChatGPT backend base, pointed at the proxy's relay while the
-/// proxy runs. Codex Desktop reads it once at launch; the CLI never reads it.
-pub const CODEX_API_BASE_URL: &str = "CODEX_API_BASE_URL";
+/// Where releases of Vellum before the HTTPS relay leased
+/// `CODEX_API_BASE_URL`. Nothing takes that lease now; a leftover one is
+/// given back by [`release_backend_base_url`].
 const BACKEND_LEASE_FILE: &str = "enhanced-runtime/backend-env-lease.json";
-/// The proxy's relay path (`desktop_backend::DESKTOP_BACKEND_BASE_PATH`);
-/// spelled out because this module stays independent of the proxy runtime.
-const BACKEND_RELAY_PATH: &str = "/desktop-backend/backend-api";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,41 +57,8 @@ impl EnvironmentLease {
     }
 }
 
-/// Points Codex Desktop's backend requests at the proxy's relay.
-///
-/// Same three-way lease as `CODEX_CLI_PATH`, in its own file so the two are
-/// taken and given back independently. A relay URL of ours on another port is
-/// an earlier Vellum's leftover, not someone else's setting.
-pub fn acquire_backend_base_url(
-    data_root: &Path,
-    value: &str,
-    launch_id: &str,
-) -> Result<EnvironmentLease, EnvironmentLeaseError> {
-    acquire_variable(
-        &data_root.join(BACKEND_LEASE_FILE),
-        CODEX_API_BASE_URL,
-        value,
-        launch_id,
-        names_vellum_backend_relay,
-    )
-}
-
 pub fn release_backend_base_url(data_root: &Path) -> Result<ReleaseOutcome, EnvironmentLeaseError> {
     release_file(&data_root.join(BACKEND_LEASE_FILE))
-}
-
-pub fn names_vellum_backend_relay(value: &str) -> bool {
-    let value = value.trim_end_matches('/');
-    // Current relays are on localhost; 127.0.0.1 is what the first release
-    // leased, and a leftover of it must still read as ours.
-    [
-        "http://localhost/",
-        "http://localhost:",
-        "http://127.0.0.1:",
-    ]
-    .iter()
-    .any(|prefix| value.starts_with(prefix))
-        && value.ends_with(BACKEND_RELAY_PATH)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,44 +490,6 @@ mod tests {
         value: &str,
     ) -> Option<String> {
         super::plan_previous_value_for_acquire(existing, current, value, names_vellum_bridge)
-    }
-
-    #[test]
-    fn an_earlier_vellum_relay_on_another_port_is_ours_to_replace() {
-        let current = "http://127.0.0.1:15721/desktop-backend/backend-api".to_string();
-        let requested = "http://localhost/desktop-backend/backend-api".to_string();
-        assert!(names_vellum_backend_relay(&requested));
-        assert!(names_vellum_backend_relay(
-            "http://localhost:8000/desktop-backend/backend-api"
-        ));
-        assert!(names_vellum_backend_relay(&current));
-        assert!(!names_vellum_backend_relay(
-            "https://chatgpt.com/backend-api"
-        ));
-        assert!(!names_vellum_backend_relay(
-            "http://localhost:8000/backend-api"
-        ));
-        assert!(!super::acquisition_conflicts(
-            None,
-            Some(&current),
-            &requested,
-            names_vellum_backend_relay
-        ));
-        assert_eq!(
-            super::plan_previous_value_for_acquire(
-                None,
-                Some(&current),
-                &requested,
-                names_vellum_backend_relay
-            ),
-            None
-        );
-        assert!(super::acquisition_conflicts(
-            None,
-            Some("https://staging.example/backend-api"),
-            &requested,
-            names_vellum_backend_relay
-        ));
     }
 
     fn lease(previous: Option<&str>, applied: &str) -> EnvironmentLease {

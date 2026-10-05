@@ -481,6 +481,9 @@ mod tests {
         assert!(!root.path().join("enhanced-runtime/steer-repair").exists());
     }
 
+    // Store install paths only parse with Windows separators; on Unix the
+    // whole backslash path is a single component.
+    #[cfg(windows)]
     #[test]
     fn package_family_comes_from_the_store_install_directory() {
         assert_eq!(

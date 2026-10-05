@@ -1,23 +1,29 @@
 //! Codex Desktop's own ChatGPT backend traffic, relayed through the proxy.
 //!
 //! Desktop's main process sends every renderer backend request (`/wham/*`,
-//! `/accounts/*`, ...) to `CODEX_API_BASE_URL` when that variable is set, and
-//! attaches the signed-in account's token to it. Vellum points that variable
-//! here so it can answer one question differently: Desktop disables its
-//! composer when `/wham/usage` says the *signed-in* account is out of quota,
-//! even though the turn itself goes through this proxy and is served by
-//! whichever account Vellum routes to. Usage responses are therefore reported
-//! as unlimited; everything else is forwarded unchanged, under Desktop's own
-//! identity, so the phone and Desktop stay on the same account.
+//! `/accounts/*`, ...) to its workspace's backend origin and attaches the
+//! signed-in account's token to it. That origin comes from the app-server's
+//! `account/read` (`workspaceRouting.backendOrigin`), and the Enhanced bridge
+//! points it here so Vellum can answer one question differently: Desktop
+//! disables its composer when `/wham/usage` says the *signed-in* account is
+//! out of quota, even though the turn itself goes through this proxy and is
+//! served by whichever account Vellum routes to. Usage responses are therefore
+//! reported as unlimited; everything else is forwarded unchanged, under
+//! Desktop's own identity, so the phone and Desktop stay on the same account.
+//!
+//! Desktop keeps the request's path and swaps only the origin, so the relay
+//! serves the same `/backend-api/...` paths chatgpt.com does. Pointing
+//! `CODEX_API_BASE_URL` at a relay path instead does not work: workspace
+//! routing puts Desktop's chatgpt.com origin back in front of that path.
 //!
 //! The relay adds no Vellum credential to anything it forwards, which is why
 //! it needs no boundary key (Desktop cannot send one).
 //!
-//! It listens on its own port, not the proxy's: Desktop attaches its login
-//! only to OpenAI hosts and to exactly `localhost` or `localhost:8000`, so
-//! the relay takes port 80 where the OS allows it and 8000 otherwise. Any
-//! other loopback address makes every authenticated call fail before it is
-//! sent, and Desktop reloads in a loop.
+//! It listens on its own port, not the proxy's, and speaks TLS
+//! ([`crate::desktop_backend_tls`]): Desktop accepts only an `https:` backend
+//! origin, and attaches its login only to OpenAI hosts and to exactly
+//! `localhost` or `localhost:8000`. So the relay takes port 443 where the OS
+//! allows it and 8000 otherwise.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -27,32 +33,30 @@ use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::any;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-pub const DESKTOP_BACKEND_BASE_PATH: &str = "/desktop-backend/backend-api";
+/// The only loopback ports Desktop will send its login to over `https:`, in
+/// preference order. macOS refuses port 443 to an unprivileged process.
+pub const DESKTOP_RELAY_PORTS: [u16; 2] = [443, 8000];
 
-/// Desktop rewrites its update feed to this path whenever the backend base URL
-/// is a loopback host.
-pub const DESKTOP_APPCAST_PATH: &str = "/api/codex/app/appcast";
-
-/// The only loopback ports Desktop will send its login to, in preference
-/// order. macOS refuses port 80 to an unprivileged process.
-pub const DESKTOP_RELAY_PORTS: [u16; 2] = [80, 8000];
-
+/// The origin Desktop's own backend requests normally go to. The relay
+/// forwards to it and stands in only for it; a workspace on another backend
+/// (a data-residency one, say) is left alone.
+pub const PRODUCTION_BACKEND_ORIGIN: &str = "https://chatgpt.com";
 const PRODUCTION_BACKEND: &str = "https://chatgpt.com/backend-api";
-const PRODUCTION_APPCAST: &str = "https://updates.oaistatic.com/codex/app/appcast";
 /// Desktop's backend request bodies are small JSON; this only bounds memory.
 const MAX_RELAY_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// The value Vellum leases into `CODEX_API_BASE_URL`.
-pub fn desktop_backend_base_url(port: u16) -> String {
+/// The `backendOrigin` that sends Desktop to the relay on `port`, in the
+/// exact form Desktop requires (`new URL(origin).origin === origin`).
+pub fn desktop_backend_origin(port: u16) -> String {
     match port {
-        80 => format!("http://localhost{DESKTOP_BACKEND_BASE_PATH}"),
-        port => format!("http://localhost:{port}{DESKTOP_BACKEND_BASE_PATH}"),
+        443 => "https://localhost".to_string(),
+        port => format!("https://localhost:{port}"),
     }
 }
 
@@ -115,25 +119,69 @@ impl DesktopRelayListener {
         self.port
     }
 
-    pub fn base_url(&self) -> String {
-        desktop_backend_base_url(self.port)
+    /// The `backendOrigin` that reaches this listener.
+    pub fn origin(&self) -> String {
+        desktop_backend_origin(self.port)
     }
 
-    /// Serves until `stop` resolves or is dropped.
+    /// Serves TLS until `stop` resolves or is dropped.
     pub async fn serve(
         self,
         relay: Arc<DesktopBackendRelay>,
+        tls: Arc<rustls::ServerConfig>,
         stop: tokio::sync::oneshot::Receiver<()>,
     ) {
         let app = guarded_router(relay, self.port);
-        let servers = futures_util::future::join_all(self.listeners.into_iter().map(|listener| {
-            let app = app.clone();
-            async move { axum::serve(listener, app).await }
-        }));
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+        let servers = futures_util::future::join_all(
+            self.listeners
+                .into_iter()
+                .map(|listener| serve_tls(listener, acceptor.clone(), app.clone())),
+        );
         tokio::select! {
             _ = servers => {}
             _ = stop => {}
         }
+    }
+}
+
+/// How long a connection may take to finish its TLS handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Accepts TLS connections and serves `app` on each, with upgrades so the
+/// dictation WebSocket works. Connections live in a set owned by this future,
+/// so stopping the relay closes Desktop's kept-alive ones too.
+pub async fn serve_tls(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, app: Router) {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        while connections.try_join_next().is_some() {}
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                log::warn!("[DesktopBackend] accept failed: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        connections.spawn(async move {
+            let stream =
+                match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        // An untrusted certificate shows up here as the client
+                        // aborting the handshake.
+                        log::debug!("[DesktopBackend] TLS handshake failed: {error}");
+                        return;
+                    }
+                    Err(_) => return,
+                };
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
     }
 }
 
@@ -143,10 +191,10 @@ fn is_web_page_origin(origin: &axum::http::HeaderValue) -> bool {
     origin.starts_with("http:") || origin.starts_with("https:")
 }
 
-/// Host values a browser or Electron sends for `localhost` on `port`.
+/// Host values a browser or Electron sends for `https://localhost` on `port`.
 fn accepted_hosts(port: u16) -> Vec<String> {
     let mut hosts = vec![format!("localhost:{port}")];
-    if port == 80 {
+    if port == 443 {
         hosts.push("localhost".into());
     }
     hosts
@@ -184,19 +232,17 @@ pub fn guarded_router(relay: Arc<DesktopBackendRelay>, port: u16) -> Router {
 #[derive(Clone)]
 pub struct DesktopBackendRelay {
     backend: String,
-    appcast: String,
     client: reqwest::Client,
 }
 
 impl DesktopBackendRelay {
     pub fn production() -> Self {
-        Self::with_upstreams(PRODUCTION_BACKEND, PRODUCTION_APPCAST)
+        Self::with_backend(PRODUCTION_BACKEND)
     }
 
-    pub fn with_upstreams(backend: impl Into<String>, appcast: impl Into<String>) -> Self {
+    pub fn with_backend(backend: impl Into<String>) -> Self {
         Self {
             backend: backend.into().trim_end_matches('/').to_string(),
-            appcast: appcast.into(),
             client: reqwest::Client::builder()
                 // Desktop sends these with `redirect: "error"`; following one
                 // here would hide it.
@@ -210,8 +256,7 @@ impl DesktopBackendRelay {
 
 pub fn router(relay: Arc<DesktopBackendRelay>) -> Router {
     Router::new()
-        .route("/desktop-backend/backend-api/{*rest}", any(relay_backend))
-        .route(DESKTOP_APPCAST_PATH, get(relay_appcast))
+        .route("/backend-api/{*rest}", any(relay_backend))
         .with_state(relay)
 }
 
@@ -279,26 +324,6 @@ async fn relay_backend(
     match usage {
         Some(shape) if upstream.status().is_success() => unlimited_usage(upstream, shape).await,
         _ => passthrough(upstream),
-    }
-}
-
-async fn relay_appcast(
-    State(relay): State<Arc<DesktopBackendRelay>>,
-    request: Request,
-) -> Response {
-    let mut url = relay.appcast.clone();
-    if let Some(query) = request.uri().query() {
-        url.push('?');
-        url.push_str(query);
-    }
-    // Public feed: nothing from the caller is forwarded but what it accepts.
-    let mut builder = relay.client.get(url);
-    if let Some(accept) = request.headers().get(axum::http::header::ACCEPT) {
-        builder = builder.header(axum::http::header::ACCEPT, accept.clone());
-    }
-    match builder.send().await {
-        Ok(response) => passthrough(response),
-        Err(error) => bad_gateway(&error),
     }
 }
 
@@ -608,6 +633,7 @@ pub fn mark_unlimited(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::get;
     use serde_json::json;
 
     fn exhausted() -> Value {
@@ -715,13 +741,12 @@ mod tests {
             }),
         ))
         .await;
-        let relay = serve(router(Arc::new(DesktopBackendRelay::with_upstreams(
+        let relay = serve(router(Arc::new(DesktopBackendRelay::with_backend(
             format!("http://{upstream}/backend-api"),
-            format!("http://{upstream}/appcast"),
         ))))
         .await;
 
-        let mut request = format!("ws://{relay}/desktop-backend/backend-api/dictation/stream")
+        let mut request = format!("ws://{relay}/backend-api/dictation/stream")
             .into_client_request()
             .unwrap();
         request
@@ -747,19 +772,18 @@ mod tests {
         assert!(usage_shape("wham/tasks/list").is_none());
     }
 
-    /// Desktop's own allowlist: exact host `localhost` or `localhost:8000`.
+    /// Desktop's two rules for the origin: `https:` and already in origin
+    /// form, and a host its login allowlist names exactly (`localhost` or
+    /// `localhost:8000`).
     #[test]
-    fn base_urls_are_ones_desktop_will_send_its_login_to() {
-        assert_eq!(
-            desktop_backend_base_url(80),
-            "http://localhost/desktop-backend/backend-api"
-        );
-        assert_eq!(
-            desktop_backend_base_url(8000),
-            "http://localhost:8000/desktop-backend/backend-api"
-        );
+    fn origins_are_ones_desktop_will_route_to_and_send_its_login_to() {
+        assert_eq!(desktop_backend_origin(443), "https://localhost");
+        assert_eq!(desktop_backend_origin(8000), "https://localhost:8000");
         for port in DESKTOP_RELAY_PORTS {
-            let url = url::Url::parse(&desktop_backend_base_url(port)).unwrap();
+            let origin = desktop_backend_origin(port);
+            let url = url::Url::parse(&origin).unwrap();
+            assert_eq!(url.scheme(), "https");
+            assert_eq!(url.origin().ascii_serialization(), origin);
             let host = match url.port() {
                 Some(port) => format!("{}:{port}", url.host_str().unwrap()),
                 None => url.host_str().unwrap().to_string(),
@@ -779,13 +803,12 @@ mod tests {
     #[tokio::test]
     async fn browser_pages_and_foreign_hosts_are_refused() {
         use tower::ServiceExt;
-        let relay = Arc::new(DesktopBackendRelay::with_upstreams(
+        let relay = Arc::new(DesktopBackendRelay::with_backend(
             "http://127.0.0.1:9/backend-api",
-            "http://127.0.0.1:9/appcast",
         ));
         let send = |port: u16, host: &str, origin: Option<&str>| {
             let mut builder = axum::http::Request::builder()
-                .uri("/desktop-backend/backend-api/wham/usage")
+                .uri("/backend-api/wham/usage")
                 .header("host", host);
             if let Some(origin) = origin {
                 builder = builder.header("origin", origin);
@@ -795,18 +818,18 @@ mod tests {
         let status = |response: Response| response.status();
         assert_eq!(
             status(
-                send(80, "localhost", Some("https://evil.example"))
+                send(443, "localhost", Some("https://evil.example"))
                     .await
                     .unwrap()
             ),
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            status(send(80, "localhost", Some("app://-")).await.unwrap()),
+            status(send(443, "localhost", Some("app://-")).await.unwrap()),
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(
-            status(send(80, "evil.example", None).await.unwrap()),
+            status(send(443, "evil.example", None).await.unwrap()),
             StatusCode::MISDIRECTED_REQUEST
         );
         assert_eq!(
@@ -815,7 +838,7 @@ mod tests {
         );
         // Admitted: reaches the (closed) upstream and reports it.
         assert_eq!(
-            status(send(80, "localhost", None).await.unwrap()),
+            status(send(443, "localhost", None).await.unwrap()),
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(
@@ -854,16 +877,12 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, upstream).await;
         });
-        let relay = router(Arc::new(DesktopBackendRelay::with_upstreams(
-            format!("http://{address}/backend-api"),
-            format!("http://{address}/appcast"),
-        )));
+        let relay = router(Arc::new(DesktopBackendRelay::with_backend(format!(
+            "http://{address}/backend-api"
+        ))));
         for (path, unlimited) in [
-            ("/desktop-backend/backend-api/wham/usage", true),
-            (
-                "/desktop-backend/backend-api/wham/tasks/list?limit=5",
-                false,
-            ),
+            ("/backend-api/wham/usage", true),
+            ("/backend-api/wham/tasks/list?limit=5", false),
         ] {
             let response = relay
                 .clone()
@@ -889,5 +908,64 @@ mod tests {
         assert!(seen
             .iter()
             .all(|(_, auth)| auth.as_deref() == Some("Bearer desktop-login")));
+    }
+
+    /// What Desktop does once the bridge has pointed it here: an `https:`
+    /// request to `localhost`, trusting the relay's certificate, with usage
+    /// coming back unlimited and everything else untouched.
+    #[tokio::test]
+    async fn desktop_reaches_the_relay_over_tls() {
+        let upstream = Router::new().route(
+            "/backend-api/{*rest}",
+            any(|| async {
+                axum::Json(json!({"rate_limit": {"allowed": false, "limit_reached": true}}))
+            }),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let certificate =
+            crate::desktop_backend_tls::LocalhostCertificate::load_or_create(dir.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let relay = Arc::new(DesktopBackendRelay::with_backend(format!(
+            "http://{upstream_address}/backend-api"
+        )));
+        tokio::spawn(serve_tls(
+            listener,
+            tokio_rustls::TlsAcceptor::from(certificate.server_config().unwrap()),
+            guarded_router(relay, port),
+        ));
+
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_der(certificate.der()).unwrap())
+            .resolve(
+                "localhost",
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+            .build()
+            .unwrap();
+        let usage: Value = client
+            .get(format!("https://localhost:{port}/backend-api/wham/usage"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(usage["rate_limit"]["limit_reached"], false);
+        let other: Value = client
+            .get(format!("https://localhost:{port}/backend-api/me"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(other["rate_limit"]["limit_reached"], true);
     }
 }
