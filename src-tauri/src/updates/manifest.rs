@@ -336,6 +336,82 @@ pub fn current_arch() -> &'static str {
     }
 }
 
+/// The machine an asset will run on: this one for Desktop and Core, the SSH
+/// host for Remote. Values use the manifest vocabulary (`windows`/`macos`/
+/// `linux`, `x64`/`arm64`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetTarget {
+    pub platform: String,
+    pub arch: String,
+}
+
+impl AssetTarget {
+    pub fn local() -> Self {
+        Self {
+            platform: current_platform().into(),
+            arch: current_arch().into(),
+        }
+    }
+}
+
+/// One release carries every platform's files, and a bundled release also
+/// carries other layers' files (a Desktop manifest has listed the core
+/// archives and the `.dmg`). Matching OS/arch alone picked the first of those,
+/// so each layer only accepts the one kind of file it can install.
+pub fn select_asset<'a>(
+    manifest: &'a UpdateManifest,
+    component: UpdateComponent,
+    target: &AssetTarget,
+) -> Option<&'a AssetRef> {
+    let core_asset = manifest
+        .core
+        .as_ref()
+        .filter(|_| component == UpdateComponent::Core)
+        .and_then(|core| core.target(&target.platform, &target.arch))
+        .map(|core_target| core_target.asset.as_str());
+    manifest.assets.iter().find(|asset| {
+        asset.platform == target.platform
+            && asset.arch == target.arch
+            && match component {
+                UpdateComponent::Desktop => is_desktop_installer(&asset.name, &asset.platform),
+                UpdateComponent::Remote => is_remote_package(&asset.name),
+                UpdateComponent::Core => match core_asset {
+                    Some(name) => asset.name == name,
+                    None => is_core_archive(&asset.name),
+                },
+            }
+    })
+}
+
+/// Remote releases hold one package per host platform; the host is chosen
+/// only at download time, so a release qualifies if it has any package.
+pub fn has_remote_package(manifest: &UpdateManifest) -> bool {
+    manifest
+        .assets
+        .iter()
+        .any(|asset| is_remote_package(&asset.name))
+}
+
+fn is_desktop_installer(name: &str, platform: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    match platform {
+        "windows" => name.ends_with("-setup.exe"),
+        "macos" => name.ends_with(".app.tar.gz"),
+        _ => false,
+    }
+}
+
+fn is_remote_package(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("vellum-remote-") && name.ends_with(".tar.gz")
+}
+
+fn is_core_archive(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".tgz")
+}
+
 pub fn sign_raw(raw: &[u8], signing: &ed25519_dalek::SigningKey) -> [u8; 64] {
     use ed25519_dalek::Signer;
     signing.sign(raw).to_bytes()
@@ -393,6 +469,118 @@ pub(crate) fn normalize_semver(value: &str) -> String {
 
 pub fn parse_version(value: &str) -> Option<semver::Version> {
     semver::Version::parse(&normalize_semver(value)).ok()
+}
+
+#[cfg(test)]
+mod asset_selection_tests {
+    use super::*;
+
+    fn asset(platform: &str, arch: &str, name: &str) -> AssetRef {
+        AssetRef {
+            platform: platform.into(),
+            arch: arch.into(),
+            name: name.into(),
+            size: 1,
+            sha256: "aa".into(),
+        }
+    }
+
+    fn target(platform: &str, arch: &str) -> AssetTarget {
+        AssetTarget {
+            platform: platform.into(),
+            arch: arch.into(),
+        }
+    }
+
+    /// Asset order of the published `desktop-v0.2.10-nightly.20260914.2.1`
+    /// manifest: core archives sort before the installers.
+    fn bundled_desktop_manifest() -> UpdateManifest {
+        UpdateManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            component: UpdateComponent::Desktop,
+            version: "0.2.10".into(),
+            source_commit: "c".into(),
+            release_tag: "desktop-v0.2.10".into(),
+            sequence: 1,
+            key_id: "k".into(),
+            prerelease: true,
+            release_notes: None,
+            min_desktop_version: "0.2.0".into(),
+            bridge_api_compat: CompatRange::new("*"),
+            remote_protocol_compat: CompatRange::new("*"),
+            data_format: DataFormat::default(),
+            assets: vec![
+                asset(
+                    "macos",
+                    "arm64",
+                    "enhanced-codex-core-aarch64-apple-darwin.tar.gz",
+                ),
+                asset(
+                    "windows",
+                    "x64",
+                    "enhanced-codex-core-x86_64-pc-windows-msvc.zip",
+                ),
+                asset("macos", "arm64", "Vellum_0.2.10_aarch64-macos-arm64.dmg"),
+                asset("windows", "x64", "Vellum_0.2.10_x64-setup.exe"),
+                asset("macos", "arm64", "Vellum-macos-arm64.app.tar.gz"),
+            ],
+            core: None,
+        }
+    }
+
+    #[test]
+    fn desktop_picks_the_installer_not_a_bundled_core_or_dmg() {
+        let manifest = bundled_desktop_manifest();
+        let pick = |platform, arch| {
+            select_asset(&manifest, UpdateComponent::Desktop, &target(platform, arch))
+                .map(|asset| asset.name.as_str())
+        };
+        assert_eq!(pick("windows", "x64"), Some("Vellum_0.2.10_x64-setup.exe"));
+        assert_eq!(
+            pick("macos", "arm64"),
+            Some("Vellum-macos-arm64.app.tar.gz")
+        );
+        assert_eq!(pick("macos", "x64"), None);
+        assert_eq!(pick("linux", "x64"), None);
+    }
+
+    #[test]
+    fn core_picks_the_archive_its_manifest_names() {
+        let mut manifest = bundled_desktop_manifest();
+        manifest.component = UpdateComponent::Core;
+        assert_eq!(
+            select_asset(&manifest, UpdateComponent::Core, &target("windows", "x64"))
+                .map(|asset| asset.name.as_str()),
+            Some("enhanced-codex-core-x86_64-pc-windows-msvc.zip")
+        );
+    }
+
+    #[test]
+    fn remote_picks_the_package_for_the_host_not_this_machine() {
+        let mut manifest = bundled_desktop_manifest();
+        manifest.component = UpdateComponent::Remote;
+        manifest.assets = vec![
+            asset("linux", "arm64", "vellum-remote-linux-arm64.tar.gz"),
+            asset("linux", "x64", "vellum-remote-linux-x64.tar.gz"),
+            asset("macos", "arm64", "vellum-remote-darwin-arm64.tar.gz"),
+        ];
+        let pick = |platform, arch| {
+            select_asset(&manifest, UpdateComponent::Remote, &target(platform, arch))
+                .map(|asset| asset.name.as_str())
+        };
+        assert_eq!(pick("linux", "x64"), Some("vellum-remote-linux-x64.tar.gz"));
+        assert_eq!(
+            pick("linux", "arm64"),
+            Some("vellum-remote-linux-arm64.tar.gz")
+        );
+        assert_eq!(
+            pick("macos", "arm64"),
+            Some("vellum-remote-darwin-arm64.tar.gz")
+        );
+        assert_eq!(pick("windows", "x64"), None);
+        assert!(has_remote_package(&manifest));
+        assert!(!has_remote_package(&bundled_desktop_manifest()));
+    }
 }
 
 #[cfg(test)]

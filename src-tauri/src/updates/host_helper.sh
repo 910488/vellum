@@ -76,6 +76,28 @@ guard_tar_members() {
   done <"$list"
 }
 
+host_platform() {
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+  esac
+  printf '%s-%s\n' "$os" "$arch"
+}
+
+guard_platform() {
+  # Packages are one platform directory (linux-amd64, linux-arm64,
+  # darwin-arm64). Refuse another platform's package here, before the running
+  # set is stopped: its binaries would not start and the host would stay down.
+  want=$(host_platform)
+  top=$(sed -n '/./{s#^\./##;s#/.*##;p;q;}' "$ROOT/tar-members.txt")
+  if [ "$top" != "$want" ]; then
+    echo "platformMismatch: package is for ${top:-unknown}, host is $want" >&2
+    exit 1
+  fi
+}
+
 proxy_image_from_expected() {
   [ -f "$EXPECTED" ] || return 0
   sed -n 's/.*"proxyImage"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p; s/.*"proxy_image"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$EXPECTED" | head -1
@@ -184,6 +206,7 @@ apply_locked() {
     verify_package
     require_replace_space
     guard_tar_members
+    guard_platform
     tar -xzf "$PKG" -C "$STAGE"
     record stage
   fi

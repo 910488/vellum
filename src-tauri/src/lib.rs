@@ -82,24 +82,35 @@ fn toggle_proxy_from_tray(app: &tauri::AppHandle) {
 
 fn shutdown_proxy_and_restore(app: &tauri::AppHandle, apply_desktop_update: bool) {
     let state = app.state::<AppState>().clone();
-    // Exit, tray Stop, and the explicit Stop command share one teardown. This
-    // is also where the Enhanced CODEX_CLI_PATH lease is released; keeping a
-    // duplicate exit-only restore path previously left the bridge armed.
     tauri::async_runtime::block_on(async move {
-        if let Err(error) = crate::commands::proxy::stop_proxy_gracefully(&state).await {
-            log::error!("[Codex] 結束前還原 Proxy/Enhanced 啟動接管失敗：{error}");
-        }
-        // The lease is back, but Codex Desktop still runs the bridge and the
-        // Enhanced core it started; closing Vellum has to end those too.
-        crate::commands::proxy::stop_enhanced_sidecars();
-        // Hiding the main window leaves this process alive, so an installer
-        // may only start for the tray's explicit process exit.
-        if apply_desktop_update {
-            if let Err(error) = crate::updates::apply_staged_on_exit(&state) {
-                log::error!("[Updates] exit-time desktop apply failed: {error}");
-            }
-        }
+        shutdown_for_exit(&state, apply_desktop_update).await;
     });
+}
+
+/// Exit, tray Stop, the explicit Stop command, and restart-to-update share one
+/// teardown. This is also where the Enhanced CODEX_CLI_PATH lease is released;
+/// keeping a duplicate exit-only restore path previously left the bridge
+/// armed. Returns the Desktop apply outcome when one was requested.
+pub(crate) async fn shutdown_for_exit(
+    state: &AppState,
+    apply_desktop_update: bool,
+) -> Option<error::AppResult<crate::updates::UpdateOperation>> {
+    if let Err(error) = crate::commands::proxy::stop_proxy_gracefully(state).await {
+        log::error!("[Codex] 結束前還原 Proxy/Enhanced 啟動接管失敗：{error}");
+    }
+    // The lease is back, but Codex Desktop still runs the bridge and the
+    // Enhanced core it started; closing Vellum has to end those too.
+    crate::commands::proxy::stop_enhanced_sidecars();
+    // Hiding the main window leaves this process alive, so an installer
+    // may only start when the process is about to exit.
+    if !apply_desktop_update {
+        return None;
+    }
+    let applied = crate::updates::apply_staged_on_exit(state);
+    if let Err(error) = &applied {
+        log::error!("[Updates] exit-time desktop apply failed: {error}");
+    }
+    Some(applied)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -142,6 +153,13 @@ pub fn run() {
                 }
             }
             let data_root = app.state::<AppState>().data_root();
+            // Before the auto check: a check rewrites the Desktop layer, and
+            // only this launch can tell whether the last installer worked.
+            match crate::updates::reconcile_desktop_after_restart(&app.state::<AppState>()) {
+                Ok(Some(phase)) => log::info!("[Updates] desktop update settled: {phase:?}"),
+                Ok(None) => {}
+                Err(error) => log::warn!("[Updates] cannot settle desktop update: {error}"),
+            }
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
             let boot = crate::boot::record_boot(&data_root);
@@ -301,6 +319,7 @@ pub fn run() {
             commands::set_update_preferences,
             commands::download_update,
             commands::apply_update,
+            commands::restart_to_apply_desktop_update,
             commands::cancel_update_download,
             commands::rollback_update,
             commands::set_remote_update_policy,

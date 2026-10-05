@@ -1246,6 +1246,11 @@ export const api = {
     if (!hasTauri()) return delay({ operationId: "preview", component, phase: "waitingForRestart", targetVersion: null });
     return call<UpdateOperation>("apply_update", { component, hostId });
   },
+  /** Installs the staged Vellum update: stops the proxy, starts the installer, and exits. */
+  restartToApplyDesktopUpdate(): Promise<UpdateOperation> {
+    if (!hasTauri()) return delay({ operationId: "preview", component: "desktop", phase: "applying", targetVersion: null });
+    return call<UpdateOperation>("restart_to_apply_desktop_update");
+  },
   cancelUpdateDownload(component: UpdateComponent): Promise<UpdateOperation> {
     if (!hasTauri()) return delay({ operationId: "preview", component, phase: "available", targetVersion: null });
     return call<UpdateOperation>("cancel_update_download", { component });
