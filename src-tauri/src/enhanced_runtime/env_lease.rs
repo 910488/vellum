@@ -85,7 +85,16 @@ pub fn release_backend_base_url(data_root: &Path) -> Result<ReleaseOutcome, Envi
 
 pub fn names_vellum_backend_relay(value: &str) -> bool {
     let value = value.trim_end_matches('/');
-    value.starts_with("http://127.0.0.1:") && value.ends_with(BACKEND_RELAY_PATH)
+    // Current relays are on localhost; 127.0.0.1 is what the first release
+    // leased, and a leftover of it must still read as ours.
+    [
+        "http://localhost/",
+        "http://localhost:",
+        "http://127.0.0.1:",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+        && value.ends_with(BACKEND_RELAY_PATH)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,7 +531,11 @@ mod tests {
     #[test]
     fn an_earlier_vellum_relay_on_another_port_is_ours_to_replace() {
         let current = "http://127.0.0.1:15721/desktop-backend/backend-api".to_string();
-        let requested = "http://127.0.0.1:15722/desktop-backend/backend-api".to_string();
+        let requested = "http://localhost/desktop-backend/backend-api".to_string();
+        assert!(names_vellum_backend_relay(&requested));
+        assert!(names_vellum_backend_relay(
+            "http://localhost:8000/desktop-backend/backend-api"
+        ));
         assert!(names_vellum_backend_relay(&current));
         assert!(!names_vellum_backend_relay(
             "https://chatgpt.com/backend-api"
