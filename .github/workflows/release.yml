@@ -245,7 +245,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - run: pnpm install --frozen-lockfile
       - name: Require embedded update trust
         run: |
@@ -318,7 +318,7 @@ jobs:
         with:
           tag: ${{ needs.resolve.outputs.tag }}
           enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: aarch64-apple-darwin
       - name: Build Darwin remote payload
@@ -468,7 +468,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - run: pnpm install --frozen-lockfile
       - name: Require signing key
         env:

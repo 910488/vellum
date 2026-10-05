@@ -14,6 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-toolchain-pin:
+    name: Rust toolchain pin is consistent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # dtolnay/rust-toolchain cannot read rust-toolchain.toml, so the version
+      # lives in both places. Fail when any workflow ref drifts from the file.
+      - name: Compare rust-toolchain.toml with workflow refs
+        run: |
+          pinned="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$pinned" || { echo "rust-toolchain.toml has no channel"; exit 1; }
+          drift="$(grep -rnE 'uses: *dtolnay/rust-toolchain@' .github/workflows | grep -vF "dtolnay/rust-toolchain@$pinned" || true)"
+          if [ -n "$drift" ]; then
+            echo "rust-toolchain.toml pins $pinned, but these workflow refs differ:"
+            echo "$drift"
+            exit 1
+          fi
+          echo "All workflow toolchain refs use $pinned"
+
   update-signing-key:
     name: Update signing key matches public key
     if: github.event_name == 'push'
@@ -92,7 +111,7 @@ jobs:
           cache: pnpm
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
 
@@ -147,7 +166,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
 
@@ -203,7 +222,7 @@ jobs:
           cache: pnpm
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
 
@@ -243,7 +262,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: aarch64-apple-darwin
           components: clippy

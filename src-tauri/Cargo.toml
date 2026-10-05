@@ -5,7 +5,7 @@ description = "Vellum — 本機代理管理器"
 authors = ["Josh Huang"]
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.85.0"
+rust-version = "1.99.0"
 autobins = false
 default-run = "vellum-proxy-desktop"
 

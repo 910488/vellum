@@ -1,0 +1,8 @@
+# Local builds and CI use this exact compiler. New clippy lints arrive with new
+# Rust releases and CI runs clippy with `-D warnings`, so an unpinned `stable`
+# turns CI red without any code change. Upgrade deliberately: bump this version
+# and the `dtolnay/rust-toolchain@<version>` refs in .github/workflows together;
+# the CI job "Rust toolchain pin is consistent" fails if they differ.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
