@@ -88,13 +88,15 @@ enum InstallError {
     Unavailable(String),
 }
 
-fn quiet(mut command: Command) -> Command {
+fn quiet(command: Command) -> Command {
     #[cfg(windows)]
-    {
+    let command = {
         use std::os::windows::process::CommandExt;
+        let mut command = command;
         // No console window; the trust dialog is a GUI prompt of its own.
         command.creation_flags(0x08000000);
-    }
+        command
+    };
     command
 }
 
