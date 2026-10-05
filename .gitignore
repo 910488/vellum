@@ -9,6 +9,7 @@ src-tauri/gen/
 *.local
 .DS_Store
 __pycache__/
+.venv/
 logs/
 artifacts/
 issue*_body.json
@@ -49,6 +50,7 @@ qa/reports/**/*.html
 .worktrees/
 .pnpm-store/
 .claude/
+.vscode/settings.json
 
 # Staged App Server bridge sidecar (scripts/build-sidecar.mjs); built per release.
 src-tauri/binaries/*

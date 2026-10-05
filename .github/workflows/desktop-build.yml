@@ -68,7 +68,7 @@ jobs:
           node-version: 22
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: aarch64-apple-darwin
 
@@ -112,7 +112,7 @@ jobs:
           cache: pnpm
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -175,7 +175,7 @@ jobs:
           cache: pnpm
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2

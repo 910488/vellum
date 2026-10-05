@@ -1,0 +1,12 @@
+# Python tooling for evals/tools (SWE-bench preparation and grading) and
+# src-tauri/icons/make_icon.py. The app itself is Rust + Node and needs none of this.
+# Tested with Python 3.12.
+#
+#   python -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+datasets==5.0.1
+docker==7.2.0
+pandas==3.0.6
+pillow==12.3.0
+pyarrow==25.0.1
+swebench==5.0.2
