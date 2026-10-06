@@ -85,6 +85,29 @@ fn bridge_is_started_by_codex_desktop() -> bool {
         .is_some_and(super::desktop_manager::is_known_codex_desktop_executable)
 }
 
+/// Where Vellum advertises its backend relay, for a bridge that answers
+/// Desktop's own `account/read`. Only the bridge Desktop itself started
+/// speaks for Desktop's backend; a gate or test run leaves it alone.
+fn desktop_backend_relay(manifest: &LaunchManifestV1, adopted_by_desktop: bool) -> Option<PathBuf> {
+    adopted_by_desktop
+        .then(|| super::backend_relay::advertisement_path_beside(&manifest.attestation_path))
+        .flatten()
+}
+
+/// Desktop takes its backend origin from an `account/read` response; while
+/// Vellum's relay is up, that origin is the relay.
+fn route_desktop_backend_to_relay(relay: Option<&Path>, response: &mut Value) {
+    let Some(path) = relay else {
+        return;
+    };
+    let Some(result) = response.get_mut("result") else {
+        return;
+    };
+    if let Some(origin) = super::backend_relay::live_relay_origin(path) {
+        super::backend_relay::route_workspace_to_relay(result, &origin);
+    }
+}
+
 fn should_isolate_bridge_state(adopted_by_desktop: bool, canonical_is_live: bool) -> bool {
     !adopted_by_desktop && canonical_is_live
 }
@@ -363,12 +386,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         attestation,
         journal,
     );
-    // Only the bridge Desktop itself started speaks for Desktop's backend; a
-    // gate or test run of the bridge leaves `account/read` alone.
-    if adopted_by_desktop {
-        state.backend_relay =
-            super::backend_relay::advertisement_path_beside(&manifest.attestation_path);
-    }
+    state.backend_relay = desktop_backend_relay(&manifest, adopted_by_desktop);
     // Desktop builds currently ship without the optional relay sidecar, so
     // this is the production bridge path. Keep the same launch-scoped
     // observation file the relay path writes; otherwise the Enhanced Core tab
@@ -1167,18 +1185,8 @@ impl BridgeState {
         Ok(vec![BridgeAction::ToClient(value)])
     }
 
-    /// Desktop takes its backend origin from this response; while Vellum's
-    /// relay is up, that origin is the relay.
     fn route_desktop_backend_to_relay(&self, response: &mut Value) {
-        let Some(path) = self.backend_relay.as_deref() else {
-            return;
-        };
-        let Some(result) = response.get_mut("result") else {
-            return;
-        };
-        if let Some(origin) = super::backend_relay::live_relay_origin(path) {
-            super::backend_relay::route_workspace_to_relay(result, &origin);
-        }
+        route_desktop_backend_to_relay(self.backend_relay.as_deref(), response);
     }
 
     fn bind_spawned_agent_threads(
