@@ -341,12 +341,26 @@ fn is_remote_acceptance_method(method: &str) -> bool {
     )
 }
 
+/// Only Desktop (client 0) reaches the backend relay on localhost; a phone
+/// keeps the backend origin it was given.
+fn route_desktop_account_read(
+    client: u64,
+    method: Option<&str>,
+    relay: Option<&Path>,
+    response: &mut Value,
+) {
+    if client == 0 && method == Some("account/read") {
+        route_desktop_backend_to_relay(relay, response);
+    }
+}
+
 async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     let m = &config.manifest;
     let relay_identity = m
         .relay
         .as_ref()
         .ok_or_else(|| BridgeError::Protocol("relay not configured".into()))?;
+    let backend_relay = desktop_backend_relay(m, bridge_is_started_by_codex_desktop());
     // Kernel-held lock: a stale file is never interpreted as a live owner.
     let owner_path = m.official.codex_home.join("vellum-relay-owner.lock");
     let owner = std::fs::OpenOptions::new()
@@ -673,6 +687,12 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                         let initialized = client == 0
                             && method.as_deref() == Some("initialize")
                             && value.get("error").is_none();
+                        route_desktop_account_read(
+                            client,
+                            method.as_deref(),
+                            backend_relay.as_deref(),
+                            &mut value,
+                        );
                         if client != 0 {
                             if value.get("error").is_some() {
                                 if method.as_deref().is_some_and(is_remote_acceptance_method) {
@@ -820,5 +840,32 @@ mod tests {
             connected
         );
         assert_eq!(status.on_status(connected), None, "do not duplicate");
+    }
+
+    #[test]
+    fn only_desktops_account_read_is_pointed_at_the_relay() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        crate::enhanced_runtime::backend_relay::advertise(
+            temp.path(),
+            &crate::enhanced_runtime::backend_relay::RelayAdvertisement {
+                origin: "https://localhost".into(),
+                port: listener.local_addr().unwrap().port(),
+                certificate_sha256: "00".into(),
+            },
+        )
+        .unwrap();
+        let relay = crate::enhanced_runtime::backend_relay::advertisement_path(temp.path());
+        let origin = |client, method| {
+            let mut response = json!({"id": 1, "result": {
+                "account": {"type": "chatgpt"},
+                "workspaceRouting": {"chatgptAccountId": "acct", "backendOrigin": "https://chatgpt.com"}
+            }});
+            route_desktop_account_read(client, Some(method), Some(&relay), &mut response);
+            response["result"]["workspaceRouting"]["backendOrigin"].clone()
+        };
+        assert_eq!(origin(0, "account/read"), "https://localhost");
+        assert_eq!(origin(1, "account/read"), "https://chatgpt.com");
+        assert_eq!(origin(0, "config/read"), "https://chatgpt.com");
     }
 }
