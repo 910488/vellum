@@ -1,6 +1,12 @@
-//! Session-aware quota allocation. Scores are heuristics in percentage points,
-//! not a conversion between tokens and subscription allowance. No prompts,
-//! credentials, or raw conversation identities are retained here.
+//! Session-aware quota allocation. No prompts, credentials, or raw
+//! conversation identities are retained here.
+//!
+//! Accounts differ in size, not only in how full they are: 10% left on a Pro
+//! account outlasts 50% left on a Plus one. The usage endpoint reports only
+//! percentages, so each account's size is a relative capacity — a prior from
+//! its plan, replaced by a measurement once Vellum has routed enough tokens
+//! through it to move its weekly percentage. New conversations go where the
+//! active context load is smallest relative to the capacity still left.
 
 use std::collections::HashMap;
 use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
@@ -8,10 +14,70 @@ use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
 const IDLE_MS: u64 = 30 * 60 * 1000;
 const MAX_SESSIONS: usize = 1024;
 const MAX_REQUESTS: usize = 4096;
+/// A calibration sample needs the weekly percentage to have moved this much,
+/// so integer rounding in the usage report stays a small error.
+const CALIBRATION_MIN_POINTS: f64 = 2.0;
+const CALIBRATION_MIN_TOKENS: f64 = 20_000.0;
+/// Cached input is billed at a fraction of fresh input.
+const CACHED_TOKEN_WEIGHT: f64 = 0.1;
 
 pub(crate) struct Candidate {
     pub account_id: String,
+    /// Spendable fraction left, 0–100, after floors and reserves.
     pub headroom: f64,
+    /// Relative account size from the plan; Plus is 1.
+    pub capacity_prior: f64,
+    /// Raw weekly used percentage, the calibration signal.
+    pub weekly_used: Option<f64>,
+}
+
+/// Relative weekly allowance by plan. Only a starting point: ChatGPT may
+/// report both Pro tiers as `pro`, and workspace plans vary by seat, so
+/// measured throughput replaces this as soon as there is one.
+pub(crate) fn plan_capacity_prior(plan_type: Option<&str>) -> f64 {
+    let plan = plan_type.map(|plan| plan.trim().to_ascii_lowercase());
+    match plan.as_deref() {
+        Some(plan) if plan.contains("lite") || plan.contains("5x") => 5.0,
+        Some(plan) if plan.starts_with("pro") => 20.0,
+        _ => 1.0,
+    }
+}
+
+/// Tokens Vellum routed through one account since its weekly percentage was
+/// last read, and the measured tokens per weekly point. Usage spent outside
+/// Vellum on the same account reads as a smaller account, which errs toward
+/// sending it less.
+#[derive(Default)]
+struct Calibration {
+    anchor_used: Option<f64>,
+    tokens_since: f64,
+    tokens_per_point: Option<f64>,
+}
+
+impl Calibration {
+    fn update(&mut self, used: f64) {
+        match self.anchor_used {
+            Some(anchor) if used + 0.5 < anchor => {
+                // The weekly window reset; start over from the new baseline.
+                self.anchor_used = Some(used);
+                self.tokens_since = 0.0;
+            }
+            Some(anchor)
+                if used - anchor >= CALIBRATION_MIN_POINTS
+                    && self.tokens_since >= CALIBRATION_MIN_TOKENS =>
+            {
+                let sample = self.tokens_since / (used - anchor);
+                self.tokens_per_point = Some(
+                    self.tokens_per_point
+                        .map_or(sample, |previous| 0.5 * previous + 0.5 * sample),
+                );
+                self.anchor_used = Some(used);
+                self.tokens_since = 0.0;
+            }
+            Some(_) => {}
+            None => self.anchor_used = Some(used),
+        }
+    }
 }
 
 struct Session {
@@ -34,6 +100,8 @@ struct RequestBinding {
 pub(crate) struct SmartRouter {
     sessions: HashMap<String, Session>,
     requests: HashMap<String, RequestBinding>,
+    /// Account size outlives sessions and settings changes.
+    calibration: HashMap<String, Calibration>,
 }
 
 impl SmartRouter {
@@ -64,6 +132,7 @@ impl SmartRouter {
             // guessing which account owns an account-scoped continuation.
             return (0, "unidentified_session_rank");
         };
+        let capacities = self.capacities(candidates);
         let previous = self.sessions.get(key);
         let incumbent = previous.and_then(|session| {
             candidates
@@ -92,19 +161,21 @@ impl SmartRouter {
                 loads[index] = loads[index].saturating_add(session.tokens);
             }
         }
-        let total = loads
-            .iter()
-            .fold(tokens, |sum, load| sum.saturating_add(*load))
-            .max(1) as f64;
-        let score = |index: usize| {
-            candidates[index].headroom - 20.0 * (loads[index].saturating_add(tokens) as f64 / total)
+        // Active context per unit of capacity still left. Equal-sized accounts
+        // reduce to headroom and load; a 20x account takes twenty
+        // conversations for every one a Plus account takes at equal fullness.
+        let pressure = |index: usize| {
+            loads[index].saturating_add(tokens) as f64
+                / (candidates[index].headroom.max(0.01) * capacities[index])
         };
         let mut best = 0;
         for index in 1..candidates.len() {
-            if score(index) > score(best) + 0.001 {
+            if pressure(index) < pressure(best) * (1.0 - 1e-9) {
                 best = index;
             }
         }
+        // How much less loaded `to` is than `from`, in points out of 100.
+        let advantage = |from: usize, to: usize| 100.0 * (1.0 - pressure(to) / pressure(from));
         let (selected, reason) = match incumbent {
             // Preserve warm cache and provider continuation affinity. Account
             // changes mid-window happen only when the incumbent fails a gate.
@@ -116,7 +187,7 @@ impl SmartRouter {
                     .filter(|window| *window > 0)
                     .map_or(0.0, |window| (tokens as f64 / window as f64).min(1.0));
                 let switching_cost = 15.0 + 25.0 * cache_ratio + 25.0 * pressure;
-                if score(best) - score(index) > switching_cost {
+                if advantage(index, best) > switching_cost {
                     (best, "context_window_rebalance")
                 } else {
                     (index, "cache_affinity")
@@ -196,6 +267,11 @@ impl SmartRouter {
         if !(200..300).contains(&status) || input == 0 {
             return;
         }
+        let billed = cached.min(input);
+        self.calibration
+            .entry(binding.account_id.clone())
+            .or_default()
+            .tokens_since += (input - billed) as f64 + CACHED_TOKEN_WEIGHT * billed as f64;
         if let Some(session) = self.sessions.get_mut(&binding.session) {
             if session.account_id == binding.account_id
                 && session.latest_request == request_id
@@ -208,6 +284,41 @@ impl SmartRouter {
                 session.cache_ratio = cached.min(input) as f64 / input as f64;
             }
         }
+    }
+}
+
+impl SmartRouter {
+    /// Measured sizes where they exist, put in plan units through the
+    /// measured accounts so measured and unmeasured accounts still compare.
+    fn capacities(&mut self, candidates: &[Candidate]) -> Vec<f64> {
+        for candidate in candidates {
+            if let Some(used) = candidate.weekly_used {
+                self.calibration
+                    .entry(candidate.account_id.clone())
+                    .or_default()
+                    .update(used);
+            }
+        }
+        let measured = |candidate: &Candidate| {
+            self.calibration
+                .get(&candidate.account_id)
+                .and_then(|calibration| calibration.tokens_per_point)
+        };
+        let mut per_unit = candidates
+            .iter()
+            .filter_map(|candidate| {
+                measured(candidate).map(|tokens| tokens / candidate.capacity_prior.max(0.01))
+            })
+            .collect::<Vec<_>>();
+        per_unit.sort_by(f64::total_cmp);
+        let unit = per_unit.get(per_unit.len() / 2).copied();
+        candidates
+            .iter()
+            .map(|candidate| match (measured(candidate), unit) {
+                (Some(tokens), Some(unit)) if unit > 0.0 => (tokens / unit).clamp(0.05, 100.0),
+                _ => candidate.capacity_prior.max(0.01),
+            })
+            .collect()
     }
 }
 
@@ -227,17 +338,16 @@ mod tests {
             context_window: Some(100_000),
         }
     }
+    fn candidate(id: &str, headroom: f64, capacity_prior: f64) -> Candidate {
+        Candidate {
+            account_id: id.into(),
+            headroom,
+            capacity_prior,
+            weekly_used: None,
+        }
+    }
     fn accounts(a: f64, b: f64) -> Vec<Candidate> {
-        vec![
-            Candidate {
-                account_id: "a".into(),
-                headroom: a,
-            },
-            Candidate {
-                account_id: "b".into(),
-                headroom: b,
-            },
-        ]
+        vec![candidate("a", a, 1.0), candidate("b", b, 1.0)]
     }
     #[test]
     fn new_sessions_balance_context_load_with_priority_ties() {
@@ -298,10 +408,7 @@ mod tests {
         router.choose(&accounts(80.0, 70.0), &request, 1);
         let mut second = request.clone();
         second.request_id = "second".into();
-        let only_b = vec![Candidate {
-            account_id: "b".into(),
-            headroom: 70.0,
-        }];
+        let only_b = vec![candidate("b", 70.0, 1.0)];
         assert_eq!(
             router.choose(&only_b, &second, 2).1,
             "session_account_unavailable"
@@ -331,5 +438,69 @@ mod tests {
             ),
             (0, "unidentified_session_rank")
         );
+    }
+    #[test]
+    fn plan_priors_map_plus_and_pro_tiers() {
+        assert_eq!(plan_capacity_prior(Some("plus")), 1.0);
+        assert_eq!(plan_capacity_prior(Some("Pro")), 20.0);
+        assert_eq!(plan_capacity_prior(Some("prolite")), 5.0);
+        assert_eq!(plan_capacity_prior(Some("team")), 1.0);
+        assert_eq!(plan_capacity_prior(None), 1.0);
+    }
+    #[test]
+    fn equally_full_accounts_share_new_conversations_by_size() {
+        let mut router = SmartRouter::default();
+        let candidates = vec![candidate("plus", 80.0, 1.0), candidate("pro", 80.0, 20.0)];
+        let mut on_plus = 0;
+        for session in 0..210 {
+            let picked = router
+                .choose(&candidates, &context(&format!("s{session}"), 1_000, "w1"), 1)
+                .0;
+            on_plus += usize::from(picked == 0);
+        }
+        assert!((9..=11).contains(&on_plus), "plus took {on_plus} of 210");
+    }
+    #[test]
+    fn a_nearly_empty_large_account_still_outlasts_a_fresh_small_one() {
+        let mut router = SmartRouter::default();
+        let candidates = vec![candidate("plus", 90.0, 1.0), candidate("pro", 10.0, 20.0)];
+        assert_eq!(router.choose(&candidates, &context("s", 1_000, "w1"), 1).0, 1);
+    }
+    #[test]
+    fn measured_throughput_replaces_the_plan_prior() {
+        let mut router = SmartRouter::default();
+        // Both report the same plan; "big" turns out to move 4x slower.
+        let at = |small: f64, big: f64| {
+            vec![
+                Candidate {
+                    weekly_used: Some(small),
+                    ..candidate("small", 50.0, 20.0)
+                },
+                Candidate {
+                    weekly_used: Some(big),
+                    ..candidate("big", 50.0, 20.0)
+                },
+            ]
+        };
+        router.capacities(&at(10.0, 10.0));
+        for account in ["small", "big"] {
+            router.requests.insert(
+                account.into(),
+                RequestBinding {
+                    session: account.into(),
+                    account_id: account.into(),
+                    window: None,
+                    touched: 1,
+                },
+            );
+            router.observe(account, 400_000, 0, 200);
+        }
+        let capacities = router.capacities(&at(18.0, 12.0));
+        assert!(
+            (capacities[1] / capacities[0] - 4.0).abs() < 1e-6,
+            "{capacities:?}"
+        );
+        // A weekly reset moves the baseline instead of producing a sample.
+        assert_eq!(router.capacities(&at(1.0, 1.0)), capacities);
     }
 }

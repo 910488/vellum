@@ -856,7 +856,7 @@ impl CodexOAuthManager {
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
                 if observation.usable {
                     if settings.strategy == QuotaPoolStrategy::Balanced {
-                        eligible.push((auth, rank, observation.headroom));
+                        eligible.push((auth, rank, observation));
                         continue;
                     }
                     if *self.quota_pool.read().await != settings {
@@ -910,13 +910,21 @@ impl CodexOAuthManager {
                     "quota pool changed during account selection; retry the request".into(),
                 ));
             }
+            let plans = self.accounts.read().await;
             let candidates = eligible
                 .iter()
-                .map(|(auth, _, headroom)| crate::quota_pool_router::Candidate {
+                .map(|(auth, _, observation)| crate::quota_pool_router::Candidate {
                     account_id: auth.credential_id.clone(),
-                    headroom: *headroom,
+                    headroom: observation.headroom,
+                    capacity_prior: crate::quota_pool_router::plan_capacity_prior(
+                        plans
+                            .get(&auth.credential_id)
+                            .and_then(|account| account.plan_type.as_deref()),
+                    ),
+                    weekly_used: Some(observation.weekly_used),
                 })
                 .collect::<Vec<_>>();
+            drop(plans);
             let (index, reason) = self.smart_router.lock().choose(
                 &candidates,
                 context,
@@ -966,6 +974,8 @@ impl CodexOAuthManager {
                     &[crate::quota_pool_router::Candidate {
                         account_id: auth.credential_id.clone(),
                         headroom: 0.0,
+                        capacity_prior: 1.0,
+                        weekly_used: None,
                     }],
                     context,
                     chrono::Utc::now().timestamp_millis().max(0) as u64,
@@ -1284,6 +1294,7 @@ struct QuotaPoolObservation {
     usable: bool,
     skip_reason: Option<&'static str>,
     headroom: f64,
+    weekly_used: f64,
 }
 
 fn log_pool_decision(
@@ -1343,6 +1354,7 @@ fn quota_pool_observation(
     Some(QuotaPoolObservation {
         usable: skip_reason.is_none(),
         skip_reason,
+        weekly_used: weekly.used_percent.clamp(0.0, 100.0),
         // Compare remaining fractions rather than raw tokens across plans.
         // Reserve/floor headroom is normalized to each spendable window.
         headroom: (burnable / (100.0 - f64::from(weekly_floor)).max(1.0) * 100.0).min(

@@ -353,8 +353,17 @@ actual usage-limit response determines whether it can proceed. Auto Review's
 explicitly selected billing account bypasses this ordinary-request policy.
 
 The optional `balanced` strategy keeps the same admission gates and manual
-fallback. It compares normalized weekly/five-hour headroom and estimates the
-context load of active conversations, using member order to break ties.
+fallback. It places a new conversation on the member whose active context
+load is smallest relative to its remaining capacity: normalized weekly/five-hour
+headroom times a relative account size, with member order breaking ties. The
+size starts from the plan (Plus 1, Pro 20, a `lite`/`5x` plan 5; others 1)
+because the usage endpoint reports only percentages and both Pro tiers may
+report `pro`. Once two members have each moved their weekly percentage by at
+least 2 points across 20k routed tokens, tokens per weekly point replaces the
+prior for those members. Calibration counts cached input at one tenth; that is
+a measurement weight, not a claim about billing. Usage of the same account
+outside Vellum reads as a smaller account. Calibration lives in memory, survives
+strategy and settings changes, and restarts at a weekly reset or app restart.
 Ordinary HTTP and WebSocket authorization receive the same routing hints.
 Identity is namespaced by route and upstream model: Codex session+thread,
 otherwise a prompt cache key or WebSocket connection. Conflicting identity or
