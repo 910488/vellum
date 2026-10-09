@@ -567,6 +567,10 @@ export function App() {
           snapshot={status.updates ?? null}
           onChanged={(updates) => setStatus((current) => ({ ...current, updates }))}
           onClose={() => setUpdatesOpen(false)}
+          onOpenHosts={() => {
+            setUpdatesOpen(false);
+            navigate("remote");
+          }}
         />
 
         {liveAlerts.length ? (

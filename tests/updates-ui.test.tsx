@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import i18n from "i18next";
 import "@/i18n";
 import { UpdateCards } from "@/components/UpdateCards";
 import { Rail } from "@/components/Rail";
 import { api } from "@/lib/api";
 import { attention, headline, type SystemStatus } from "@/lib/status";
+import { vellumUpdateHosts, vellumUpdateState } from "@/lib/vellumUpdate";
 import type { LayerStatus, Overview, ProxyStatus, RuntimeStatus, UpdateStatusSnapshot } from "@/types";
 import statusBarSource from "../src/components/StatusBar.tsx?raw";
 import settingsSource from "../src/screens/Settings.tsx?raw";
@@ -19,6 +20,9 @@ vi.mock("@/lib/api", () => ({
     downloadUpdate: vi.fn(),
     applyUpdate: vi.fn(),
     restartToApplyDesktopUpdate: vi.fn(),
+    updateVellum: vi.fn(),
+    restartToUpdate: vi.fn(),
+    cancelScheduledRestart: vi.fn(),
     cancelUpdateDownload: vi.fn(),
     rollbackUpdate: vi.fn(),
     setRemoteUpdatePolicy: vi.fn(),
@@ -58,8 +62,23 @@ const snapshot = (patch: Partial<UpdateStatusSnapshot> = {}): UpdateStatusSnapsh
   preferences: { channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false },
   liveAutoUpdate: false,
   attention: "available",
+  checkedAt: null,
+  restartSchedule: null,
   ...patch,
 });
+
+/** A signed build with nothing going on. */
+const live = (patch: Partial<UpdateStatusSnapshot> = {}): UpdateStatusSnapshot =>
+  snapshot({
+    liveAutoUpdate: true,
+    desktop: layer("desktop", { liveAutoUpdate: true, phase: "idle", availableVersion: null, targetVersion: null }),
+    core: layer("core", { liveAutoUpdate: true, phase: "idle", availableVersion: null, targetVersion: null }),
+    remote: layer("remote", { liveAutoUpdate: true, phase: "idle", hosts: [] }),
+    ...patch,
+  });
+
+const panel = (current: UpdateStatusSnapshot, onChanged: (next: UpdateStatusSnapshot) => void = () => undefined) =>
+  render(<UpdateCards snapshot={current} onChanged={onChanged} onOpenHosts={() => undefined} />);
 
 const proxy = (): ProxyStatus => ({
   running: true,
@@ -99,20 +118,93 @@ const status = (patch: Partial<SystemStatus> = {}): SystemStatus => ({
   ...patch,
 });
 
-describe("update settings cards", () => {
-  it("renders one primary update action and keeps component controls experimental", async () => {
+describe("one Vellum version over three layers", () => {
+  it("cannot update itself without a signing key, whatever the layers say", () => {
+    expect(vellumUpdateState(snapshot(), { checking: false })).toEqual({ kind: "unsigned" });
+  });
+
+  it("follows the desktop layer from available to ready", () => {
+    const available = live({ desktop: layer("desktop", { liveAutoUpdate: true }) });
+    expect(vellumUpdateState(available, { checking: false })).toEqual({ kind: "available", version: "0.3.0" });
+    const ready = live({
+      desktop: layer("desktop", { liveAutoUpdate: true, phase: "waitingForRestart", stagedVersion: "0.3.0" }),
+    });
+    expect(vellumUpdateState(ready, { checking: false })).toEqual({ kind: "ready", version: "0.3.0" });
+  });
+
+  it("adds core bytes to the download progress without showing a core version", () => {
+    const state = vellumUpdateState(
+      live({
+        desktop: layer("desktop", { liveAutoUpdate: true, phase: "downloading", downloadBytes: 30, downloadTotal: 100 }),
+        core: layer("core", {
+          liveAutoUpdate: true,
+          phase: "verifying",
+          downloadBytes: 50,
+          downloadTotal: 100,
+          targetVersion: "0.150.0",
+        }),
+      }),
+      { checking: false },
+    );
+    expect(state).toEqual({ kind: "downloading", version: "0.3.0", percent: 40 });
+  });
+
+  it("reports a core failure without pretending it is a Vellum version", () => {
+    const state = vellumUpdateState(
+      live({
+        core: layer("core", { liveAutoUpdate: true, phase: "failed", failureReason: "pendingCoreRejectedBeforeLaunch" }),
+      }),
+      { checking: false },
+    );
+    expect(state).toEqual({ kind: "failed", version: null, reason: "pendingCoreRejectedBeforeLaunch" });
+  });
+
+  it("puts a scheduled restart ahead of everything but the signing key", () => {
+    const state = vellumUpdateState(
+      live({
+        desktop: layer("desktop", { liveAutoUpdate: true, phase: "waitingForRestart", stagedVersion: "0.3.0" }),
+        restartSchedule: { version: "0.3.0", openTurns: 2, activeRequests: 1, since: 1 },
+      }),
+      { checking: true },
+    );
+    expect(state).toEqual({ kind: "scheduled", version: "0.3.0", turns: 2, requests: 1 });
+  });
+
+  it("says when it last looked", () => {
+    expect(vellumUpdateState(live({ checkedAt: 1_760_000_000 }), { checking: false })).toEqual({
+      kind: "current",
+      checkedAt: new Date(1_760_000_000_000).toISOString(),
+    });
+  });
+
+  it("counts hosts that are behind or broken", () => {
+    const host = (hostId: string, phase: LayerStatus["phase"]) => ({
+      hostId,
+      phase,
+      currentVersion: "0.2.9",
+      stagedVersion: null,
+      idleAutoUpdate: true,
+      failureReason: null,
+    });
+    expect(
+      vellumUpdateHosts(
+        layer("remote", { hosts: [host("a", "idle"), host("b", "waitingForIdle"), host("c", "failed")] }),
+      ),
+    ).toEqual({ total: 3, pending: 1, failed: 1 });
+  });
+});
+
+describe("update panel", () => {
+  it("points an unsigned build at the downloads page and locks its switches", async () => {
     await i18n.changeLanguage("en");
-    render(<UpdateCards snapshot={snapshot()} onChanged={() => undefined} />);
-    expect(screen.getByTestId("update-layer-desktop")).toBeTruthy();
-    expect(screen.getByTestId("update-layer-remote")).toBeTruthy();
-    expect(screen.getByTestId("update-layer-core")).toBeTruthy();
-    expect(screen.getByTestId("update-live-disabled").textContent).toMatch(/signing/i);
-    expect(screen.getByRole("progressbar")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Update all" })).toBeTruthy();
-    expect(screen.getByText("Experimental: component updates")).toBeTruthy();
-    expect((screen.getByText("Experimental: component updates").closest("details") as HTMLDetailsElement).open).toBe(false);
-    expect(screen.getByTestId("update-layer-desktop").textContent).toContain("0.2.9");
-    expect(screen.getByTestId("update-layer-desktop").textContent).toContain("0.3.0");
+    panel(snapshot());
+    expect(screen.getByRole("button", { name: "Open downloads" })).toBeTruthy();
+    const switches = screen.getAllByRole("switch");
+    expect(switches).toHaveLength(2);
+    for (const toggle of switches) {
+      expect((toggle as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect(screen.queryByText(/Experimental/)).toBeNull();
   });
 
   it("is mounted globally instead of becoming a Settings card or real screen", () => {
@@ -121,105 +213,94 @@ describe("update settings cards", () => {
     expect(appSource).toMatch(/onOpenUpdates/);
   });
 
-  it("updates remote per host and core, and only stages desktop from Update all", async () => {
+  it("downloads during the check when automatic updates are on", async () => {
     await i18n.changeLanguage("en");
-    let current = snapshot({
-      liveAutoUpdate: true,
-      desktop: layer("desktop", { liveAutoUpdate: true }),
-      remote: layer("remote", { liveAutoUpdate: true }),
-      core: layer("core", { liveAutoUpdate: true, phase: "available" }),
-    });
-    vi.mocked(api.checkUpdates).mockImplementation(async () => current);
-    vi.mocked(api.getUpdateStatus).mockImplementation(async () => current);
-    vi.mocked(api.downloadUpdate).mockImplementation(async (component) => {
-      current = { ...current, [component]: { ...current[component], phase: "staged" } };
-      return { operationId: `download-${component}`, component, phase: "staged", targetVersion: "0.3.0" };
-    });
-    vi.mocked(api.applyUpdate).mockImplementation(async (component) => {
-      current = { ...current, [component]: { ...current[component], phase: "applied" } };
-      return { operationId: `apply-${component}`, component, phase: "applied", targetVersion: "0.3.0" };
-    });
-
-    render(<UpdateCards snapshot={current} onChanged={(next) => { current = next; }} />);
-    fireEvent.click(screen.getByRole("button", { name: "Update all" }));
-
-    await waitFor(() => expect(api.downloadUpdate).toHaveBeenCalledTimes(3));
-    expect(api.downloadUpdate).toHaveBeenCalledWith("remote", "host-1");
-    expect(api.downloadUpdate).toHaveBeenCalledWith("core");
-    expect(api.downloadUpdate).toHaveBeenCalledWith("desktop");
-    expect(api.applyUpdate).toHaveBeenCalledWith("remote", "host-1");
-    expect(api.applyUpdate).toHaveBeenCalledWith("core");
-    // Installing Vellum restarts it; that stays a separate, explicit action.
-    expect(api.applyUpdate).not.toHaveBeenCalledWith("desktop");
-    expect(api.restartToApplyDesktopUpdate).not.toHaveBeenCalled();
+    vi.mocked(api.updateVellum).mockResolvedValue(live());
+    panel(live());
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    await waitFor(() => expect(api.updateVellum).toHaveBeenCalledTimes(1));
+    expect(api.checkUpdates).not.toHaveBeenCalled();
   });
 
-  it("continues the remaining components when one update fails", async () => {
+  it("only checks when automatic updates are off, and downloads on request", async () => {
     await i18n.changeLanguage("en");
-    let current = snapshot({
-      liveAutoUpdate: true,
-      desktop: layer("desktop", { liveAutoUpdate: true }),
-      remote: layer("remote", { liveAutoUpdate: true }),
-      core: layer("core", { liveAutoUpdate: true, phase: "available" }),
+    const manual = live({
+      preferences: { channel: "stable", autoCheck: false, autoDownload: false, coreIdleHandoff: false },
     });
-    vi.mocked(api.checkUpdates).mockImplementation(async () => current);
-    vi.mocked(api.getUpdateStatus).mockImplementation(async () => current);
-    vi.mocked(api.downloadUpdate).mockImplementation(async (component) => {
-      if (component === "desktop") throw new Error("desktop mirror unavailable");
-      current = { ...current, [component]: { ...current[component], phase: "staged" } };
-      return { operationId: `download-${component}`, component, phase: "staged", targetVersion: "0.3.0" };
-    });
-    vi.mocked(api.applyUpdate).mockImplementation(async (component) => ({
-      operationId: `apply-${component}`, component, phase: "applied", targetVersion: "0.3.0",
-    }));
+    vi.mocked(api.checkUpdates).mockResolvedValue(manual);
+    vi.mocked(api.updateVellum).mockResolvedValue(manual);
+    const view = panel(manual);
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    await waitFor(() => expect(api.checkUpdates).toHaveBeenCalledTimes(1));
+    expect(api.updateVellum).not.toHaveBeenCalled();
 
-    render(<UpdateCards snapshot={current} onChanged={(next) => { current = next; }} />);
-    fireEvent.click(screen.getByRole("button", { name: "Update all" }));
-
-    await waitFor(() => expect(api.downloadUpdate).toHaveBeenCalledTimes(3));
-    expect(api.applyUpdate).toHaveBeenCalledWith("remote", "host-1");
-    expect(api.applyUpdate).toHaveBeenCalledWith("core");
-    expect((await screen.findByRole("alert")).textContent).toContain("desktop mirror unavailable");
-  });
-
-  it("offers a restart once the desktop update is staged", async () => {
-    await i18n.changeLanguage("en");
-    const staged = snapshot({
-      liveAutoUpdate: true,
-      desktop: layer("desktop", { liveAutoUpdate: true, phase: "waitingForRestart", stagedVersion: "0.3.0" }),
-    });
-    vi.mocked(api.restartToApplyDesktopUpdate).mockResolvedValue({
-      operationId: "op", component: "desktop", phase: "applying", targetVersion: "0.3.0",
-    });
-    render(<UpdateCards snapshot={staged} onChanged={() => undefined} />);
-
-    expect(screen.getByTestId("update-restart").textContent).toContain("0.3.0");
-    fireEvent.click(screen.getByRole("button", { name: "Restart Vellum to update" }));
-    await waitFor(() => expect(api.restartToApplyDesktopUpdate).toHaveBeenCalledTimes(1));
-  });
-
-  it("hides the restart action until the desktop update is staged", async () => {
-    await i18n.changeLanguage("en");
-    render(<UpdateCards snapshot={snapshot({ liveAutoUpdate: true, desktop: layer("desktop", { liveAutoUpdate: true }) })} onChanged={() => undefined} />);
-    expect(screen.queryByTestId("update-restart")).toBeNull();
-  });
-
-  it("explains a refused restart instead of showing the reason code", async () => {
-    await i18n.changeLanguage("en");
-    vi.mocked(api.restartToApplyDesktopUpdate).mockRejectedValueOnce(new Error("coreBusy"));
-    render(
+    view.rerender(
       <UpdateCards
-        snapshot={snapshot({
-          liveAutoUpdate: true,
-          desktop: layer("desktop", { liveAutoUpdate: true, phase: "staged", stagedVersion: "0.3.0" }),
-        })}
+        snapshot={{ ...manual, desktop: layer("desktop", { liveAutoUpdate: true }) }}
         onChanged={() => undefined}
+        onOpenHosts={() => undefined}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Restart Vellum to update" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Download and update" }));
+    await waitFor(() => expect(api.updateVellum).toHaveBeenCalledTimes(1));
+  });
+
+  it("turns both backend switches with the one automatic-updates switch", async () => {
+    await i18n.changeLanguage("en");
+    vi.mocked(api.setUpdatePreferences).mockResolvedValue({
+      channel: "stable",
+      autoCheck: false,
+      autoDownload: false,
+      coreIdleHandoff: false,
+    });
+    vi.mocked(api.getUpdateStatus).mockResolvedValue(live());
+    panel(live());
+    fireEvent.click(screen.getByRole("switch", { name: "Automatic updates" }));
+    await waitFor(() =>
+      expect(api.setUpdatePreferences).toHaveBeenCalledWith({ autoCheck: false, autoDownload: false }),
+    );
+  });
+
+  it("schedules the restart while work is running and can take it back", async () => {
+    await i18n.changeLanguage("en");
+    const ready = live({
+      desktop: layer("desktop", { liveAutoUpdate: true, phase: "waitingForRestart", stagedVersion: "0.3.0" }),
+    });
+    const scheduled = { ...ready, restartSchedule: { version: "0.3.0", openTurns: 1, activeRequests: 0, since: 1 } };
+    vi.mocked(api.restartToUpdate).mockResolvedValue("scheduled");
+    vi.mocked(api.getUpdateStatus).mockResolvedValue(scheduled);
+    const changed = vi.fn();
+    const view = panel(ready, changed);
+
+    fireEvent.click(screen.getByRole("button", { name: "Restart and update now" }));
+    await waitFor(() => expect(changed).toHaveBeenCalledWith(scheduled));
+    // The old command refuses while a turn runs; the panel must not use it.
+    expect(api.restartToApplyDesktopUpdate).not.toHaveBeenCalled();
+
+    view.rerender(<UpdateCards snapshot={scheduled} onChanged={changed} onOpenHosts={() => undefined} />);
+    expect(screen.getByTestId("vellum-update").textContent).toContain("1 Codex conversation");
+    vi.mocked(api.cancelScheduledRestart).mockResolvedValue(true);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(api.cancelScheduledRestart).toHaveBeenCalledTimes(1));
+  });
+
+  it("explains a refused action instead of showing the reason code", async () => {
+    await i18n.changeLanguage("en");
+    vi.mocked(api.restartToUpdate).mockRejectedValueOnce(new Error("nothingStaged"));
+    vi.mocked(api.getUpdateStatus).mockResolvedValue(live());
+    panel(live({ desktop: layer("desktop", { liveAutoUpdate: true, phase: "staged", stagedVersion: "0.3.0" }) }));
+    fireEvent.click(screen.getByRole("button", { name: "Restart and update now" }));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("A Codex task is still running");
-    expect(alert.textContent).not.toContain("coreBusy");
+    expect(alert.textContent).toContain("There is no downloaded update to install.");
+    expect(alert.textContent).not.toContain("nothingStaged");
+  });
+
+  it("opens the release notes in place", async () => {
+    await i18n.changeLanguage("en");
+    panel(live({ desktop: layer("desktop", { liveAutoUpdate: true, releaseNotes: "Faster routing" }) }));
+    expect(screen.queryByText("Faster routing")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Release notes" }));
+    expect(screen.getByText("Faster routing")).toBeTruthy();
   });
 
   it("opens updates from a tab-like rail action without navigating", async () => {
@@ -239,13 +320,6 @@ describe("update settings cards", () => {
     fireEvent.click(screen.getByRole("button", { name: /Updates/ }));
     expect(openUpdates).toHaveBeenCalledTimes(1);
     expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("shows command failures instead of leaving an unhandled rejection", async () => {
-    vi.mocked(api.checkUpdates).mockRejectedValueOnce(new Error("network unavailable"));
-    const view = render(<UpdateCards snapshot={snapshot({ liveAutoUpdate: true, desktop: layer("desktop", { liveAutoUpdate: true }) })} onChanged={() => undefined} />);
-    fireEvent.click(within(view.getByTestId("update-layer-desktop")).getByText("Check for updates"));
-    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("network unavailable"));
   });
 });
 

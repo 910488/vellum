@@ -70,6 +70,7 @@ import type {
   SshTrustStatus,
   PendingHostFingerprint,
   UpdateStatusSnapshot,
+  RestartToUpdate,
   UpdateOperation,
   UpdatePreferences,
   UpdateComponent,
@@ -178,6 +179,8 @@ function previewUpdateStatus(): UpdateStatusSnapshot {
     preferences: { channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false },
     liveAutoUpdate: false,
     attention: "none",
+    checkedAt: null,
+    restartSchedule: null,
   };
 }
 
@@ -1250,6 +1253,20 @@ export const api = {
   restartToApplyDesktopUpdate(): Promise<UpdateOperation> {
     if (!hasTauri()) return delay({ operationId: "preview", component: "desktop", phase: "applying", targetVersion: null });
     return call<UpdateOperation>("restart_to_apply_desktop_update");
+  },
+  /** Check, then download what this machine needs; Desktop is staged, not installed. */
+  updateVellum(): Promise<UpdateStatusSnapshot> {
+    if (!hasTauri()) return delay(previewUpdateStatus());
+    return call<UpdateStatusSnapshot>("update_vellum");
+  },
+  /** Restarts into the staged update now, or once running work has finished. */
+  restartToUpdate(): Promise<RestartToUpdate> {
+    if (!hasTauri()) return delay("scheduled" as const);
+    return call<RestartToUpdate>("restart_to_update");
+  },
+  cancelScheduledRestart(): Promise<boolean> {
+    if (!hasTauri()) return delay(true);
+    return call<boolean>("cancel_scheduled_restart");
   },
   cancelUpdateDownload(component: UpdateComponent): Promise<UpdateOperation> {
     if (!hasTauri()) return delay({ operationId: "preview", component, phase: "available", targetVersion: null });

@@ -1,20 +1,12 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "@/lib/api";
-import { Btn, Cap, Card, Meter, Row, Rows, Segment, Toggle } from "@/components/ui";
-import type {
-  LayerStatus,
-  UpdateChannel,
-  UpdateComponent,
-  UpdateStatusSnapshot,
-} from "@/types";
+import { Btn, Card } from "@/components/ui";
+import { VellumUpdate } from "@/components/VellumUpdate";
+import { autoUpdateOn, vellumUpdateHosts, vellumUpdateState } from "@/lib/vellumUpdate";
+import type { UpdateStatusSnapshot } from "@/types";
 
-const CHANNELS: UpdateChannel[] = ["stable", "preview"];
-const COMPONENTS: UpdateComponent[] = ["desktop", "remote", "core"];
-/** Desktop goes last: installing it restarts Vellum. "Update all" only stages it. */
-const UPDATE_ALL_ORDER: UpdateComponent[] = ["remote", "core", "desktop"];
-const APPLYABLE_PHASES = new Set(["staged", "waitingForIdle", "waitingForRestart"]);
-const DESKTOP_READY_PHASES = new Set(["staged", "waitingForRestart"]);
+const RELEASES_URL = "https://github.com/910488/vellum/releases/latest";
 
 /** Backend reasons arrive as codes such as `proxyBusy`; anything else is shown as is. */
 function describeReason(t: (key: string, options?: Record<string, unknown>) => string, raw: string): string {
@@ -23,39 +15,18 @@ function describeReason(t: (key: string, options?: Record<string, unknown>) => s
     : raw;
 }
 
-/** Remote packages are per host platform, so each host downloads its own before applying. */
-async function updateRemoteHosts(layer: LayerStatus) {
-  for (const host of layer.hosts) {
-    await api.downloadUpdate("remote", host.hostId);
-    await api.applyUpdate("remote", host.hostId);
-  }
-}
-
-function layerProgress(layer: LayerStatus): number {
-  if (layer.phase === "downloading") {
-    return layer.downloadTotal > 0
-      ? Math.min(90, Math.round((layer.downloadBytes / layer.downloadTotal) * 90))
-      : 5;
-  }
-  if (layer.phase === "checking") return 5;
-  if (layer.phase === "available") return 10;
-  if (layer.phase === "verifying") return 92;
-  if (layer.phase === "applying") return 94;
-  if (layer.phase === "validating") return 97;
-  if (["staged", "waitingForIdle", "waitingForRestart", "applied", "idle"].includes(layer.phase)) return 100;
-  return 0;
-}
-
 export function UpdatePanel({
   open,
   snapshot,
   onChanged,
   onClose,
+  onOpenHosts,
 }: {
   open: boolean;
   snapshot: UpdateStatusSnapshot | null;
   onChanged: (next: UpdateStatusSnapshot) => void;
   onClose: () => void;
+  onOpenHosts: () => void;
 }) {
   const { t } = useTranslation();
   const ref = useRef<HTMLDialogElement>(null);
@@ -79,7 +50,7 @@ export function UpdatePanel({
           <Btn soft onClick={onClose}>{t("common.close")}</Btn>
         </div>
         {snapshot ? (
-          <UpdateCards snapshot={snapshot} onChanged={onChanged} />
+          <UpdateCards snapshot={snapshot} onChanged={onChanged} onOpenHosts={onOpenHosts} />
         ) : (
           <p className="note">{t("common.loading")}</p>
         )}
@@ -88,450 +59,130 @@ export function UpdatePanel({
   );
 }
 
+/**
+ * 更新面板的容器：把後端三層快照翻成一張卡（見 lib/vellumUpdate），
+ * 動作也只剩「更新 Vellum」這一件事 —— 後端的 update_vellum 會一起
+ * 處理 Desktop、core 與開了閒置更新的遠端主機。
+ */
 export function UpdateCards({
   snapshot,
   onChanged,
+  onOpenHosts,
 }: {
   snapshot: UpdateStatusSnapshot;
   onChanged: (next: UpdateStatusSnapshot) => void;
+  onOpenHosts: () => void;
 }) {
   const { t } = useTranslation();
-  const [busy, setBusy] = useState<string | null>(null);
-  const busyRef = useRef<string | null>(null);
+  const [busy, setBusy] = useState<"restarting" | boolean>(false);
+  const busyRef = useRef(false);
+  const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expandedRemote, setExpandedRemote] = useState(false);
-  const [operationProgress, setOperationProgress] = useState(0);
 
-  async function run(label: string, work: () => Promise<void>) {
+  const refresh = useCallback(async () => {
+    onChanged(await api.getUpdateStatus());
+  }, [onChanged]);
+
+  async function run(work: () => Promise<void>, kind: "restarting" | true = true) {
     if (busyRef.current) return;
-    busyRef.current = label;
-    setBusy(label);
+    busyRef.current = true;
+    setBusy(kind);
     setError(null);
     try {
       await work();
     } catch (cause) {
-      setError(describeReason(t, cause instanceof Error ? cause.message : String(cause)));
+      setError(
+        t("settings.page.updates.actionFailed", {
+          error: describeReason(t, cause instanceof Error ? cause.message : String(cause)),
+        }),
+      );
+      await refresh().catch(() => undefined);
     } finally {
-      busyRef.current = null;
-      setBusy(null);
+      busyRef.current = false;
+      setBusy(false);
+      setChecking(false);
     }
   }
 
+  const state = vellumUpdateState(snapshot, { checking });
+  // 下載與排定都在後端進行；畫面每秒讀一次，進度與剩餘工作才會動。
+  const live = busy !== false || state.kind === "downloading" || state.kind === "scheduled";
   useEffect(() => {
-    if (!busy) return;
+    if (!live) return;
     let alive = true;
-    const refresh = () => {
+    const timer = window.setInterval(() => {
       void api.getUpdateStatus().then((next) => {
         if (alive) onChanged(next);
       }).catch(() => undefined);
-    };
-    const timer = window.setInterval(refresh, 500);
+    }, 1000);
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [busy, onChanged]);
+  }, [live, onChanged]);
 
-  const computedProgress = Math.round(
-    COMPONENTS.reduce((sum, component) => sum + layerProgress(snapshot[component]), 0) /
-      COMPONENTS.length,
-  );
-  const overallProgress = busy === "all"
-    ? Math.max(computedProgress, operationProgress)
-    : computedProgress;
-
-  function updateAll() {
-    void run("all", async () => {
-      const failures: string[] = [];
-      setOperationProgress(3);
-      let next = await api.checkUpdates();
-      onChanged(next);
-      setOperationProgress(10);
-
-      for (const [index, component] of UPDATE_ALL_ORDER.entries()) {
-        try {
-          let layer = next[component];
-          if (!layer.liveAutoUpdate) continue;
-          setOperationProgress(12 + index * 25);
-          if (component === "remote") {
-            if (layer.phase === "available" || APPLYABLE_PHASES.has(layer.phase)) {
-              await updateRemoteHosts(layer);
-              next = await api.getUpdateStatus();
-              onChanged(next);
-            }
-          } else {
-            if (layer.phase === "available") {
-              await api.downloadUpdate(component);
-              next = await api.getUpdateStatus();
-              onChanged(next);
-              layer = next[component];
-            }
-            // A staged Desktop waits for the explicit restart action below.
-            if (component === "core" && APPLYABLE_PHASES.has(layer.phase)) {
-              await api.applyUpdate(component);
-              next = await api.getUpdateStatus();
-              onChanged(next);
-            }
-          }
-        } catch (cause) {
-          const message = cause instanceof Error ? cause.message : String(cause);
-          failures.push(`${component}: ${describeReason(t, message)}`);
-          next = await api.getUpdateStatus().catch(() => next);
-          onChanged(next);
-        }
-        setOperationProgress(35 + index * 30);
-      }
-
-      onChanged(await api.getUpdateStatus());
-      setOperationProgress(100);
-      if (failures.length) throw new Error(failures.join("; "));
-    });
-  }
-
-  function restartToUpdate() {
-    // On success the backend exits this process; the busy state stays until then.
-    void run("restart", async () => {
-      await api.restartToApplyDesktopUpdate();
-    });
-  }
-
-  const desktopReady =
-    snapshot.desktop.liveAutoUpdate && DESKTOP_READY_PHASES.has(snapshot.desktop.phase);
+  const auto = autoUpdateOn(snapshot);
+  const update = () => run(async () => onChanged(await api.updateVellum()));
 
   return (
-    <Card data-testid="update-cards" className="update-card">
-      <div className="update-summary">
-        <div>
-          <Cap>{t("settings.page.updates.overall")}</Cap>
-          <p className="note" style={{ marginTop: 8 }}>
-            {busy === "all"
-              ? t("settings.page.updates.updatingAll")
-              : t("settings.page.updates.overallHint")}
-          </p>
-        </div>
-        <strong className="update-summary__percent">{overallProgress}%</strong>
-      </div>
-      <Meter percent={overallProgress} tone={error ? "coral" : "honey"} />
-      <div className="update-primary-actions">
-        <Btn
-          soft
-          disabled={busy !== null || !snapshot.liveAutoUpdate}
-          onClick={() => void run("check-all", async () => onChanged(await api.checkUpdates()))}
-        >
-          {t("settings.page.updates.checkAll")}
-        </Btn>
-        <Btn disabled={busy !== null || !snapshot.liveAutoUpdate} onClick={updateAll}>
-          {busy === "all" ? t("settings.page.updates.updatingAll") : t("settings.page.updates.updateAll")}
-        </Btn>
-      </div>
-      {desktopReady ? (
-        <div data-testid="update-restart" style={{ marginTop: 12 }}>
-          <p className="note">
-            {t("settings.page.updates.restartHint", {
-              version: snapshot.desktop.stagedVersion ?? snapshot.desktop.targetVersion ?? "",
-            })}
-          </p>
-          <Btn disabled={busy !== null} onClick={restartToUpdate}>
-            {busy === "restart"
-              ? t("settings.page.updates.restarting")
-              : t("settings.page.updates.restartToUpdate")}
-          </Btn>
-        </div>
-      ) : null}
-      {!snapshot.liveAutoUpdate ? (
-        <p className="note" data-testid="update-live-disabled">
-          {t("settings.page.updates.liveDisabled")}
-        </p>
-      ) : null}
-      {error ? (
-        <p className="note" role="alert" data-testid="update-action-error">
-          {t("settings.page.updates.actionFailed", { error })}
-        </p>
-      ) : null}
-      <Rows>
-        <Row label={t("settings.page.updates.channel")}>
-          <Segment
-            value={snapshot.preferences.channel}
-            options={CHANNELS.map((channel) => ({
-              value: channel,
-              label: t(`settings.page.updates.${channel}`),
-            }))}
-            onChange={(channel) =>
-              void run("channel", async () => {
-                await api.setUpdatePreferences({ channel });
-                onChanged(await api.getUpdateStatus());
-              })
-            }
-          />
-        </Row>
-        <Row label={t("settings.page.updates.autoCheck")}>
-          <Toggle
-            checked={snapshot.preferences.autoCheck}
-            label={t("settings.page.updates.autoCheck")}
-            onChange={(autoCheck) =>
-              void run("auto-check", async () => {
-                await api.setUpdatePreferences({ autoCheck });
-                onChanged(await api.getUpdateStatus());
-              })
-            }
-          />
-        </Row>
-        <Row label={t("settings.page.updates.autoDownload")}>
-          <Toggle
-            checked={snapshot.preferences.autoDownload}
-            label={t("settings.page.updates.autoDownload")}
-            onChange={(autoDownload) =>
-              void run("auto-download", async () => {
-                await api.setUpdatePreferences({ autoDownload });
-                onChanged(await api.getUpdateStatus());
-              })
-            }
-          />
-        </Row>
-        <Row label={t("settings.page.updates.idleHandoff")}>
-          <Toggle
-            checked={snapshot.preferences.coreIdleHandoff}
-            label={t("settings.page.updates.idleHandoff")}
-            onChange={(coreIdleHandoff) =>
-              void run("handoff", async () => {
-                await api.setUpdatePreferences({ coreIdleHandoff });
-                onChanged(await api.getUpdateStatus());
-              })
-            }
-          />
-        </Row>
-      </Rows>
-      <details className="update-experimental">
-        <summary>{t("settings.page.updates.experimentalParts")}</summary>
-        <p className="note">{t("settings.page.updates.experimentalPartsHint")}</p>
-        <LayerCard
-        layer={snapshot.desktop}
-        busy={busy}
-        onCheck={() =>
-          void run("check-desktop", async () => {
-            onChanged(await api.checkUpdates("desktop"));
-          })
-        }
-        onDownload={() =>
-          void run("dl-desktop", async () => {
-            await api.downloadUpdate("desktop");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onApply={restartToUpdate}
-        onCancel={() =>
-          void run("cancel-desktop", async () => {
-            await api.cancelUpdateDownload("desktop");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onRollback={() =>
-          void run("rb-desktop", async () => {
-            await api.rollbackUpdate("desktop");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        />
-        <LayerCard
-        layer={snapshot.remote}
-        busy={busy}
-        expandable
-        expanded={expandedRemote}
-        onToggleExpand={() => setExpandedRemote((open) => !open)}
-        onCheck={() =>
-          void run("check-remote", async () => {
-            onChanged(await api.checkUpdates("remote"));
-          })
-        }
-        onDownload={() =>
-          void run("dl-remote", async () => {
-            // Without a host the backend answers remoteHostRequired.
-            await api.downloadUpdate("remote", snapshot.remote.hosts[0]?.hostId);
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onApply={() =>
-          void run("apply-remote", async () => {
-            await updateRemoteHosts(snapshot.remote);
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onCancel={() =>
-          void run("cancel-remote", async () => {
-            await api.cancelUpdateDownload("remote");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onRollback={() =>
-          void run("rb-remote", async () => {
-            await api.rollbackUpdate("remote");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onHostPolicy={(hostId, idleAutoUpdate) =>
-          void run(`policy-${hostId}`, async () => {
-            await api.setRemoteUpdatePolicy(hostId, idleAutoUpdate);
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        />
-        <LayerCard
-        layer={snapshot.core}
-        busy={busy}
-        onCheck={() =>
-          void run("check-core", async () => {
-            onChanged(await api.checkUpdates("core"));
-          })
-        }
-        onDownload={() =>
-          void run("dl-core", async () => {
-            await api.downloadUpdate("core");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onApply={() =>
-          void run("apply-core", async () => {
-            await api.applyUpdate("core");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onCancel={() =>
-          void run("cancel-core", async () => {
-            await api.cancelUpdateDownload("core");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        onRollback={() =>
-          void run("rb-core", async () => {
-            await api.rollbackUpdate("core");
-            onChanged(await api.getUpdateStatus());
-          })
-        }
-        />
-      </details>
+    <Card data-testid="update-cards">
+      <VellumUpdate
+        view={{
+          current: snapshot.desktop.currentVersion,
+          state,
+          autoUpdate: auto,
+          earlyAccess: snapshot.preferences.channel === "preview",
+          hosts: vellumUpdateHosts(snapshot.remote),
+          notes: snapshot.desktop.releaseNotes,
+          busy: busy === "restarting" ? "restarting" : busy !== false && state.kind !== "checking",
+          error,
+        }}
+        actions={{
+          onCheck: () => {
+            setChecking(true);
+            // 自動更新開著時，檢查到新版就直接下載，和背景排程做的事一樣。
+            void run(async () => onChanged(auto ? await api.updateVellum() : await api.checkUpdates()));
+          },
+          onUpdate: () => void update(),
+          onRetry: () => void update(),
+          onCancel: () =>
+            void run(async () => {
+              for (const component of ["desktop", "core"] as const) {
+                const phase = snapshot[component].phase;
+                if (phase === "downloading" || phase === "verifying") {
+                  await api.cancelUpdateDownload(component);
+                }
+              }
+              await refresh();
+            }),
+          onRestart: () =>
+            void run(async () => {
+              // 成功時後端會結束這個程序；排定時則回到面板顯示在等什麼。
+              const outcome = await api.restartToUpdate();
+              if (outcome === "scheduled") await refresh();
+            }, "restarting"),
+          onUnschedule: () =>
+            void run(async () => {
+              await api.cancelScheduledRestart();
+              await refresh();
+            }),
+          onOpenDownloads: () => {
+            window.open(RELEASES_URL, "_blank", "noopener,noreferrer");
+          },
+          onAutoUpdate: (next) =>
+            void run(async () => {
+              await api.setUpdatePreferences({ autoCheck: next, autoDownload: next });
+              await refresh();
+            }),
+          onEarlyAccess: (next) =>
+            void run(async () => {
+              await api.setUpdatePreferences({ channel: next ? "preview" : "stable" });
+              // 換了頻道，「最新版」的定義就跟著換，要重查一次。
+              onChanged(await api.checkUpdates());
+            }),
+          onOpenHosts,
+        }}
+      />
     </Card>
   );
-}
-
-function LayerCard({
-  layer,
-  busy,
-  expandable,
-  expanded,
-  onToggleExpand,
-  onCheck,
-  onDownload,
-  onApply,
-  onCancel,
-  onRollback,
-  onHostPolicy,
-}: {
-  layer: LayerStatus;
-  busy: string | null;
-  expandable?: boolean;
-  expanded?: boolean;
-  onToggleExpand?: () => void;
-  onCheck: () => void;
-  onDownload: () => void;
-  onApply: () => void;
-  onCancel: () => void;
-  onRollback: () => void;
-  onHostPolicy?: (hostId: string, idle: boolean) => void;
-}) {
-  const { t } = useTranslation();
-  const progress =
-    layer.downloadTotal > 0
-      ? Math.min(100, Math.round((layer.downloadBytes / layer.downloadTotal) * 100))
-      : layer.phase === "downloading"
-        ? 0
-        : null;
-  return (
-    <div data-testid={`update-layer-${layer.component}`} style={{ marginTop: 18 }}>
-      <Cap>{t(`settings.page.updates.layer.${layer.component}`)}</Cap>
-      {!layer.liveAutoUpdate ? (
-        <p className="note">{t("settings.page.updates.layerDisabled")}</p>
-      ) : null}
-      <Rows>
-        <Row label={t("settings.page.updates.current")}>{layer.currentVersion}</Row>
-        <Row label={t("settings.page.updates.available")}>
-          {layer.availableVersion ?? t("settings.page.updates.none")}
-        </Row>
-        <Row label={t("settings.page.updates.progress")}>
-          {progress === null ? t("settings.page.updates.phase." + layer.phase) : `${progress}%`}
-        </Row>
-        <Row label={t("settings.page.updates.applyWhen")}>
-          {t(`settings.page.updates.condition.${layer.applyCondition}`, {
-            defaultValue: layer.applyCondition,
-          })}
-        </Row>
-        {layer.releaseNotes ? (
-          <Row label={t("settings.page.updates.notes")}>{layer.releaseNotes}</Row>
-        ) : null}
-        {layer.failureReason ? (
-          <Row label={t("settings.page.updates.failure")}>{describeReason(t, layer.failureReason)}</Row>
-        ) : null}
-      </Rows>
-      <div className="rowline" style={{ marginTop: 12 }}>
-        <Btn soft disabled={busy !== null || !layer.liveAutoUpdate} onClick={onCheck}>
-          {t("settings.page.updates.check")}
-        </Btn>
-        <Btn soft disabled={busy !== null || !layer.liveAutoUpdate || layer.phase !== "available"} onClick={onDownload}>
-          {t("settings.page.updates.download")}
-        </Btn>
-        <Btn
-          soft
-          disabled={
-            busy !== null ||
-            !layer.liveAutoUpdate ||
-            (layer.phase !== "waitingForIdle" &&
-              layer.phase !== "waitingForRestart" &&
-              layer.phase !== "staged")
-          }
-          onClick={onApply}
-        >
-          {t("settings.page.updates.apply")}
-        </Btn>
-        <Btn soft disabled={busy !== null || layer.phase !== "downloading"} onClick={onCancel}>
-          {t("settings.page.updates.cancel")}
-        </Btn>
-        <Btn
-          soft
-          disabled={busy !== null || (layer.phase !== "failed" && layer.phase !== "rolledBack" && layer.phase !== "applied")}
-          onClick={onRollback}
-        >
-          {t("settings.page.updates.rollback")}
-        </Btn>
-      </div>
-      {expandable ? (
-        <div style={{ marginTop: 8 }}>
-          <Btn soft onClick={onToggleExpand}>
-            {t("settings.page.updates.hosts")}
-          </Btn>
-          {expanded
-            ? layer.hosts.map((host) => (
-                <Rows key={host.hostId}>
-                  <Row label={host.hostId}>
-                    <span className="runtime-control">
-                      <span>
-                        {t(`settings.page.updates.phase.${host.phase}`)}
-                        {host.stagedVersion ? ` · ${host.stagedVersion}` : ""}
-                      </span>
-                      <Toggle
-                        checked={host.idleAutoUpdate}
-                        onChange={(idle) => onHostPolicy?.(host.hostId, idle)}
-                        label={t("settings.page.updates.idleAuto")}
-                      />
-                    </span>
-                  </Row>
-                </Rows>
-              ))
-            : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-export function layerTitle(_component: UpdateComponent): string {
-  return _component;
 }

@@ -17,6 +17,7 @@ mod manifest;
 mod observe;
 mod remote_helper;
 mod remote_host;
+mod schedule;
 mod select;
 mod trust;
 
@@ -45,6 +46,7 @@ pub use github::{
 pub use observe::{desktop_apply_input, live_idle_evidence, live_idle_evidence_from};
 pub use remote_helper::{apply_remote_package, FakeRemoteHost, RemoteApplyPlan, RemoteBackend};
 pub use remote_host::{idle_from_host_facts, observe_remote_host, AppRemoteBackend};
+pub use schedule::{cancel_scheduled_restart, restart_schedule, schedule_restart, RestartSchedule};
 
 pub use journal::{Journal, JournalEntry};
 pub use machine::{UpdateEvent, UpdatePhase};
@@ -212,6 +214,12 @@ pub struct UpdateStatusSnapshot {
     pub preferences: UpdatePreferences,
     pub live_auto_update: bool,
     pub attention: UpdateAttention,
+    /// Unix seconds of the last check that reached GitHub.
+    #[serde(default)]
+    pub checked_at: Option<i64>,
+    /// A Desktop restart that waits for running work to finish.
+    #[serde(default)]
+    pub restart_schedule: Option<RestartSchedule>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,30 +259,15 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
         tokio::time::sleep(Duration::from_secs(8)).await;
         loop {
             let state = (*app.state::<AppState>()).clone();
-            if should_auto_check(live_auto_update_enabled(), &get_status(&state).preferences) {
-                if let Ok(snapshot) = check_updates(&state, None).await {
+            let preferences = get_status(&state).preferences;
+            if should_auto_check(live_auto_update_enabled(), &preferences) {
+                let result = if preferences.auto_download {
+                    update_vellum(&state).await
+                } else {
+                    check_updates(&state, None).await
+                };
+                if let Ok(snapshot) = result {
                     let _ = app.emit(UPDATES_PROGRESS_EVENT, &snapshot.attention);
-                    if snapshot.preferences.auto_download {
-                        for component in [
-                            UpdateComponent::Desktop,
-                            UpdateComponent::Remote,
-                            UpdateComponent::Core,
-                        ] {
-                            let layer = match component {
-                                UpdateComponent::Desktop => &snapshot.desktop,
-                                UpdateComponent::Remote => &snapshot.remote,
-                                UpdateComponent::Core => &snapshot.core,
-                            };
-                            // Remote packages are per host; they are fetched
-                            // when a host is updated, not in the background.
-                            if component != UpdateComponent::Remote
-                                && layer.live_auto_update
-                                && layer.phase == UpdatePhase::Available
-                            {
-                                let _ = download_update(&state, component, None).await;
-                            }
-                        }
-                    }
                 }
             }
             let jitter = auto_check_jitter_secs();
@@ -282,6 +275,54 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
         }
     });
     let _ = data_root;
+}
+
+/// One "update Vellum": check, then fetch what this machine needs.
+///
+/// Desktop is only staged; it installs when Vellum quits or on an explicit
+/// restart. A downloaded core is pending and the next Codex launch takes it.
+/// Remote hosts that opted into idle updates get their package and apply it
+/// when they are idle. A failure in one part is recorded on its layer and
+/// does not stop the others.
+pub async fn update_vellum(state: &AppState) -> crate::error::AppResult<UpdateStatusSnapshot> {
+    let snapshot = check_updates(state, None).await?;
+    if !snapshot.live_auto_update {
+        return Ok(snapshot);
+    }
+    for component in [UpdateComponent::Desktop, UpdateComponent::Core] {
+        let layer = match component {
+            UpdateComponent::Desktop => &snapshot.desktop,
+            _ => &snapshot.core,
+        };
+        if layer.phase == UpdatePhase::Available {
+            if let Err(error) = download_update(state, component, None).await {
+                log::warn!("[Updates] {} download failed: {error}", component.as_str());
+            }
+        }
+    }
+    if matches!(
+        snapshot.remote.phase,
+        UpdatePhase::Available | UpdatePhase::Staged | UpdatePhase::WaitingForIdle
+    ) {
+        for host in snapshot
+            .remote
+            .hosts
+            .iter()
+            .filter(|host| host.idle_auto_update)
+        {
+            let id = host.host_id.clone();
+            let result = match download_update(state, UpdateComponent::Remote, Some(id.clone()))
+                .await
+            {
+                Ok(_) => apply_update(state, UpdateComponent::Remote, Some(id.clone())).map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                log::warn!("[Updates] remote host {id} update failed: {error}");
+            }
+        }
+    }
+    Ok(get_status(state))
 }
 
 fn should_auto_check(live_enabled: bool, preferences: &UpdatePreferences) -> bool {

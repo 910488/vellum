@@ -513,9 +513,7 @@ html[data-performance="low"] .card {
   max-height: calc(100vh - 96px);
   overflow-y: auto;
 }
-.update-panel__head,
-.update-summary,
-.update-primary-actions {
+.update-panel__head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -524,48 +522,139 @@ html[data-performance="low"] .card {
 .update-panel__head .note {
   margin-top: 6px;
 }
-.update-card {
-  display: grid;
-  gap: 16px;
-}
-.update-summary__percent {
-  flex: none;
-  font-family: var(--font-mono);
-  font-size: 24px;
-  font-weight: 600;
-  color: var(--ink);
-}
-.update-primary-actions {
-  justify-content: flex-end;
-  align-items: center;
-}
-.update-experimental {
-  margin-top: 2px;
-  padding-top: 14px;
-  border-top: 1px solid var(--edge);
-}
-.update-experimental > summary {
-  cursor: pointer;
-  color: var(--ink-soft);
-  font-family: var(--font-display);
-  font-size: 13px;
-  font-weight: 600;
-}
-.update-experimental > .note {
-  margin-top: 8px;
-}
 @media (max-width: 720px) {
   .update-panel__body {
     padding: 20px;
   }
-  .update-panel__head,
-  .update-summary,
-  .update-primary-actions {
+  .update-panel__head {
     align-items: stretch;
     flex-direction: column;
   }
-  .update-primary-actions .btn {
+}
+
+/* ---------- Vellum 更新（單一版本） ----------
+   主角是版本號本身：沒有新版時只有一個數字，有新版時寫成「舊 → 新」，
+   舊的變淡。狀態只用一個點的顏色與一句話表達，不再分三層卡片。
+   數字用 mono，是為了 0.2.10-nightly 這種長版本號在四種語言下都不換行亂跳。 */
+.vupdate {
+  display: grid;
+  gap: 14px;
+}
+.vupdate__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+.vupdate__version {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.vupdate__name {
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: var(--track-title);
+  color: var(--ink-faint);
+}
+.vupdate__numbers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-family: var(--font-mono);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.vupdate__from {
+  color: var(--ink-faint);
+  font-size: 20px;
+}
+.vupdate__arrow {
+  color: var(--ink-ghost);
+  font-size: 20px;
+}
+.vupdate__act {
+  flex: none;
+}
+/* 點一欄、句子一欄：長句（例如沒有簽章的那一句）折行時，點仍貼在第一行旁邊。 */
+.vupdate__state {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  column-gap: 10px;
+  align-items: start;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+.vupdate__dot {
+  width: 8px;
+  height: 8px;
+  margin-top: calc((1.6em - 8px) / 2);
+  border-radius: 50%;
+  background: var(--ok);
+}
+.vupdate--busy .vupdate__dot { background: var(--honey); animation: vupdate-pulse 1.4s ease-in-out infinite; }
+.vupdate--ready .vupdate__dot { background: var(--lavender); }
+.vupdate--warn .vupdate__dot { background: var(--warn); }
+.vupdate--crit .vupdate__dot { background: var(--crit); }
+.vupdate--crit .vupdate__state { color: var(--crit-ink); }
+.vupdate--ready .vupdate__to { color: var(--lavender-ink); }
+@keyframes vupdate-pulse {
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vupdate--busy .vupdate__dot { animation: none; }
+}
+.vupdate__link {
+  margin-left: 10px;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--lavender-ink);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+/* 版本說明直接攤在狀態句下面，不另開視窗；縮排對齊狀態句的文字，
+   讓它讀起來是那一句的延伸。 */
+.vupdate__notes {
+  margin-left: 18px;
+  padding-left: 12px;
+  border-left: 2px solid var(--lavender-wash);
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow: auto;
+}
+.vupdate__error {
+  margin: 0 0 0 18px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--warn-ink);
+}
+.vupdate__hosts {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+@media (max-width: 720px) {
+  .vupdate__head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .vupdate__act .btn {
     width: 100%;
+    justify-content: center;
   }
 }
 

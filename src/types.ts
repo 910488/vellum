@@ -1575,7 +1575,20 @@ export interface UpdateStatusSnapshot {
   preferences: UpdatePreferences;
   liveAutoUpdate: boolean;
   attention: UpdateAttention;
+  /** Unix seconds of the last check that reached GitHub. */
+  checkedAt: number | null;
+  /** A Desktop restart waiting for running work to finish. */
+  restartSchedule: RestartSchedule | null;
 }
+
+export interface RestartSchedule {
+  version: string | null;
+  openTurns: number;
+  activeRequests: number;
+  since: number;
+}
+
+export type RestartToUpdate = "restarting" | "scheduled";
 
 export interface UpdateOperation {
   operationId: string;

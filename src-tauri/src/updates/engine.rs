@@ -42,6 +42,9 @@ struct PersistedState {
     remote_policies: Vec<RemoteUpdatePolicy>,
     layers: HashMap<String, LayerRecord>,
     restart_reasons_at_stage: Vec<String>,
+    /// Unix seconds of the last check that reached GitHub.
+    #[serde(default)]
+    last_checked_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +241,8 @@ impl UpdateEngine {
             preferences: state.preferences,
             live_auto_update: live,
             attention,
+            checked_at: state.last_checked_at,
+            restart_schedule: None,
         }
     }
 
@@ -492,6 +497,7 @@ impl UpdateEngine {
                     .unwrap_or(UpdatePhase::Idle);
             }
         }
+        state.last_checked_at = Some(now_secs());
         self.save(&state)?;
         Ok(op)
     }
@@ -1041,7 +1047,9 @@ pub fn get_status(state: &AppState) -> UpdateStatusSnapshot {
     let engine = super::engine(&state.data_root());
     let core_version = current_core_version(state);
     let currents = current_versions(&core_version);
-    engine.snapshot(currents.desktop, currents.remote, currents.core)
+    let mut snapshot = engine.snapshot(currents.desktop, currents.remote, currents.core);
+    snapshot.restart_schedule = super::restart_schedule(state);
+    snapshot
 }
 
 pub async fn check_updates(
@@ -1052,7 +1060,9 @@ pub async fn check_updates(
     let core_version = current_core_version(state);
     let currents = current_versions(&core_version);
     engine.check(component, currents).await?;
-    Ok(engine.snapshot(currents.desktop, currents.remote, currents.core))
+    let mut snapshot = engine.snapshot(currents.desktop, currents.remote, currents.core);
+    snapshot.restart_schedule = super::restart_schedule(state);
+    Ok(snapshot)
 }
 
 pub async fn download_update(
@@ -1512,11 +1522,15 @@ mod tests {
             b"ignored-for-core",
             recorder,
         );
+        assert!(engine
+            .snapshot("0.2.9", "0.2.9", "bundled")
+            .checked_at
+            .is_none());
         engine.check(None, currents).await.unwrap();
-        assert_eq!(
-            engine.snapshot("0.2.9", "0.2.9", "bundled").core.phase,
-            UpdatePhase::Available
-        );
+        let snapshot = engine.snapshot("0.2.9", "0.2.9", "bundled");
+        assert_eq!(snapshot.core.phase, UpdatePhase::Available);
+        // The panel says when Vellum last looked, so the check must be remembered.
+        assert!(snapshot.checked_at.is_some());
     }
 
     #[tokio::test]
