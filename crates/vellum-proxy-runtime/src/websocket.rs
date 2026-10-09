@@ -69,10 +69,10 @@ fn managed_account_changed(
         (&current.auth_posture, &next.auth_posture),
         (
             crate::exec::OfficialWebSocketAuthPosture::Managed {
-                account_id: Some(current),
+                execution_identity: Some(current),
             },
             crate::exec::OfficialWebSocketAuthPosture::Managed {
-                account_id: Some(next),
+                execution_identity: Some(next),
             },
         ) if current != next
     )
@@ -2739,6 +2739,15 @@ mod tests {
 
     #[tokio::test]
     async fn official_websocket_account_switch_replays_portable_history_on_new_account() {
+        run_official_websocket_account_switch(false).await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_switches_users_in_the_same_workspace() {
+        run_official_websocket_account_switch(true).await;
+    }
+
+    async fn run_official_websocket_account_switch(shared_workspace: bool) {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
 
@@ -2746,10 +2755,33 @@ mod tests {
             format!("{:x}", Sha256::digest(account_id.as_bytes()))
         }
 
-        fn jwt_for(account_id: &str) -> String {
-            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(json!({"chatgpt_account_id": account_id}).to_string());
+        fn jwt_for(account_id: &str, shared_workspace: bool) -> String {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                if shared_workspace {
+                    json!({"chatgpt_account_id": "shared-workspace", "sub": account_id})
+                } else {
+                    json!({"chatgpt_account_id": account_id})
+                }
+                .to_string(),
+            );
             format!("header.{payload}.signature")
+        }
+
+        fn execution_from_headers(headers: &HeaderMap) -> String {
+            let token = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            token
+                .and_then(crate::chatgpt_identity_from_jwt)
+                .map(|id| id.credential_id)
+                .unwrap_or_else(|| {
+                    headers
+                        .get("chatgpt-account-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                })
         }
 
         fn select_account(root: &std::path::Path, account_id: &str, revision: u64) {
@@ -2767,23 +2799,34 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let auth_root = temp.path().join("official-auth");
+        let identity_for = |account: &str| {
+            crate::chatgpt_identity_from_jwt(&jwt_for(account, shared_workspace))
+                .map_or_else(|| account.to_string(), |id| id.credential_id)
+        };
+        let identity_a = identity_for("acct-a");
+        let identity_b = identity_for("acct-b");
         for account_id in ["acct-a", "acct-b"] {
             let path = auth_root
                 .join("grants")
-                .join(format!("{}.json", account_hash(account_id)));
+                .join(format!("{}.json", account_hash(&identity_for(account_id))));
             crate::official_auth::write_grant_atomic(
                 &path,
                 &crate::official_auth::FileOfficialGrant {
-                    credential_id: None,
-                    account_id: account_id.into(),
-                    access_token: jwt_for(account_id),
+                    credential_id: shared_workspace.then(|| identity_for(account_id)),
+                    account_id: if shared_workspace {
+                        "shared-workspace"
+                    } else {
+                        account_id
+                    }
+                    .into(),
+                    access_token: jwt_for(account_id, shared_workspace),
                     refresh_token: format!("refresh-{account_id}"),
                     expires_at_ms: chrono::Utc::now().timestamp_millis() + 600_000,
                 },
             )
             .unwrap();
         }
-        select_account(&auth_root, "acct-a", 1);
+        select_account(&auth_root, &identity_a, 1);
 
         #[derive(Clone, Default)]
         struct Capture {
@@ -2799,13 +2842,11 @@ mod tests {
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
                 let capture = get_capture.clone();
                 async move {
-                    capture.websocket_accounts.lock().unwrap().push(
-                        headers
-                            .get("chatgpt-account-id")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
+                    capture
+                        .websocket_accounts
+                        .lock()
+                        .unwrap()
+                        .push(execution_from_headers(&headers));
                     ws.on_upgrade(move |mut socket| async move {
                         while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
                             let request: Value = serde_json::from_str(&text).unwrap();
@@ -2844,11 +2885,7 @@ mod tests {
                 move |headers: HeaderMap, axum::extract::Json(body): axum::extract::Json<Value>| {
                     let capture = post_capture.clone();
                     async move {
-                        let account = headers
-                            .get("chatgpt-account-id")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string();
+                        let account = execution_from_headers(&headers);
                         capture.http_requests.lock().unwrap().push((account, body));
                         axum::Json(json!({
                             "id": "resp_account_b",
@@ -2922,7 +2959,7 @@ mod tests {
             "response.completed"
         );
 
-        select_account(&auth_root, "acct-b", 2);
+        select_account(&auth_root, &identity_b, 2);
         client
             .send(TungsteniteMessage::Text(
                 json!({
@@ -2959,14 +2996,14 @@ mod tests {
         }
 
         let websocket_accounts = capture.websocket_accounts.lock().unwrap().clone();
-        assert_eq!(websocket_accounts, ["acct-a"]);
+        assert_eq!(websocket_accounts, [identity_a]);
         let requests = capture.http_requests.lock().unwrap().clone();
         assert_eq!(
             requests.len(),
             1,
             "account handoff must use one portable POST"
         );
-        assert_eq!(requests[0].0, "acct-b");
+        assert_eq!(requests[0].0, identity_b);
         assert!(
             requests[0].1.get("previous_response_id").is_none(),
             "old account response id must not reach the new account: {}",

@@ -206,6 +206,33 @@ describe("Models screen Effort probe status", () => {
     expect(apiMocks.setCodexQuotaPool.mock.calls[1]![0].members[0].accountId).toBe("b");
   });
 
+  it("saves smart balance and reports the backend selection instead of first priority", async () => {
+    apiMocks.getCodexOAuthStatus.mockResolvedValue({ authenticated: true, defaultAccountId: "a", accounts: [
+      { accountId: "a", email: "a@example.test", authenticatedAt: 1, isDefault: true },
+      { accountId: "b", email: "b@example.test", authenticatedAt: 1, isDefault: false },
+    ] });
+    apiMocks.getCodexQuotaPool.mockResolvedValue({ enabled: true, strategy: "rank", activeAccountId: "b", members: [
+      { accountId: "a", inPool: true, paused: false, weeklyFloor: 0 },
+      { accountId: "b", inPool: true, paused: false, weeklyFloor: 0 },
+    ] });
+    apiMocks.getCodexOAuthAccountQuota.mockResolvedValue([
+      { usedPercent: 10, period: { unit: "week", amount: null }, resetAt: null },
+    ]);
+    apiMocks.getCodexOAuthResetCredits.mockResolvedValue({ credits: [], availableCount: 0 });
+    apiMocks.setCodexQuotaPool.mockImplementation(async (settings) => ({ ...settings, activeAccountId: "b" }));
+    renderModels();
+    const strategy = await screen.findByRole("combobox", { name: t("models.ui.pool.strategyLabel") });
+    await screen.findByText(t("models.ui.pool.lastSelected", { account: "b@example.test · Workspace b" }));
+    const activeRank = document.querySelector(".acct__rank--active");
+    expect(activeRank?.textContent).toContain("b@example.test");
+    expect(activeRank?.querySelector("b")?.textContent).toBe("2");
+    fireEvent.change(strategy, { target: { value: "balanced" } });
+    await waitFor(() => expect(apiMocks.setCodexQuotaPool).toHaveBeenCalledTimes(1));
+    expect(apiMocks.setCodexQuotaPool.mock.calls[0]![0].strategy).toBe("balanced");
+    await screen.findByText(t("models.ui.pool.balancedHint"));
+    expect((strategy as HTMLSelectElement).value).toBe("balanced");
+  });
+
   it("shows a weekly-only pool account as usable without a five-hour automation control", async () => {
     apiMocks.getCodexOAuthStatus.mockResolvedValue({ authenticated: true, defaultAccountId: "pro", accounts: [
       { accountId: "pro", email: "pro@example.test", planType: "pro", authenticatedAt: 1, isDefault: true },

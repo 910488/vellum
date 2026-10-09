@@ -352,6 +352,27 @@ floor, but never consumes a Reset credit. The request reaches upstream so its
 actual usage-limit response determines whether it can proceed. Auto Review's
 explicitly selected billing account bypasses this ordinary-request policy.
 
+The optional `balanced` strategy keeps the same admission gates and manual
+fallback. It compares normalized weekly/five-hour headroom and estimates the
+context load of active conversations, using member order to break ties.
+Ordinary HTTP and WebSocket authorization receive the same routing hints.
+Identity is namespaced by route and upstream model: Codex session+thread,
+otherwise a prompt cache key or WebSocket connection. Conflicting identity or
+no stable identity uses member order rather than guessed affinity. Prompt
+content and cache keys are not changed or sent as additional upstream fields.
+An eligible incumbent is retained throughout a context window. At an explicit
+context-window change, a score improvement must exceed a switching threshold
+that increases with context pressure and observed cached-input ratio. If the
+incumbent no longer passes admission gates, another eligible member is chosen.
+Successful upstream usage refines context estimates and cached-input ratio;
+cached tokens are never treated as a known subscription-quota discount.
+Affinity/load state is bounded, expires after 30 minutes of inactivity, and
+resets on app restart, strategy changes, or disabling the pool. Gate edits and
+priority changes retain affinity, subject to current eligibility. This is a best-effort cache and
+load heuristic, not a guarantee of equal spending or provider cache hits.
+The UI reports the backend's last selection; concurrently active conversations
+may use different accounts. It does not infer the active account from priority.
+
 Quota readings are cached for at most 30 seconds per token and workspace;
 force-refresh invalidates the previous reading. Gates control automatic
 rotation, not whether a request can be sent. Usage by other clients and
@@ -363,6 +384,12 @@ the authenticated user; their access tokens, quota caches, gates, and rotation
 state remain separate. The pool also accepts credentials from different users
 and workspaces when explicitly enrolled. Reauthenticating a legacy workspace-id
 credential retains its pool membership under the new user-and-workspace id.
+WebSocket reuse, continuation realms, execution usage identity, and refresh
+identity checks use the stable user+workspace credential identity when the
+managed token carries it. The upstream `ChatGPT-Account-Id` header remains the
+workspace id. Two user seats in one workspace must not reuse each other's
+authenticated upstream socket. Manual selection and pool allocation both
+take effect on new turns; already-sent turns keep their resolved credential.
 A configuration change during selection rejects that selection so the caller
 can retry with the new settings.
 

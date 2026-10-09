@@ -46,9 +46,7 @@ export function normalizeQuotaPool(
       });
     }
   }
-  // 順序只有一種：使用者排的那一種。後端存的設定可能還帶著舊的 most／soonest，
-  // 這裡一律收成 rank —— 畫面上的號碼才會跟實際順序一致，下一次存檔也會把它寫回去。
-  return { ...settings, strategy: "rank", members: ordered };
+  return { ...settings, strategy: settings.strategy === "balanced" ? "balanced" : "rank", members: ordered };
 }
 
 export function quotaPoolAccounts(
@@ -95,4 +93,13 @@ export function quotaPoolAccounts(
 /** 輪替順序就是成員順序，跳過現在用不了的帳號。跳過不會改變其餘的先後。 */
 export function quotaPoolRotation(accounts: QuotaPoolAccount[]): QuotaPoolAccount[] {
   return accounts.filter((entry) => entry.usable);
+}
+
+/** Backend selection is an observation, never inferred from quota snapshots. */
+export function quotaPoolLastSelection(
+  settings: QuotaPoolSettings & { activeAccountId?: string | null },
+  accounts: QuotaPoolAccount[],
+): QuotaPoolAccount | null {
+  if (!settings.enabled) return null;
+  return accounts.find((entry) => entry.account.accountId === settings.activeAccountId) ?? null;
 }

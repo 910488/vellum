@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CodexOAuthAccount, QuotaPoolSettings, QuotaSnapshot } from "../types";
-import { normalizeQuotaPool, quotaPoolAccounts, quotaPoolRotation } from "./quotaPool";
+import { normalizeQuotaPool, quotaPoolAccounts, quotaPoolRotation, quotaPoolLastSelection } from "./quotaPool";
 
 const accounts: CodexOAuthAccount[] = [
   { accountId: "alice-personal", workspaceId: "personal", workspaceKind: "personal", email: "alice@example.test", authenticatedAt: 1, isDefault: true },
@@ -16,6 +16,21 @@ function windows(weeklyUsed: number): QuotaSnapshot[] {
 }
 
 describe("ChatGPT quota pool eligibility", () => {
+  it("preserves smart allocation when editing members", () => {
+    expect(normalizeQuotaPool({ enabled: true, strategy: "balanced", members: [] }, accounts).strategy)
+      .toBe("balanced");
+  });
+  it("shows the backend selection rather than predicting it from rank", () => {
+    const settings: QuotaPoolSettings = { enabled: true, strategy: "balanced",
+      members: accounts.map((account) => ({ accountId: account.accountId, inPool: true, paused: false, weeklyFloor: 0 })) };
+    const entries = quotaPoolAccounts(settings, accounts, {
+      "alice-personal": windows(0), "alice-business": windows(30), "bob-business": windows(20),
+    });
+    expect(quotaPoolLastSelection({ ...settings, activeAccountId: "bob-business" }, entries)?.account.accountId)
+      .toBe("bob-business");
+    expect(quotaPoolLastSelection(settings, entries)).toBeNull();
+    expect(quotaPoolLastSelection({ ...settings, enabled: false, activeAccountId: "bob-business" }, entries)).toBeNull();
+  });
   it("offers every managed credential and rotates across users and workspaces", () => {
     const settings: QuotaPoolSettings = { enabled: true, strategy: "rank", members: [] };
     const available = normalizeQuotaPool(settings, accounts);

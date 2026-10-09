@@ -101,7 +101,11 @@ impl ResolvedAuth {
             RuntimeAuthKind::ChatGpt => {
                 let requested_account = request.metadata.review_official_account_id.as_deref();
                 let decision = official_auth
-                    .authorize_as(&route.route_id, requested_account)
+                    .authorize_with_context(
+                        &route.route_id,
+                        requested_account,
+                        &crate::official_auth::OfficialRoutingContext::from_request(route, request),
+                    )
                     .await
                     .map_err(RuntimeError::AuthenticationFailed)?;
                 match decision {
@@ -127,8 +131,13 @@ impl ResolvedAuth {
                         // not choose is a silent failure, and a silent
                         // billing failure is worse than a loud one.
                         if let Some(account) = requested_account {
-                            match auth.account_id.as_deref() {
-                                Some(actual) if actual == account => {}
+                            let execution_identity =
+                                crate::official_auth::managed_execution_identity(
+                                    &auth.access_token,
+                                    auth.account_id.as_deref(),
+                                );
+                            match execution_identity.as_deref() {
+                                Some(actual) if actual == account || auth.account_id.as_deref() == Some(account) => {}
                                 Some(actual) => {
                                     return Err(RuntimeError::AuthenticationFailed(format!(
                                         "Auto Review is set to bill account {account}, but this                                          host authorized {actual}"
@@ -414,6 +423,105 @@ mod tests {
             access_mode: None,
             chat_capabilities: crate::route::RuntimeChatCapabilities::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn official_authorization_receives_context_without_mutating_the_prompt() {
+        struct ContextAuth;
+        #[async_trait::async_trait]
+        impl OfficialAuthProvider for ContextAuth {
+            async fn authorize(&self, _: &str) -> Result<OfficialAuthDecision, String> {
+                Err("context port was bypassed".into())
+            }
+            async fn authorize_with_context(
+                &self,
+                _: &str,
+                account: Option<&str>,
+                context: &crate::official_auth::OfficialRoutingContext,
+            ) -> Result<OfficialAuthDecision, String> {
+                assert_eq!(account, Some("review-account"));
+                assert_eq!(context.request_id, "req-auth");
+                assert_eq!(context.session_key.as_ref().unwrap().len(), 64);
+                assert!(context.estimated_input_tokens > 100);
+                assert_eq!(context.context_window, Some(128_000));
+                Ok(OfficialAuthDecision::Managed(
+                    crate::official_auth::OfficialAuthorization {
+                        access_token: "context-token".into(),
+                        account_id: Some("review-account".into()),
+                        selection_revision: Some(0),
+                        selection_verified: true,
+                    },
+                ))
+            }
+            async fn refresh_after_rejection(
+                &self,
+                _: &str,
+                _: &crate::official_auth::OfficialAuthorization,
+            ) -> Result<crate::official_auth::OfficialAuthorization, String> {
+                unreachable!()
+            }
+        }
+        let mut request = request_with_auth(
+            serde_json::json!({
+                "input": "long prompt ".repeat(100), "prompt_cache_key": "private-cache-key",
+            }),
+            IncomingAuthContext::default(),
+        );
+        request.metadata.review_official_account_id = Some("review-account".into());
+        let before = request.body.clone();
+        let auth = ResolvedAuth::resolve(
+            &route(RuntimeAuthKind::ChatGpt, None),
+            &request,
+            &MemoryCredentialProvider::new(),
+            &ContextAuth,
+            &GrokSessionRegistry::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(auth, ResolvedAuth::OfficialManaged { account_id: Some(id), .. } if id == "review-account")
+        );
+        assert_eq!(request.body, before);
+    }
+
+    #[test]
+    fn official_context_separates_models_threads_and_conflicting_identity() {
+        use crate::codex_metadata::{CodexIdentityTrust, CodexOpaqueId, CodexTurnIdentity};
+        use crate::official_auth::OfficialRoutingContext;
+        let mut model = route(RuntimeAuthKind::ChatGpt, None);
+        let mut request = request_with_auth(
+            serde_json::json!({ "prompt_cache_key": "fallback" }),
+            IncomingAuthContext::default(),
+        );
+        request.metadata.codex_identity = Some(CodexTurnIdentity {
+            session_id: Some(CodexOpaqueId::new("session_id", "s").unwrap()),
+            thread_id: Some(CodexOpaqueId::new("thread_id", "t").unwrap()),
+            context_window_id: Some(CodexOpaqueId::new("context_window_id", "w").unwrap()),
+            trust: CodexIdentityTrust::Exact,
+            ..Default::default()
+        });
+        let first = OfficialRoutingContext::from_request(&model, &request);
+        request.metadata.connection_id = Some("other-socket".into());
+        assert_eq!(
+            first.session_key,
+            OfficialRoutingContext::from_request(&model, &request).session_key
+        );
+        model.upstream_model = "other-model".into();
+        assert_ne!(
+            first.session_key,
+            OfficialRoutingContext::from_request(&model, &request).session_key
+        );
+        request.metadata.codex_identity.as_mut().unwrap().thread_id =
+            Some(CodexOpaqueId::new("thread_id", "child").unwrap());
+        assert_ne!(
+            first.session_key,
+            OfficialRoutingContext::from_request(&model, &request).session_key
+        );
+        request.metadata.codex_identity.as_mut().unwrap().trust = CodexIdentityTrust::Conflict;
+        let conflict = OfficialRoutingContext::from_request(&model, &request);
+        assert!(conflict.session_key.is_none());
+        assert!(conflict.context_window_key.is_none());
     }
 
     #[tokio::test]

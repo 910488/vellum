@@ -733,7 +733,7 @@ impl Drop for CancelRegistration {
 pub(crate) enum OfficialWebSocketAuthPosture {
     None,
     PreserveIncoming,
-    Managed { account_id: Option<String> },
+    Managed { execution_identity: Option<String> },
     Bearer { credential_id: Option<String> },
 }
 
@@ -8367,9 +8367,11 @@ fn official_usage_identity(
         .as_deref()
         .map(hashed_account_identity);
     let execution = match auth {
-        ResolvedAuth::OfficialManaged { account_id, .. } => {
-            account_id.as_deref().map(hashed_account_identity)
-        }
+        ResolvedAuth::OfficialManaged {
+            account_id, token, ..
+        } => crate::official_auth::managed_execution_identity(token, account_id.as_deref())
+            .as_deref()
+            .map(hashed_account_identity),
         ResolvedAuth::OfficialPreserveIncoming { account, .. } => {
             account.as_deref().map(hashed_account_identity)
         }
@@ -8401,6 +8403,13 @@ fn official_refresh_matches_snapshot(
     refreshed: &OfficialAuthorization,
 ) -> bool {
     refreshed.account_id == rejected.account_id
+        && crate::official_auth::managed_execution_identity(
+            &refreshed.access_token,
+            refreshed.account_id.as_deref(),
+        ) == crate::official_auth::managed_execution_identity(
+            &rejected.access_token,
+            rejected.account_id.as_deref(),
+        )
         && refreshed.selection_revision == rejected.selection_revision
         && refreshed.selection_verified
 }
@@ -8418,12 +8427,19 @@ fn hashed_account_identity(account_id: &str) -> String {
 /// `response_realm.realm_fingerprint`. Raw account ids never reach history.
 fn official_continuation_realm(route: &RuntimeModelRoute, auth: &ResolvedAuth) -> Option<String> {
     let account = match auth {
-        ResolvedAuth::OfficialManaged { account_id, .. } => account_id.as_deref(),
-        ResolvedAuth::OfficialPreserveIncoming { account, .. } => account.as_deref(),
+        ResolvedAuth::OfficialManaged {
+            account_id, token, ..
+        } => crate::official_auth::managed_execution_identity(token, account_id.as_deref()),
+        ResolvedAuth::OfficialPreserveIncoming { account, .. } => account.clone(),
         _ => None,
     }?;
     let mut hasher = Sha256::new();
-    for part in ["official", route.base_url.as_str(), "chatgpt", account] {
+    for part in [
+        "official",
+        route.base_url.as_str(),
+        "chatgpt",
+        account.as_str(),
+    ] {
         hasher.update(part.trim().to_ascii_lowercase().as_bytes());
         hasher.update([0]);
     }
@@ -8543,8 +8559,13 @@ fn official_websocket_auth_posture(
         ResolvedAuth::OfficialPreserveIncoming { .. } => {
             OfficialWebSocketAuthPosture::PreserveIncoming
         }
-        ResolvedAuth::OfficialManaged { account_id, .. } => OfficialWebSocketAuthPosture::Managed {
-            account_id: account_id.clone(),
+        ResolvedAuth::OfficialManaged {
+            account_id, token, ..
+        } => OfficialWebSocketAuthPosture::Managed {
+            execution_identity: crate::official_auth::managed_execution_identity(
+                token,
+                account_id.as_deref(),
+            ),
         },
         ResolvedAuth::Bearer(_) => OfficialWebSocketAuthPosture::Bearer {
             credential_id: route.credential_id.clone(),
@@ -11051,6 +11072,26 @@ mod tests {
                 .dispatch,
             WebSocketTurnDispatch::OfficialNative(_)
         ));
+    }
+
+    #[test]
+    fn official_shared_workspace_identity_keeps_refresh_but_separates_users() {
+        use base64::Engine as _;
+        let token = |user: &str, revision: u32| format!("header.{}.signature", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({ "sub": user, "chatgpt_account_id": "shared", "iat": revision }).to_string()));
+        let authorization = |user: &str, revision: u32| OfficialAuthorization {
+            access_token: token(user, revision), account_id: Some("shared".into()),
+            selection_revision: Some(3), selection_verified: true,
+        };
+        assert!(official_refresh_matches_snapshot(&authorization("a", 1), &authorization("a", 2)));
+        assert!(!official_refresh_matches_snapshot(&authorization("a", 1), &authorization("b", 2)));
+        let auth = |user: &str| ResolvedAuth::OfficialManaged {
+            token: token(user, 1), account_id: Some("shared".into()), selection_revision: Some(3), selection_verified: true,
+        };
+        let route = sample_route(None);
+        assert_ne!(official_continuation_realm(&route, &auth("a")), official_continuation_realm(&route, &auth("b")));
+        assert_ne!(official_usage_identity(&auth("a"), &request(json!({}))).1,
+            official_usage_identity(&auth("b"), &request(json!({}))).1);
     }
 
     #[test]

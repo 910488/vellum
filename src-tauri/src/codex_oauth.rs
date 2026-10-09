@@ -76,6 +76,7 @@ pub enum QuotaPoolStrategy {
     #[default]
     #[serde(alias = "most", alias = "soonest")]
     Rank,
+    Balanced,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +221,7 @@ pub struct CodexOAuthManager {
     selection_verified: RwLock<bool>,
     quota_pool: RwLock<QuotaPoolSettings>,
     active_pool_account_id: RwLock<Option<String>>,
+    smart_router: parking_lot::Mutex<crate::quota_pool_router::SmartRouter>,
     selection_lock: Mutex<()>,
     access_tokens: RwLock<HashMap<String, CachedToken>>,
     refresh_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
@@ -322,6 +324,7 @@ impl CodexOAuthManager {
             selection_verified: RwLock::new(store.selection_verified),
             quota_pool: RwLock::new(store.quota_pool),
             active_pool_account_id: RwLock::new(None),
+            smart_router: parking_lot::Mutex::new(crate::quota_pool_router::SmartRouter::default()),
             selection_lock: Mutex::const_new(()),
             access_tokens: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
@@ -595,9 +598,14 @@ impl CodexOAuthManager {
             *self.quota_pool.write().await = previous;
             return Err(error);
         }
-        if !self.quota_pool.read().await.enabled {
+        let current = self.quota_pool.read().await;
+        if !current.enabled {
             *self.active_pool_account_id.write().await = None;
         }
+        if !current.enabled || current.strategy != previous.strategy {
+            self.smart_router.lock().clear();
+        }
+        drop(current);
         self.cadence_notify.notify_one();
         Ok(self.quota_pool_status().await)
     }
@@ -709,6 +717,20 @@ impl CodexOAuthManager {
     /// reach upstream and receive its actual usage-limit response.
     /// Auto Review calls `valid_auth_for` and remains explicitly billed.
     pub async fn valid_routing_auth(&self) -> Result<Option<AppliedOAuth>, OAuthError> {
+        self.valid_routing_auth_with_context(&Default::default())
+            .await
+    }
+
+    pub fn observe_routing_usage(&self, request_id: &str, input: u64, cached: u64, status: u16) {
+        self.smart_router
+            .lock()
+            .observe(request_id, input, cached, status);
+    }
+
+    pub async fn valid_routing_auth_with_context(
+        &self,
+        context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
+    ) -> Result<Option<AppliedOAuth>, OAuthError> {
         let settings = self.quota_pool.read().await.clone();
         let selection_id = ulid::Ulid::new();
         if !settings.enabled || !settings.members.iter().any(|member| member.in_pool) {
@@ -727,6 +749,7 @@ impl CodexOAuthManager {
         let mut failures = Vec::new();
         let mut rank = 0;
         let mut fallback_auth = None;
+        let mut eligible = Vec::new();
         for member in &settings.members {
             if !member.in_pool {
                 continue;
@@ -832,6 +855,10 @@ impl CodexOAuthManager {
             };
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
                 if observation.usable {
+                    if settings.strategy == QuotaPoolStrategy::Balanced {
+                        eligible.push((auth, rank, observation.headroom));
+                        continue;
+                    }
                     if *self.quota_pool.read().await != settings {
                         log_pool_decision(
                             selection_id,
@@ -876,6 +903,33 @@ impl CodexOAuthManager {
             }
         }
 
+        if !eligible.is_empty() {
+            let _selection_guard = self.selection_lock.lock().await;
+            if *self.quota_pool.read().await != settings {
+                return Err(OAuthError::AuthenticationFailed(
+                    "quota pool changed during account selection; retry the request".into(),
+                ));
+            }
+            let candidates = eligible
+                .iter()
+                .map(|(auth, _, headroom)| crate::quota_pool_router::Candidate {
+                    account_id: auth.credential_id.clone(),
+                    headroom: *headroom,
+                })
+                .collect::<Vec<_>>();
+            let (index, reason) = self.smart_router.lock().choose(
+                &candidates,
+                context,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            );
+            let (auth, rank, _) = eligible.swap_remove(index);
+            *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
+            log_pool_decision(selection_id, "selected", &auth.credential_id, rank, reason);
+            log::info!("[QuotaPool] selection={selection_id} strategy=balanced context_tokens={} context_limit={}",
+                context.estimated_input_tokens, context.context_window.unwrap_or(0));
+            return Ok(Some(auth));
+        }
+
         // The usage endpoint is advisory. A depleted or unreadable snapshot
         // must not prevent a valid credential from reaching the provider.
         // Prefer the user's manual selection, including an account outside the
@@ -901,10 +955,21 @@ impl CodexOAuthManager {
             fallback_auth
         };
         if let Some(auth) = fallback {
+            let _selection_guard = self.selection_lock.lock().await;
             if *self.quota_pool.read().await != settings {
                 return Err(OAuthError::AuthenticationFailed(
                     "quota pool changed during account selection; retry the request".into(),
                 ));
+            }
+            if settings.strategy == QuotaPoolStrategy::Balanced {
+                self.smart_router.lock().choose(
+                    &[crate::quota_pool_router::Candidate {
+                        account_id: auth.credential_id.clone(),
+                        headroom: 0.0,
+                    }],
+                    context,
+                    chrono::Utc::now().timestamp_millis().max(0) as u64,
+                );
             }
             *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
             let fallback_rank = settings
@@ -1218,6 +1283,7 @@ impl CodexOAuthManager {
 struct QuotaPoolObservation {
     usable: bool,
     skip_reason: Option<&'static str>,
+    headroom: f64,
 }
 
 fn log_pool_decision(
@@ -1277,6 +1343,15 @@ fn quota_pool_observation(
     Some(QuotaPoolObservation {
         usable: skip_reason.is_none(),
         skip_reason,
+        // Compare remaining fractions rather than raw tokens across plans.
+        // Reserve/floor headroom is normalized to each spendable window.
+        headroom: (burnable / (100.0 - f64::from(weekly_floor)).max(1.0) * 100.0).min(
+            five_hour_remaining.map_or(100.0, |remaining| {
+                ((remaining - FIVE_HOUR_ROUTING_RESERVE_PERCENT).max(0.0)
+                    / (100.0 - FIVE_HOUR_ROUTING_RESERVE_PERCENT))
+                    * 100.0
+            }),
+        ),
     })
 }
 
@@ -1926,6 +2001,129 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("authentication_failed"));
+    }
+
+    #[tokio::test]
+    async fn quota_pool_balanced_routes_with_context_and_preserves_explicit_billing() {
+        use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let mut members = Vec::new();
+        for (id, used) in [("balanced-a", 60.0), ("balanced-b", 10.0)] {
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({
+                "sub": id, "chatgpt_account_id": "shared-balanced", "chatgpt_plan_type": "business",
+            }).to_string());
+            let token = format!("header.{payload}.signature");
+            manager.accounts.write().await.insert(
+                id.into(),
+                AccountMetadata {
+                    account_id: id.into(),
+                    chatgpt_account_id: Some("shared-balanced".into()),
+                    workspace_name: None,
+                    plan_type: Some("business".into()),
+                    email: None,
+                    authenticated_at: 1,
+                },
+            );
+            manager.access_tokens.write().await.insert(
+                id.into(),
+                CachedToken {
+                    access_token: token.clone(),
+                    expires_at_ms: i64::MAX,
+                },
+            );
+            crate::codex_quota::seed_test_quota(
+                &token,
+                "shared-balanced",
+                vec![
+                    quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 10.0, None),
+                    quota_window(crate::model::QuotaPeriodUnit::Week, None, used, None),
+                ],
+            )
+            .await;
+            members.push(QuotaPoolMember {
+                account_id: id.into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 0,
+                maintain_five_hour_window: false,
+            });
+        }
+        *manager.default_account_id.write().await = Some("balanced-a".into());
+        let mut settings = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Balanced,
+            members,
+        };
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            load_store(temp.path()).unwrap().quota_pool.strategy,
+            QuotaPoolStrategy::Balanced
+        );
+        let context = OfficialRoutingContext {
+            session_key: Some("session-balanced".into()),
+            estimated_input_tokens: 80_000,
+            request_id: "req-balanced".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "balanced-b"
+        );
+        assert_eq!(
+            manager
+                .quota_pool_status()
+                .await
+                .active_account_id
+                .as_deref(),
+            Some("balanced-b")
+        );
+        assert_eq!(
+            manager
+                .valid_auth_for("balanced-a")
+                .await
+                .unwrap()
+                .credential_id,
+            "balanced-a"
+        );
+        settings.members.swap(0, 1);
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "balanced-b"
+        );
+        settings.members[0].paused = true;
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "balanced-a"
+        );
+        settings.members[1].weekly_floor = 100;
+        manager.set_quota_pool(settings).await.unwrap();
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "balanced-a"
+        );
     }
 
     #[tokio::test]

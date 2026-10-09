@@ -39,6 +39,18 @@ pub struct OfficialAuthorization {
     pub selection_verified: bool,
 }
 
+/// Stable execution principal, distinct from the workspace header. Legacy
+/// grants without a user claim retain their workspace identity. Token bytes
+/// are deliberately excluded so refresh does not invalidate a warm socket.
+pub(crate) fn managed_execution_identity(token: &str, workspace: Option<&str>) -> Option<String> {
+    let workspace = workspace?;
+    Some(
+        crate::chatgpt_identity_from_jwt(token)
+            .filter(|identity| identity.workspace_id == workspace)
+            .map_or_else(|| workspace.to_owned(), |identity| identity.credential_id),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfficialAuthDecision {
     /// No Vellum-managed ChatGPT account for this route: preserve the
@@ -47,9 +59,89 @@ pub enum OfficialAuthDecision {
     Managed(OfficialAuthorization),
 }
 
+/// Routing hints, never credentials or prompt content. Session identity is
+/// namespaced by route/model and hashed before crossing the host boundary.
+#[derive(Debug, Clone, Default)]
+pub struct OfficialRoutingContext {
+    pub session_key: Option<String>,
+    pub context_window_key: Option<String>,
+    pub request_id: String,
+    pub estimated_input_tokens: u64,
+    pub context_window: Option<u64>,
+}
+
+impl OfficialRoutingContext {
+    pub fn from_request(
+        route: &crate::route::RuntimeModelRoute,
+        request: &crate::request::RuntimeRequest,
+    ) -> Self {
+        let hash = |value: &str| format!("{:x}", Sha256::digest(value.as_bytes()));
+        let identity = if request.metadata.codex_identity_conflicted() {
+            None
+        } else {
+            request
+                .metadata
+                .codex_thread_key()
+                .map(|key| key.to_string())
+                .or_else(|| {
+                    request
+                        .body
+                        .get("prompt_cache_key")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|key| !key.is_empty())
+                        .map(|key| format!("cache:{key}"))
+                })
+                .or_else(|| {
+                    request
+                        .metadata
+                        .connection_id
+                        .as_ref()
+                        .map(|key| format!("socket:{key}"))
+                })
+        };
+        let session_key = identity.map(|key| {
+            hash(&serde_json::json!([route.route_id, route.upstream_model, key]).to_string())
+        });
+        let context_window_key = request
+            .metadata
+            .codex_identity
+            .as_ref()
+            .filter(|_| !request.metadata.codex_identity_conflicted())
+            .and_then(|id| id.context_window_id.as_ref())
+            .map(|key| hash(key.as_str()));
+        // Include the whole prompt surface; input may be a string, not an array.
+        let estimated_input_tokens = request
+            .body
+            .get("input")
+            .map(crate::compaction::estimate_json_tokens)
+            .unwrap_or(0)
+            .saturating_add(crate::compaction::estimate_non_input_context_tokens(
+                &request.body,
+            ));
+        Self {
+            session_key,
+            context_window_key,
+            request_id: request.metadata.request_id.clone(),
+            estimated_input_tokens,
+            context_window: route.context_window,
+        }
+    }
+}
+
 #[async_trait]
 pub trait OfficialAuthProvider: Send + Sync {
     async fn authorize(&self, route_id: &str) -> Result<OfficialAuthDecision, String>;
+
+    /// Ordinary requests may use session-aware allocation. Explicit review
+    /// billing remains authoritative, including on hosts with one credential.
+    async fn authorize_with_context(
+        &self,
+        route_id: &str,
+        account_id: Option<&str>,
+        _context: &OfficialRoutingContext,
+    ) -> Result<OfficialAuthDecision, String> {
+        self.authorize_as(route_id, account_id).await
+    }
 
     /// Authorize against a *named* managed account instead of whichever one
     /// is currently the default. Used by the Auto Review pipeline so a

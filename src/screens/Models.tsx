@@ -41,6 +41,7 @@ import {
   normalizeQuotaPool,
   quotaPoolAccounts,
   quotaPoolRotation,
+  quotaPoolLastSelection,
 } from "@/lib/quotaPool";
 import { providerState } from "@/lib/vocabulary";
 import { Btn, Cap, Card, Confirm, Empty, KV, Meter, Pill, Row, Rows, State, Toggle, Tray } from "@/components/ui";
@@ -630,6 +631,27 @@ export function Models({
     () => quotaPoolRotation(pooledAccounts),
     [normalizedQuotaPool, pooledAccounts],
   );
+  const lastPoolSelection = quotaPoolLastSelection(
+    { ...normalizedQuotaPool, activeAccountId: quotaPool?.activeAccountId }, pooledAccounts,
+  );
+
+  useEffect(() => {
+    if (!normalizedQuotaPool.enabled || quotaPoolBusy) return;
+    let alive = true;
+    let pending = false;
+    const update = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const status = await api.getCodexQuotaPool();
+        if (alive) setQuotaPool((current) => current
+          ? { ...current, activeAccountId: status.activeAccountId } : status);
+      } catch { /* Keep the last observation when the local status read fails. */ }
+      finally { pending = false; }
+    };
+    const timer = window.setInterval(() => void update(), 5000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [normalizedQuotaPool.enabled, quotaPoolBusy]);
 
   async function saveQuotaPool(settings: QuotaPoolSettings) {
     const previous = quotaPool;
@@ -1486,9 +1508,22 @@ export function Models({
 
         {normalizedQuotaPool.enabled ? (
           <div className="quota-pool__head">
+            <label>
+              {t("models.ui.pool.strategyLabel")}{" "}
+              <select
+                value={normalizedQuotaPool.strategy}
+                disabled={quotaPoolBusy}
+                onChange={(event) => void saveQuotaPool({ ...normalizedQuotaPool,
+                  strategy: event.target.value === "balanced" ? "balanced" : "rank" })}
+              >
+                <option value="rank">{t("models.ui.pool.strategyRank")}</option>
+                <option value="balanced">{t("models.ui.pool.strategyBalanced")}</option>
+              </select>
+            </label>
+            <p className="prose">{t(normalizedQuotaPool.strategy === "balanced"
+              ? "models.ui.pool.balancedHint" : "models.ui.pool.rankHint")}</p>
             {pooledAccounts.some((entry) => entry.member.inPool) ? (
               <>
-                <small>{t("models.ui.pool.rankHint")}</small>
                 {(() => {
                   const members = pooledAccounts.filter((entry) => entry.member.inPool);
                   const total = members.reduce(
@@ -1526,12 +1561,9 @@ export function Models({
                         <span className="quota-pool__confluence-rest" style={{ flexGrow: Math.max(0, members.length * 100 - total) }} />
                       </div>
                       <p className="prose">
-                        {poolRotation.length
-                          ? t("models.ui.pool.currentAndNext", {
-                              current: codexAccountLabel(poolRotation[0]!.account),
-                              next: poolRotation[1] ? codexAccountLabel(poolRotation[1].account) : t("common.emDash"),
-                            })
-                          : t("models.ui.pool.stalled")}
+                        {t("models.ui.pool.lastSelected", { account: lastPoolSelection
+                          ? codexAccountLabel(lastPoolSelection.account) : t("common.emDash") })}
+                        {!poolRotation.length ? ` ${t("models.ui.pool.stalled")}` : ""}
                       </p>
                     </div>
                   );
@@ -1600,14 +1632,12 @@ export function Models({
                 );
                 const resetsOpen = openResets === account.accountId;
                 const soonest = credits ? soonestResetExpiry(credits.credits) : null;
-                const rank =
-                  poolRotation.findIndex(
-                    (candidate) => candidate.account.accountId === account.accountId,
-                  ) + 1;
                 const memberOrder = pooledAccounts.filter((candidate) => candidate.member.inPool);
                 const memberRank = memberOrder.findIndex(
                   (candidate) => candidate.account.accountId === account.accountId,
                 );
+                const rank = memberRank + 1;
+                const lastSelected = lastPoolSelection?.account.accountId === account.accountId;
                 // 拖曳中的閘門值只存在畫面上，放開才寫回設定。一次只拖得動
                 // 一道閘門，所以這裡只要記住是哪一個帳號、拉到多少。
                 const floor =
@@ -1619,9 +1649,10 @@ export function Models({
                 const reason = entry.member.inPool
                   ? entry.reason
                     ? t(`models.ui.pool.reason.${entry.reason}`)
-                    : rank === 1
-                      ? t("models.ui.pool.using")
-                      : rank === 2
+                    : lastSelected
+                      ? t("models.ui.pool.selectedLast")
+                      : normalizedQuotaPool.enabled && normalizedQuotaPool.strategy === "rank"
+                        && poolRotation[0]?.account.accountId === account.accountId
                         ? t("models.ui.pool.next")
                         : t("models.ui.pool.standby")
                   : t("models.ui.pool.outside");
@@ -1631,7 +1662,7 @@ export function Models({
                   <Row
                     key={account.accountId}
                     label={
-                      <span className={`acct__rank${rank === 1 ? " acct__rank--active" : ""}`}>
+                      <span className={`acct__rank${lastSelected ? " acct__rank--active" : ""}`}>
                         <b>{rank || t("common.emDash")}</b>
                         <span>{accountLabel}</span>
                         {reorderable ? (
@@ -1996,7 +2027,7 @@ export function Models({
         <Confirm
           open={poolRulesOpen}
           title={t("models.ui.pool.rulesTitle")}
-          facts={(["gate", "fiveHour", "order", "pause", "reset", "empty"] as const).map((key) => ({
+          facts={(["gate", "fiveHour", "order", "smart", "pause", "reset", "empty"] as const).map((key) => ({
             key: t(`models.ui.pool.rule.${key}.title`),
             value: t(`models.ui.pool.rule.${key}.body`),
           }))}

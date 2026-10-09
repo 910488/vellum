@@ -36,6 +36,7 @@ pub mod proxy;
 pub mod proxy_prepare;
 pub mod proxy_runtime_bridge;
 pub mod quota;
+mod quota_pool_router;
 pub mod remote;
 pub mod review;
 pub mod runtime;

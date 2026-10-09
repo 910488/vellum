@@ -155,6 +155,30 @@ struct DesktopOfficialAuth {
 }
 #[async_trait]
 impl OfficialAuthProvider for DesktopOfficialAuth {
+    async fn authorize_with_context(
+        &self,
+        route_id: &str,
+        account_id: Option<&str>,
+        context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
+    ) -> Result<OfficialAuthDecision, String> {
+        if account_id.is_some() {
+            return self.authorize_as(route_id, account_id).await;
+        }
+        self.state
+            .codex_oauth()
+            .valid_routing_auth_with_context(context)
+            .await
+            .map(|auth| match auth {
+                Some(auth) => OfficialAuthDecision::Managed(OfficialAuthorization {
+                    access_token: auth.access_token,
+                    account_id: Some(auth.account_id),
+                    selection_revision: Some(auth.selection_revision),
+                    selection_verified: auth.selection_verified,
+                }),
+                None => OfficialAuthDecision::PreserveIncoming,
+            })
+            .map_err(|e| e.to_string())
+    }
     async fn authorize(&self, _route_id: &str) -> Result<OfficialAuthDecision, String> {
         self.state
             .codex_oauth()
@@ -602,11 +626,20 @@ impl RuntimeHistoryStore for DesktopHistory {
 }
 
 struct DesktopUsage {
+    accounts: Arc<crate::codex_oauth::CodexOAuthManager>,
     inner: Arc<crate::usage::UsageStore>,
     records: Mutex<Vec<RuntimeUsageRecord>>,
 }
 impl RuntimeUsageStore for DesktopUsage {
     fn record(&self, value: &RuntimeUsageRecord) -> Result<(), String> {
+        if let Some(request_id) = value.request_id.as_deref() {
+            self.accounts.observe_routing_usage(
+                request_id,
+                value.input_tokens,
+                value.cached_input_tokens,
+                value.status,
+            );
+        }
         let agent_attribution_json = value
             .agent_attribution
             .as_ref()
@@ -840,6 +873,7 @@ impl DesktopProxyRuntimeState {
             inner: state.history_store(),
         }))
         .with_usage_store(Arc::new(DesktopUsage {
+            accounts: state.codex_oauth(),
             inner: state.usage_store(),
             records: Mutex::new(Vec::new()),
         }))
