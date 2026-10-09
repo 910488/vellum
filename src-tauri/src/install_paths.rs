@@ -144,20 +144,6 @@ pub fn macos_codex_desktop_cli_candidates(home: Option<&Path>) -> Vec<PathBuf> {
     candidates
 }
 
-/// Every Codex CLI worth trying on macOS, Desktop's own first. A GUI app
-/// inherits launchd's PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so the
-/// package-manager locations a shell would find must be named here or they
-/// are never seen.
-pub fn macos_codex_cli_candidates(home: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = macos_codex_desktop_cli_candidates(home);
-    candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
-    candidates.push(PathBuf::from("/usr/local/bin/codex"));
-    if let Some(home) = home {
-        candidates.push(home.join(".local").join("bin").join("codex"));
-    }
-    candidates
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,13 +215,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_desktop_is_tried_before_any_package_manager_cli() {
+    fn only_codex_desktops_own_cli_is_a_candidate() {
         let home = Path::new("/Users/someone");
         let desktop = macos_codex_desktop_cli_candidates(Some(home));
-        let all = macos_codex_cli_candidates(Some(home));
 
         assert_eq!(
-            all[0],
+            desktop[0],
             Path::new("/Applications")
                 .join("ChatGPT.app")
                 .join("Contents")
@@ -246,7 +231,6 @@ mod tests {
                 .join("MacOS")
                 .join("codex")
         );
-        assert_eq!(&all[..desktop.len()], &desktop[..]);
         assert!(desktop.contains(
             &Path::new("/Applications")
                 .join("ChatGPT.app")
@@ -272,8 +256,10 @@ mod tests {
                 .join(".plugin-appserver")
                 .join("codex")
         ));
-        assert!(all[desktop.len()..].contains(&PathBuf::from("/opt/homebrew/bin/codex")));
+        // A Homebrew `codex` is a `#!/usr/bin/env node` script; launched from
+        // a GUI app it dies with "env: node" before speaking any protocol.
         assert!(!desktop.contains(&PathBuf::from("/opt/homebrew/bin/codex")));
+        assert!(!desktop.contains(&PathBuf::from("/usr/local/bin/codex")));
     }
 
     #[test]
@@ -301,7 +287,7 @@ mod tests {
     #[test]
     fn without_a_home_only_system_locations_remain() {
         assert_eq!(macos_codex_app_candidates(None).len(), 2);
-        assert!(macos_codex_cli_candidates(None)
+        assert!(macos_codex_desktop_cli_candidates(None)
             .iter()
             .all(|candidate| candidate.has_root()));
     }

@@ -437,17 +437,21 @@ fn local_codex_candidates_from(
     }
     #[cfg(not(windows))]
     let _ = local_app_data;
-    // A macOS GUI app inherits launchd's PATH, which has neither Homebrew nor
-    // Codex on it, so a bare `codex` fails with "No such file or directory"
-    // even with Codex Desktop installed. Only existing files are probed;
-    // `codex_not_found_detail` names the rest when none of them is there.
+    // On macOS only the CLI inside Codex Desktop counts. A package-manager
+    // `codex` (Homebrew, npm) is a `#!/usr/bin/env node` script: started from
+    // a GUI app it exits with "env: node" before it speaks any protocol, and
+    // the failure then reads as a protocol mismatch. A bare `codex` on PATH is
+    // the same script when Vellum was started from a shell. Missing every
+    // Desktop location is reported as Desktop's CLI not being found.
     #[cfg(target_os = "macos")]
-    for executable in crate::install_paths::macos_codex_cli_candidates(dirs::home_dir().as_deref())
+    for executable in
+        crate::install_paths::macos_codex_desktop_cli_candidates(dirs::home_dir().as_deref())
     {
         if executable.is_file() {
             push_unique_codex_candidate(&mut candidates, executable);
         }
     }
+    #[cfg(not(target_os = "macos"))]
     push_unique_codex_candidate(&mut candidates, PathBuf::from("codex"));
     candidates
 }
@@ -457,7 +461,7 @@ fn local_codex_candidates_from(
 fn codex_search_locations() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        crate::install_paths::macos_codex_cli_candidates(dirs::home_dir().as_deref())
+        crate::install_paths::macos_codex_desktop_cli_candidates(dirs::home_dir().as_deref())
     }
     #[cfg(windows)]
     {
@@ -483,6 +487,12 @@ fn codex_not_found_detail() -> String {
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
+    if cfg!(target_os = "macos") {
+        return format!(
+            "找不到 ChatGPT（Codex Desktop）內建的 Codex CLI；請安裝或更新 ChatGPT，或以 VELLUM_CODEX_BIN 指定路徑。Homebrew／npm 的 codex 不會被採用。已找過：{}",
+            searched.join("、")
+        );
+    }
     searched.push("PATH 上的 codex".into());
     format!(
         "找不到 Codex CLI；請確認已安裝 Codex Desktop，或以 VELLUM_CODEX_BIN 指定路徑。已找過：{}",
@@ -2206,7 +2216,9 @@ mod tests {
     fn a_missing_codex_says_where_it_looked_and_how_to_fix_it() {
         let detail = codex_not_found_detail();
         assert!(detail.contains("VELLUM_CODEX_BIN"));
-        assert!(detail.contains("PATH"));
+        if !cfg!(target_os = "macos") {
+            assert!(detail.contains("PATH"));
+        }
         for location in codex_search_locations() {
             assert!(detail.contains(&location.display().to_string()));
         }
