@@ -146,13 +146,15 @@ export function Pill({
   children,
   tone = "default",
   dot = false,
+  title,
 }: {
   children: ReactNode;
   tone?: PillTone;
   dot?: boolean;
+  title?: string;
 }) {
   return (
-    <span className={`pill${tone !== "default" ? ` pill--${tone}` : ""}`}>
+    <span className={`pill${tone !== "default" ? ` pill--${tone}` : ""}`} title={title}>
       {dot ? <i className="pill__dot" /> : null}
       {children}
     </span>

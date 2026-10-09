@@ -978,6 +978,10 @@ html[data-performance="low"] .card {
   color: var(--ink-faint);
   overflow-wrap: anywhere;
 }
+/* 動作沒有完成時的回報。灰字會被讀成「說明」而不是「結果」。 */
+.rows__hint--warn {
+  color: var(--warn-ink);
+}
 
 /* ---------- 按鈕 ----------
    主按鈕是實色 + 上緣受光，不是漸層。紫色漸層是 AI 介面最常見的

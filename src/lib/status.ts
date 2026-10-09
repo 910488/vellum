@@ -24,6 +24,10 @@ export interface Headline {
   endpoint: string | null;
   quotaRemaining: number | null;
   restartRequired: boolean;
+  /** 為什麼要重啟。亮燈卻說不出原因，使用者只能猜。 */
+  restartReasons: RuntimeNotice[];
+  /** Enhanced Runtime 自己判定重啟能修好的狀況。 */
+  enhancedRestart: boolean;
   /** 真的壞掉時的原文，直接顯示。 */
   error: string | null;
   /** 需要處理、但不是故障的狀態。前端自己組句子。 */
@@ -45,6 +49,8 @@ export function headline({ proxy, runtime, enhancedRuntime, overview, updates }:
         ? 100 - overview.quota.usedPercent
         : null,
     restartRequired: (runtime?.restartRequired ?? false) || (enhancedRuntime?.restartRequired ?? false),
+    restartReasons: runtime?.restartRequired ? runtime.restartReasons : [],
+    enhancedRestart: enhancedRuntime?.restartRequired ?? false,
     error: proxy?.lastError ?? null,
     notice: proxy?.notice ?? null,
     updateAttention: updates?.attention ?? "none",

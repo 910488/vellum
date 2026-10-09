@@ -1900,14 +1900,19 @@ impl AppState {
             proxy.restart_process_identity = None;
             return;
         }
-        let Some(previous) = proxy.restart_process_identity.as_deref() else {
-            return;
-        };
         let Some(current) = current_identity.as_deref() else {
             // Codex is between stop and start. Keep waiting for a new instance.
             return;
         };
-        if current != previous {
+        // A reason recorded while no Codex was running has no old instance to
+        // outlive: the first Codex seen afterwards started with the new
+        // configuration. Waiting for a PID change there kept the badge lit
+        // until a managed restart, whatever Codex actually loaded.
+        let restarted = proxy
+            .restart_process_identity
+            .as_deref()
+            .is_none_or(|previous| previous != current);
+        if restarted {
             proxy.restart_reasons.clear();
             proxy.restart_process_identity = None;
             let notice = RuntimeNotice::new("codexRestartDetected");
@@ -3167,6 +3172,22 @@ mod tests {
             .live_applied
             .iter()
             .any(|notice| notice.code == "codexRestartDetected"));
+    }
+
+    /// Changing the catalog while Codex was closed recorded a reason with no
+    /// process to outlive, and nothing but a managed restart could clear it:
+    /// the badge stayed lit across any number of Codex launches.
+    #[test]
+    fn a_reason_recorded_while_codex_was_closed_clears_when_codex_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state.mark_restart_required(RuntimeNotice::new("routesAndCatalogUpdated"));
+
+        state.reconcile_codex_restart(None);
+        assert!(state.runtime_status().restart_required);
+
+        state.reconcile_codex_restart(Some("300:3000".into()));
+        assert!(!state.runtime_status().restart_required);
     }
 
     #[test]

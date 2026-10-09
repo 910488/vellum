@@ -1038,13 +1038,7 @@ fn status_for_settings(
         && status.artifact_ready
         && status.active
         && status.environment_state == "leased";
-    status.restart_required = status.enabled != status.active
-        || (!status.enabled && status.bridge_observed)
-        || (status.active && status.environment_state != "leased")
-        // A launch left on a superseded core is exactly what a managed restart
-        // fixes, and the only thing that fixes it: the path is adopted already,
-        // so nothing changes until the children are respawned from it.
-        || status.launch_core_drift;
+    status.restart_required = restart_would_fix(&status);
     status.activation_state = activation_state(&status).into();
     status
 }
@@ -1071,6 +1065,29 @@ fn qualification_matches_settings(
             .and_then(serde_json::Value::as_str);
         sha256_file(path).ok().as_deref() == actual
     })
+}
+
+/// Whether restarting Codex Desktop is both needed and sufficient.
+///
+/// The restart badge is the one thing on screen that asks the user to act, so
+/// it only lights for faults a restart repairs. A cleared or foreign
+/// `CODEX_CLI_PATH` used to light it too, while the live launch kept working
+/// and a restart would have dropped Desktop onto native Codex instead; those
+/// are lease problems, repaired by re-acquiring or reported as a conflict.
+fn restart_would_fix(status: &DesktopRuntimeStatus) -> bool {
+    // Enabled but not running this launch: a restart adopts it only when the
+    // artifact verified and the launch path is ours to hand Desktop.
+    let adopt = status.enabled
+        && !status.active
+        && status.artifact_ready
+        && status.environment_state == "leased";
+    // Disabled while Desktop is still on the bridge: a restart returns it to
+    // native Codex.
+    let release = !status.enabled && (status.active || status.bridge_observed);
+    // A launch left on a superseded core is exactly what a managed restart
+    // fixes, and the only thing that fixes it: the path is adopted already,
+    // so nothing changes until the children are respawned from it.
+    adopt || release || status.launch_core_drift
 }
 
 fn activation_state(status: &DesktopRuntimeStatus) -> &'static str {
@@ -1114,6 +1131,15 @@ fn apply_environment_state(
                 && lease.applied_value.as_str() == bridge.as_ref() =>
         {
             "leased"
+        }
+        // Absent is not someone else's value: nothing owns the variable, and
+        // re-acquiring is safe (see `acquisition_conflicts`). The running
+        // launch is unaffected; only Desktop's next launch would go native.
+        Some(lease) if current.is_none() && lease.applied_value.as_str() == bridge.as_ref() => {
+            status.blockers.push(
+                "CODEX_CLI_PATH was cleared while Vellum's Enhanced Runtime lease was active; Vellum restores it while the Proxy runs".into(),
+            );
+            "leaseValueMissing"
         }
         Some(_) => {
             status.blockers.push(
@@ -1289,6 +1315,25 @@ fn apply_observed_launch(
     true
 }
 
+/// A bridge that found this launch's Official core replaced and fell back to
+/// Desktop's current one. Same repair as a superseded live launch: rebuild the
+/// Proxy launch so the next app-server Desktop starts gets Enhanced back.
+fn apply_official_drift(data_root: &Path, status: &mut DesktopRuntimeStatus) -> bool {
+    let Ok(manifest) = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)) else {
+        return false;
+    };
+    let Some(record) = super::official_drift::OfficialDriftRecord::for_launch(&manifest) else {
+        return false;
+    };
+    status.launch_id.get_or_insert(manifest.launch_id);
+    status.blockers.push(format!(
+        "Codex Desktop replaced its Official core ({} -> {}); the bridge is serving it without Enhanced until the launch is rebuilt",
+        record.recorded_executable.display(),
+        record.current_executable.display()
+    ));
+    true
+}
+
 /// The launch whose Proxy transaction should be rebuilt, if any.
 ///
 /// Detecting the drift was never the hard part; the hard part is that nothing
@@ -1315,25 +1360,6 @@ fn apply_observed_launch(
 pub fn superseded_launch_repair(
     status: &DesktopRuntimeStatus,
     proxy_running: bool,
-/// A bridge that found this launch's Official core replaced and fell back to
-/// Desktop's current one. Same repair as a superseded live launch: rebuild the
-/// Proxy launch so the next app-server Desktop starts gets Enhanced back.
-fn apply_official_drift(data_root: &Path, status: &mut DesktopRuntimeStatus) -> bool {
-    let Ok(manifest) = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)) else {
-        return false;
-    };
-    let Some(record) = super::official_drift::OfficialDriftRecord::for_launch(&manifest) else {
-        return false;
-    };
-    status.launch_id.get_or_insert(manifest.launch_id);
-    status.blockers.push(format!(
-        "Codex Desktop replaced its Official core ({} -> {}); the bridge is serving it without Enhanced until the launch is rebuilt",
-        record.recorded_executable.display(),
-        record.current_executable.display()
-    ));
-    true
-}
-
 ) -> Option<&str> {
     (status.launch_core_drift && status.enabled && proxy_running)
         .then_some(status.launch_id.as_deref())
@@ -1885,6 +1911,36 @@ mod tests {
         status.environment_state = "leased".into();
         status.ready = true;
         assert_eq!(activation_state(&status), "active");
+    }
+
+    #[test]
+    fn restart_is_asked_for_only_when_a_restart_would_change_something() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut status = empty_status(temp.path(), true, Vec::new());
+        status.enabled = true;
+        status.artifact_ready = true;
+        status.environment_state = "leased".into();
+        assert!(restart_would_fix(&status), "armed but not yet adopted");
+
+        status.active = true;
+        assert!(!restart_would_fix(&status), "adopted and leased");
+
+        // A live bridge whose lease value was cleared underneath it is
+        // repaired by re-acquiring the lease, not by restarting Codex.
+        status.environment_state = "leaseValueMissing".into();
+        assert!(!restart_would_fix(&status));
+        status.active = false;
+        assert!(!restart_would_fix(&status), "a restart now would start native Codex");
+
+        status.launch_core_drift = true;
+        assert!(restart_would_fix(&status));
+
+        status.launch_core_drift = false;
+        status.enabled = false;
+        status.bridge_observed = true;
+        assert!(restart_would_fix(&status), "disabled but the bridge is still running");
+        status.bridge_observed = false;
+        assert!(!restart_would_fix(&status), "disabled and gone");
     }
 
     #[test]

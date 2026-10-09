@@ -379,6 +379,7 @@ export interface EnhancedDesktopRuntimeStatus {
   environmentState:
     | "leased"
     | "released"
+    | "leaseValueMissing"
     | "orphanedBridge"
     | "foreignValue"
     | "unreadable"

@@ -28,6 +28,10 @@ export function StatusBar({
      的那一份」。一座上一次啟動留下來的 bridge 仍然在服務每一輪，把它說成
      未載入是假的——ready 另外還要求它跑的是這次啟動的設定，那是別的事。
      未驗證用 warn，因為那正是「可用但不保證正確性」:不是故障，也不是沒事。 */
+  const restartTitle = [
+    ...h.restartReasons.map((reason) => noticeText(reason, t)),
+    ...(h.enhancedRestart ? [t("status.restartReasonEnhanced")] : []),
+  ].join("\n");
   const loaded = Boolean(enhanced?.serving);
   const enhancedTone = loaded
     ? enhanced?.unverified || !enhanced?.ready
@@ -179,7 +183,11 @@ export function StatusBar({
 
       {/* 待重啟是尚未套用的變更，不是故障。只在右側用琥珀色提醒一次；左側
           繼續陳述 Proxy 的真實狀態，避免同一句警告出現兩次。 */}
-      {h.restartRequired ? <Pill tone="warn" dot>{t("status.restartCodexRequired")}</Pill> : null}
+      {h.restartRequired ? (
+        <Pill tone="warn" dot title={restartTitle}>
+          {t("status.restartCodexRequired")}
+        </Pill>
+      ) : null}
       {h.updateAttention === "available" ? <Pill tone="warn" dot>{t("status.updateAvailable")}</Pill> : null}
       {h.updateAttention === "waitingIdle" ? <Pill tone="warn" dot>{t("status.updateWaitingIdle")}</Pill> : null}
       {h.updateAttention === "waitingRestart" ? <Pill tone="warn" dot>{t("status.updateWaitingRestart")}</Pill> : null}

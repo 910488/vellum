@@ -115,7 +115,7 @@ describe("headline", () => {
 
   it("右側待重啟提示使用琥珀色警示，而不是紅色故障", () => {
     expect(statusBarSource).toMatch(
-      /h\.restartRequired \? <Pill tone="warn" dot>\{t\("status\.restartCodexRequired"\)\}<\/Pill>/,
+      /h\.restartRequired \? \(\s*<Pill tone="warn" dot title=\{restartTitle\}>\s*\{t\("status\.restartCodexRequired"\)\}\s*<\/Pill>/,
     );
   });
 

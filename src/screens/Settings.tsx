@@ -86,6 +86,7 @@ export function Settings({
   const [dashboardRouteIds, setDashboardRouteIds] = useState<string[]>([]);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [restart, setRestart] = useState<RestartResult | null>(null);
+  const [restartError, setRestartError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [logExporting, setLogExporting] = useState(false);
   const [logExportPath, setLogExportPath] = useState<string | null>(null);
@@ -606,13 +607,14 @@ export function Settings({
   /// 中間畫面必須看得出來它在做事，否則使用者只會再按一次。
   async function restartCodex(force = false) {
     setCodexRestarting(true);
-    setError(null);
+    setRestart(null);
+    setRestartError(null);
     try {
       setRestart(await api.restartCodexSafely(force));
       setRuntime(await api.getRuntimeStatus());
       onChanged();
     } catch (cause) {
-      setError(t("settings.page.errors.restart", { detail: String(cause) }));
+      setRestartError(t("settings.page.errors.restart", { detail: String(cause) }));
     } finally {
       setCodexRestarting(false);
     }
@@ -1437,15 +1439,20 @@ export function Settings({
           <Row label={t("settings.page.advanced.catalogVersion")}>{runtime?.activeCatalogVersion ?? t("settings.page.advanced.notCreated")}</Row>
           <Row label={t("settings.page.advanced.restartTitle")}>
             <span className="runtime-control">
-              <span className="runtime-control__copy rows__hint">
-                {restart ? noticeText(restart.notice, t) : t("settings.page.advanced.restartHint")}
+              <span
+                className={`runtime-control__copy rows__hint${restartError || (restart && !restart.restarted) ? " rows__hint--warn" : ""}`}
+                role="status"
+              >
+                {codexRestarting
+                  ? t("settings.page.advanced.restarting")
+                  : restartError ?? (restart ? noticeText(restart.notice, t) : t("settings.page.advanced.restartHint"))}
               </span>
               <Btn
                 soft
                 disabled={codexRestarting}
                 onClick={() => void restartCodex()}
               >
-                {t("settings.page.advanced.restartAction")}
+                {codexRestarting ? t("settings.page.advanced.restartingAction") : t("settings.page.advanced.restartAction")}
               </Btn>
               {restartBlockedByTurn ? (
                 <Btn soft disabled={codexRestarting} onClick={() => void restartCodex(true)}>
