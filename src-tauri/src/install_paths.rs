@@ -108,21 +108,38 @@ pub fn macos_codex_desktop_executable_candidates(home: Option<&Path>) -> Vec<Pat
         .collect()
 }
 
-/// The Codex CLI that belongs to Codex Desktop itself: each app bundle's
-/// `Contents/Resources/codex`, then the copy Desktop keeps for plugin app
-/// servers under `~/.codex`. These speak the protocol Desktop speaks.
+/// The Codex CLI that belongs to Codex Desktop itself. Recent macOS builds
+/// ship the native executable inside `codex-cli/CodexCLI.app`; older builds
+/// used `Contents/Resources/codex`. Prefer the native executable so its hash
+/// and protocol probe describe the process the bridge actually starts.
 pub fn macos_codex_desktop_cli_candidates(home: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = macos_codex_app_candidates(home)
-        .into_iter()
-        .map(|app| app.join("Contents").join("Resources").join("codex"))
-        .collect();
-    if let Some(home) = home {
+    let mut candidates = Vec::new();
+    for app in macos_codex_app_candidates(home) {
+        let resources = app.join("Contents").join("Resources");
         candidates.push(
-            home.join(".codex")
-                .join("plugins")
-                .join(".plugin-appserver")
+            resources
+                .join("codex-cli")
+                .join("CodexCLI.app")
+                .join("Contents")
+                .join("MacOS")
                 .join("codex"),
         );
+        candidates.push(resources.join("codex"));
+    }
+    if let Some(home) = home {
+        let plugin = home
+            .join(".codex")
+            .join("plugins")
+            .join(".plugin-appserver");
+        candidates.push(
+            plugin
+                .join("codex-cli")
+                .join("CodexCLI.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("codex"),
+        );
+        candidates.push(plugin.join("codex"));
     }
     candidates
 }
@@ -223,9 +240,31 @@ mod tests {
                 .join("ChatGPT.app")
                 .join("Contents")
                 .join("Resources")
+                .join("codex-cli")
+                .join("CodexCLI.app")
+                .join("Contents")
+                .join("MacOS")
                 .join("codex")
         );
         assert_eq!(&all[..desktop.len()], &desktop[..]);
+        assert!(desktop.contains(
+            &Path::new("/Applications")
+                .join("ChatGPT.app")
+                .join("Contents")
+                .join("Resources")
+                .join("codex")
+        ));
+        assert!(desktop.contains(
+            &home
+                .join(".codex")
+                .join("plugins")
+                .join(".plugin-appserver")
+                .join("codex-cli")
+                .join("CodexCLI.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("codex")
+        ));
         assert!(desktop.contains(
             &home
                 .join(".codex")
