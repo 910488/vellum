@@ -30,6 +30,10 @@ on:
         required: false
         type: boolean
         default: false
+      release_notes:
+        required: false
+        type: string
+        default: ""
   push:
     tags:
       - "desktop-v*"
@@ -71,6 +75,10 @@ on:
         required: true
         default: true
         type: boolean
+      release_notes:
+        description: "Release notes shown in Vellum's update panel; empty lists the commits since the previous tag"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -459,6 +467,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.source_ref || github.sha }}
+          # Release notes default to the commits since the previous tag.
+          fetch-depth: 0
+      - name: Release notes
+        env:
+          COMPONENT: ${{ needs.resolve.outputs.component }}
+          PROVIDED_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PROVIDED_NOTES" ]; then
+            printf '%s\n' "$PROVIDED_NOTES" > release-notes.md
+          else
+            PREVIOUS="$(git describe --tags --abbrev=0 --match "$COMPONENT-v*" HEAD 2>/dev/null || true)"
+            if [ -n "$PREVIOUS" ]; then
+              RANGE="$PREVIOUS..HEAD"
+            else
+              RANGE="HEAD~20..HEAD"
+            fi
+            git log --no-merges --format='- %s' "$RANGE" | head -n 40 > release-notes.md
+          fi
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/prepare-release-source
         with:
           tag: ${{ needs.resolve.outputs.tag }}
@@ -493,7 +521,10 @@ jobs:
           PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
           ASSET_DIR: release-assets
           VELLUM_UPDATE_KEY_ID: ${{ vars.VELLUM_UPDATE_KEY_ID }}
-        run: node scripts/write-update-manifest.mjs
+        run: |
+          RELEASE_NOTES="$(cat release-notes.md)"
+          export RELEASE_NOTES
+          node scripts/write-update-manifest.mjs
       - name: Remove build-only protocol probes
         if: needs.resolve.outputs.component == 'core'
         shell: bash
@@ -523,6 +554,6 @@ jobs:
           fi
           gh release create "$TAG" \
             --title "$TAG" \
-            --notes "Signed update $TAG built with the pinned Enhanced Codex Core. Assets are bound by update-manifest.json." \
+            --notes-file release-notes.md \
             "${extra[@]}" \
             update-manifest.json update-manifest.json.sig release-assets/*

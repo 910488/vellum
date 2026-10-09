@@ -29,6 +29,10 @@ on:
         required: true
         default: true
         type: boolean
+      release_notes:
+        description: "Release notes shown in Vellum's update panel; empty lists the commits since the previous tag"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -136,4 +140,5 @@ jobs:
       enhanced_core_release: ${{ needs.resolve.outputs.core_release }}
       enhanced_core_lock: ${{ needs.core-update.outputs.enhanced_core_lock }}
       publish: ${{ needs.resolve.outputs.publish == 'true' }}
+      release_notes: ${{ inputs.release_notes }}
     secrets: inherit
