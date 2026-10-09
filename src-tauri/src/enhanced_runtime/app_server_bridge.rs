@@ -191,19 +191,21 @@ pub fn run_from_env() -> Result<(), BridgeError> {
         .and_then(super::process_info::executable_of);
     if is_native_tool_helper(parent_executable.as_deref()) {
         let manifest = LaunchManifestV1::read(&manifest_path)?;
-        manifest.official.verify_on_disk("official")?;
-        return wait_for_delegated_command(native_tool_app_server_command(
-            &manifest.official,
-            &child_args,
-        ));
+        let (official, _) = super::official_drift::resolve_official(&manifest)?;
+        return wait_for_delegated_command(native_tool_app_server_command(&official, &child_args));
     }
-    if bridge_is_started_by_codex_desktop() && enhanced_lease_released() {
+    if bridge_is_started_by_codex_desktop() {
         let manifest = LaunchManifestV1::read(&manifest_path)?;
-        manifest.official.verify_on_disk("official")?;
-        return wait_for_delegated_command(released_app_server_command(
-            &manifest.official,
-            &child_args,
-        ));
+        // Desktop replaced its core after this launch was prepared. Serving
+        // plain Official keeps Desktop usable until Vellum rebuilds the launch;
+        // exiting here is what left it with no app-server at all.
+        let (official, drifted) = super::official_drift::resolve_official(&manifest)?;
+        if drifted || enhanced_lease_released() {
+            return wait_for_delegated_command(released_app_server_command(
+                &official,
+                &child_args,
+            ));
+        }
     }
     run(BridgeConfig::load(&manifest_path, child_args)?)
 }
@@ -287,7 +289,10 @@ fn native_tool_app_server_command(official: &RuntimeBinaryIdentity, args: &[Stri
 /// unmodified Official Codex behavior and must stay that way.
 fn delegate_non_app_server(manifest_path: &Path, args: Vec<String>) -> Result<(), BridgeError> {
     let manifest = LaunchManifestV1::read(manifest_path)?;
-    let mut command = Command::new(&manifest.official.executable);
+    let official = super::official_drift::resolve_official(&manifest)
+        .map(|(official, _)| official.executable)
+        .unwrap_or(manifest.official.executable);
+    let mut command = Command::new(official);
     command.args(args);
     wait_for_delegated_command(command)
 }

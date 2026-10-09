@@ -18,6 +18,7 @@ pub mod launch_manifest;
 mod manifest;
 mod model_provider_map;
 pub mod observations;
+pub mod official_drift;
 mod process;
 pub mod process_info;
 pub mod protocol_compat;

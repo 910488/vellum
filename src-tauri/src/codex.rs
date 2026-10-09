@@ -389,7 +389,7 @@ fn push_unique_codex_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf
 /// hash changes across Desktop updates, so discovery must enumerate the
 /// versioned children instead of persisting one resolved path.
 #[cfg(windows)]
-fn desktop_runtime_codex_candidates(local_app_data: &Path) -> Vec<PathBuf> {
+pub(crate) fn desktop_runtime_codex_candidates(local_app_data: &Path) -> Vec<PathBuf> {
     let runtime_root = local_app_data.join("OpenAI/Codex/bin");
     let mut discovered = std::fs::read_dir(&runtime_root)
         .into_iter()

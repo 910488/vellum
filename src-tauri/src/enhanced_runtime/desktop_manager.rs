@@ -991,7 +991,8 @@ fn status_for_settings(
         &settings.official_codex_executable,
         &settings.enhanced_codex_executable,
     );
-    status.launch_core_drift = apply_observed_launch(data_root, settings, &mut status);
+    status.launch_core_drift = apply_observed_launch(data_root, settings, &mut status)
+        || apply_official_drift(data_root, &mut status);
     apply_environment_state(data_root, settings, &mut status);
 
     // Once an old development bridge is fully released, present the sidecar
@@ -1314,6 +1315,25 @@ fn apply_observed_launch(
 pub fn superseded_launch_repair(
     status: &DesktopRuntimeStatus,
     proxy_running: bool,
+/// A bridge that found this launch's Official core replaced and fell back to
+/// Desktop's current one. Same repair as a superseded live launch: rebuild the
+/// Proxy launch so the next app-server Desktop starts gets Enhanced back.
+fn apply_official_drift(data_root: &Path, status: &mut DesktopRuntimeStatus) -> bool {
+    let Ok(manifest) = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)) else {
+        return false;
+    };
+    let Some(record) = super::official_drift::OfficialDriftRecord::for_launch(&manifest) else {
+        return false;
+    };
+    status.launch_id.get_or_insert(manifest.launch_id);
+    status.blockers.push(format!(
+        "Codex Desktop replaced its Official core ({} -> {}); the bridge is serving it without Enhanced until the launch is rebuilt",
+        record.recorded_executable.display(),
+        record.current_executable.display()
+    ));
+    true
+}
+
 ) -> Option<&str> {
     (status.launch_core_drift && status.enabled && proxy_running)
         .then_some(status.launch_id.as_deref())
