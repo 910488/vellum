@@ -228,7 +228,8 @@ impl ProfileManager {
         require_healthy_proxy(proxy)?;
         let profile = self.inspect(profile_id)?;
         let current = read_toml(&PathBuf::from(&profile.codex_home).join("config.toml"))?;
-        let desired = desired_values(&profile, proxy)?;
+        let image_generation = self.user_image_generation(profile_id, &current)?;
+        let desired = desired_values(&profile, proxy, image_generation)?;
         let managed_changes = MANAGED_PATHS
             .iter()
             .map(|path| ManagedChange {
@@ -267,10 +268,18 @@ impl ProfileManager {
 
         let original_raw = read_text(&config_path)?;
         let mut applied = parse_toml(&original_raw)?;
-        let desired = desired_values(&plan.profile, proxy)?;
+        let image_generation = self.user_image_generation(profile_id, &applied)?;
+        let desired = desired_values(&plan.profile, proxy, image_generation.clone())?;
         let original_values = MANAGED_PATHS
             .iter()
-            .map(|path| ((*path).into(), get_path(&applied, path)))
+            .map(|path| {
+                let original = if *path == IMAGE_GENERATION_PATH {
+                    image_generation.clone()
+                } else {
+                    get_path(&applied, path)
+                };
+                ((*path).into(), original)
+            })
             .collect();
         for (path, value) in &desired {
             set_path(&mut applied, path, value.clone());
@@ -600,6 +609,42 @@ impl ProfileManager {
             .join(id)
             .join("profile.json")
     }
+    /// The user's own `features.image_generation`. Earlier versions pinned it
+    /// to `false`, which hides Codex's image tool; a deployment can re-inject
+    /// over that lease without restoring it first, so a live value that is
+    /// still exactly what an unrestored lease wrote is replaced by that
+    /// lease's recorded original. Anything else is the user's and is kept.
+    fn user_image_generation(
+        &self,
+        profile_id: &str,
+        current: &TomlValue,
+    ) -> Result<Option<TomlValue>, String> {
+        let now = get_path(current, IMAGE_GENERATION_PATH);
+        let lease_path = self.lease_path(profile_id);
+        if !lease_path.exists() {
+            return Ok(now);
+        }
+        let lease: ConfigLease = read_json(&lease_path, "lease")?;
+        if lease.profile_id != profile_id
+            || matches!(lease.state.as_str(), "restored" | "configConflict")
+        {
+            return Ok(now);
+        }
+        let written = lease
+            .applied_managed_values
+            .get(IMAGE_GENERATION_PATH)
+            .cloned()
+            .flatten();
+        if now == written {
+            return Ok(lease
+                .original_managed_values
+                .get(IMAGE_GENERATION_PATH)
+                .cloned()
+                .flatten());
+        }
+        Ok(now)
+    }
+
     fn lease_path(&self, id: &str) -> PathBuf {
         self.store.paths().leases_dir.join(format!("{id}.json"))
     }
@@ -851,9 +896,12 @@ fn model_providers_table(proxy: &ProxyStatusView) -> Result<TomlValue, String> {
     Ok(TomlValue::Table(providers))
 }
 
+const IMAGE_GENERATION_PATH: &str = "features.image_generation";
+
 fn desired_values(
     profile: &ProfileRecord,
     proxy: &ProxyStatusView,
+    image_generation: Option<TomlValue>,
 ) -> Result<BTreeMap<String, Option<TomlValue>>, String> {
     let catalog = PathBuf::from(&profile.codex_home)
         .join("vellum-model-catalog.json")
@@ -903,10 +951,9 @@ fn desired_values(
             "features.enable_request_compression".into(),
             Some(TomlValue::Boolean(false)),
         ),
-        (
-            "features.image_generation".into(),
-            Some(TomlValue::Boolean(false)),
-        ),
+        // Left at the user's own value (see `user_image_generation`): the
+        // proxy forwards Codex's `images/*` calls to the Official route.
+        (IMAGE_GENERATION_PATH.into(), image_generation),
         (
             "cli_auth_credentials_store".into(),
             Some(TomlValue::String("file".into())),
@@ -1181,7 +1228,8 @@ mod tests {
         );
         assert_eq!(
             get_path(&config, "features.image_generation"),
-            Some(TomlValue::Boolean(false))
+            None,
+            "the proxy serves Codex's image extension, so the flag stays the user's"
         );
         assert_eq!(
             get_path(&config, "features.auto_compaction"),
@@ -1248,6 +1296,83 @@ mod tests {
         assert_eq!(
             get_path(&restored, "model_auto_compact_token_limit_scope"),
             Some(TomlValue::String("body_after_prefix".into()))
+        );
+    }
+
+    /// Recreate what an earlier version left behind: a live lease that pinned
+    /// `image_generation = false` over the user's `original` value.
+    fn pin_legacy_image_generation(
+        manager: &ProfileManager,
+        config: &Path,
+        original: Option<TomlValue>,
+    ) {
+        let mut current = read_toml(config).unwrap();
+        set_path(
+            &mut current,
+            IMAGE_GENERATION_PATH,
+            Some(TomlValue::Boolean(false)),
+        );
+        fs::write(config, toml::to_string_pretty(&current).unwrap()).unwrap();
+        let lease_path = manager.lease_path("profile-1");
+        let mut lease: ConfigLease = read_json(&lease_path, "lease").unwrap();
+        lease.applied_managed_values.insert(
+            IMAGE_GENERATION_PATH.into(),
+            Some(TomlValue::Boolean(false)),
+        );
+        lease
+            .original_managed_values
+            .insert(IMAGE_GENERATION_PATH.into(), original);
+        atomic_json(&lease_path, &lease, 0o600).unwrap();
+    }
+
+    #[test]
+    fn reinjecting_over_a_legacy_lease_hands_image_generation_back() {
+        for original in [None, Some(TomlValue::Boolean(true))] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = ProfileManager::new(AgentStateStore::new(AgentPaths::from_root(
+                temp.path().join("state"),
+            )));
+            let profile = manager.create_managed("profile-1", None).unwrap();
+            let config = PathBuf::from(&profile.codex_home).join("config.toml");
+            manager.inject("profile-1", &proxy(), "{}").unwrap();
+            pin_legacy_image_generation(&manager, &config, original.clone());
+
+            // A catalog-only deployment re-injects without restoring first.
+            manager.inject("profile-1", &proxy(), "{}").unwrap();
+            assert_eq!(
+                get_path(&read_toml(&config).unwrap(), IMAGE_GENERATION_PATH),
+                original,
+                "the legacy pin must give way to the user's own value"
+            );
+
+            manager.restore("profile-1").unwrap();
+            assert_eq!(
+                get_path(&read_toml(&config).unwrap(), IMAGE_GENERATION_PATH),
+                original,
+                "restore must not bring the legacy pin back"
+            );
+        }
+    }
+
+    #[test]
+    fn injection_keeps_an_image_generation_value_the_user_chose() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = ProfileManager::new(AgentStateStore::new(AgentPaths::from_root(
+            temp.path().join("state"),
+        )));
+        let profile = manager.create_managed("profile-1", None).unwrap();
+        let config = PathBuf::from(&profile.codex_home).join("config.toml");
+        fs::write(&config, "[features]\nimage_generation = false\n").unwrap();
+
+        manager.inject("profile-1", &proxy(), "{}").unwrap();
+        assert_eq!(
+            get_path(&read_toml(&config).unwrap(), IMAGE_GENERATION_PATH),
+            Some(TomlValue::Boolean(false))
+        );
+        manager.restore("profile-1").unwrap();
+        assert_eq!(
+            get_path(&read_toml(&config).unwrap(), IMAGE_GENERATION_PATH),
+            Some(TomlValue::Boolean(false))
         );
     }
 

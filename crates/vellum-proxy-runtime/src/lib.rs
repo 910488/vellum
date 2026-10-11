@@ -133,7 +133,7 @@ pub use environment::{
     RuntimePlatform, RuntimeShellKind,
 };
 pub use error::RuntimeError;
-pub use exec::{ProxyRuntime, RuntimeResponse, SubagentIdentityMode};
+pub use exec::{ImageOperation, ProxyRuntime, RawImageBody, RuntimeResponse, SubagentIdentityMode};
 pub use grok_session::{
     conversation_key_from_raw, conversation_key_from_request, grok_request_fingerprint,
     GrokRequestIdentity, GrokSessionRegistry,

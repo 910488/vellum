@@ -1676,6 +1676,7 @@ pub fn apply_proxy_config(
         .transpose()?
     {
         relinquish_legacy_openai_base_url(&mut document, &original_doc, &previous_applied);
+        relinquish_legacy_image_generation(&mut document, &original_doc, &previous_applied);
     }
     document["model_provider"] = value(VELLUM_PROVIDER_NAME);
     document["model_catalog_json"] = value(path_string(&paths.catalog)?);
@@ -1700,7 +1701,10 @@ pub fn apply_proxy_config(
     // its own threshold and compact the thread locally, which is what the
     // Enhanced runtime is there to do.
     set_feature(&mut document, "enable_request_compression", false);
-    set_feature(&mut document, "image_generation", false);
+    // `image_generation` is left to the user. Codex 0.160's image extension
+    // posts `images/generations` and `images/edits` to the provider base URL,
+    // and the proxy forwards both to the Official route, so there is no
+    // longer a reason to switch it off.
     clear_conflicting_global_compaction_keys(&mut document);
     remove_reserved_provider_tables(&mut document);
     write_vellum_provider(&mut document, proxy_base_url, boundary_key)?;
@@ -1772,6 +1776,28 @@ fn relinquish_legacy_openai_base_url(
         None => {
             current.as_table_mut().remove(KEY);
         }
+    }
+}
+
+/// Earlier versions pinned `features.image_generation = false`, which hides
+/// Codex's image tool. Hand the flag back: where the live value is still the
+/// one Vellum wrote, restore the user's pre-Vellum value (or remove it). A
+/// value the user changed while Vellum ran is theirs and stays.
+fn relinquish_legacy_image_generation(
+    current: &mut DocumentMut,
+    original: &DocumentMut,
+    previous_applied: &DocumentMut,
+) {
+    const KEY: &str = "image_generation";
+    if !items_equal(
+        feature_item(current, KEY),
+        feature_item(previous_applied, KEY),
+    ) {
+        return;
+    }
+    match feature_item(original, KEY) {
+        Some(item) => set_feature_item(current, KEY, item.clone()),
+        None => remove_feature(current, KEY),
     }
 }
 
@@ -2528,10 +2554,110 @@ mod tests {
             Some(false),
             "Vellum's inbound contract only accepts identity encoding"
         );
+        assert!(
+            feature_item(&applied, "image_generation").is_none(),
+            "the proxy serves Codex's image extension, so the flag stays the user's"
+        );
+    }
+
+    /// A lease written by a version that pinned `image_generation = false`
+    /// must not keep image generation off: the next apply hands the flag back
+    /// to the user's own value.
+    #[test]
+    fn applying_proxy_relinquishes_a_legacy_image_generation_pin() {
+        for (original, expected) in [
+            ("model_provider = \"openai\"\n", None),
+            (
+                "model_provider = \"openai\"\n[features]\nimage_generation = true\n",
+                Some(true),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+            let previous_applied =
+                "model_provider = \"vellum\"\n[features]\nimage_generation = false\n";
+            std::fs::write(&paths.config, previous_applied).unwrap();
+            write_json_atomic(
+                &paths.lease,
+                &ConfigLeaseV2 {
+                    schema_version: LEASE_SCHEMA_VERSION,
+                    owner: build_lease_owner(15721),
+                    original_hash: hash_config(original),
+                    applied_hash: hash_config(previous_applied),
+                    original_config: original.into(),
+                    applied_config: previous_applied.into(),
+                    boundary_credential_id: vellum_proxy_runtime::BOUNDARY_CREDENTIAL_ID.into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .unwrap();
+
+            apply_proxy_config(
+                &paths,
+                "http://127.0.0.1:15721/v1",
+                &SubagentSettings::default(),
+                TEST_BOUNDARY_KEY,
+                15721,
+            )
+            .unwrap();
+
+            let applied = std::fs::read_to_string(&paths.config)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                feature_item(&applied, "image_generation").and_then(Item::as_bool),
+                expected,
+                "original: {original}"
+            );
+        }
+    }
+
+    /// A user who turned image generation off while Vellum ran keeps it off.
+    #[test]
+    fn applying_proxy_keeps_an_image_generation_value_the_user_set_during_the_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        let original = "model_provider = \"openai\"\n";
+        let previous_applied = "model_provider = \"vellum\"\n";
+        std::fs::write(
+            &paths.config,
+            "model_provider = \"vellum\"\n[features]\nimage_generation = false\n",
+        )
+        .unwrap();
+        write_json_atomic(
+            &paths.lease,
+            &ConfigLeaseV2 {
+                schema_version: LEASE_SCHEMA_VERSION,
+                owner: build_lease_owner(15721),
+                original_hash: hash_config(original),
+                applied_hash: hash_config(previous_applied),
+                original_config: original.into(),
+                applied_config: previous_applied.into(),
+                boundary_credential_id: vellum_proxy_runtime::BOUNDARY_CREDENTIAL_ID.into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        apply_proxy_config(
+            &paths,
+            "http://127.0.0.1:15721/v1",
+            &SubagentSettings::default(),
+            TEST_BOUNDARY_KEY,
+            15721,
+        )
+        .unwrap();
+
+        let applied = std::fs::read_to_string(&paths.config)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
         assert_eq!(
-            applied["features"]["image_generation"].as_bool(),
-            Some(false),
-            "this third-party path does not expose the backend image extension"
+            feature_item(&applied, "image_generation").and_then(Item::as_bool),
+            Some(false)
         );
     }
 

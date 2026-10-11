@@ -27,6 +27,7 @@ pub enum RuntimeEndpoint {
     ChatCompletions,
     Compact,
     Search,
+    Images,
 }
 
 /// The authorization context of the *incoming* request. Only the fields that
