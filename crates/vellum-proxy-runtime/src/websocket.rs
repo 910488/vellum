@@ -2375,8 +2375,21 @@ pub async fn send_websocket_failure(client: &mut WebSocket, message: &str) -> bo
         .is_ok()
 }
 
-async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> bool {
-    let value = json!({
+/// Codex parses `response.failed.error` with a string `code`; a numeric one
+/// fails that parse, so the turn surfaced only "response.failed event
+/// received" and Vellum's message was lost. Codex then retries every
+/// failure, so a request Vellum rejects as malformed (HTTP 400 on the HTTP
+/// transport, which Codex treats as fatal) carries `invalid_prompt`, the
+/// code Codex maps to the same non-retryable invalid-request error. The HTTP
+/// status stays available as `status`.
+fn runtime_failure_event(error: &RuntimeError) -> Value {
+    let status = error.http_status();
+    let code = if status == axum::http::StatusCode::BAD_REQUEST {
+        "invalid_prompt"
+    } else {
+        error.category()
+    };
+    json!({
         "type": "response.failed",
         "sequence_number": 0,
         "response": {
@@ -2384,12 +2397,17 @@ async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> b
             "status": "failed",
             "error": {
                 "type": "vellum_proxy_error",
-                "code": error.http_status().as_u16(),
+                "code": code,
+                "status": status.as_u16(),
                 "category": error.category(),
                 "message": error.to_string()
             }
         }
-    });
+    })
+}
+
+async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> bool {
+    let value = runtime_failure_event(error);
     client
         .send(AxumWsMessage::Text(value.to_string().into()))
         .await
@@ -2410,6 +2428,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    #[test]
+    fn runtime_failure_code_is_a_string_and_malformed_requests_are_final() {
+        let invalid = runtime_failure_event(&RuntimeError::InvalidRequest("bad shape".into()));
+        let error = &invalid["response"]["error"];
+        assert_eq!(error["code"], "invalid_prompt");
+        assert_eq!(error["status"], 400);
+        assert_eq!(error["category"], "invalid_request");
+        assert!(error["message"].as_str().unwrap().contains("bad shape"));
+
+        let unauthorized =
+            runtime_failure_event(&RuntimeError::ProviderUnauthorized("free tier".into()));
+        let error = &unauthorized["response"]["error"];
+        assert_eq!(error["code"], "provider_unauthorized");
+        assert_eq!(error["status"], 401);
+        assert!(error["code"].is_string());
+    }
     #[test]
     fn response_create_discriminator_is_preserved_for_route_selection() {
         let message = AxumWsMessage::Text(
