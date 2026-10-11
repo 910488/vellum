@@ -20,7 +20,7 @@ use crate::inbound::{InboundAccessPolicy, BOUNDARY_KEY_HEADER};
 use crate::request::{IncomingAuthContext, RequestMetadata, RuntimeEndpoint, RuntimeRequest};
 use crate::resource::{collect_request_body, CollectBodyError, ResourcePolicy};
 use crate::state::ProxyRuntimeState;
-use crate::streaming::{failed_sse_event, failed_sse_event_with_category};
+use crate::streaming::{failed_sse_event, failed_sse_event_for_runtime_error};
 use crate::websocket::responses_websocket;
 use crate::PROXY_RUNTIME_VERSION;
 
@@ -561,11 +561,8 @@ async fn responses<S: ProxyRuntimeState>(
                     send(Ok(Bytes::from(failed_sse_event(&message)))).await;
                 }
                 Err(error) => {
-                    send(Ok(Bytes::from(failed_sse_event_with_category(
-                        error.category(),
-                        &error.to_string(),
-                    ))))
-                    .await;
+                    send(Ok(Bytes::from(failed_sse_event_for_runtime_error(&error))))
+                        .await;
                 }
             }
         });

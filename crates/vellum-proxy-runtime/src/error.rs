@@ -72,6 +72,15 @@ pub enum RuntimeError {
     #[error("provider protocol error: {0}")]
     ProviderProtocol(String),
 
+    /// An upstream explicitly rejected the request with a deterministic 4xx.
+    /// Normalize the client-facing status to 400 so HTTP and WS clients stop
+    /// retrying the same invalid input; preserve the original status separately.
+    #[error("provider protocol error: upstream HTTP {upstream_status}: {message}")]
+    ProviderRequestRejected {
+        upstream_status: u16,
+        message: String,
+    },
+
     /// Continuation (server-side resume / local replay) failed.
     #[error("continuation failed: {0}")]
     Continuation(String),
@@ -170,7 +179,7 @@ impl RuntimeError {
             Self::ProviderUnauthorized(_) => "provider_unauthorized",
             Self::ProviderQuota { .. } => "provider_quota",
             Self::ProviderUnavailable(_) => "provider_unavailable",
-            Self::ProviderProtocol(_) => "provider_protocol",
+            Self::ProviderProtocol(_) | Self::ProviderRequestRejected { .. } => "provider_protocol",
             Self::Continuation(_) => "continuation",
             Self::Compaction(_) => "compaction",
             Self::History(_) => "history",
@@ -191,7 +200,9 @@ impl RuntimeError {
     /// never allowed to translate categories themselves.
     pub fn http_status(&self) -> StatusCode {
         match self {
-            Self::InvalidRequest(_) | Self::HarnessMismatch(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidRequest(_)
+            | Self::HarnessMismatch(_)
+            | Self::ProviderRequestRejected { .. } => StatusCode::BAD_REQUEST,
             Self::UnsupportedMode(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::UnsupportedMedia(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::RouteNotFound(_) | Self::RouteInactive(_) => StatusCode::NOT_FOUND,
@@ -227,6 +238,12 @@ impl RuntimeError {
             "category": self.category(),
             "message": self.to_string(),
         });
+        if let Self::ProviderRequestRejected {
+            upstream_status, ..
+        } = self
+        {
+            error["upstream_status"] = json!(upstream_status);
+        }
         if let Self::ProviderQuota {
             retry_after_secs,
             upstream_attempted,
@@ -241,6 +258,40 @@ impl RuntimeError {
             }
         }
         json!({ "error": error })
+    }
+
+    /// Responses failure event shared by WebSocket and committed HTTP SSE.
+    /// Codex's event parser requires a string code; HTTP JSON keeps its numeric
+    /// code. Invalid input remains fatal even when SSE headers are already sent.
+    pub fn to_response_failed_event(&self) -> Value {
+        let status = self.http_status();
+        let code = if status == axum::http::StatusCode::BAD_REQUEST {
+            "invalid_prompt"
+        } else {
+            self.category()
+        };
+        let mut event = json!({
+            "type": "response.failed",
+            "sequence_number": 0,
+            "response": {
+                "object": "response",
+                "status": "failed",
+                "error": {
+                    "type": "vellum_proxy_error",
+                    "code": code,
+                    "status": status.as_u16(),
+                    "category": self.category(),
+                    "message": self.to_string()
+                }
+            }
+        });
+        if let RuntimeError::ProviderRequestRejected {
+            upstream_status, ..
+        } = self
+        {
+            event["response"]["error"]["upstream_status"] = json!(upstream_status);
+        }
+        event
     }
 
     pub fn provider_quota(
@@ -298,6 +349,10 @@ mod tests {
             RuntimeError::provider_quota("q", None, true),
             RuntimeError::ProviderUnavailable("x".into()),
             RuntimeError::ProviderProtocol("p".into()),
+            RuntimeError::ProviderRequestRejected {
+                upstream_status: 422,
+                message: "bad input".into(),
+            },
             RuntimeError::Continuation("c".into()),
             RuntimeError::Compaction("c".into()),
             RuntimeError::History("h".into()),

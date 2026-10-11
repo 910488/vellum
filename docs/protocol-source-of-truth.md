@@ -694,6 +694,16 @@ The outward error must retain its category:
 - stream or transport; or
 - internal invariant failure.
 
+Explicit upstream request rejections (4xx other than authentication, quota,
+408, 409, 425, and 426) retain their typed upstream status but return buffered HTTP 400
+and a string `invalid_prompt` code in WebSocket or already-committed HTTP SSE
+`response.failed` events.
+This prevents unchanged invalid input from being retried across transports.
+The HTTP error envelope keeps its numeric client-facing code and adds
+`upstream_status`; the provider protocol diagnostic category stays intact.
+Quota-bearing 400s remain quota failures, transient 4xx remain retryable,
+and 5xx remain provider-unavailable failures.
+
 Include only a bounded, sanitized provider diagnostic. Never replace distinct
 failures with a generic high-demand message, and never expose secrets or an
 unbounded upstream body.

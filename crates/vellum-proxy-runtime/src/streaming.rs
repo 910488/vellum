@@ -187,6 +187,13 @@ pub fn failed_sse_event(message: &str) -> String {
     failed_sse_event_inner(None, message)
 }
 
+/// A typed runtime failure after HTTP SSE headers have been committed.
+/// Shares string code and status semantics with the portable WebSocket path.
+pub fn failed_sse_event_for_runtime_error(error: &crate::error::RuntimeError) -> String {
+    let value = error.to_response_failed_event();
+    format!("event: response.failed\ndata: {value}\n\n")
+}
+
 /// The same envelope, carrying a canonical [`crate::error::RuntimeError`]
 /// category.
 ///
