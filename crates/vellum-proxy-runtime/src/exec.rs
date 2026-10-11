@@ -5570,7 +5570,7 @@ impl ProxyRuntime {
         route: &RuntimeModelRoute,
         request: &RuntimeRequest,
     ) -> Result<RuntimeResponse, RuntimeError> {
-        let mut auth = ResolvedAuth::resolve(
+        let auth = ResolvedAuth::resolve(
             route,
             request,
             self.credentials.as_ref(),
@@ -5597,6 +5597,81 @@ impl ProxyRuntime {
             timeout: None,
             max_response_bytes: None,
         };
+        let response = self
+            .execute_official_with_refresh(route, auth, upstream_request)
+            .await?;
+        Ok(raw_upstream_response(response))
+    }
+
+    /// Execute a Codex image request (`images/generations` or
+    /// `images/edits`).
+    ///
+    /// Codex's image-generation extension calls these against the active
+    /// provider's base URL, so every session pointed at Vellum lands here —
+    /// third-party sessions included. Image generation is an OpenAI service,
+    /// so the request is forwarded byte-for-byte (an edit may be multipart) to
+    /// the first Official route, whichever model the session is on. The body
+    /// names an image model, not a catalog model, so the route cannot be
+    /// resolved from it. With no Official route there is nowhere to send it,
+    /// and the caller gets a reason instead of a bare 404.
+    pub async fn execute_image(
+        &self,
+        operation: ImageOperation,
+        request: RuntimeRequest,
+        body: RawImageBody,
+    ) -> Result<RuntimeResponse, RuntimeError> {
+        let _guard = self.begin_lifecycle()?;
+        let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
+        let route = snapshot
+            .routes
+            .iter()
+            .map(|snapshot| &snapshot.route)
+            .find(|route| route.provider_kind == RuntimeProviderKind::Official)
+            .ok_or_else(|| {
+                RuntimeError::UnsupportedMode(
+                    "image generation needs a ChatGPT account: add one in Vellum to generate images"
+                        .into(),
+                )
+            })?;
+        let auth = ResolvedAuth::resolve(
+            route,
+            &request,
+            self.credentials.as_ref(),
+            self.official_auth.as_ref(),
+            self.grok_sessions.as_ref(),
+            Some(self.history.as_ref()),
+        )
+        .await?;
+        let endpoint = official_image_endpoint(&route.base_url, operation);
+        let upstream_request = |auth: &ResolvedAuth| {
+            let mut headers = auth.upstream_headers(&route.upstream_model);
+            if let Some(content_type) = &body.content_type {
+                headers.push(("content-type".into(), content_type.clone()));
+            }
+            headers.extend(body.forwarded_headers.iter().cloned());
+            UpstreamRequest {
+                method: "POST".into(),
+                url: endpoint.clone(),
+                headers,
+                body: body.bytes.clone(),
+                timeout: None,
+                max_response_bytes: None,
+            }
+        };
+        let response = self
+            .execute_official_with_refresh(route, auth, upstream_request)
+            .await?;
+        Ok(raw_upstream_response(response))
+    }
+
+    /// Send one Official request; on 401/403 with a Vellum-managed account,
+    /// refresh the token for the same account and send it once more.
+    async fn execute_official_with_refresh(
+        &self,
+        route: &RuntimeModelRoute,
+        mut auth: ResolvedAuth,
+        upstream_request: impl Fn(&ResolvedAuth) -> UpstreamRequest,
+    ) -> Result<UpstreamResponse, RuntimeError> {
         let mut response = self
             .transport
             .execute(&upstream_request(&auth))
@@ -5641,16 +5716,7 @@ impl ProxyRuntime {
                 }
             }
         }
-        let content_type = response
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.clone());
-        Ok(RuntimeResponse::Raw {
-            status: response.status,
-            content_type,
-            body: response.body,
-        })
+        Ok(response)
     }
 
     /// Streaming dispatch (M5): the request body is already prepared and
@@ -8779,6 +8845,60 @@ fn compaction_trigger_response(request: &Value, item: Value) -> RuntimeResponse 
     RuntimeResponse::Sse(futures_util::stream::iter(payload).boxed())
 }
 
+/// Hand an Official upstream reply back unchanged: status, content type and
+/// body.
+fn raw_upstream_response(response: UpstreamResponse) -> RuntimeResponse {
+    let content_type = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone());
+    RuntimeResponse::Raw {
+        status: response.status,
+        content_type,
+        body: response.body,
+    }
+}
+
+/// The two image operations Codex's image-generation extension calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageOperation {
+    /// `images/generations`: a prompt with no reference image.
+    Generate,
+    /// `images/edits`: a prompt with one or more reference images.
+    Edit,
+}
+
+impl ImageOperation {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Generate => "images/generations",
+            Self::Edit => "images/edits",
+        }
+    }
+}
+
+/// An image request body exactly as Codex sent it. It is never parsed: an
+/// edit may be `multipart/form-data`, whose boundary lives in `content_type`.
+#[derive(Debug, Clone, Default)]
+pub struct RawImageBody {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    /// Codex's own image-request headers (`x-codex-image*`), passed through
+    /// so the upstream can correlate the call with its turn.
+    pub forwarded_headers: Vec<(String, String)>,
+}
+
+fn official_image_endpoint(base_url: &str, operation: ImageOperation) -> String {
+    let base = base_url.trim_end_matches('/');
+    let path = operation.path();
+    if base.ends_with("/v1") || base.ends_with("/codex") {
+        format!("{base}/{path}")
+    } else {
+        format!("{base}/v1/{path}")
+    }
+}
+
 fn alpha_search_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/v1") || base.ends_with("/codex") {
@@ -11318,6 +11438,159 @@ mod tests {
             .headers
             .iter()
             .any(|(_, value)| value == "Bearer refreshed-token"));
+    }
+
+    fn image_runtime(
+        routes: Vec<RuntimeModelRoute>,
+        responses: Vec<UpstreamResponse>,
+    ) -> (ProxyRuntime, Arc<RecordingTransport>) {
+        let transport = Arc::new(RecordingTransport::new(responses));
+        let runtime = ProxyRuntime::new(
+            Arc::new(FixedCatalog { routes }),
+            Arc::new(MemoryCredentialProvider::new()),
+            Arc::new(RefreshingOfficial {
+                token: std::sync::Mutex::new("image-token".into()),
+                refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(CountingRequestLifecycle::new()),
+            transport.clone(),
+        );
+        (runtime, transport)
+    }
+
+    fn official_image_route() -> RuntimeModelRoute {
+        let mut route = sample_route(None);
+        route.catalog_id = "gpt-official".into();
+        route.provider_kind = RuntimeProviderKind::Official;
+        route.auth_kind = RuntimeAuthKind::ChatGpt;
+        route.base_url = "https://chatgpt.test/backend-api/codex".into();
+        route
+    }
+
+    #[tokio::test]
+    async fn image_generation_forwards_to_the_official_route_from_a_third_party_session() {
+        // Codex 0.160's image extension posts to whichever provider the
+        // session uses. A third-party session must still reach OpenAI, and
+        // the body (an image model, not a catalog model) goes through as-is.
+        let (runtime, transport) = image_runtime(
+            vec![sample_route(None), official_image_route()],
+            vec![UpstreamResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: br#"{"data":[{"b64_json":"aW1n"}]}"#.to_vec(),
+            }],
+        );
+        let body = br#"{"model":"gpt-image-2","prompt":"a cabin"}"#.to_vec();
+        let response = runtime
+            .execute_image(
+                ImageOperation::Generate,
+                request(Value::Null),
+                RawImageBody {
+                    bytes: body.clone(),
+                    content_type: Some("application/json".into()),
+                    forwarded_headers: vec![("x-codex-imagegen-request-id".into(), "ig_1".into())],
+                },
+            )
+            .await
+            .unwrap();
+        let RuntimeResponse::Raw {
+            status, body: out, ..
+        } = response
+        else {
+            panic!("image responses must pass through raw");
+        };
+        assert_eq!(status, 200);
+        assert_eq!(out, br#"{"data":[{"b64_json":"aW1n"}]}"#);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url,
+            "https://chatgpt.test/backend-api/codex/images/generations"
+        );
+        assert_eq!(requests[0].body, body);
+        let header = |name: &str| {
+            requests[0]
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("authorization"), Some("Bearer image-token"));
+        assert_eq!(header("content-type"), Some("application/json"));
+        assert_eq!(header("x-codex-imagegen-request-id"), Some("ig_1"));
+    }
+
+    #[tokio::test]
+    async fn image_edit_keeps_the_multipart_body_and_boundary() {
+        let (runtime, transport) = image_runtime(
+            vec![official_image_route()],
+            vec![UpstreamResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: b"{}".to_vec(),
+            }],
+        );
+        let content_type = "multipart/form-data; boundary=XyZ";
+        let body =
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nmug\r\n--XyZ--\r\n"
+                .to_vec();
+        runtime
+            .execute_image(
+                ImageOperation::Edit,
+                request(Value::Null),
+                RawImageBody {
+                    bytes: body.clone(),
+                    content_type: Some(content_type.into()),
+                    forwarded_headers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].url,
+            "https://chatgpt.test/backend-api/codex/images/edits"
+        );
+        assert_eq!(requests[0].body, body);
+        assert!(requests[0]
+            .headers
+            .iter()
+            .any(|(key, value)| key == "content-type" && value == content_type));
+    }
+
+    #[tokio::test]
+    async fn image_request_without_an_official_route_explains_why() {
+        let (runtime, transport) = image_runtime(vec![sample_route(None)], Vec::new());
+        let error = runtime
+            .execute_image(
+                ImageOperation::Generate,
+                request(Value::Null),
+                RawImageBody::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::UnsupportedMode(ref message)
+            if message.contains("ChatGPT account")));
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn official_image_endpoint_follows_the_base_url_shape() {
+        assert_eq!(
+            official_image_endpoint(
+                "https://chatgpt.com/backend-api/codex/",
+                ImageOperation::Edit
+            ),
+            "https://chatgpt.com/backend-api/codex/images/edits"
+        );
+        assert_eq!(
+            official_image_endpoint("https://api.openai.com/v1", ImageOperation::Generate),
+            "https://api.openai.com/v1/images/generations"
+        );
+        assert_eq!(
+            official_image_endpoint("https://api.openai.com", ImageOperation::Generate),
+            "https://api.openai.com/v1/images/generations"
+        );
     }
 
     #[tokio::test]
