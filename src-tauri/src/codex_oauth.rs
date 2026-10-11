@@ -11,6 +11,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+// Fetch a bounded group concurrently, retaining policy order regardless of
+// upstream completion order. Rank routing does not use this batch collector.
+async fn collect_balanced_quota_reads<T, F>(reads: Vec<F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    use futures_util::StreamExt;
+    futures_util::stream::iter(reads)
+        .buffered(4)
+        .collect()
+        .await
+}
+
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_START_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
@@ -746,6 +759,42 @@ impl CodexOAuthManager {
             return self.valid_default_auth().await;
         }
 
+        // Balanced needs every eligible candidate. Read independent members
+        // concurrently instead of adding each cold quota round-trip to dispatch
+        // latency. Buffered preserves member order for ties and manual fallback;
+        // rank mode retains its first-usable-member short circuit.
+        let balanced_reads = if settings.strategy == QuotaPoolStrategy::Balanced {
+            let reads = settings
+                .members
+                .iter()
+                .filter(|member| member.in_pool && !member.paused)
+                .map(|member| {
+                    let account_id = member.account_id.clone();
+                    async move {
+                        let auth = self.valid_auth_for(&account_id).await;
+                        let quota = match &auth {
+                            Ok(auth) => Some(
+                                crate::codex_quota::query_with_cache_ttl(
+                                    &auth.access_token,
+                                    &auth.account_id,
+                                    &auth.credential_id,
+                                    false,
+                                    crate::codex_quota::ROUTING_QUOTA_CACHE_TTL,
+                                )
+                                .await,
+                            ),
+                            Err(_) => None,
+                        };
+                        (auth, quota)
+                    }
+                })
+                .collect::<Vec<_>>();
+            collect_balanced_quota_reads(reads).await
+        } else {
+            Vec::new()
+        };
+        let mut balanced_reads = balanced_reads.into_iter();
+
         let mut failures = Vec::new();
         let mut rank = 0;
         let mut fallback_auth = None;
@@ -759,7 +808,11 @@ impl CodexOAuthManager {
                 log_pool_decision(selection_id, "skip", &member.account_id, rank, "paused");
                 continue;
             }
-            let mut auth = match self.valid_auth_for(&member.account_id).await {
+            let (auth_result, quota_result) = match balanced_reads.next() {
+                Some(read) => read,
+                None => (self.valid_auth_for(&member.account_id).await, None),
+            };
+            let mut auth = match auth_result {
                 Ok(auth) => auth,
                 Err(error) => {
                     log_pool_decision(
@@ -776,15 +829,20 @@ impl CodexOAuthManager {
             if fallback_auth.is_none() {
                 fallback_auth = Some(auth.clone());
             }
-            let windows = match crate::codex_quota::query_with_cache_ttl(
-                &auth.access_token,
-                &auth.account_id,
-                &auth.credential_id,
-                false,
-                crate::codex_quota::ROUTING_QUOTA_CACHE_TTL,
-            )
-            .await
-            {
+            let quota_result = match quota_result {
+                Some(result) => result,
+                None => {
+                    crate::codex_quota::query_with_cache_ttl(
+                        &auth.access_token,
+                        &auth.account_id,
+                        &auth.credential_id,
+                        false,
+                        crate::codex_quota::ROUTING_QUOTA_CACHE_TTL,
+                    )
+                    .await
+                }
+            };
+            let windows = match quota_result {
                 Ok(windows) => windows,
                 Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
                     log_pool_decision(
@@ -2013,6 +2071,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("authentication_failed"));
+    }
+
+    #[tokio::test]
+    async fn balanced_quota_reads_overlap_with_a_bound_and_preserve_member_order() {
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(8);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let reads = (0..6)
+            .map(|index| {
+                let ready_tx = ready_tx.clone();
+                let gate = Arc::clone(&gate);
+                async move {
+                    ready_tx.send(index).await.unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    index
+                }
+            })
+            .collect();
+        let batch = tokio::spawn(collect_balanced_quota_reads(reads));
+        // The first four all start before any can finish. A sequential
+        // implementation stalls here, while an unbounded one starts six.
+        for expected in 0..4 {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv())
+                    .await
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        assert!(ready_rx.try_recv().is_err());
+        gate.add_permits(4);
+        for expected in 4..6 {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv())
+                    .await
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        gate.add_permits(2);
+        assert_eq!(batch.await.unwrap(), vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[tokio::test]

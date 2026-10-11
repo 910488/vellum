@@ -382,6 +382,15 @@ load heuristic, not a guarantee of equal spending or provider cache hits.
 The UI reports the backend's last selection; concurrently active conversations
 may use different accounts. It does not infer the active account from priority.
 
+Routing uses a two-second quota cache while display reads tolerate 30 seconds.
+Quota HTTP connections are reused across misses. Concurrent reads of the same
+token/workspace share one in-flight result, including failures; forced reads
+still reach upstream and invalidate any earlier reading. Balanced routing reads
+up to four independent members concurrently and processes results in member
+order. Rank routing retains its first-usable-member short circuit. Cold reads
+still wait for upstream quota; dispatch timing reports account authorization
+separately from history hydration.
+
 Quota readings are cached for at most 30 seconds per token and workspace;
 force-refresh invalidates the previous reading. Gates control automatic
 rotation, not whether a request can be sent. Usage by other clients and
