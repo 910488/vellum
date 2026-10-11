@@ -237,6 +237,16 @@ whole text payload to 128 MiB, and records truncation in `manifest.json`.
 Secrets and user paths are redacted again, while request, session, thread, and
 call identifiers become stable short hashes so related events remain useful.
 
+Desktop logging rotates `Vellum.log` at 10 MiB and retains four dated archives
+(`Vellum_YYYY-MM-DD_HH-MM-SS.log`) alongside the active file, approximately
+50 MiB total. A cleanup at startup and every minute counts same-second
+collision backups (`.log.bak`) toward the same four-archive limit; these may
+temporarily exceed the count between cleanups. The plugin's size threshold is
+soft for a single oversized log record. Support ZIPs include and redact both
+dated archives and collision backups. For historical timeline analysis, read
+the retained rotations as well as the current `Vellum.log`. Existing QA lanes
+use their own command transcripts rather than assuming one Desktop log file.
+
 ## The retired Vellum compaction surface
 
 Canonical is no longer something a Vellum install can select. Removed with the
