@@ -971,16 +971,25 @@ impl CodexOAuthManager {
             let plans = self.accounts.read().await;
             let candidates = eligible
                 .iter()
-                .map(|(auth, _, observation)| crate::quota_pool_router::Candidate {
-                    account_id: auth.credential_id.clone(),
-                    headroom: observation.headroom,
-                    capacity_prior: crate::quota_pool_router::plan_capacity_prior(
-                        plans
+                .map(
+                    |(auth, _, observation)| crate::quota_pool_router::Candidate {
+                        account_id: auth.credential_id.clone(),
+                        headroom: observation.headroom,
+                        plan_type: plans
                             .get(&auth.credential_id)
-                            .and_then(|account| account.plan_type.as_deref()),
-                    ),
-                    weekly_used: Some(observation.weekly_used),
-                })
+                            .and_then(|a| a.plan_type.clone()),
+                        capacity_prior: crate::quota_pool_router::plan_capacity_prior(
+                            plans
+                                .get(&auth.credential_id)
+                                .and_then(|account| account.plan_type.as_deref()),
+                        ),
+                        weekly_used: Some(observation.weekly_used),
+                        weekly_headroom: Some(observation.weekly_headroom),
+                        weekly_reset_at: observation.weekly_reset_at,
+                        five_hour_used: observation.five_hour_used,
+                        five_hour_reset_at: observation.five_hour_reset_at,
+                    },
+                )
                 .collect::<Vec<_>>();
             drop(plans);
             let (index, reason) = self.smart_router.lock().choose(
@@ -1034,6 +1043,7 @@ impl CodexOAuthManager {
                         headroom: 0.0,
                         capacity_prior: 1.0,
                         weekly_used: None,
+                        ..Default::default()
                     }],
                     context,
                     chrono::Utc::now().timestamp_millis().max(0) as u64,
@@ -1353,6 +1363,10 @@ struct QuotaPoolObservation {
     skip_reason: Option<&'static str>,
     headroom: f64,
     weekly_used: f64,
+    weekly_headroom: f64,
+    weekly_reset_at: Option<u64>,
+    five_hour_used: Option<f64>,
+    five_hour_reset_at: Option<u64>,
 }
 
 fn log_pool_decision(
@@ -1387,6 +1401,12 @@ fn pool_decision_message(
 /// as spendable can select an account whose in-flight request crosses 100%.
 const FIVE_HOUR_ROUTING_RESERVE_PERCENT: f64 = 5.0;
 
+fn quota_reset_ms(window: &crate::model::QuotaSnapshot) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(window.reset_at.as_deref()?)
+        .ok()
+        .map(|t| t.timestamp_millis().max(0) as u64)
+}
+
 fn quota_pool_observation(
     windows: &[crate::model::QuotaSnapshot],
     weekly_floor: u8,
@@ -1413,6 +1433,10 @@ fn quota_pool_observation(
         usable: skip_reason.is_none(),
         skip_reason,
         weekly_used: weekly.used_percent.clamp(0.0, 100.0),
+        weekly_headroom: burnable,
+        weekly_reset_at: quota_reset_ms(weekly),
+        five_hour_used: five_hour.map(|w| w.used_percent.clamp(0.0, 100.0)),
+        five_hour_reset_at: five_hour.and_then(quota_reset_ms),
         // Compare remaining fractions rather than raw tokens across plans.
         // Reserve/floor headroom is normalized to each spendable window.
         headroom: (burnable / (100.0 - f64::from(weekly_floor)).max(1.0) * 100.0).min(
@@ -2238,6 +2262,10 @@ mod tests {
 
     #[tokio::test]
     async fn quota_pool_routes_across_users_and_workspaces() {
+        // Rank routing has no session affinity or migration hysteresis.
+        // The seeded offline snapshots must not expire while settings are
+        // persisted: after opening pool-c, pool-b remains exactly at its
+        // weekly floor and pool-a remains paused, so only pool-c is usable.
         let temp = tempfile::tempdir().unwrap();
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         let mut members = Vec::new();

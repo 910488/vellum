@@ -10,8 +10,22 @@ pub const ROUTING_QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::fr
 
 #[derive(Clone)]
 struct CachedQuota {
+    #[cfg(test)]
+    offline_fixture: bool,
     fetched_at: std::time::Instant,
     windows: Vec<QuotaSnapshot>,
+}
+
+impl CachedQuota {
+    fn is_fresh(&self, ttl: std::time::Duration) -> bool {
+        // Synthetic manager fixtures have no upstream to refresh from. Keep
+        // them deterministic on slow CI; real cache entries still use the TTL.
+        #[cfg(test)]
+        if self.offline_fixture {
+            return true;
+        }
+        cache_is_fresh(self.fetched_at, ttl)
+    }
 }
 
 fn quota_cache() -> &'static tokio::sync::RwLock<HashMap<String, CachedQuota>> {
@@ -137,7 +151,7 @@ async fn query_with_client(
     // refreshed while we waited. Forced reads still always reach upstream.
     if !force_refresh {
         if let Some(cached) = quota_cache().read().await.get(&cache_key).cloned() {
-            if cache_is_fresh(cached.fetched_at, cache_ttl) {
+            if cached.is_fresh(cache_ttl) {
                 return Ok(cached
                     .windows
                     .into_iter()
@@ -169,10 +183,12 @@ async fn query_with_client(
     };
     *guard = None;
     let mut cache = quota_cache().write().await;
-    cache.retain(|_, entry| entry.fetched_at.elapsed() < QUOTA_CACHE_TTL);
+    cache.retain(|_, entry| entry.is_fresh(QUOTA_CACHE_TTL));
     cache.insert(
         cache_key,
         CachedQuota {
+            #[cfg(test)]
+            offline_fixture: false,
             fetched_at: std::time::Instant::now(),
             windows: windows.clone(),
         },
@@ -344,6 +360,7 @@ pub(crate) async fn seed_test_quota(token: &str, account: &str, windows: Vec<Quo
     quota_cache().write().await.insert(
         key,
         CachedQuota {
+            offline_fixture: true,
             fetched_at: std::time::Instant::now(),
             windows,
         },
@@ -592,6 +609,58 @@ mod tests {
         let fetched_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
         assert!(!cache_is_fresh(fetched_at, ROUTING_QUOTA_CACHE_TTL));
         assert!(cache_is_fresh(fetched_at, QUOTA_CACHE_TTL));
+    }
+
+    #[tokio::test]
+    async fn offline_quota_fixtures_survive_routing_and_display_cache_expiry() {
+        use std::sync::atomic::Ordering;
+        let (url, _, requests, server) = local_usage_server().await;
+        let token = "offline-expired-fixture";
+        let account = "offline-expired-workspace";
+        let windows = parse_quota_windows(
+            account,
+            &json!({ "rate_limit": {
+                "primary_window": { "used_percent": 10, "limit_window_seconds": 18000 }
+            }}),
+        )
+        .unwrap();
+        seed_test_quota(token, account, windows).await;
+        let key = format!("{account}:{:x}", Sha256::digest(token.as_bytes()));
+        // Reproduce a slow CI worker without sleeping or contacting upstream.
+        quota_cache()
+            .write()
+            .await
+            .get_mut(&key)
+            .unwrap()
+            .fetched_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        // A real refresh prunes stale cache entries as well. Offline fixtures
+        // must survive that sweep when other tests refresh in parallel.
+        query_with_client(
+            quota_client().unwrap(),
+            &url,
+            "local-refresh-token",
+            "local-refresh-workspace",
+            "local-refresh-route",
+            false,
+            ROUTING_QUOTA_CACHE_TTL,
+        )
+        .await
+        .unwrap();
+        let result = query_with_client(
+            quota_client().unwrap(),
+            &url,
+            token,
+            account,
+            "offline-route",
+            false,
+            ROUTING_QUOTA_CACHE_TTL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0].used_percent, 10.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(result[0].route_id, "offline-route");
+        server.abort();
     }
 
     #[tokio::test]

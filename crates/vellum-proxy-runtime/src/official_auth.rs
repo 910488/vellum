@@ -60,7 +60,7 @@ pub enum OfficialAuthDecision {
 }
 
 /// Routing hints, never credentials or prompt content. Session identity is
-/// namespaced by route/model and hashed before crossing the host boundary.
+/// namespaced by route and session class and hashed before crossing the host boundary.
 #[derive(Debug, Clone, Default)]
 pub struct OfficialRoutingContext {
     pub session_key: Option<String>,
@@ -100,7 +100,22 @@ impl OfficialRoutingContext {
                 })
         };
         let session_key = identity.map(|key| {
-            hash(&serde_json::json!([route.route_id, route.upstream_model, key]).to_string())
+            format!(
+                "{}:{}",
+                if request
+                    .body
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("codex-auto-review")
+                    || request.metadata.review_run_id.is_some()
+                    || request.metadata.review_official_account_id.is_some()
+                {
+                    "review"
+                } else {
+                    "main"
+                },
+                hash(&serde_json::json!([route.route_id, key]).to_string())
+            )
         });
         let context_window_key = request
             .metadata
