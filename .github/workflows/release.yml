@@ -487,7 +487,7 @@ jobs:
             else
               RANGE="HEAD~20..HEAD"
             fi
-            git log --no-merges --format='- %s' "$RANGE" | head -n 40 > release-notes.md
+            git log --no-merges -n 40 --format='- %s' "$RANGE" > release-notes.md
           fi
           cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/prepare-release-source
