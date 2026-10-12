@@ -27,6 +27,7 @@ pub(crate) struct Candidate {
     pub account_id: String,
     pub headroom: f64,
     pub capacity_prior: f64,
+    pub plan_type: Option<String>,
     pub weekly_used: Option<f64>,
     /// Raw spendable percentage points, not renormalized after the floor.
     pub weekly_headroom: Option<f64>,
@@ -50,6 +51,9 @@ struct Calibration {
     tokens_since: f64,
     tokens_per_point: Option<f64>,
     external_points: f64,
+    // Recent rejected nonzero samples and their provisional external points.
+    // Three consistent samples distinguish a sustained drop from one burst.
+    low_samples: VecDeque<(f64, f64)>,
 }
 impl Calibration {
     fn update(&mut self, used: f64, prior: f64) {
@@ -57,6 +61,7 @@ impl Calibration {
             Some(anchor) if used + 0.5 < anchor => {
                 self.anchor_used = Some(used);
                 self.tokens_since = 0.0;
+                self.low_samples.clear();
             }
             Some(anchor)
                 if used - anchor >= 2.0
@@ -64,17 +69,43 @@ impl Calibration {
                     && self.tokens_since / (used - anchor)
                         < self.tokens_per_point.unwrap_or(prior) * 0.5 =>
             {
-                // Pool observations cannot explain this quota jump. Retain the
-                // capacity estimate and advance the anchor; otherwise external
-                // spending would lower both weekly and 5h capacity. A first
-                // nonzero sample can still replace an inaccurate plan prior.
-                self.external_points +=
+                let sample = self.tokens_since / (used - anchor);
+                let external =
                     (used - anchor - self.tokens_since / self.tokens_per_point.unwrap_or(prior))
                         .max(0.0);
+                self.external_points += external;
+                if sample > 0.0 {
+                    self.low_samples.push_back((sample, external));
+                    if self.low_samples.len() > 3 {
+                        self.low_samples.pop_front();
+                    }
+                    if self.low_samples.len() == 3 {
+                        let mut samples =
+                            self.low_samples.iter().map(|(s, _)| *s).collect::<Vec<_>>();
+                        samples.sort_by(f64::total_cmp);
+                        if samples[2] <= 2.0 * samples[0] {
+                            self.tokens_per_point = Some(samples[1]);
+                            // Only this confirmed streak is reclassified;
+                            // earlier isolated external usage remains recorded.
+                            self.external_points = (self.external_points
+                                - self
+                                    .low_samples
+                                    .iter()
+                                    .map(|(_, points)| points)
+                                    .sum::<f64>())
+                            .max(0.0);
+                            self.low_samples.clear();
+                        }
+                    }
+                } else {
+                    // No pool usage cannot establish a positive capacity.
+                    self.low_samples.clear();
+                }
                 self.anchor_used = Some(used);
                 self.tokens_since = 0.0;
             }
             Some(anchor) if used - anchor >= 2.0 && self.tokens_since >= 20_000.0 => {
+                self.low_samples.clear();
                 let sample = self.tokens_since / (used - anchor);
                 self.tokens_per_point = Some(
                     self.tokens_per_point
@@ -147,6 +178,7 @@ pub(crate) struct SmartRouter {
     requests: HashMap<String, RequestBinding>,
     calibration: HashMap<String, Calibration>,
     five_calibration: HashMap<String, Calibration>,
+    plan_types: HashMap<String, Option<String>>,
     loads: HashMap<String, Rate>,
     samples: [VecDeque<(String, f64)>; 2],
     lambda: f64,
@@ -159,6 +191,7 @@ impl Default for SmartRouter {
             requests: HashMap::new(),
             calibration: HashMap::new(),
             five_calibration: HashMap::new(),
+            plan_types: HashMap::new(),
             loads: HashMap::new(),
             samples: Default::default(),
             lambda: DEFAULT_LAMBDA,
@@ -212,6 +245,16 @@ impl SmartRouter {
         candidates
             .iter()
             .map(|c| {
+                let plan = c.plan_type.as_ref().map(|p| p.trim().to_ascii_lowercase());
+                if self
+                    .plan_types
+                    .get(&c.account_id)
+                    .is_some_and(|previous| previous != &plan)
+                {
+                    self.calibration.remove(&c.account_id);
+                    self.five_calibration.remove(&c.account_id);
+                }
+                self.plan_types.insert(c.account_id.clone(), plan);
                 let cal = self.calibration.entry(c.account_id.clone()).or_default();
                 if let Some(used) = c.weekly_used {
                     cal.update(used, PRIOR_TOKENS_PER_POINT * c.capacity_prior.max(0.01));
@@ -661,6 +704,92 @@ mod tests {
         }
     }
     #[test]
+    fn sustained_twenty_fold_capacity_drop_replaces_old_estimate() {
+        for capacity in [600_000.0, 50_000.0] {
+            let mut cal = Calibration {
+                anchor_used: Some(10.0),
+                tokens_per_point: Some(capacity),
+                external_points: 7.0,
+                ..Default::default()
+            };
+            for n in 1..=3 {
+                cal.tokens_since = 2.0 * capacity / 20.0;
+                cal.update(10.0 + 2.0 * n as f64, capacity);
+                assert_eq!(
+                    cal.tokens_per_point,
+                    Some(if n == 3 { capacity / 20.0 } else { capacity })
+                );
+            }
+            assert!((cal.external_points - 7.0).abs() < 1e-9);
+            assert!(cal.low_samples.is_empty());
+        }
+    }
+
+    #[test]
+    fn normal_sample_and_reset_break_low_capacity_streak() {
+        let mut cal = Calibration {
+            anchor_used: Some(0.0),
+            tokens_per_point: Some(100_000.0),
+            ..Default::default()
+        };
+        for used in [2.0, 4.0] {
+            cal.tokens_since = 20_000.0;
+            cal.update(used, 100_000.0);
+        }
+        cal.tokens_since = 200_000.0;
+        cal.update(6.0, 100_000.0);
+        assert!(cal.low_samples.is_empty());
+        cal.tokens_since = 20_000.0;
+        cal.update(8.0, 100_000.0);
+        assert_eq!(cal.tokens_per_point, Some(100_000.0));
+        cal.update(0.0, 100_000.0);
+        assert!(cal.low_samples.is_empty());
+    }
+
+    #[test]
+    fn inconsistent_external_samples_do_not_reset_capacity() {
+        let mut cal = Calibration {
+            anchor_used: Some(0.0),
+            tokens_per_point: Some(100_000.0),
+            ..Default::default()
+        };
+        for (n, sample) in [1000.0, 30_000.0, 1000.0, 30_000.0].into_iter().enumerate() {
+            cal.tokens_since = 2.0 * sample;
+            cal.update(2.0 * (n + 1) as f64, 100_000.0);
+        }
+        assert_eq!(cal.tokens_per_point, Some(100_000.0));
+        assert!(cal.external_points > 0.0);
+        assert_eq!(cal.low_samples.len(), 3);
+    }
+
+    #[test]
+    fn plan_change_resets_weekly_and_five_hour_calibration_to_prior() {
+        let mut router = SmartRouter::default();
+        let mut c = candidate("a", 90.0);
+        c.plan_type = Some("Pro".into());
+        c.capacity_prior = 20.0;
+        c.weekly_used = Some(10.0);
+        c.five_hour_used = Some(10.0);
+        router.fair_rates(std::slice::from_ref(&c), 1);
+        for cal in [&mut router.calibration, &mut router.five_calibration] {
+            cal.get_mut("a").unwrap().tokens_per_point = Some(600_000.0);
+            cal.get_mut("a").unwrap().external_points = 12.0;
+        }
+        c.plan_type = Some(" pro ".into());
+        router.fair_rates(std::slice::from_ref(&c), 2);
+        assert_eq!(router.calibration["a"].tokens_per_point, Some(600_000.0));
+        c.plan_type = Some("Plus".into());
+        c.capacity_prior = 1.0;
+        let rates = router.fair_rates(&[c], 3);
+        assert_eq!(rates[0].1, PRIOR_TOKENS_PER_POINT);
+        for cal in [&router.calibration, &router.five_calibration] {
+            assert_eq!(cal["a"].tokens_per_point, None);
+            assert_eq!(cal["a"].tokens_since, 0.0);
+            assert_eq!(cal["a"].external_points, 0.0);
+        }
+    }
+
+    #[test]
     fn first_capacity_sample_can_replace_an_overstated_prior() {
         let mut cal = Calibration::default();
         cal.update(10.0, 200_000.0);
@@ -709,6 +838,7 @@ mod tests {
                 five_hour_used: Some(0.0),
                 five_hour_reset_at: Some(18_000_001),
                 capacity_prior: 20.0,
+                plan_type: None,
             }
         });
         let fair = router.fair_rates(&accounts, 1)[0].0;

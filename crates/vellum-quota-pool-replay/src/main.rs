@@ -81,6 +81,7 @@ impl Account {
             account_id: format!("synthetic-{index}"),
             headroom: (week / (100.0 - self.model.weekly_floor) * 100.0).min(five / 95.0 * 100.0),
             capacity_prior: self.model.plan_prior,
+            plan_type: None,
             weekly_used: Some(self.weekly),
             weekly_headroom: Some(week),
             weekly_reset_at: Some(self.weekly_reset),
@@ -115,6 +116,7 @@ struct ResultRow {
     effective_tokens: f64,
     used_std: f64,
     used_spread: f64,
+    final_used: Vec<f64>,
     time_mean_sd: f64,
     time_p90_sd: f64,
     diagnostics: Vec<Decision>,
@@ -227,6 +229,7 @@ struct ExternalEvent {
     at: u64,
     account: usize,
     weekly_points: f64,
+    capacity_factor: Option<f64>,
 }
 fn simulate_events(
     rows: &[Row],
@@ -265,11 +268,18 @@ fn simulate_events(
             advance_accounts(&mut accounts, last_at, e.at, &mut time_metrics);
             last_at = e.at;
             let a = &mut accounts[e.account];
-            a.spend(e.weekly_points * a.model.weekly_capacity / 100.0);
-            // An upstream 5h observation is bounded at 100%; external spend
-            // includes activity outside the replay's pool, not billed pool input.
-            a.five = a.five.min(100.0);
-            quota_events.push(serde_json::json!({"event":"external_burst", "hour":(e.at-first) as f64/3_600_000.0,"account":e.account,"weekly_points":e.weekly_points}));
+            if let Some(factor) = e.capacity_factor {
+                // Change real capacity without announcing a plan change to
+                // the router. Preserve observed used%, so subsequent samples
+                // must learn the new tokens/point rather than an instant gate.
+                a.model.weekly_capacity *= factor;
+                a.model.five_hour_capacity = a.model.five_hour_capacity.map(|c| c * factor);
+                quota_events.push(serde_json::json!({"event":"capacity_drop", "hour":(e.at-first) as f64/3_600_000.0,"account":e.account,"factor":factor}));
+            } else {
+                a.spend(e.weekly_points * a.model.weekly_capacity / 100.0);
+                a.five = a.five.min(100.0);
+                quota_events.push(serde_json::json!({"event":"external_burst", "hour":(e.at-first) as f64/3_600_000.0,"account":e.account,"weekly_points":e.weekly_points}));
+            }
             event_index += 1;
         }
         advance_accounts(&mut accounts, last_at, row.at, &mut time_metrics);
@@ -445,6 +455,7 @@ fn simulate_events(
         effective_tokens,
         used_std,
         used_spread,
+        final_used: accounts.iter().map(|a| a.weekly).collect(),
         time_mean_sd,
         time_p90_sd,
         diagnostics,
@@ -510,10 +521,19 @@ fn external_events(first: u64, last: u64, count: usize, seed: u64) -> Vec<Extern
             at: first + duration / 5 + next() % (duration / 2).max(1),
             account: (seed as usize + i as usize) % count,
             weekly_points: 10.0 + (next() % 2001) as f64 / 100.0,
+            capacity_factor: None,
         })
         .collect::<Vec<_>>();
     events.sort_by_key(|e| e.at);
     events
+}
+fn capacity_drop_events(first: u64, last: u64, count: usize, seed: u64) -> Vec<ExternalEvent> {
+    vec![ExternalEvent {
+        at: first + last.saturating_sub(first) * (45 + seed % 11) / 100,
+        account: seed as usize % count,
+        weekly_points: 0.0,
+        capacity_factor: Some(0.25),
+    }]
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::set_logger(&DECISION_LOGGER).map_err(|_| "decision logger already installed")?;
@@ -615,6 +635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "staggered_reset",
             "heterogeneous",
             "external_burst",
+            "capacity_drop",
         ] {
             for seed in [17, 29, 43, 59, 71] {
                 if scenario != "unequal_start" && seed > 43 {
@@ -623,6 +644,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let models = seeded_models(&models, scenario, seed);
                 let events = if scenario == "external_burst" {
                     external_events(rows[0].at, rows.last().unwrap().at, models.len(), seed)
+                } else if scenario == "capacity_drop" {
+                    capacity_drop_events(rows[0].at, rows.last().unwrap().at, models.len(), seed)
                 } else {
                     vec![]
                 };
@@ -633,7 +656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for lambda in [0.05, 0.1, 0.2, 0.5, 1.0] {
                     comparisons.push(simulate_events(&rows, &models, "full", lambda, &events));
                 }
-                suite.push(serde_json::json!({"scenario":scenario,"seed":seed,"models":models,"external_events":events.iter().map(|e| serde_json::json!({"hour":(e.at-rows[0].at) as f64/3_600_000.0,"account":e.account,"weekly_points":e.weekly_points})).collect::<Vec<_>>(),"results":comparisons}));
+                suite.push(serde_json::json!({"scenario":scenario,"seed":seed,"models":models,"external_events":events.iter().map(|e| serde_json::json!({"hour":(e.at-rows[0].at) as f64/3_600_000.0,"account":e.account,"weekly_points":e.weekly_points,"capacity_factor":e.capacity_factor})).collect::<Vec<_>>(),"results":comparisons}));
             }
         }
     }
@@ -732,6 +755,7 @@ mod replay_tests {
             at: 1_800_001,
             account: 0,
             weekly_points: 20.0,
+            capacity_factor: None,
         }];
         for kind in ["legacy", "review08", "full"] {
             let result = simulate_events(&rows, &[a.clone()], kind, 0.2, &events);
@@ -739,6 +763,36 @@ mod replay_tests {
             assert!((result.reserve_hours - 0.5).abs() < 1e-9);
             assert!(result.time_mean_sd.abs() < 1e-9);
             assert_eq!(result.quota_events[0]["event"], "external_burst");
+        }
+    }
+    #[test]
+    fn capacity_drop_changes_true_budget_without_pool_billing() {
+        let rows = [
+            Row {
+                at: 1,
+                session: "s".into(),
+                model: "sol".into(),
+                input: 100,
+                cached: 0,
+                original_account: "a".into(),
+            },
+            Row {
+                at: 3_600_001,
+                session: "s".into(),
+                model: "sol".into(),
+                input: 100,
+                cached: 0,
+                original_account: "a".into(),
+            },
+        ];
+        for seed in [17, 29, 43] {
+            let events = capacity_drop_events(1, 3_600_001, 1, seed);
+            let result = simulate_events(&rows, &[model(1_000_000.0)], "full", 0.2, &events);
+            assert_eq!(result.effective_tokens, 200.0);
+            assert!((result.final_used[0] - 0.05).abs() < 1e-9);
+            assert_eq!(result.quota_events[0]["event"], "capacity_drop");
+            assert_eq!(events[0].capacity_factor, Some(0.25));
+            assert!(events[0].at > 1 && events[0].at < 3_600_001);
         }
     }
     #[test]

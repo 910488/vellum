@@ -975,6 +975,9 @@ impl CodexOAuthManager {
                     |(auth, _, observation)| crate::quota_pool_router::Candidate {
                         account_id: auth.credential_id.clone(),
                         headroom: observation.headroom,
+                        plan_type: plans
+                            .get(&auth.credential_id)
+                            .and_then(|a| a.plan_type.clone()),
                         capacity_prior: crate::quota_pool_router::plan_capacity_prior(
                             plans
                                 .get(&auth.credential_id)
