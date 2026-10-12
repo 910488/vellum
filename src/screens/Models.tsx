@@ -195,16 +195,18 @@ interface AccountQuotaGate {
   onCommit: (floor: number) => void;
 }
 
-function AccountQuota({
+export function AccountQuota({
   windows,
   t,
   resetLabel,
   gate = null,
+  officialLayout = false,
 }: {
   windows: AccountQuotaPresentation[];
   t: Translate;
   resetLabel: (iso: string | null) => string;
   gate?: AccountQuotaGate | null;
+  officialLayout?: boolean;
 }) {
   const binding = windows.reduce<AccountQuotaPresentation | null>(
     (tightest, window) =>
@@ -212,8 +214,8 @@ function AccountQuota({
     null,
   );
   return (
-    <span className="acct__quota">
-      {windows.map((window) => {
+    <span className={`acct__quota${officialLayout ? " acct__quota--official" : ""}`}>
+      {(officialLayout ? [...windows].sort((a, b) => Number(isWeeklyQuota(b)) - Number(isWeeklyQuota(a))) : windows).map((window) => {
         // 閘門只設在每週窗。5 小時窗與每週窗的換算會改，拿它當設定值等於把
         // 一個會變的比例寫進使用者的設定裡；每週窗才是硬標準。
         const gated = gate && isWeeklyQuota(window) ? gate : null;
@@ -1616,7 +1618,7 @@ export function Models({
 
         {oauth?.accounts.length ? (
           normalizedQuotaPool.enabled ? (
-            <Rows>
+            <Rows className="rows--official">
               {pooledAccounts.map((entry) => {
                 const account = entry.account;
                 const accountLabel = codexAccountLabel(account);
@@ -1692,7 +1694,7 @@ export function Models({
                       </span>
                     }
                   >
-                    <span className={`acct${entry.member.paused ? " acct--paused" : ""}`}>
+                    <span className={`acct acct--official${entry.member.paused ? " acct--paused" : ""}`}>
                       <State
                         tone={
                           rank === 1
@@ -1706,6 +1708,7 @@ export function Models({
                       <span className="acct__actions">
                         {quotaWindows.length ? (
                           <AccountQuota
+                            officialLayout
                             windows={quotaWindows}
                             t={t}
                             resetLabel={resetLabel}
@@ -1745,8 +1748,7 @@ export function Models({
                           </Pill>
                         )}
                         <span className="acct__resets">
-                          {entry.fiveHour ? (
-                          <Btn
+                          {entry.fiveHour ? <Btn
                             soft
                             mini
                             disabled={quotaPoolBusy || oauthBusy}
@@ -1763,8 +1765,7 @@ export function Models({
                                 ? "models.ui.fiveHour.autoOn"
                                 : "models.ui.fiveHour.autoOff",
                             )}
-                          </Btn>
-                          ) : null}
+                          </Btn> : null}
                           {resetError || !credits ? (
                             <Pill tone={resetError ? "warn" : "quiet"}>
                               {resetError ? t("models.ui.reset.failed") : t("models.ui.reset.loading")}
@@ -1860,7 +1861,7 @@ export function Models({
               })}
             </Rows>
           ) : (
-          <Rows>
+          <Rows className="rows--official">
             {oauth.accounts.map((account) => {
               const accountLabel = codexAccountLabel(account);
               const credits = resetCredits[account.accountId];
@@ -1881,14 +1882,14 @@ export function Models({
               );
               return (
                 <Row key={account.accountId} label={accountLabel}>
-                  <span className="acct">
+                  <span className="acct acct--official">
                     <State
                       tone={isVerifiedCurrent ? "ok" : "quiet"}
                       label={isVerifiedCurrent ? t("models.ui.account.active") : t("models.ui.account.authenticated")}
                     />
                     <span className="acct__actions">
                       {quotaWindows.length ? (
-                        <AccountQuota windows={quotaWindows} t={t} resetLabel={resetLabel} />
+                        <AccountQuota officialLayout windows={quotaWindows} t={t} resetLabel={resetLabel} />
                       ) : (
                         <Pill tone={quotaError ? "warn" : "quiet"}>
                           {quotaError ? t("models.ui.quota.failed") : t("models.ui.quota.loading")}
@@ -1900,8 +1901,7 @@ export function Models({
                           個按不動的把手。重試接在同一格，不另外占一欄：那顆
                           按鈕只在出錯時存在，常設欄位會讓整列平常空一格。 */}
                       <span className="acct__resets">
-                        {quotaWindows.some(isFiveHourQuota) ? (
-                        <Btn
+                        {quotaWindows.some(isFiveHourQuota) ? <Btn
                           soft
                           mini
                           disabled={quotaPoolBusy || oauthBusy}
@@ -1918,8 +1918,7 @@ export function Models({
                               ? "models.ui.fiveHour.autoOn"
                               : "models.ui.fiveHour.autoOff",
                           )}
-                        </Btn>
-                        ) : null}
+                        </Btn> : null}
                         {resetError || !credits ? (
                           <Pill tone={resetError ? "warn" : "quiet"}>
                             {resetError

@@ -233,7 +233,7 @@ describe("Models screen Effort probe status", () => {
     expect((strategy as HTMLSelectElement).value).toBe("balanced");
   });
 
-  it("shows a weekly-only pool account as usable without a five-hour automation control", async () => {
+  it("shows a weekly-only pool account as usable with a disabled five-hour slot", async () => {
     apiMocks.getCodexOAuthStatus.mockResolvedValue({ authenticated: true, defaultAccountId: "pro", accounts: [
       { accountId: "pro", email: "pro@example.test", planType: "pro", authenticatedAt: 1, isDefault: true },
     ] });
