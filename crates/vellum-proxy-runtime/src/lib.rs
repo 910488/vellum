@@ -125,7 +125,8 @@ pub use diagnostics::{
     CompactionOutcome, DetailLevel, DiagnosticEvent, DiagnosticsSink, InputItemManifest,
     LinkConfidence, NoopSink, OfficialAccountSelected, OfficialAuthMode,
     OfficialReasoningSummaryAction, OfficialRequestPrepared, OfficialRequestTransport,
-    RuntimeDiagnostics, SpawnCompleted, SpawnRequested, SubagentGraphLinked,
+    QuotaPoolCandidateDiagnostic, QuotaPoolDecision, RuntimeDiagnostics, SpawnCompleted,
+    SpawnRequested, SubagentGraphLinked,
     SubagentLinkComparison, SubagentLinkMethod, T3CaptureSession, WebSocketClosed, WebSocketOpened,
     WebSocketTransport, T3_MAX_AGE, T3_MAX_BYTES,
 };

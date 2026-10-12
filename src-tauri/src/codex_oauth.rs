@@ -235,6 +235,7 @@ pub struct CodexOAuthManager {
     quota_pool: RwLock<QuotaPoolSettings>,
     active_pool_account_id: RwLock<Option<String>>,
     smart_router: parking_lot::Mutex<crate::quota_pool_router::SmartRouter>,
+    pool_diagnostics: parking_lot::Mutex<crate::quota_pool_diagnostics::DecisionObserver>,
     selection_lock: Mutex<()>,
     access_tokens: RwLock<HashMap<String, CachedToken>>,
     refresh_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
@@ -338,12 +339,35 @@ impl CodexOAuthManager {
             quota_pool: RwLock::new(store.quota_pool),
             active_pool_account_id: RwLock::new(None),
             smart_router: parking_lot::Mutex::new(crate::quota_pool_router::SmartRouter::default()),
+            pool_diagnostics: parking_lot::Mutex::new(Default::default()),
             selection_lock: Mutex::const_new(()),
             access_tokens: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
             cadence_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    pub(crate) fn set_pool_diagnostics_sink(
+        &self,
+        sink: Arc<dyn vellum_proxy_runtime::DiagnosticsSink>,
+    ) {
+        self.pool_diagnostics.lock().set_sink(sink);
+    }
+
+    fn record_pool_diagnostic(
+        &self,
+        selected: Option<&str>,
+        reason: &str,
+        candidates: Vec<vellum_proxy_runtime::QuotaPoolCandidateDiagnostic>,
+    ) {
+        self.pool_diagnostics
+            .lock()
+            .record(vellum_proxy_runtime::QuotaPoolDecision {
+                selected_account_hash: selected.map(pool_account_hash),
+                reason: reason.into(),
+                candidates,
+            });
     }
 
     /// Non-blocking peek of the default ChatGPT account subject for realm
@@ -795,6 +819,47 @@ impl CodexOAuthManager {
         };
         let mut balanced_reads = balanced_reads.into_iter();
 
+        let mut diagnostic_candidates = if settings.strategy == QuotaPoolStrategy::Balanced {
+            let plans = self.accounts.read().await;
+            let router = self.smart_router.lock();
+            settings
+                .members
+                .iter()
+                .filter(|m| m.in_pool)
+                .map(|m| {
+                    let prior = crate::quota_pool_router::plan_capacity_prior(
+                        plans
+                            .get(&m.account_id)
+                            .and_then(|a| a.plan_type.as_deref()),
+                    );
+                    let (capacity, measured, external, low) =
+                        router.diagnostic_capacity(&m.account_id, prior);
+                    let (_, _, five_external, five_low) =
+                        router.diagnostic_five_capacity(&m.account_id, capacity);
+                    vellum_proxy_runtime::QuotaPoolCandidateDiagnostic {
+                        account_hash: pool_account_hash(&m.account_id),
+                        exclusion_reason: Some("quota_unavailable".into()),
+                        headroom: None,
+                        weekly_used: None,
+                        five_hour_used: None,
+                        weekly_reset_at: None,
+                        five_hour_reset_at: None,
+                        tokens_per_point: capacity,
+                        capacity_source: if measured { "measured" } else { "prior" }.into(),
+                        external_points: external,
+                        low_sample_count: low,
+                        five_hour_tokens_per_point: None,
+                        five_hour_capacity_source: None,
+                        five_hour_external_points: five_external,
+                        five_hour_low_sample_count: five_low,
+                        request_budget_fits: None,
+                        request_budget_enforced: false,
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let mut failures = Vec::new();
         let mut rank = 0;
         let mut fallback_auth = None;
@@ -805,7 +870,14 @@ impl CodexOAuthManager {
             }
             rank += 1;
             if member.paused {
-                log_pool_decision(selection_id, "skip", &member.account_id, rank, "paused");
+                log_pool_candidate(
+                    &mut diagnostic_candidates,
+                    selection_id,
+                    "skip",
+                    &member.account_id,
+                    rank,
+                    "paused",
+                );
                 continue;
             }
             let (auth_result, quota_result) = match balanced_reads.next() {
@@ -815,7 +887,8 @@ impl CodexOAuthManager {
             let mut auth = match auth_result {
                 Ok(auth) => auth,
                 Err(error) => {
-                    log_pool_decision(
+                    log_pool_candidate(
+                        &mut diagnostic_candidates,
                         selection_id,
                         "skip",
                         &member.account_id,
@@ -845,7 +918,8 @@ impl CodexOAuthManager {
             let windows = match quota_result {
                 Ok(windows) => windows,
                 Err(crate::codex_quota::CodexQuotaError::Unauthorized) => {
-                    log_pool_decision(
+                    log_pool_candidate(
+                        &mut diagnostic_candidates,
                         selection_id,
                         "retry",
                         &member.account_id,
@@ -858,7 +932,8 @@ impl CodexOAuthManager {
                     {
                         Ok(refreshed) => refreshed,
                         Err(error) => {
-                            log_pool_decision(
+                            log_pool_candidate(
+                                &mut diagnostic_candidates,
                                 selection_id,
                                 "skip",
                                 &member.account_id,
@@ -887,7 +962,8 @@ impl CodexOAuthManager {
                     {
                         Ok(windows) => windows,
                         Err(error) => {
-                            log_pool_decision(
+                            log_pool_candidate(
+                                &mut diagnostic_candidates,
                                 selection_id,
                                 "skip",
                                 &member.account_id,
@@ -900,7 +976,8 @@ impl CodexOAuthManager {
                     }
                 }
                 Err(error) => {
-                    log_pool_decision(
+                    log_pool_candidate(
+                        &mut diagnostic_candidates,
                         selection_id,
                         "skip",
                         &member.account_id,
@@ -912,13 +989,67 @@ impl CodexOAuthManager {
                 }
             };
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
+                if settings.strategy == QuotaPoolStrategy::Balanced {
+                    // Reconcile resets even when this account is still gated.
+                    let plan_type = self
+                        .accounts
+                        .read()
+                        .await
+                        .get(&member.account_id)
+                        .and_then(|a| a.plan_type.clone());
+                    let observed = crate::quota_pool_router::Candidate {
+                        account_id: member.account_id.clone(),
+                        headroom: observation.headroom,
+                        capacity_prior: crate::quota_pool_router::plan_capacity_prior(
+                            plan_type.as_deref(),
+                        ),
+                        plan_type,
+                        weekly_used: Some(observation.weekly_used),
+                        weekly_headroom: Some(observation.weekly_headroom),
+                        weekly_reset_at: observation.weekly_reset_at,
+                        five_hour_used: observation.five_hour_used,
+                        five_hour_reset_at: observation.five_hour_reset_at,
+                    };
+                    let (capacity, measured, external, low) = {
+                        let mut router = self.smart_router.lock();
+                        router.update_quota_observation(&observed);
+                        router.diagnostic_capacity(&member.account_id, observed.capacity_prior)
+                    };
+                    if let Some(d) = diagnostic_candidates
+                        .iter_mut()
+                        .find(|d| d.account_hash == pool_account_hash(&member.account_id))
+                    {
+                        d.exclusion_reason = observation.skip_reason.map(str::to_owned);
+                        d.tokens_per_point = capacity;
+                        d.capacity_source = if measured { "measured" } else { "prior" }.into();
+                        d.external_points = external;
+                        d.low_sample_count = low;
+                        d.headroom = Some(observation.headroom);
+                        d.weekly_used = Some(observation.weekly_used);
+                        d.five_hour_used = observation.five_hour_used;
+                        if observation.five_hour_used.is_some() {
+                            let (capacity, measured, external, low) = self
+                                .smart_router
+                                .lock()
+                                .diagnostic_five_capacity(&member.account_id, d.tokens_per_point);
+                            d.five_hour_tokens_per_point = Some(capacity);
+                            d.five_hour_capacity_source =
+                                Some(if measured { "measured" } else { "prior" }.into());
+                            d.five_hour_external_points = external;
+                            d.five_hour_low_sample_count = low;
+                        }
+                        d.weekly_reset_at = observation.weekly_reset_at;
+                        d.five_hour_reset_at = observation.five_hour_reset_at;
+                    }
+                }
                 if observation.usable {
                     if settings.strategy == QuotaPoolStrategy::Balanced {
                         eligible.push((auth, rank, observation));
                         continue;
                     }
                     if *self.quota_pool.read().await != settings {
-                        log_pool_decision(
+                        log_pool_candidate(
+                            &mut diagnostic_candidates,
                             selection_id,
                             "reject",
                             &member.account_id,
@@ -930,7 +1061,8 @@ impl CodexOAuthManager {
                         ));
                     }
                     *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
-                    log_pool_decision(
+                    log_pool_candidate(
+                        &mut diagnostic_candidates,
                         selection_id,
                         "selected",
                         &auth.credential_id,
@@ -939,7 +1071,8 @@ impl CodexOAuthManager {
                     );
                     return Ok(Some(auth));
                 }
-                log_pool_decision(
+                log_pool_candidate(
+                    &mut diagnostic_candidates,
                     selection_id,
                     "skip",
                     &member.account_id,
@@ -947,7 +1080,8 @@ impl CodexOAuthManager {
                     observation.skip_reason.unwrap_or("quota_unavailable"),
                 );
             } else {
-                log_pool_decision(
+                log_pool_candidate(
+                    &mut diagnostic_candidates,
                     selection_id,
                     "skip",
                     &member.account_id,
@@ -992,14 +1126,53 @@ impl CodexOAuthManager {
                 )
                 .collect::<Vec<_>>();
             drop(plans);
-            let (index, reason) = self.smart_router.lock().choose(
-                &candidates,
-                context,
-                chrono::Utc::now().timestamp_millis().max(0) as u64,
-            );
+            let (index, reason) = {
+                let mut router = self.smart_router.lock();
+                let result = router.choose(
+                    &candidates,
+                    context,
+                    chrono::Utc::now().timestamp_millis().max(0) as u64,
+                );
+                for (i, candidate) in candidates.iter().enumerate() {
+                    if let Some(d) = diagnostic_candidates
+                        .iter_mut()
+                        .find(|d| d.account_hash == pool_account_hash(&candidate.account_id))
+                    {
+                        let (capacity, measured, external, low) = router
+                            .diagnostic_capacity(&candidate.account_id, candidate.capacity_prior);
+                        d.tokens_per_point = capacity;
+                        d.capacity_source = if measured { "measured" } else { "prior" }.into();
+                        d.external_points = external;
+                        d.low_sample_count = low;
+                        if candidate.five_hour_used.is_some() {
+                            let (five_capacity, five_measured, external, low) =
+                                router.diagnostic_five_capacity(&candidate.account_id, capacity);
+                            d.five_hour_tokens_per_point = Some(five_capacity);
+                            d.five_hour_capacity_source =
+                                Some(if five_measured { "measured" } else { "prior" }.into());
+                            d.five_hour_external_points = external;
+                            d.five_hour_low_sample_count = low;
+                        }
+                        d.request_budget_fits = router.last_admission.get(i).copied();
+                        d.request_budget_enforced = router.budget_enforced;
+                        if router.budget_enforced && d.request_budget_fits == Some(false) {
+                            d.exclusion_reason = Some("gate_request_budget".into());
+                        }
+                    }
+                }
+                result
+            };
             let (auth, rank, _) = eligible.swap_remove(index);
             *self.active_pool_account_id.write().await = Some(auth.credential_id.clone());
-            log_pool_decision(selection_id, "selected", &auth.credential_id, rank, reason);
+            log_pool_candidate(
+                &mut diagnostic_candidates,
+                selection_id,
+                "selected",
+                &auth.credential_id,
+                rank,
+                reason,
+            );
+            self.record_pool_diagnostic(Some(&auth.credential_id), reason, diagnostic_candidates);
             log::info!("[QuotaPool] selection={selection_id} strategy=balanced context_tokens={} context_limit={}",
                 context.estimated_input_tokens, context.context_window.unwrap_or(0));
             return Ok(Some(auth));
@@ -1037,11 +1210,20 @@ impl CodexOAuthManager {
                 ));
             }
             if settings.strategy == QuotaPoolStrategy::Balanced {
+                let plan_type = self
+                    .accounts
+                    .read()
+                    .await
+                    .get(&auth.credential_id)
+                    .and_then(|a| a.plan_type.clone());
                 self.smart_router.lock().choose(
                     &[crate::quota_pool_router::Candidate {
                         account_id: auth.credential_id.clone(),
                         headroom: 0.0,
-                        capacity_prior: 1.0,
+                        capacity_prior: crate::quota_pool_router::plan_capacity_prior(
+                            plan_type.as_deref(),
+                        ),
+                        plan_type,
                         weekly_used: None,
                         ..Default::default()
                     }],
@@ -1056,16 +1238,27 @@ impl CodexOAuthManager {
                 .filter(|member| member.in_pool)
                 .position(|member| member.account_id == auth.credential_id)
                 .map_or(0, |index| index + 1);
-            log_pool_decision(
+            log_pool_candidate(
+                &mut diagnostic_candidates,
                 selection_id,
                 "selected",
                 &auth.credential_id,
                 fallback_rank,
                 "manual_fallback",
             );
+            if settings.strategy == QuotaPoolStrategy::Balanced {
+                self.record_pool_diagnostic(
+                    Some(&auth.credential_id),
+                    "manual_fallback",
+                    diagnostic_candidates,
+                );
+            }
             return Ok(Some(auth));
         }
 
+        if settings.strategy == QuotaPoolStrategy::Balanced {
+            self.record_pool_diagnostic(None, "no_valid_credential", diagnostic_candidates);
+        }
         *self.active_pool_account_id.write().await = None;
         log::info!(
             "[QuotaPool] selection={selection_id} event=exhausted reason=no_valid_credential"
@@ -1369,6 +1562,29 @@ struct QuotaPoolObservation {
     five_hour_reset_at: Option<u64>,
 }
 
+fn pool_account_hash(account_id: &str) -> String {
+    vellum_proxy_runtime::account_hash(account_id)
+}
+
+fn log_pool_candidate(
+    candidates: &mut [vellum_proxy_runtime::QuotaPoolCandidateDiagnostic],
+    selection_id: ulid::Ulid,
+    event: &'static str,
+    account_id: &str,
+    rank: usize,
+    reason: &'static str,
+) {
+    if event == "skip" {
+        if let Some(c) = candidates
+            .iter_mut()
+            .find(|c| c.account_hash == pool_account_hash(account_id))
+        {
+            c.exclusion_reason = Some(reason.into());
+        }
+    }
+    log_pool_decision(selection_id, event, account_id, rank, reason);
+}
+
 fn log_pool_decision(
     selection_id: ulid::Ulid,
     event: &'static str,
@@ -1411,6 +1627,18 @@ fn quota_pool_observation(
     windows: &[crate::model::QuotaSnapshot],
     weekly_floor: u8,
 ) -> Option<QuotaPoolObservation> {
+    quota_pool_observation_at(
+        windows,
+        weekly_floor,
+        chrono::Utc::now().timestamp_millis().max(0) as u64,
+    )
+}
+
+fn quota_pool_observation_at(
+    windows: &[crate::model::QuotaSnapshot],
+    weekly_floor: u8,
+    now: u64,
+) -> Option<QuotaPoolObservation> {
     let weekly = windows
         .iter()
         .find(|window| window.period.unit == crate::model::QuotaPeriodUnit::Week)?;
@@ -1421,11 +1649,26 @@ fn quota_pool_observation(
     let five_hour_remaining = five_hour.map(|window| 100.0 - window.used_percent.clamp(0.0, 100.0));
     let burnable = (weekly_remaining - f64::from(weekly_floor)).max(0.0);
     let skip_reason = if burnable <= 0.0 {
-        Some("weekly_floor")
+        Some(
+            if quota_reset_ms(weekly).is_some_and(|reset| reset <= now) {
+                "weekly_reset_pending"
+            } else {
+                "weekly_floor"
+            },
+        )
     } else if five_hour_remaining
         .is_some_and(|remaining| remaining <= FIVE_HOUR_ROUTING_RESERVE_PERCENT)
     {
-        Some("five_hour_reserve")
+        Some(
+            if five_hour
+                .and_then(quota_reset_ms)
+                .is_some_and(|reset| reset <= now)
+            {
+                "five_hour_reset_pending"
+            } else {
+                "five_hour_reserve"
+            },
+        )
     } else {
         None
     };
@@ -1757,7 +2000,9 @@ mod tests {
         let open = quota_pool_observation(&windows, 30).unwrap();
         assert!(open.usable);
 
-        let gated = quota_pool_observation(&windows, 59).unwrap();
+        // Keep the historical fixture before its reset; elapsed snapshots
+        // now have a distinct diagnostic reason without changing the gate.
+        let gated = quota_pool_observation_at(&windows, 59, 0).unwrap();
         assert!(!gated.usable);
         assert_eq!(gated.skip_reason, Some("weekly_floor"));
 
@@ -2257,6 +2502,229 @@ mod tests {
                 .unwrap()
                 .credential_id,
             "balanced-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_pool_manual_fallback_preserves_real_plan_and_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().into());
+        let id = "diagnostic-fallback-pro";
+        manager.accounts.write().await.insert(
+            id.into(),
+            AccountMetadata {
+                account_id: id.into(),
+                chatgpt_account_id: Some(id.into()),
+                workspace_name: None,
+                plan_type: Some("Pro".into()),
+                email: None,
+                authenticated_at: 1,
+            },
+        );
+        manager.access_tokens.write().await.insert(
+            id.into(),
+            CachedToken {
+                access_token: "synthetic-fallback".into(),
+                expires_at_ms: i64::MAX,
+            },
+        );
+        *manager.default_account_id.write().await = Some(id.into());
+        *manager.quota_pool.write().await = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Balanced,
+            members: vec![QuotaPoolMember {
+                account_id: id.into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 0,
+                maintain_five_hour_window: false,
+            }],
+        };
+        let context = vellum_proxy_runtime::official_auth::OfficialRoutingContext {
+            session_key: Some("fallback-plan-session".into()),
+            request_id: "fallback-plan-request".into(),
+            estimated_input_tokens: 40_000,
+            ..Default::default()
+        };
+        for used in [10.0, 12.0, 100.0, 12.0] {
+            crate::codex_quota::seed_test_quota(
+                "synthetic-fallback",
+                id,
+                vec![quota_window(
+                    crate::model::QuotaPeriodUnit::Week,
+                    None,
+                    used,
+                    None,
+                )],
+            )
+            .await;
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap();
+            if used == 10.0 {
+                manager.observe_routing_usage("fallback-plan-request", 40_000, 0, 200);
+            } else {
+                // The advisory fallback must not masquerade as Pro -> None
+                // and erase the learned 20k effective tokens per weekly point.
+                assert_eq!(
+                    manager.smart_router.lock().diagnostic_capacity(id, 20.0).0,
+                    20_000.0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_pool_diagnostics_cover_gates_budget_and_recovery() {
+        use vellum_proxy_runtime::{DetailLevel, DiagnosticEvent, DiagnosticsSink};
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<DiagnosticEvent>>);
+        impl DiagnosticsSink for Sink {
+            fn record(&self, event: DiagnosticEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn detail_level(&self) -> DetailLevel {
+                DetailLevel::T1Summary
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().into());
+        let sink = Arc::new(Sink::default());
+        manager.set_pool_diagnostics_sink(sink.clone());
+        let mut members = Vec::new();
+        // Unique synthetic identities avoid interference with parallel tests.
+        for (id, weekly, five) in [
+            ("diagnostic-open", 10.0, 10.0),
+            ("diagnostic-week", 100.0, 10.0),
+            ("diagnostic-five", 10.0, 96.0),
+            ("diagnostic-budget", 10.0, 94.0),
+            ("diagnostic-missing", 0.0, 0.0),
+        ] {
+            manager.accounts.write().await.insert(
+                id.into(),
+                AccountMetadata {
+                    account_id: id.into(),
+                    chatgpt_account_id: Some(id.into()),
+                    workspace_name: None,
+                    plan_type: None,
+                    email: None,
+                    authenticated_at: 1,
+                },
+            );
+            manager.access_tokens.write().await.insert(
+                id.into(),
+                CachedToken {
+                    access_token: format!("synthetic-{id}"),
+                    expires_at_ms: i64::MAX,
+                },
+            );
+            let windows = if id == "diagnostic-missing" {
+                vec![]
+            } else {
+                vec![
+                    quota_window(crate::model::QuotaPeriodUnit::Week, None, weekly, None),
+                    quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), five, None),
+                ]
+            };
+            crate::codex_quota::seed_test_quota(&format!("synthetic-{id}"), id, windows).await;
+            members.push(QuotaPoolMember {
+                account_id: id.into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 0,
+                maintain_five_hour_window: false,
+            });
+        }
+        *manager.quota_pool.write().await = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Balanced,
+            members,
+        };
+        let context = vellum_proxy_runtime::official_auth::OfficialRoutingContext {
+            session_key: Some("diagnostic-session".into()),
+            request_id: "diagnostic-request".into(),
+            estimated_input_tokens: 2000,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap();
+        }
+        {
+            let events = sink.0.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let DiagnosticEvent::QuotaPoolDecision(d) = &events[0] else {
+                panic!("wrong event")
+            };
+            for (id, reason) in [
+                ("diagnostic-week", "weekly_floor"),
+                ("diagnostic-five", "five_hour_reserve"),
+                ("diagnostic-budget", "gate_request_budget"),
+                ("diagnostic-missing", "missing_quota_windows"),
+            ] {
+                let c = d
+                    .candidates
+                    .iter()
+                    .find(|c| c.account_hash == pool_account_hash(id))
+                    .unwrap();
+                assert_eq!(c.exclusion_reason.as_deref(), Some(reason));
+            }
+            let encoded = serde_json::to_string(d).unwrap();
+            assert!(!encoded.contains("synthetic-"));
+            assert!(!encoded.contains("diagnostic-open"));
+        }
+        // Missing quota is a temporary exclusion, not a persistent blacklist.
+        crate::codex_quota::seed_test_quota(
+            "synthetic-diagnostic-missing",
+            "diagnostic-missing",
+            vec![quota_window(
+                crate::model::QuotaPeriodUnit::Week,
+                None,
+                0.0,
+                None,
+            )],
+        )
+        .await;
+        manager
+            .valid_routing_auth_with_context(&context)
+            .await
+            .unwrap();
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        let DiagnosticEvent::QuotaPoolDecision(d) = &events[1] else {
+            panic!("wrong event")
+        };
+        assert!(d
+            .candidates
+            .iter()
+            .find(|c| c.account_hash == pool_account_hash("diagnostic-missing"))
+            .unwrap()
+            .exclusion_reason
+            .is_none());
+    }
+
+    #[test]
+    fn quota_pool_reports_stale_reset_and_accepts_refreshed_window() {
+        let mut windows = vec![quota_window(
+            crate::model::QuotaPeriodUnit::Week,
+            None,
+            100.0,
+            Some("2026-10-01T00:00:00Z"),
+        )];
+        assert_eq!(
+            quota_pool_observation_at(&windows, 0, u64::MAX)
+                .unwrap()
+                .skip_reason,
+            Some("weekly_reset_pending")
+        );
+        windows[0].used_percent = 0.0;
+        assert!(
+            quota_pool_observation_at(&windows, 0, u64::MAX)
+                .unwrap()
+                .usable
         );
     }
 

@@ -134,6 +134,37 @@ pub struct OfficialAccountSelected {
     pub selection_verified: bool,
 }
 
+/// Balanced pool observations contain quota numbers and hashed identities only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaPoolCandidateDiagnostic {
+    pub account_hash: String,
+    pub exclusion_reason: Option<String>,
+    pub headroom: Option<f64>,
+    pub weekly_used: Option<f64>,
+    pub five_hour_used: Option<f64>,
+    pub weekly_reset_at: Option<u64>,
+    pub five_hour_reset_at: Option<u64>,
+    pub tokens_per_point: f64,
+    pub capacity_source: String,
+    pub external_points: f64,
+    pub low_sample_count: usize,
+    pub five_hour_tokens_per_point: Option<f64>,
+    pub five_hour_capacity_source: Option<String>,
+    pub five_hour_external_points: f64,
+    pub five_hour_low_sample_count: usize,
+    pub request_budget_fits: Option<bool>,
+    pub request_budget_enforced: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaPoolDecision {
+    pub selected_account_hash: Option<String>,
+    pub reason: String,
+    pub candidates: Vec<QuotaPoolCandidateDiagnostic>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OfficialRequestTransport {
@@ -561,6 +592,7 @@ pub enum DiagnosticEvent {
     WebSocketOpened(WebSocketOpened),
     WebSocketClosed(WebSocketClosed),
     OfficialAccountSelected(OfficialAccountSelected),
+    QuotaPoolDecision(QuotaPoolDecision),
     OfficialRequestPrepared(OfficialRequestPrepared),
     SpawnRequested(SpawnRequested),
     ChildTurn(ChildTurn),

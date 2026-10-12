@@ -416,6 +416,21 @@ members, retries, the selected member, or exhaustion. Entries include an
 opaque selection id, member order, a short credential hash, and a fixed reason
 code. They never include tokens, email addresses, or raw account/workspace ids.
 
+Balanced routing also stores a `quota_pool_decision` diagnostic and one JSON
+app-log line when the selected credential or a candidate's exclusion changes.
+The snapshot includes all enrolled members (including paused or unreadable
+ones), existing hashed account identities, quota headroom/reset timestamps,
+weekly and 5h capacity estimates and their prior/measured sources, external
+usage points, rejected-sample counts, and per-request budget eligibility.
+Changing numeric readings alone does not write another event. A request budget
+is advisory when no candidate fits; the selected manual fallback may still
+carry a quota exclusion. Expired gated readings are labeled reset-pending,
+not assumed to have replenished. Missing quota is retried on subsequent
+routing reads rather than retained in a blacklist; an unknown plan uses the
+Plus prior. Quota rollover clears the window's calibration anchor, pending
+consumption, rejected samples and external-use tally, while retaining learned
+capacity. Manual fallback preserves the actual plan and its calibration.
+
 Opt-in local validation: `cargo test -p vellum --lib live_quota_pool_routing
 -- --ignored --nocapture`. It refreshes existing managed grants, reads real
 upstream quota, and requires two usable accounts. Pool settings and runtime
