@@ -18,6 +18,10 @@ const BALANCE_HORIZON_SECONDS: f64 = 6.0 * 3600.0;
 // A 5h percentage point starts at 1/12 of a weekly point. Independent
 // simultaneous usage calibration replaces this prior as observations arrive.
 const FIVE_HOUR_CAPACITY_RATIO: f64 = 1.0 / 12.0;
+// A real rollover moves reset_at by a whole window (5h or a week). Smaller
+// moves are rounding or an idle window sliding forward, and must not wipe the
+// window's accumulated calibration.
+const RESET_JITTER_MS: u64 = 10 * 60 * 1000;
 const FIVE_HOUR_BALANCE_SECONDS: f64 = 3600.0;
 const RECOVERY_FIVE_HOUR_SHARE: f64 = 0.5;
 pub(crate) const DEFAULT_LAMBDA: f64 = 0.2;
@@ -61,7 +65,7 @@ impl Calibration {
         if self
             .reset_at
             .zip(reset_at)
-            .is_some_and(|(old, new)| new > old)
+            .is_some_and(|(old, new)| new > old.saturating_add(RESET_JITTER_MS))
         {
             self.anchor_used = None;
             self.tokens_since = 0.0;
@@ -811,6 +815,24 @@ mod tests {
         assert!(cal.low_samples.is_empty());
     }
 
+    const FIVE_HOUR_MS: u64 = 5 * 60 * 60 * 1000;
+
+    #[test]
+    fn reset_timestamp_jitter_keeps_window_calibration() {
+        let mut cal = Calibration {
+            anchor_used: Some(20.0),
+            tokens_since: 30_000.0,
+            tokens_per_point: Some(10_000.0),
+            external_points: 12.0,
+            low_samples: VecDeque::new(),
+            reset_at: Some(1_000_000),
+        };
+        cal.update_window(20.0, 10_000.0, Some(1_000_000 + 1_000));
+        assert_eq!(cal.anchor_used, Some(20.0));
+        assert_eq!(cal.tokens_since, 30_000.0);
+        assert_eq!(cal.external_points, 12.0);
+    }
+
     #[test]
     fn quota_reset_clears_window_usage_but_preserves_learned_capacity() {
         for reset_by_time in [false, true] {
@@ -828,7 +850,7 @@ mod tests {
             cal.update_window(
                 if reset_by_time { 25.0 } else { 0.0 },
                 10_000.0,
-                Some(if reset_by_time { 200 } else { 100 }),
+                Some(if reset_by_time { 100 + FIVE_HOUR_MS } else { 100 }),
             );
             assert_eq!(cal.external_points, 0.0);
             assert_eq!(cal.tokens_since, 0.0);
@@ -848,8 +870,8 @@ mod tests {
         }
         // Even a newly exhausted post-reset snapshot must reconcile its
         // window state before eligibility filtering skips this account.
-        gated.weekly_reset_at = Some(200);
-        gated.five_hour_reset_at = Some(200);
+        gated.weekly_reset_at = Some(100 + FIVE_HOUR_MS);
+        gated.five_hour_reset_at = Some(100 + FIVE_HOUR_MS);
         router.update_quota_observation(&gated);
         for cal in [&router.calibration, &router.five_calibration] {
             assert_eq!(cal["gated"].external_points, 0.0);
