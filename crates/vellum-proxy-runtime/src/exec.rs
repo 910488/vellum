@@ -7441,7 +7441,7 @@ impl ProxyRuntime {
         };
         // A bridge strips previous_response_id, but same-account replay is
         // still a native wire contract. Durable portable projections cannot
-        // preserve its prefix (developer/image/opaque items were filtered).
+        // preserve its prefix (image/opaque items were filtered).
         if force_portable && route.provider_kind == RuntimeProviderKind::Official {
             if let Some(entry) =
                 self.official_replay
@@ -7454,10 +7454,21 @@ impl ProxyRuntime {
                 ));
             }
         }
-        let chain = self
+        let mut chain = self
             .history
             .get_chain(previous)
             .map_err(RuntimeError::History)?;
+        if force_portable && route.provider_kind == RuntimeProviderKind::Official {
+            // A cache miss must not replay provider-issued item identities from
+            // a different account. call_id is caller-owned tool pairing state.
+            for entry in &mut chain {
+                for item in entry.input_items.iter_mut().chain(&mut entry.output_items) {
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove("id");
+                    }
+                }
+            }
+        }
         let previous_route_id = chain.last().map(|entry| entry.route_id.as_str());
         let decision = if force_portable {
             crate::continuation::ContinuationDecision {
@@ -8823,10 +8834,27 @@ fn bounded_provider_diagnostic(body: &[u8]) -> String {
     normalized.chars().take(512).collect()
 }
 
-/// Persist an exchange and, for Official compaction responses, bind every
-/// opaque compaction id to a provider-independent source window. The daemon
-/// uses the shared HistoryStore directly (there is no Desktop bridge), so
-/// this must live in the runtime for bundled macOS/Linux proxy images too.
+/// Durable conversation projection, distinct from compaction/trajectory input.
+fn sanitize_official_durable_history(items: &[Value]) -> Vec<Value> {
+    items
+        .iter()
+        .flat_map(|item| {
+            if matches!(
+                crate::compaction::classify_item(item),
+                crate::compaction::ItemRole::System
+            ) {
+                // Caller context is not compactor input: losing it changes the
+                // permissions and tool instructions on a later account handoff.
+                vec![crate::compaction::strip_opaque_fields(item.clone())]
+            } else {
+                sanitize_portable_history(std::slice::from_ref(item))
+            }
+        })
+        .collect()
+}
+
+/// Persist an exchange and bind Official opaque compaction ids to portable
+/// source windows. Shared by Desktop and headless daemon history stores.
 fn record_exchange_with_official_compactions(
     history: &dyn HistoryStore,
     request: &Value,
@@ -8837,7 +8865,9 @@ fn record_exchange_with_official_compactions(
     continuation_realm: Option<&str>,
 ) -> Result<bool, String> {
     // Keep Official wire payloads untouched for Codex, but persist a separate
-    // portable projection for a later provider switch. Opaque OpenAI state is
+    // durable conversation projection for a later provider/account switch.
+    // Caller system/developer context is retained, unlike compactor input.
+    // Opaque OpenAI state is
     // valid only on the native route/account realm.
     let (portable_request, portable_response) = if official {
         let mut portable_request = request.clone();
@@ -8845,14 +8875,14 @@ fn record_exchange_with_official_compactions(
             .get_mut("input")
             .and_then(Value::as_array_mut)
         {
-            *input = sanitize_portable_history(input);
+            *input = sanitize_official_durable_history(input);
         }
         let mut portable_response = response.clone();
         if let Some(output) = portable_response
             .get_mut("output")
             .and_then(Value::as_array_mut)
         {
-            *output = sanitize_portable_history(output);
+            *output = sanitize_official_durable_history(output);
         }
         (portable_request, portable_response)
     } else {
@@ -11383,6 +11413,108 @@ mod tests {
                 .dispatch,
             WebSocketTurnDispatch::OfficialNative(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn official_account_handoff_preserves_caller_developer_context() {
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let developer = json!({"type":"message","role":"developer","content":[
+            {"type":"input_text","text":"Permissions: workspace-write; approval never. Use exec for shell and apply_patch. Follow AGENTS.md and developer instructions."}]});
+        let system = json!({"type":"message","role":"system","content":"Caller system context"});
+        let first = json!({"type":"response.create","model":"vlm-test","input":[
+            system.clone(), developer.clone(),
+            {"type":"message","role":"user","content":"Fix the issue"},
+            {"type":"reasoning","id":"rs_account_a","encrypted_content":"account-a-ciphertext"},
+            {"type":"function_call","id":"fc_account_a","call_id":"call_shell","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_shell","output":"workspace ready"}]});
+        let response = json!({"id":"resp_context_a","output":[
+            {"type":"message","id":"msg_account_a","role":"assistant","content":[
+                {"type":"output_text","text":"I will continue using the tools."}]}]});
+        let mut plan = runtime
+            .prepare_official_websocket(&request(first.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate a completed native turn in the previous account's realm.
+        plan.continuation_realm = Some("account-a-realm".into());
+        runtime
+            .record_official_websocket_completion(
+                &plan,
+                &first,
+                "context-thread",
+                "request-a",
+                "execution-a",
+                &response,
+                1,
+                Some(1),
+                Some(1),
+                "connection",
+                None,
+            )
+            .unwrap();
+        let next = request(json!({"type":"response.create","model":"vlm-test",
+            "previous_response_id":"resp_context_a","input":[{"role":"user","content":"Continue"}]}));
+        assert!(matches!(
+            runtime
+                .prepare_websocket_turn(&next)
+                .await
+                .unwrap()
+                .dispatch,
+            WebSocketTurnDispatch::PortableReplay {
+                force_official_handoff: true
+            }
+        ));
+        runtime.execute(next, "context-account-b").await.unwrap();
+        let sent = transport.requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["input"][0], system);
+        assert_eq!(body["input"][1], developer);
+        assert!(body.get("previous_response_id").is_none());
+        let wire = body.to_string();
+        assert!(!wire.contains("account-a-ciphertext"));
+        assert!(!wire.contains("msg_account_a"));
+        assert!(wire.contains("workspace ready") && wire.contains("I will continue"));
+    }
+
+    #[test]
+    fn official_durable_context_is_not_compaction_or_trajectory_input() {
+        let history = Arc::new(MemoryHistoryStore::new());
+        let developer = json!({"type":"message","role":"developer","content":"Permissions and tool instructions"});
+        let items = vec![
+            developer.clone(),
+            json!({"role":"user","content":"task"}),
+            json!({"type":"reasoning","id":"rs_old","encrypted_content":"old-account-secret"}),
+        ];
+        record_exchange_with_official_compactions(
+            history.as_ref(),
+            &json!({"input":items}),
+            &json!({"id":"resp_durable_context","output":[]}),
+            "official-route",
+            true,
+            None,
+            Some("old-realm"),
+        )
+        .unwrap();
+        let runtime = runtime_with(sample_route(None)).with_history_store(history);
+        let original = json!({"previous_response_id":"resp_durable_context","input":[{"role":"user","content":"continue"}]});
+        let mut body = original.clone();
+        runtime
+            .hydrate_request_history(&sample_route(None), &original, &mut body, false, None)
+            .unwrap();
+        assert_eq!(
+            body["input"][0], developer,
+            "portable instructions also belong to third-party callers"
+        );
+        assert!(!body.to_string().contains("old-account-secret"));
+        let portable = sanitize_portable_history(&items);
+        assert_eq!(portable, vec![items[1].clone()]);
+        let ids = vec!["system".into(), "user".into(), "reasoning".into()];
+        let provenance =
+            crate::compaction::sanitize_portable_history_with_provenance(&items, &ids).unwrap();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].value, items[1]);
+        assert_eq!(provenance[0].original_index, 1);
     }
 
     #[tokio::test]
