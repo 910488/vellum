@@ -2470,11 +2470,17 @@ html[data-performance="low"] .card {
   gap: 10px;
   min-width: 0;
 }
+/* Official accounts reserve the short-window slot even when it is absent.
+   rem units reserve vertical space without depending on Latin glyph widths. */
+.acct__quota--official { grid-template-rows: 4.5rem auto; }
+.acct__quota-window--placeholder { color: var(--ink-faint); }
+.acct__quota-window--placeholder .acct__quota-line strong { color: var(--ink-faint); }
 /* 數字一欄、量條一欄，說明字掛在量條那一欄：讀數的左緣對齊量條的左緣，
    不從百分比底下開始 —— 數字靠右貼著量條，說明字要是從欄位最左邊起頭，
    三樣東西就有兩條不同的左緣。 */
 .acct__quota-window {
   display: grid;
+  align-content: start;
   grid-template-columns: 3.2em minmax(0, 1fr);
   gap: 4px 9px;
   min-width: 0;
@@ -2490,6 +2496,7 @@ html[data-performance="low"] .card {
   opacity: 0.72;
 }
 .acct__quota-line {
+  min-height: 22px;
   grid-column: 1 / -1;
   display: grid;
   grid-template-columns: subgrid;

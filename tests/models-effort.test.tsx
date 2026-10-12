@@ -233,7 +233,7 @@ describe("Models screen Effort probe status", () => {
     expect((strategy as HTMLSelectElement).value).toBe("balanced");
   });
 
-  it("shows a weekly-only pool account as usable without a five-hour automation control", async () => {
+  it("shows a weekly-only pool account as usable with a disabled five-hour slot", async () => {
     apiMocks.getCodexOAuthStatus.mockResolvedValue({ authenticated: true, defaultAccountId: "pro", accounts: [
       { accountId: "pro", email: "pro@example.test", planType: "pro", authenticatedAt: 1, isDefault: true },
     ] });
@@ -248,6 +248,9 @@ describe("Models screen Effort probe status", () => {
     await screen.findByRole("slider");
     expect(screen.queryByText(t("models.ui.pool.reason.missingQuota"))).toBeNull();
     expect(screen.queryByTitle(t("models.ui.fiveHour.autoHint"))).toBeNull();
+    const missingControl = screen.getByTitle(t("models.ui.fiveHour.unavailable"));
+    expect(missingControl.hasAttribute("disabled")).toBe(true);
+    expect(missingControl.getAttribute("title")).toBe(t("models.ui.fiveHour.unavailable"));
     expect(screen.getAllByRole("progressbar").some((meter) => meter.getAttribute("aria-valuenow") === "100")).toBe(true);
   });
 
