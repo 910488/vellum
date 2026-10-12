@@ -735,6 +735,20 @@ just like the top-level error envelope. In contrast,
 Codex recognizes the preserved code and reconnects instead of treating it as
 an invalid prompt. The proxy does not silently replay an expired turn.
 
+Official HTTP dispatch preserves the explicit `session-id` and `session_id`
+cache-affinity headers from the HTTP request or WebSocket handshake, including
+streaming and retry paths. They are distinct from turn metadata and are never
+forwarded to third-party providers. The caller owns `prompt_cache_key`.
+Same-account HTTP bridge continuation prefers a volatile snapshot of the exact
+dispatched input and completed output, scoped to both route and authorization
+realm. This preserves the serialized input prefix, including developer, image
+and canonical encrypted reasoning items. The cache holds at most 256 snapshots
+and 32 MiB of serialized payload, expires entries after 20 minutes, and never
+writes ciphertext to durable history. On expiry, eviction, missing realm, or
+account/route changes, existing durable portable replay remains the fallback.
+Client-carried complete history uses the existing provider-output/id overlap
+gate; repeated user text alone is never deduplicated.
+
 Portable Official sanitization applies only to conversation `input` items.
 The current request owns `tools`, `instructions`, `tool_choice`, and other
 top-level controls; historical request controls never replace them. Tool

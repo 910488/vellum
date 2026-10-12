@@ -1888,6 +1888,7 @@ fn should_forward_official_header(name: &str) -> bool {
     name == "user-agent"
         || name == "openai-beta"
         || name == "session-id"
+        || name == "session_id"
         || name == "thread-id"
         || name == "x-client-request-id"
         || name == "originator"
@@ -2711,6 +2712,7 @@ mod tests {
         assert!(should_forward_official_header("openai-beta"));
         assert!(should_forward_official_header("user-agent"));
         assert!(should_forward_official_header("session-id"));
+        assert!(should_forward_official_header("session_id"));
         assert!(should_forward_official_header("thread-id"));
         assert!(should_forward_official_header("x-client-request-id"));
         assert!(should_forward_official_header("originator"));
@@ -3061,6 +3063,7 @@ mod tests {
         struct Capture {
             websocket_accounts: Arc<Mutex<Vec<String>>>,
             http_requests: Arc<Mutex<Vec<(String, Value)>>>,
+            http_headers: Arc<Mutex<Vec<HeaderMap>>>,
         }
 
         let capture = Capture::default();
@@ -3071,6 +3074,8 @@ mod tests {
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
                 let capture = get_capture.clone();
                 async move {
+                    assert_eq!(headers["session-id"], "bridge-affinity");
+                    assert_eq!(headers["session_id"], "bridge-affinity-legacy");
                     capture
                         .websocket_accounts
                         .lock()
@@ -3114,6 +3119,7 @@ mod tests {
                 move |headers: HeaderMap, axum::extract::Json(body): axum::extract::Json<Value>| {
                     let capture = post_capture.clone();
                     async move {
+                        capture.http_headers.lock().unwrap().push(headers.clone());
                         let account = execution_from_headers(&headers);
                         let streaming = body["stream"] == true;
                         capture.http_requests.lock().unwrap().push((account, body));
@@ -3171,10 +3177,12 @@ mod tests {
             let _ = axum::serve(proxy_listener, proxy).await;
         });
 
-        let (mut client, _) =
-            tokio_tungstenite::connect_async(format!("ws://{proxy_address}/v1/responses"))
-                .await
-                .unwrap();
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut handshake = format!("ws://{proxy_address}/v1/responses")
+            .into_client_request().unwrap();
+        handshake.headers_mut().insert("session-id", "bridge-affinity".parse().unwrap());
+        handshake.headers_mut().insert("session_id", "bridge-affinity-legacy".parse().unwrap());
+        let (mut client, _) = tokio_tungstenite::connect_async(handshake).await.unwrap();
         client
             .send(TungsteniteMessage::Text(
                 json!({
@@ -3281,6 +3289,10 @@ mod tests {
         let websocket_accounts = capture.websocket_accounts.lock().unwrap().clone();
         assert_eq!(websocket_accounts, [identity_a.clone()]);
         let requests = capture.http_requests.lock().unwrap().clone();
+        for headers in capture.http_headers.lock().unwrap().iter() {
+            assert_eq!(headers["session-id"], "bridge-affinity");
+            assert_eq!(headers["session_id"], "bridge-affinity-legacy");
+        }
         assert_eq!(
             requests.len(),
             1,

@@ -406,6 +406,16 @@ pub(crate) fn build_request_metadata(
         .map(|id| crate::codex_metadata::resolve_codex_capabilities(None, Some(id), None));
 
     RequestMetadata {
+        official_cache_affinity: crate::request::OfficialCacheAffinity {
+            session_id: headers
+                .get("session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            session_id_legacy: headers
+                .get("session_id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        },
         request_id,
         received_at_ms: now_ms(),
         review_run_id: None,
