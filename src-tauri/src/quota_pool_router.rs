@@ -14,6 +14,11 @@ const CACHED_TOKEN_WEIGHT: f64 = 0.1;
 /// Bootstrap Plus allowance: 1M effective input tokens/week. Measurements
 /// replace this prior; unknown resets conservatively assume a full window.
 const PRIOR_TOKENS_PER_POINT: f64 = 10_000.0;
+const BALANCE_HORIZON_SECONDS: f64 = 6.0 * 3600.0;
+// A 5h percentage point starts at 1/12 of a weekly point. Independent
+// simultaneous usage calibration replaces this prior as observations arrive.
+const FIVE_HOUR_CAPACITY_RATIO: f64 = 1.0 / 12.0;
+const FIVE_HOUR_BALANCE_SECONDS: f64 = 3600.0;
 pub(crate) const DEFAULT_LAMBDA: f64 = 0.1;
 
 #[derive(Clone, Default)]
@@ -171,6 +176,20 @@ impl SmartRouter {
             .max(0.01)
     }
     fn fair_rates(&mut self, candidates: &[Candidate], now: u64) -> Vec<(f64, f64, bool)> {
+        let mean_remaining = candidates
+            .iter()
+            .map(|c| c.weekly_headroom.unwrap_or(c.headroom).max(0.0))
+            .sum::<f64>()
+            / candidates.len() as f64;
+        let five_remaining = candidates
+            .iter()
+            .filter_map(|c| c.five_hour_used.map(|u| (95.0 - u).max(0.0)))
+            .collect::<Vec<_>>();
+        let mean_five = if five_remaining.is_empty() {
+            95.0
+        } else {
+            five_remaining.iter().sum::<f64>() / five_remaining.len() as f64
+        };
         candidates
             .iter()
             .map(|c| {
@@ -186,7 +205,11 @@ impl SmartRouter {
                     .weekly_reset_at
                     .map_or(7.0 * 86400.0, |t| t.saturating_sub(now) as f64 / 1000.0)
                     .max(60.0);
-                let mut fair = remaining * capacity / until;
+                // Recover accumulated percentage-point skew within hours,
+                // rather than letting the reset horizon postpone correction.
+                let recovery =
+                    (remaining - mean_remaining) * capacity / until.min(BALANCE_HORIZON_SECONDS);
+                let mut fair = remaining * capacity / until + recovery;
                 if let Some(used) = c.five_hour_used {
                     let five = self
                         .five_calibration
@@ -194,17 +217,17 @@ impl SmartRouter {
                         .or_default();
                     five.update(used);
                     let left = (95.0 - used).max(0.0);
-                    if let Some(size) = five.tokens_per_point {
-                        let until = c
-                            .five_hour_reset_at
-                            .map_or(18000.0, |t| t.saturating_sub(now) as f64 / 1000.0)
-                            .max(60.0);
-                        fair = fair.min(left * size / until);
-                    } else {
-                        // No measured 5h capacity: retain hard admission gate and
-                        // gradually penalize the last 15 spendable points.
-                        fair *= (left / 15.0).clamp(0.01, 1.0);
-                    }
+                    let size = five
+                        .tokens_per_point
+                        .unwrap_or(capacity * FIVE_HOUR_CAPACITY_RATIO);
+                    let until = c
+                        .five_hour_reset_at
+                        .map_or(18000.0, |t| t.saturating_sub(now) as f64 / 1000.0)
+                        .max(60.0);
+                    let five_recovery =
+                        (left - mean_five) * size / until.min(FIVE_HOUR_BALANCE_SECONDS);
+                    // Recovery can tighten the 5h budget, never raise its S/T cap.
+                    fair = fair.min(left * size / until + five_recovery.min(0.0));
                 }
                 (
                     fair.max(0.000_001),
@@ -301,6 +324,7 @@ impl SmartRouter {
                     self.five_calibration
                         .get(&candidates[i].account_id)
                         .and_then(|c| c.tokens_per_point)
+                        .or(Some(fair[i].1 * FIVE_HOUR_CAPACITY_RATIO))
                         .map(|size| (95.0 - used).max(0.0) * size)
                 });
                 let near = weekly_left.min(five_left.unwrap_or(f64::INFINITY)) <= tokens as f64
@@ -428,9 +452,11 @@ impl SmartRouter {
         );
         let candidates = candidates.iter().enumerate().map(|(i,c)| {
             let id=format!("{:x}",Sha256::digest(c.account_id.as_bytes()));
-            format!("account={} headroom={:.3} weekly_used={:?} capacity={:.3} source={} L={:.3} f={:.3} u={:.3}",
+            format!("account={} headroom={:.3} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} L={:.3} f={:.3} u={:.3}",
                 &id[..12],c.weekly_headroom.unwrap_or(c.headroom),c.weekly_used,fair[i].1,
-                if fair[i].2 {"measured"} else {"prior"},loads[i],fair[i].0,loads[i]/fair[i].0)
+                if fair[i].2 {"measured"} else {"prior"},c.five_hour_used,
+                self.five_calibration.get(&c.account_id).and_then(|c|c.tokens_per_point).unwrap_or(fair[i].1*FIVE_HOUR_CAPACITY_RATIO),
+                if self.five_calibration.get(&c.account_id).is_some_and(|c|c.tokens_per_point.is_some()) {"measured"} else {"prior"},loads[i],fair[i].0,loads[i]/fair[i].0)
         }).collect::<Vec<_>>().join("; ");
         log::info!("[QuotaPool] strategy=balanced candidates=[{}] rho={:.3} X={} gap_ms={} cost={:.3} benefit={:.3} selected_rank={} selected_account={} reason={}",
             candidates,session.0,session.1,session.2,session.3,session.4,selected+1,&selected_hash[..12],reason);
@@ -503,6 +529,43 @@ mod tests {
             capacity_prior: 1.0,
             ..Default::default()
         }
+    }
+    #[test]
+    fn accumulated_weekly_skew_changes_placement_before_new_usage_arrives() {
+        let mut router = SmartRouter::default();
+        let mut high = candidate("high", 70.0);
+        high.weekly_headroom = Some(35.0);
+        // The old reset-only rate favors the busy measured account over an
+        // underused account still on its smaller capacity prior.
+        router.calibration.insert(
+            "high".into(),
+            Calibration {
+                tokens_per_point: Some(600_000.0),
+                ..Default::default()
+            },
+        );
+        let mut low = candidate("low", 80.0);
+        low.weekly_headroom = Some(80.0);
+        // An unloaded but heavily spent rank-one account must not win ties.
+        assert_eq!(router.choose(&[high, low], &context("new", 1, 100), 1).0, 1);
+    }
+    #[test]
+    fn five_hour_prior_caps_rate_before_any_capacity_measurement() {
+        let mut router = SmartRouter::default();
+        let mut capped = candidate("a", 80.0);
+        capped.weekly_reset_at = Some(3_600_001);
+        capped.five_hour_used = Some(10.0);
+        capped.five_hour_reset_at = Some(18_000_001);
+        let mut uncapped = capped.clone();
+        uncapped.account_id = "b".into();
+        uncapped.five_hour_used = None;
+        let mut busy = capped.clone();
+        busy.account_id = "c".into();
+        busy.five_hour_used = Some(50.0);
+        let fair = router.fair_rates(&[capped, uncapped, busy], 1);
+        assert!(fair[0].0 < fair[1].0);
+        assert!((fair[0].0 - 85.0 * 10_000.0 / 12.0 / 18000.0).abs() < 1e-8);
+        assert!(router.five_calibration["a"].tokens_per_point.is_none());
     }
     #[test]
     fn concurrent_new_sessions_reserve_load_before_usage_arrives() {

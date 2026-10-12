@@ -9,12 +9,16 @@ mod legacy;
 #[path = "../../../src-tauri/src/quota_pool_router.rs"]
 mod router;
 
+#[allow(dead_code)]
+#[path = "quota_pool_previous.rs"]
+mod previous_router;
+
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Model {
     weekly_capacity: f64,
     five_hour_capacity: Option<f64>,
@@ -25,6 +29,7 @@ struct Model {
     five_hour_reset_seconds: u64,
     plan_prior: f64,
 }
+#[derive(Clone)]
 struct Account {
     model: Model,
     weekly: f64,
@@ -98,7 +103,6 @@ struct Row {
 struct Point {
     elapsed_hours: f64,
     used_std: f64,
-    used_spread: f64,
 }
 #[derive(Serialize)]
 struct ResultRow {
@@ -107,10 +111,95 @@ struct ResultRow {
     effective_tokens: f64,
     used_std: f64,
     used_spread: f64,
+    time_mean_sd: f64,
+    time_p90_sd: f64,
+    diagnostics: Vec<Decision>,
     migrations: u64,
     reserve_hours: f64,
     all_gated_requests: u64,
     timeline: Vec<Point>,
+}
+struct DecisionLogger(std::sync::Mutex<String>);
+static DECISION_LOGGER: DecisionLogger = DecisionLogger(std::sync::Mutex::new(String::new()));
+impl log::Log for DecisionLogger {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        let line = record.args().to_string();
+        if line.starts_with("[QuotaPool] strategy=balanced") {
+            *self.0.lock().unwrap() = line;
+        }
+    }
+    fn flush(&self) {}
+}
+#[derive(Serialize)]
+struct Decision {
+    decision_log: String,
+    elapsed_hours: f64,
+    reason: String,
+    selected: usize,
+    moved: bool,
+    sd_increase: f64,
+    before_used: Vec<f64>,
+    candidate_headroom: Vec<f64>,
+}
+#[derive(Default)]
+struct TimeDispersion {
+    segments: Vec<(f64, u64)>,
+}
+impl TimeDispersion {
+    fn add(&mut self, sd: f64, duration: u64) {
+        if duration > 0 {
+            self.segments.push((sd, duration));
+        }
+    }
+    fn metrics(&self) -> (f64, f64) {
+        let duration = self.segments.iter().map(|(_, dt)| *dt).sum::<u64>();
+        if duration == 0 {
+            return (0.0, 0.0);
+        }
+        let mean = self
+            .segments
+            .iter()
+            .map(|(sd, dt)| sd * *dt as f64)
+            .sum::<f64>()
+            / duration as f64;
+        let mut ordered = self.segments.clone();
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut cumulative = 0u64;
+        let p90 = ordered
+            .into_iter()
+            .find_map(|(sd, dt)| {
+                cumulative += dt;
+                (cumulative as f64 >= duration as f64 * 0.9).then_some(sd)
+            })
+            .unwrap_or(0.0);
+        (mean, p90)
+    }
+}
+fn advance_accounts(accounts: &mut [Account], from: u64, now: u64, metrics: &mut TimeDispersion) {
+    let mut at = from;
+    while at < now {
+        let next = accounts
+            .iter()
+            .flat_map(|a| {
+                [
+                    Some(a.weekly_reset),
+                    a.model.five_hour_capacity.map(|_| a.five_reset),
+                ]
+            })
+            .flatten()
+            .filter(|t| *t > at)
+            .min()
+            .unwrap_or(now)
+            .min(now);
+        metrics.add(dispersion(accounts).0, next - at);
+        for a in accounts.iter_mut() {
+            a.advance(next);
+        }
+        at = next;
+    }
 }
 fn dispersion(accounts: &[Account]) -> (f64, f64) {
     let values = accounts
@@ -133,18 +222,22 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
         .collect::<Vec<_>>();
     let mut smart = router::SmartRouter::for_replay(lambda, kind == "placement_only");
     let mut old = legacy::SmartRouter::default();
+    let mut prior = previous_router::SmartRouter::for_replay(lambda, kind == "previous_placement");
     let mut previous = HashMap::<String, usize>::new();
     let mut original_context = HashMap::<String, (u64, String)>::new();
     let mut windows = HashMap::<String, u64>::new();
     let mut effective_tokens = 0.0;
     let mut migrations = 0;
     let mut all_gated = 0;
-    let mut timeline = Vec::new();
-    let mut timeline_at = first;
+
+    let mut time_metrics = TimeDispersion::default();
+    let mut last_at = first;
+    let mut diagnostics = Vec::new();
     for (n, row) in rows.iter().enumerate() {
-        for account in &mut accounts {
-            account.advance(row.at);
-        }
+        advance_accounts(&mut accounts, last_at, row.at, &mut time_metrics);
+        last_at = row.at;
+        let before_sd = dispersion(&accounts).0;
+        let before_used = accounts.iter().map(|a| a.weekly).collect::<Vec<_>>();
         let mut eligible = (0..accounts.len())
             .filter(|i| {
                 accounts[*i].weekly < 100.0 - accounts[*i].model.weekly_floor
@@ -191,7 +284,7 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
             .iter()
             .map(|i| accounts[*i].candidate(*i))
             .collect::<Vec<_>>();
-        let selected = if kind == "legacy" {
+        let (selected, reason) = if kind == "legacy" {
             let c = candidates
                 .iter()
                 .map(|c| legacy::Candidate {
@@ -201,9 +294,24 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
                     weekly_used: c.weekly_used,
                 })
                 .collect::<Vec<_>>();
-            old.choose(&c, &context, row.at).0
+            old.choose(&c, &context, row.at)
+        } else if kind.starts_with("previous_") {
+            let c = candidates
+                .iter()
+                .map(|c| previous_router::Candidate {
+                    account_id: c.account_id.clone(),
+                    headroom: c.headroom,
+                    capacity_prior: c.capacity_prior,
+                    weekly_used: c.weekly_used,
+                    weekly_headroom: c.weekly_headroom,
+                    weekly_reset_at: c.weekly_reset_at,
+                    five_hour_used: c.five_hour_used,
+                    five_hour_reset_at: c.five_hour_reset_at,
+                })
+                .collect::<Vec<_>>();
+            prior.choose(&c, &context, row.at)
         } else {
-            smart.choose(&candidates, &context, row.at).0
+            smart.choose(&candidates, &context, row.at)
         };
         let account = eligible[selected];
         let moved = previous
@@ -216,27 +324,60 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
         effective_tokens += effective;
         if kind == "legacy" {
             old.observe(&context.request_id, row.input, cached, 200);
+        } else if kind.starts_with("previous_") {
+            prior.observe(&context.request_id, row.input, cached, 200);
         } else {
             smart.observe(&context.request_id, row.input, cached, 200);
         }
-        previous.insert(row.session.clone(), account);
-        if row.at >= timeline_at || n + 1 == rows.len() {
-            let (std, spread) = dispersion(&accounts);
-            timeline.push(Point {
-                elapsed_hours: (row.at - first) as f64 / 3_600_000.0,
-                used_std: std,
-                used_spread: spread,
+        let elapsed_hours = (row.at - first) as f64 / 3_600_000.0;
+        if (20.0..=70.0).contains(&elapsed_hours) {
+            diagnostics.push(Decision {
+                decision_log: if kind == "legacy" {
+                    String::new()
+                } else {
+                    DECISION_LOGGER.0.lock().unwrap().clone()
+                },
+                elapsed_hours,
+                reason: reason.into(),
+                selected: account,
+                moved,
+                sd_increase: dispersion(&accounts).0 - before_sd,
+                before_used,
+                candidate_headroom: candidates.iter().map(|c| c.headroom).collect(),
             });
-            timeline_at = row.at + 3_600_000;
         }
+        previous.insert(row.session.clone(), account);
     }
     let (used_std, used_spread) = dispersion(&accounts);
+    let (time_mean_sd, time_p90_sd) = time_metrics.metrics();
+    let mut elapsed = 0u64;
+    let mut timeline = time_metrics
+        .segments
+        .iter()
+        .map(|(sd, dt)| {
+            let point = Point {
+                elapsed_hours: elapsed as f64 / 3_600_000.0,
+                used_std: *sd,
+            };
+            elapsed += dt;
+            point
+        })
+        .collect::<Vec<_>>();
+    timeline.push(Point {
+        elapsed_hours: elapsed as f64 / 3_600_000.0,
+        used_std,
+    });
+    diagnostics.sort_by(|a, b| b.sd_increase.total_cmp(&a.sd_increase));
+    diagnostics.truncate(10);
     ResultRow {
         strategy: kind.into(),
-        lambda: (kind == "full").then_some(lambda),
+        lambda: matches!(kind, "full" | "previous_full").then_some(lambda),
         effective_tokens,
         used_std,
         used_spread,
+        time_mean_sd,
+        time_p90_sd,
+        diagnostics,
         migrations,
         reserve_hours: accounts
             .iter()
@@ -246,7 +387,48 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
         timeline,
     }
 }
+fn seeded_models(base: &[Model], scenario: &str, seed: u64) -> Vec<Model> {
+    let mut models = base.to_vec();
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        state
+    };
+    match scenario {
+        "unequal_start" => {
+            for (m, used) in models.iter_mut().zip([10.0, 35.0, 60.0, 80.0]) {
+                m.initial_weekly_used = used;
+                m.weekly_capacity = 120_000_000.0;
+            }
+        }
+        "staggered_reset" => {
+            for (m, hours) in models.iter_mut().zip([36, 72, 120, 168]) {
+                m.weekly_reset_seconds = hours * 3600;
+            }
+        }
+        "heterogeneous" => {
+            for (i, m) in models.iter_mut().enumerate() {
+                let weight = if i == 0 { 20.0 } else { 1.0 };
+                m.plan_prior = weight;
+                m.weekly_capacity = 240_000_000.0 * weight / 23.0;
+                m.five_hour_capacity = Some(20_000_000.0 * weight / 23.0);
+            }
+        }
+        _ => {}
+    }
+    for i in (1..models.len()).rev() {
+        models.swap(i, (next() as usize) % (i + 1));
+    }
+    // A common random 5h reset phase tests burst timing without inventing usage.
+    let phase = 3600 + next() % 14401;
+    for m in &mut models {
+        m.five_hour_reset_seconds = phase;
+    }
+    models
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    log::set_logger(&DECISION_LOGGER).map_err(|_| "decision logger already installed")?;
+    log::set_max_level(log::LevelFilter::Info);
     let args = std::env::args().collect::<Vec<_>>();
     let path = args
         .get(1)
@@ -284,7 +466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if rows.is_empty() {
         return Err("No replayable successful Official requests".into());
     }
-    let models: Vec<Model> = if let Some(config) = args.get(2) {
+    let models: Vec<Model> = if let Some(config) = args.get(2).filter(|s| s.as_str() != "--suite") {
         serde_json::from_slice(&std::fs::read(config)?)?
     } else {
         (0..4)
@@ -329,16 +511,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut results = vec![
         simulate(&rows, &models, "legacy", 0.0),
-        simulate(&rows, &models, "placement_only", 0.0),
+        simulate(&rows, &models, "previous_placement", 0.0),
+        simulate(&rows, &models, "previous_full", 0.1),
     ];
     for lambda in [0.05, 0.1, 0.2, 0.5, 1.0] {
         results.push(simulate(&rows, &models, "full", lambda));
+    }
+    let mut suite = Vec::new();
+    if args.iter().any(|a| a == "--suite") {
+        for scenario in ["equal", "unequal_start", "staggered_reset", "heterogeneous"] {
+            for seed in [17, 29, 43] {
+                let models = seeded_models(&models, scenario, seed);
+                let mut comparisons = vec![simulate(&rows, &models, "legacy", 0.0)];
+                for lambda in [0.05, 0.1, 0.2, 0.5, 1.0] {
+                    comparisons.push(simulate(&rows, &models, "full", lambda));
+                }
+                suite.push(serde_json::json!({"scenario":scenario,"seed":seed,"models":models,"results":comparisons}));
+            }
+        }
     }
     println!(
         "{}",
         serde_json::to_string_pretty(
             &serde_json::json!({"requests":rows.len(),"same_account_within_30s":short,
-        "low_reuse_within_30s":low,"low_reuse_percent":100.0*low as f64/(short.max(1) as f64),"results":results})
+        "low_reuse_within_30s":low,"low_reuse_percent":100.0*low as f64/(short.max(1) as f64),"results":results,"suite":suite})
         )?
     );
     Ok(())
@@ -358,6 +554,24 @@ mod replay_tests {
             five_hour_reset_seconds: 18000,
             plan_prior: 1.0,
         }
+    }
+    #[test]
+    fn time_dispersion_weights_duration_and_p90_not_request_count() {
+        let mut m = TimeDispersion::default();
+        m.add(10.0, 1);
+        m.add(1.0, 99);
+        assert!((m.metrics().0 - 1.09).abs() < 1e-9);
+        assert_eq!(m.metrics().1, 1.0);
+    }
+    #[test]
+    fn time_dispersion_integrates_resets_inside_idle_intervals() {
+        let mut a = model(1e6);
+        a.initial_weekly_used = 20.0;
+        a.weekly_reset_seconds = 1;
+        let mut accounts = vec![Account::new(a, 1), Account::new(model(1e6), 1)];
+        let mut m = TimeDispersion::default();
+        advance_accounts(&mut accounts, 1, 2001, &mut m);
+        assert!((m.metrics().0 - 100.0 / 19.0).abs() < 1e-9);
     }
     #[test]
     fn moving_accounts_replays_uncached_input_in_every_comparison() {
