@@ -2453,6 +2453,10 @@ html[data-performance="low"] .card {
   display: contents;
 }
 .acct > .state {
+  /* 底線跟著字走、字一律靠左：撐滿整格又靠右時，「待命」的底線會比字長
+     一大截，跟上下幾列的起筆對不齊。 */
+  justify-self: start;
+  text-align: left;
   min-width: 0;
   white-space: normal;
   overflow-wrap: anywhere;
@@ -2654,8 +2658,10 @@ html[data-performance="low"] .card {
     overflow-wrap: break-word;
   }
   /* 不長、會縮：只有獨占一行還比卡片寬（手機寬度）時才會縮。 */
+  /* 寬度釘死而不是跟內容走：auto 時名稱長的那一列會被擠窄，額度塊
+     折行的位置不同，狀態欄的左緣就跟其他列錯開。 */
   .rows__item:has(> .rows__val > .acct) > .rows__val {
-    flex: 0 1 auto;
+    flex: 0 1 46em;
     margin-left: auto;
   }
 }
