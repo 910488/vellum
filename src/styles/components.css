@@ -2449,6 +2449,10 @@ html[data-performance="low"] .card {
   align-items: center;
   justify-content: end;
 }
+.acct--official {
+  grid-template-columns: 7.6em minmax(13em, 16em) 15em 8.2em 5.4em;
+}
+.acct--official .acct__resets { width: 15em; flex: 0 0 15em; }
 .acct__actions {
   display: contents;
 }
@@ -2470,11 +2474,9 @@ html[data-performance="low"] .card {
   gap: 10px;
   min-width: 0;
 }
-/* Official accounts reserve the short-window slot even when it is absent.
-   rem units reserve vertical space without depending on Latin glyph widths. */
-.acct__quota--official { grid-template-rows: 4.5rem auto; }
-.acct__quota-window--placeholder { color: var(--ink-faint); }
-.acct__quota-window--placeholder .acct__quota-line strong { color: var(--ink-faint); }
+/* Keep the weekly window first in every Official row. The second track
+   maintains vertical alignment without rendering an absent 5h window. */
+.acct__quota--official { grid-template-rows: 4.5rem 3rem; }
 /* 數字一欄、量條一欄，說明字掛在量條那一欄：讀數的左緣對齊量條的左緣，
    不從百分比底下開始 —— 數字靠右貼著量條，說明字要是從欄位最左邊起頭，
    三樣東西就有兩條不同的左緣。 */
@@ -5289,11 +5291,13 @@ html[data-performance="low"] .card {
 /* ---------- ChatGPT 帳號的 Reset 到期清單 ---------- */
 
 .acct__resets {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  width: 100%;
   align-items: center;
   gap: 8px;
-  justify-content: center;
 }
+.acct__resets > :last-child { grid-column: 2; }
 
 /* 托盤的把手。長得跟藥丸一樣，因為它本來就是那顆藥丸 —— 只是現在拉得動。
    刻意不做成 .btn：那一列已經有兩顆按鈕，第三顆會讓「Reset 3」看起來是一

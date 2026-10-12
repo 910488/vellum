@@ -248,9 +248,6 @@ describe("Models screen Effort probe status", () => {
     await screen.findByRole("slider");
     expect(screen.queryByText(t("models.ui.pool.reason.missingQuota"))).toBeNull();
     expect(screen.queryByTitle(t("models.ui.fiveHour.autoHint"))).toBeNull();
-    const missingControl = screen.getByTitle(t("models.ui.fiveHour.unavailable"));
-    expect(missingControl.hasAttribute("disabled")).toBe(true);
-    expect(missingControl.getAttribute("title")).toBe(t("models.ui.fiveHour.unavailable"));
     expect(screen.getAllByRole("progressbar").some((meter) => meter.getAttribute("aria-valuenow") === "100")).toBe(true);
   });
 
