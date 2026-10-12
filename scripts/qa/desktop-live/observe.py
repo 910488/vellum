@@ -56,6 +56,8 @@ def snapshot(out: Path) -> None:
         "subagent_events_max_id": u.execute("select coalesce(max(id),0) from subagent_events").fetchone()[0],
         "compaction_journal_count": h.execute("select count(*) from compaction_journal").fetchone()[0],
         "log_size": LOG.stat().st_size if LOG.exists() else 0,
+        # Rotation renames Vellum.log into an archive, so the file id finds it again.
+        "log_ino": LOG.stat().st_ino if LOG.exists() else 0,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(snap, indent=1), encoding="utf-8")
@@ -186,17 +188,32 @@ def history_for(tid: str, since_at: int) -> dict:
     return {"responses": rh[0], "max_context_tokens": rh[1], "realms": realms, "compaction_journal": journal}
 
 
-def log_window(since_size: int) -> dict:
+def log_files() -> list[Path]:
+    """Active log and its rotated archives, oldest first."""
+    files = [p for p in LOG.parent.glob("*.log") if p.is_file()]
+    return sorted(files, key=lambda p: (p.stat().st_mtime, p == LOG))
+
+
+def log_window(since_size: int, since_ino: int = 0) -> dict:
     if not LOG.exists():
         return {"missing": True}
-    with LOG.open("rb") as f:
-        size = f.seek(0, 2)
-        f.seek(since_size if since_size <= size else 0)
-        text = f.read().decode("utf-8", "replace")
+    files = log_files()
+    start = next((i for i, p in enumerate(files) if since_ino and p.stat().st_ino == since_ino), None)
+    rotated = start is not None and files[start] != LOG
+    if start is None:
+        # Baseline predates file ids, or its archive was already pruned.
+        size = LOG.stat().st_size
+        rotated = bool(since_ino) or since_size > size
+        files, start, since_size = [LOG], 0, since_size if since_size <= size and not since_ino else 0
+    text = ""
+    for i, path in enumerate(files[start:]):
+        with path.open("rb") as f:
+            f.seek(since_size if i == 0 else 0)
+            text += f.read().decode("utf-8", "replace")
     lines = text.splitlines()
     bad = [l[:300] for l in lines if re.search(r"\]\[(ERROR|WARN)\]|panic", l)]
     statuses = Counter(m.group(1) for l in lines for m in [re.search(r"upstream headers .*status=(\d+)", l)] if m)
-    return {"lines": len(lines), "rotated": since_size > size, "warn_error": bad[:40], "warn_error_count": len(bad),
+    return {"lines": len(lines), "rotated": rotated, "files": len(files) - start, "warn_error": bad[:40], "warn_error_count": len(bad),
             "upstream_status": dict(statuses)}
 
 
@@ -229,7 +246,7 @@ def report(tid: str, baseline: dict, out: Path) -> int:
     ev = events_for(req_ids, baseline.get("diagnostic_events_max_id", 0), int(since_at))
     subs = subagents(baseline.get("subagent_events_max_id", 0), req_ids)
     hist = history_for(tid, int(since_at))
-    logw = log_window(baseline.get("log_size", 0))
+    logw = log_window(baseline.get("log_size", 0), baseline.get("log_ino", 0))
     now_boot = boot()
     checks = []
 
