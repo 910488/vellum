@@ -195,6 +195,28 @@ The core release completes before the Desktop build starts. This ordering and
 the immutable Enhanced Core tag ensure that update assets and bundled assets
 cannot drift to different Enhanced Core commits during one release run.
 
+Windows self-updates launch NSIS with `/P /UPDATE /R` (passive progress, then
+relaunch). The preinstall hook retires bridge/core/relay images with unique
+`.old-*` names before writing their replacements; a failed rename aborts the
+installation. Startup checks the packaged bridge against this host's embedded
+digest before marking the Desktop update applied. An incomplete install stays
+failed across background checks and can retry its verified cached installer
+from the update panel. Startup removes retired images that are no longer locked.
+
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File
+scripts/qa/test-installer-locked-bridge.ps1` on Windows with Tauri's cached NSIS
+toolset. It creates isolated fake executables under the temp directory, models
+immediate respawn, demonstrates the failed legacy overwrite, and runs an actual
+NSIS test installer using the production rename macro. It never runs the global
+sidecar taskkill hook or changes the installed Vellum. Artifacts are retained
+under the printed temp path for inspection.
+
+Core slot promotion normally waits for a verified new core launch, rather than
+a Vellum restart. If a signed pending core and every signed helper already match
+the newly bundled files, startup can settle that identical tree without waiting
+for another Codex restart; otherwise pending remains until safe launch validation.
+The renderer preview is `/preview/updates-preview.html` on an isolated Vite port.
+
 `codex-code-mode-host` links `rusty_v8` and downloads a prebuilt archive from
 GitHub. If that download fails, the rest of the build still succeeds and only
 code mode is affected; retry, or set `V8_FROM_SOURCE=1` to compile V8 locally.

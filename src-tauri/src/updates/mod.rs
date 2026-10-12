@@ -11,6 +11,7 @@ mod core_slots;
 mod desktop_install;
 mod engine;
 mod github;
+mod install_integrity;
 mod journal;
 mod machine;
 mod manifest;

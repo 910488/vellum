@@ -16,7 +16,9 @@ export type VellumUpdateState =
   | { kind: "checking" }
   /** 自動更新關著時，檢查到新版只會停在這裡，等使用者按。 */
   | { kind: "available"; version: string }
-  | { kind: "downloading"; version: string; percent: number }
+  | { kind: "downloading"; version: string; percent: number; bytes: number; total: number }
+  | { kind: "installing"; version: string }
+  | { kind: "updated"; version: string; corePending: boolean }
   | { kind: "ready"; version: string }
   | { kind: "scheduled"; version: string; turns: number; requests: number }
   | { kind: "failed"; version: string | null; reason: string }
@@ -62,6 +64,7 @@ function targetOf(state: VellumUpdateState): string | null {
   switch (state.kind) {
     case "available":
     case "downloading":
+    case "installing":
     case "ready":
     case "scheduled":
     case "failed":
@@ -74,9 +77,11 @@ function targetOf(state: VellumUpdateState): string | null {
 function tone(state: VellumUpdateState): "ok" | "busy" | "ready" | "warn" | "crit" {
   switch (state.kind) {
     case "current":
+    case "updated":
       return "ok";
     case "checking":
     case "downloading":
+    case "installing":
       return "busy";
     case "available":
     case "ready":
@@ -98,7 +103,8 @@ export function VellumUpdate({
 }) {
   const { t, i18n } = useTranslation();
   const { state } = view;
-  const target = targetOf(state);
+  const candidate = targetOf(state);
+  const target = candidate === view.current ? null : candidate;
   const notesId = useId();
   const [notesOpen, setNotesOpen] = useState(false);
   const busy = Boolean(view.busy);
@@ -116,6 +122,10 @@ export function VellumUpdate({
           : t(`${K}.state.current`);
       case "checking":
         return t(`${K}.state.checking`);
+      case "installing":
+        return t(`${K}.state.installing`);
+      case "updated":
+        return t(`${K}.state.${state.corePending ? "updatedCorePending" : "updated"}`, { version: state.version });
       case "available":
         return t(`${K}.state.available`);
       case "downloading":
@@ -131,6 +141,7 @@ export function VellumUpdate({
         return t(`${K}.state.scheduled`, { work: parts.join(t(`${K}.busy.and`)) });
       }
       case "failed":
+        if (state.reason === "desktopInstallIncomplete") return t(`settings.page.updates.reason.${state.reason}`);
         return t(`${K}.state.failed`, {
           reason: t(`settings.page.updates.reason.${state.reason}`, { defaultValue: state.reason }),
         });
@@ -142,9 +153,12 @@ export function VellumUpdate({
   const primary = (() => {
     switch (state.kind) {
       case "current":
+      case "updated":
         return <Btn soft disabled={busy} onClick={actions.onCheck}>{t(`${K}.action.check`)}</Btn>;
       case "checking":
         return <Btn soft disabled>{t(`${K}.action.checking`)}</Btn>;
+      case "installing":
+        return <Btn soft disabled>{t(`${K}.state.installing`)}</Btn>;
       case "available":
         return <Btn disabled={busy} onClick={actions.onUpdate}>{t(`${K}.action.update`)}</Btn>;
       case "downloading":
@@ -158,7 +172,7 @@ export function VellumUpdate({
       case "scheduled":
         return <Btn soft disabled={busy} onClick={actions.onUnschedule}>{t(`${K}.action.unschedule`)}</Btn>;
       case "failed":
-        return <Btn disabled={busy} onClick={actions.onRetry}>{t(`${K}.action.retry`)}</Btn>;
+        return <Btn disabled={busy} onClick={actions.onRetry}>{t(`${K}.action.${state.reason === "desktopInstallIncomplete" ? "repair" : "retry"}`)}</Btn>;
       case "unsigned":
         return <Btn onClick={actions.onOpenDownloads}>{t(`${K}.action.downloads`)}</Btn>;
     }
@@ -207,7 +221,10 @@ export function VellumUpdate({
           ) : null}
         </span>
       </div>
-      {state.kind === "downloading" ? <Meter percent={state.percent} tone="honey" /> : null}
+      {state.kind === "downloading" ? <>
+        <Meter percent={state.percent} tone="honey" />
+        <p>{t(`${K}.downloadBytes`, { downloaded: (state.bytes / 1_000_000).toFixed(1), total: state.total > 0 ? (state.total / 1_000_000).toFixed(1) : "…" })}</p>
+      </> : null}
       {view.notes && target && notesOpen ? (
         <div className="vupdate__notes" id={notesId} aria-label={t(`${K}.notesTitle`)}>
           {view.notes}

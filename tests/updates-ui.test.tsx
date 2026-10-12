@@ -119,6 +119,35 @@ const status = (patch: Partial<SystemStatus> = {}): SystemStatus => ({
 });
 
 describe("one Vellum version over three layers", () => {
+  it("keeps completed desktop bytes in the combined progress while core downloads", () => {
+    const state = vellumUpdateState(live({
+      desktop: layer("desktop", { phase: "staged", downloadBytes: 100_000_000, downloadTotal: 100_000_000 }),
+      core: layer("core", { phase: "downloading", downloadBytes: 39_000_000, downloadTotal: 78_000_000 }),
+    }), { checking: false });
+    expect(state).toMatchObject({ kind: "downloading", bytes: 139_000_000, total: 178_000_000 });
+    panel(live({ desktop: layer("desktop", { phase: "downloading", downloadBytes: 50_000_000, downloadTotal: 100_000_000 }), core: layer("core", { phase: "available", downloadTotal: 78_000_000 }) }));
+    expect(screen.getByRole("progressbar")).toBeTruthy();
+    expect(screen.getByText("50.0 MB / 178.0 MB")).toBeTruthy();
+  });
+
+  it("shows installation and completion including a pending core switch", () => {
+    expect(vellumUpdateState(live({ desktop: layer("desktop", { phase: "applying", stagedVersion: "0.3.0" }) }), { checking: false }))
+      .toEqual({ kind: "installing", version: "0.3.0" });
+    expect(vellumUpdateState(live({ desktop: layer("desktop", { phase: "applied", currentVersion: "0.3.0" }), core: layer("core", { phase: "waitingForRestart" }) }), { checking: false }))
+      .toEqual({ kind: "updated", version: "0.3.0", corePending: true });
+  });
+
+  it("keeps incomplete installation visible and repairs using the cached installer", async () => {
+    const failed = live({ desktop: layer("desktop", { phase: "failed", stagedVersion: "0.3.0", failureReason: "desktopInstallIncomplete" }) });
+    expect(vellumUpdateState(failed, { checking: true })).toMatchObject({ kind: "failed", reason: "desktopInstallIncomplete" });
+    vi.mocked(api.restartToUpdate).mockResolvedValue("scheduled");
+    vi.mocked(api.getUpdateStatus).mockResolvedValue(failed);
+    panel(failed);
+    fireEvent.click(screen.getByRole("button", { name: /快取|缓存|cached|キャッシュ/ }));
+    await waitFor(() => expect(api.restartToUpdate).toHaveBeenCalledOnce());
+    expect(api.updateVellum).not.toHaveBeenCalled();
+  });
+
   it("cannot update itself without a signing key, whatever the layers say", () => {
     expect(vellumUpdateState(snapshot(), { checking: false })).toEqual({ kind: "unsigned" });
   });
@@ -146,7 +175,7 @@ describe("one Vellum version over three layers", () => {
       }),
       { checking: false },
     );
-    expect(state).toEqual({ kind: "downloading", version: "0.3.0", percent: 40 });
+    expect(state).toEqual({ kind: "downloading", version: "0.3.0", percent: 40, bytes: 80, total: 200 });
   });
 
   it("reports a core failure without pretending it is a Vellum version", () => {
