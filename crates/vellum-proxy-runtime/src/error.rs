@@ -85,6 +85,11 @@ pub enum RuntimeError {
     #[error("continuation failed: {0}")]
     Continuation(String),
 
+    /// The portable bridge cannot replay an account-scoped response locally.
+    /// Codex recognizes this code and retries with its full input history.
+    #[error("previous response `{0}` has no local history; retry with full input")]
+    PreviousResponseNotFound(String),
+
     /// Compaction failed.
     #[error("compaction failed: {0}")]
     Compaction(String),
@@ -180,7 +185,7 @@ impl RuntimeError {
             Self::ProviderQuota { .. } => "provider_quota",
             Self::ProviderUnavailable(_) => "provider_unavailable",
             Self::ProviderProtocol(_) | Self::ProviderRequestRejected { .. } => "provider_protocol",
-            Self::Continuation(_) => "continuation",
+            Self::Continuation(_) | Self::PreviousResponseNotFound(_) => "continuation",
             Self::Compaction(_) => "compaction",
             Self::History(_) => "history",
             Self::Search(_) => "search",
@@ -202,7 +207,8 @@ impl RuntimeError {
         match self {
             Self::InvalidRequest(_)
             | Self::HarnessMismatch(_)
-            | Self::ProviderRequestRejected { .. } => StatusCode::BAD_REQUEST,
+            | Self::ProviderRequestRejected { .. }
+            | Self::PreviousResponseNotFound(_) => StatusCode::BAD_REQUEST,
             Self::UnsupportedMode(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::UnsupportedMedia(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::RouteNotFound(_) | Self::RouteInactive(_) => StatusCode::NOT_FOUND,
@@ -265,7 +271,9 @@ impl RuntimeError {
     /// code. Invalid input remains fatal even when SSE headers are already sent.
     pub fn to_response_failed_event(&self) -> Value {
         let status = self.http_status();
-        let code = if status == axum::http::StatusCode::BAD_REQUEST {
+        let code = if matches!(self, Self::PreviousResponseNotFound(_)) {
+            "previous_response_not_found"
+        } else if status == axum::http::StatusCode::BAD_REQUEST {
             "invalid_prompt"
         } else {
             self.category()

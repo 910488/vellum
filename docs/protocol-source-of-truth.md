@@ -713,6 +713,18 @@ The HTTP error envelope keeps its numeric client-facing code and adds
 Quota-bearing 400s remain quota failures, transient 4xx remain retryable,
 and 5xx remain provider-unavailable failures.
 
+Official WebSocket-to-HTTP bridges always expand local continuation history
+and remove `previous_response_id`; HTTP cannot consume the WebSocket-only id.
+Account or selection-revision changes also force portable replay on a live
+native connection, independently of what initiated the selection change.
+If local history is missing, the WebSocket boundary emits a wrapped `error`
+with string code `previous_response_not_found` and status 400, which
+[Codex's WebSocket error mapper](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/endpoint/responses_websocket.rs)
+recognizes as a full-request retry. It is not a fatal `invalid_prompt`.
+Local hydration rejection records the selected account and
+`upstream_attempted=false`; dispatched native and bridged exchanges record
+`upstream_attempted=true`. Portable `generate=false` prewarms remain local.
+
 Include only a bounded, sanitized provider diagnostic. Never replace distinct
 failures with a generic high-demand message, and never expose secrets or an
 unbounded upstream body.
