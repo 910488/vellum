@@ -26,6 +26,7 @@ pub mod grok_auth;
 pub mod harness;
 pub mod history;
 pub mod install_paths;
+mod log_retention;
 pub mod loop_guard;
 pub mod model;
 pub mod panic_hook;
@@ -134,12 +135,11 @@ pub fn run() {
     }));
     builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
-        )
+        .plugin(log_retention::builder().build())
         .setup(|app| {
+            if let Ok(log_root) = app.path().app_log_dir() {
+                log_retention::spawn_archive_cleanup(log_root);
+            }
             let handle = app.handle().clone();
             app.state::<AppState>()
                 .attach_lifecycle_emitter(move |status| {

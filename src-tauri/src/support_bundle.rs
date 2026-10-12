@@ -487,6 +487,16 @@ mod tests {
             "Authorization: Bearer abc123\npassword=hunter2\nauth_token: another-secret\n",
         )
         .unwrap();
+        for name in [
+            "Vellum_2026-10-12_10-00-00.log",
+            "Vellum_2026-10-12_10-00-00.log.bak",
+        ] {
+            fs::write(
+                app.join(name),
+                "[Dispatch] retained timeline\nAuthorization: Bearer archived-secret\n",
+            )
+            .unwrap();
+        }
         fs::write(data.join("history.sqlite3"), b"conversation secret").unwrap();
         fs::write(data.join("settings.json"), b"api key secret").unwrap();
 
@@ -508,6 +518,19 @@ mod tests {
             .iter()
             .any(|name| name.ends_with("enhanced-events.jsonl")));
         assert!(names.iter().any(|name| name == "app/vellum.log"));
+        for name in [
+            "Vellum_2026-10-12_10-00-00.log",
+            "Vellum_2026-10-12_10-00-00.log.bak",
+        ] {
+            let mut contents = String::new();
+            zip.by_name(&format!("app/{name}"))
+                .unwrap()
+                .read_to_string(&mut contents)
+                .unwrap();
+            assert!(contents.contains("[Dispatch] retained timeline"));
+            assert!(contents.contains("<REDACTED>"));
+            assert!(!contents.contains("archived-secret"));
+        }
         assert!(names
             .iter()
             .any(|name| name == "data/diagnostic-events.jsonl"));
