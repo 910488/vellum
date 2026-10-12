@@ -2480,13 +2480,12 @@ html[data-performance="low"] .card {
   min-width: 0;
 }
 /* 位置固定，份量跟著實情走：剩最少的那一條是現在擋著你的，其餘退一階。
-   把大字釘在第一列會在週視窗見底、5 小時剛重置時指錯人。 */
+   只退顏色不退尺寸：兩個百分比同一個字級、量條同一個粗細，上下才對得齊；
+   字級一大一小讀起來像排版壞掉。 */
 .acct__quota-window:not(.acct__quota-window--lead) .acct__quota-line strong {
-  font-size: 13.5px;
   color: var(--ink-soft);
 }
 .acct__quota-window:not(.acct__quota-window--lead) .meter {
-  height: 5px;
   opacity: 0.72;
 }
 .acct__quota-line {
