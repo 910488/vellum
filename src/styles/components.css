@@ -2638,8 +2638,26 @@ html[data-performance="low"] .card {
     justify-content: flex-end;
     flex-wrap: wrap;
   }
+  /* 固定寬度、不跟說明字長短伸縮：每列的 .acct 靠右對齊，額度欄
+     寬一點窄一點，整列的左緣就跟著錯開。 */
   .acct__actions > .acct__quota {
-    flex: 1 1 15em;
+    flex: 0 1 16em;
+  }
+  /* 帳號列：名稱讓位、折行，額度那一塊保持整寬。名稱長的那一列
+     （常常是英文或簡中的長信箱）不能把額度擠到下一行。 */
+  .rows__item:has(> .rows__val > .acct) {
+    flex-wrap: wrap;
+  }
+  /* 信箱不從字中間斷；名稱放不下時，額度那一塊整塊換到下一行。
+     額度塊寬度固定又靠右，換不換行，各列的左緣都一樣。 */
+  .rows__item:has(> .rows__val > .acct) > .rows__key {
+    flex: 1 1 10em;
+    overflow-wrap: break-word;
+  }
+  /* 不長、會縮：只有獨占一行還比卡片寬（手機寬度）時才會縮。 */
+  .rows__item:has(> .rows__val > .acct) > .rows__val {
+    flex: 0 1 auto;
+    margin-left: auto;
   }
 }
 
