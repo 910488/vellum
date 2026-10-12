@@ -1008,9 +1008,10 @@ impl ProxyRuntime {
             .as_ref()
             .and_then(|n| n.parent_turn_id.as_ref())
             .map(|t| t.as_str().to_string());
-        let root_turn_id = node
+        let root_turn_id = binding
+            .root_turn_id
             .as_ref()
-            .and_then(|n| n.root_turn_id.as_ref())
+            .or_else(|| node.as_ref().and_then(|n| n.root_turn_id.as_ref()))
             .map(|t| t.as_str().to_string());
         let context_window_id = binding
             .context_window_id
