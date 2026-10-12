@@ -54,14 +54,32 @@ struct Calibration {
     // Recent rejected nonzero samples and their provisional external points.
     // Three consistent samples distinguish a sustained drop from one burst.
     low_samples: VecDeque<(f64, f64)>,
+    reset_at: Option<u64>,
 }
 impl Calibration {
+    fn update_window(&mut self, used: f64, prior: f64, reset_at: Option<u64>) {
+        if self
+            .reset_at
+            .zip(reset_at)
+            .is_some_and(|(old, new)| new > old)
+        {
+            self.anchor_used = None;
+            self.tokens_since = 0.0;
+            self.external_points = 0.0;
+            self.low_samples.clear();
+        }
+        if reset_at.is_some() {
+            self.reset_at = reset_at;
+        }
+        self.update(used, prior);
+    }
     fn update(&mut self, used: f64, prior: f64) {
         match self.anchor_used {
             Some(anchor) if used + 0.5 < anchor => {
                 self.anchor_used = Some(used);
                 self.tokens_since = 0.0;
                 self.low_samples.clear();
+                self.external_points = 0.0;
             }
             Some(anchor)
                 if used - anchor >= 2.0
@@ -183,6 +201,8 @@ pub(crate) struct SmartRouter {
     samples: [VecDeque<(String, f64)>; 2],
     lambda: f64,
     placement_only: bool,
+    pub(crate) last_admission: Vec<bool>,
+    pub(crate) budget_enforced: bool,
 }
 impl Default for SmartRouter {
     fn default() -> Self {
@@ -196,10 +216,36 @@ impl Default for SmartRouter {
             samples: Default::default(),
             lambda: DEFAULT_LAMBDA,
             placement_only: false,
+            last_admission: Vec::new(),
+            budget_enforced: false,
         }
     }
 }
 impl SmartRouter {
+    pub fn diagnostic_five_capacity(
+        &self,
+        account: &str,
+        weekly_capacity: f64,
+    ) -> (f64, bool, f64, usize) {
+        let cal = self.five_calibration.get(account);
+        (
+            cal.and_then(|c| c.tokens_per_point)
+                .unwrap_or(weekly_capacity * FIVE_HOUR_CAPACITY_RATIO),
+            cal.is_some_and(|c| c.tokens_per_point.is_some()),
+            cal.map_or(0.0, |c| c.external_points),
+            cal.map_or(0, |c| c.low_samples.len()),
+        )
+    }
+    pub fn diagnostic_capacity(&self, account: &str, prior: f64) -> (f64, bool, f64, usize) {
+        let cal = self.calibration.get(account);
+        (
+            cal.and_then(|c| c.tokens_per_point)
+                .unwrap_or(PRIOR_TOKENS_PER_POINT * prior.max(0.01)),
+            cal.is_some_and(|c| c.tokens_per_point.is_some()),
+            cal.map_or(0.0, |c| c.external_points),
+            cal.map_or(0, |c| c.low_samples.len()),
+        )
+    }
     /// Offline comparison uses the very same production decision path.
     #[allow(dead_code)] // Used by the offline example, not the desktop binary.
     pub fn for_replay(lambda: f64, placement_only: bool) -> Self {
@@ -227,6 +273,41 @@ impl SmartRouter {
             .unwrap_or(if review { 5.0 } else { 25.0 })
             .max(0.01)
     }
+    pub fn update_quota_observation(&mut self, c: &Candidate) -> (f64, bool) {
+        let plan = c.plan_type.as_ref().map(|p| p.trim().to_ascii_lowercase());
+        if self
+            .plan_types
+            .get(&c.account_id)
+            .is_some_and(|previous| previous != &plan)
+        {
+            self.calibration.remove(&c.account_id);
+            self.five_calibration.remove(&c.account_id);
+        }
+        self.plan_types.insert(c.account_id.clone(), plan);
+        let cal = self.calibration.entry(c.account_id.clone()).or_default();
+        if let Some(used) = c.weekly_used {
+            cal.update_window(
+                used,
+                PRIOR_TOKENS_PER_POINT * c.capacity_prior.max(0.01),
+                c.weekly_reset_at,
+            );
+        }
+        let capacity = cal
+            .tokens_per_point
+            .unwrap_or(PRIOR_TOKENS_PER_POINT * c.capacity_prior.max(0.01));
+        let measured = cal.tokens_per_point.is_some();
+        if let Some(used) = c.five_hour_used {
+            self.five_calibration
+                .entry(c.account_id.clone())
+                .or_default()
+                .update_window(
+                    used,
+                    capacity * FIVE_HOUR_CAPACITY_RATIO,
+                    c.five_hour_reset_at,
+                );
+        }
+        (capacity, measured)
+    }
     fn fair_rates(&mut self, candidates: &[Candidate], now: u64) -> Vec<(f64, f64, bool)> {
         let mean_remaining = candidates
             .iter()
@@ -245,23 +326,7 @@ impl SmartRouter {
         candidates
             .iter()
             .map(|c| {
-                let plan = c.plan_type.as_ref().map(|p| p.trim().to_ascii_lowercase());
-                if self
-                    .plan_types
-                    .get(&c.account_id)
-                    .is_some_and(|previous| previous != &plan)
-                {
-                    self.calibration.remove(&c.account_id);
-                    self.five_calibration.remove(&c.account_id);
-                }
-                self.plan_types.insert(c.account_id.clone(), plan);
-                let cal = self.calibration.entry(c.account_id.clone()).or_default();
-                if let Some(used) = c.weekly_used {
-                    cal.update(used, PRIOR_TOKENS_PER_POINT * c.capacity_prior.max(0.01));
-                }
-                let capacity = cal
-                    .tokens_per_point
-                    .unwrap_or(PRIOR_TOKENS_PER_POINT * c.capacity_prior.max(0.01));
+                let (capacity, measured) = self.update_quota_observation(c);
                 let remaining = c.weekly_headroom.unwrap_or(c.headroom).max(0.0);
                 let until = c
                     .weekly_reset_at
@@ -278,7 +343,6 @@ impl SmartRouter {
                         .five_calibration
                         .entry(c.account_id.clone())
                         .or_default();
-                    five.update(used, capacity * FIVE_HOUR_CAPACITY_RATIO);
                     let left = (95.0 - used).max(0.0);
                     let size = five
                         .tokens_per_point
@@ -302,11 +366,7 @@ impl SmartRouter {
                     // Recovery can tighten the 5h budget, never raise its S/T cap.
                     fair = fair.min(left * size / until + five_recovery.min(0.0));
                 }
-                (
-                    fair.max(0.000_001),
-                    capacity,
-                    cal.tokens_per_point.is_some(),
-                )
+                (fair.max(0.000_001), capacity, measured)
             })
             .collect()
     }
@@ -317,6 +377,8 @@ impl SmartRouter {
         now: u64,
     ) -> (usize, &'static str) {
         assert!(!candidates.is_empty());
+        self.last_admission.clear();
+        self.budget_enforced = false;
         self.sessions
             .retain(|_, s| now.saturating_sub(s.touched) < IDLE_MS);
         self.requests
@@ -385,14 +447,17 @@ impl SmartRouter {
                 .unwrap_or(f64::INFINITY);
             expected <= weekly.min(five)
         };
-        let any_fits = (0..candidates.len()).any(fits);
-        let incumbent = available_incumbent.filter(|i| !any_fits || fits(*i));
+        let admission = (0..candidates.len()).map(fits).collect::<Vec<_>>();
+        let any_fits = admission.iter().any(|fits| *fits);
+        self.last_admission = admission.clone();
+        self.budget_enforced = any_fits;
+        let incumbent = available_incumbent.filter(|i| !any_fits || admission[*i]);
         let mut best =
-            incumbent.unwrap_or_else(|| (0..candidates.len()).find(|i| fits(*i)).unwrap_or(0));
+            incumbent.unwrap_or_else(|| (0..candidates.len()).find(|i| admission[*i]).unwrap_or(0));
         let projected =
             |i: usize| (loads[i] + if Some(i) == incumbent { 0.0 } else { rho }) / fair[i].0;
-        for i in 0..candidates.len() {
-            if any_fits && !fits(i) {
+        for (i, fits) in admission.iter().enumerate() {
+            if any_fits && !fits {
                 continue;
             }
             if projected(i) < projected(best) * (1.0 - 1e-9) {
@@ -744,6 +809,62 @@ mod tests {
         assert_eq!(cal.tokens_per_point, Some(100_000.0));
         cal.update(0.0, 100_000.0);
         assert!(cal.low_samples.is_empty());
+    }
+
+    #[test]
+    fn quota_reset_clears_window_usage_but_preserves_learned_capacity() {
+        for reset_by_time in [false, true] {
+            let mut cal = Calibration {
+                anchor_used: Some(20.0),
+                tokens_since: 30_000.0,
+                tokens_per_point: Some(10_000.0),
+                external_points: 12.0,
+                low_samples: VecDeque::from([(1000.0, 2.0)]),
+                reset_at: Some(100),
+            };
+            // A rollover can be missed between snapshots: the new window
+            // may already have higher usage, so percentage decrease alone
+            // is insufficient to recognize a reset.
+            cal.update_window(
+                if reset_by_time { 25.0 } else { 0.0 },
+                10_000.0,
+                Some(if reset_by_time { 200 } else { 100 }),
+            );
+            assert_eq!(cal.external_points, 0.0);
+            assert_eq!(cal.tokens_since, 0.0);
+            assert!(cal.low_samples.is_empty());
+            assert_eq!(cal.tokens_per_point, Some(10_000.0));
+        }
+        let mut router = SmartRouter::default();
+        let mut gated = candidate("gated", 0.0);
+        gated.weekly_used = Some(100.0);
+        gated.weekly_headroom = Some(0.0);
+        gated.five_hour_used = Some(97.0);
+        gated.weekly_reset_at = Some(100);
+        gated.five_hour_reset_at = Some(100);
+        router.update_quota_observation(&gated);
+        for cal in [&mut router.calibration, &mut router.five_calibration] {
+            cal.get_mut("gated").unwrap().external_points = 12.0;
+        }
+        // Even a newly exhausted post-reset snapshot must reconcile its
+        // window state before eligibility filtering skips this account.
+        gated.weekly_reset_at = Some(200);
+        gated.five_hour_reset_at = Some(200);
+        router.update_quota_observation(&gated);
+        for cal in [&router.calibration, &router.five_calibration] {
+            assert_eq!(cal["gated"].external_points, 0.0);
+        }
+    }
+
+    #[test]
+    fn unknown_plan_remains_eligible_and_does_not_reset_repeatedly() {
+        let mut router = SmartRouter::default();
+        let c = candidate("a", 90.0);
+        router.fair_rates(std::slice::from_ref(&c), 1);
+        router.calibration.get_mut("a").unwrap().tokens_per_point = Some(30_000.0);
+        router.fair_rates(std::slice::from_ref(&c), 2);
+        assert_eq!(router.calibration["a"].tokens_per_point, Some(30_000.0));
+        assert_eq!(router.choose(&[c], &context("new", 3, 100), 3).0, 0);
     }
 
     #[test]

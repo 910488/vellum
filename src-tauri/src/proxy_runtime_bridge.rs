@@ -856,6 +856,12 @@ impl DesktopProxyRuntimeState {
             "[runtime-new] before ProxyRuntime::new {}ms",
             constructed.elapsed().as_millis()
         );
+        let diagnostics = Arc::new(crate::diagnostics_store::DesktopDiagnosticsSink::new(
+            state.usage_store(),
+        ));
+        state
+            .codex_oauth()
+            .set_pool_diagnostics_sink(diagnostics.clone());
         let mut runtime = ProxyRuntime::new(
             Arc::new(DesktopCatalog {
                 state: state.clone(),
@@ -877,9 +883,7 @@ impl DesktopProxyRuntimeState {
             inner: state.usage_store(),
             records: Mutex::new(Vec::new()),
         }))
-        .with_diagnostics_sink(Arc::new(
-            crate::diagnostics_store::DesktopDiagnosticsSink::new(state.usage_store()),
-        ))
+        .with_diagnostics_sink(diagnostics)
         .with_search_engine(Arc::new(DesktopSearch {
             engine: crate::web_search::SearchEngine::new(search_settings)
                 .map_err(|e| e.to_string())?,
