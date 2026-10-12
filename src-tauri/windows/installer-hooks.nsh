@@ -16,10 +16,12 @@
 ; Desktop can respawn a killed bridge immediately. Rename the old image so
 ; respawning cannot re-lock the destination NSIS is about to populate.
 !macro VELLUM_RETIRE_IMAGE FILE
-  IfFileExists "$INSTDIR\${FILE}" 0 +7
+  IfFileExists "$INSTDIR\${FILE}" 0 +9
   ClearErrors
   Rename "$INSTDIR\${FILE}" "$INSTDIR\${FILE}.old-$R0-$R1"
-  IfErrors 0 +4
+  IfErrors 0 +6
+  DetailPrint "Unable to retire ${FILE}; relaunching the existing Vellum before stopping installation."
+  Exec '"$INSTDIR\vellum-proxy-desktop.exe"'
   MessageBox MB_OK|MB_ICONSTOP "Vellum could not replace ${FILE}. Installation was stopped. Please run this installer again." /SD IDOK
   SetErrorLevel 1
   Abort

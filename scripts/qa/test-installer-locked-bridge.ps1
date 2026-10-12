@@ -9,7 +9,9 @@ $newImage = Join-Path $testRoot 'new.exe'
 $source = Join-Path $testRoot 'fake.cs'
 $ready = Join-Path $testRoot 'ready'
 $child = $null
-$code = 'using System; using System.IO; using System.Threading; class Fake { static void Main(string[] args) { File.WriteAllText(args[0], "ready"); while(true) Thread.Sleep(100); } }'
+$relaunched = $null
+$locked = $null
+$code = 'using System; using System.IO; using System.Threading; using System.Diagnostics; class Fake { static void Main(string[] args) { string ready = args.Length > 0 ? args[0] : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "relaunched.txt"); File.WriteAllText(ready, "ready"); if(args.Length == 0) File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "relaunched-pid.txt"), Process.GetCurrentProcess().Id.ToString()); while(true) Thread.Sleep(100); } }'
 [IO.File]::WriteAllText($source, $code, [Text.UTF8Encoding]::new($false))
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 function Start-Fake {
@@ -23,10 +25,10 @@ function Start-Fake {
     return $process
 }
 try {
-    & $compiler /nologo /target:exe "/out:$bridge" $source
+    & $compiler /nologo /target:winexe "/out:$bridge" $source
     if ($LASTEXITCODE -ne 0) { throw 'compile old fake bridge failed' }
     [IO.File]::WriteAllText($source, $code.Replace('"ready"', '"new-ready"'), [Text.UTF8Encoding]::new($false))
-    & $compiler /nologo /target:exe "/out:$newImage" $source
+    & $compiler /nologo /target:winexe "/out:$newImage" $source
     if ($LASTEXITCODE -ne 0) { throw 'compile new fake bridge failed' }
     $oldHash = (Get-FileHash -LiteralPath $bridge).Hash
     $newHash = (Get-FileHash -LiteralPath $newImage).Hash
@@ -77,7 +79,28 @@ SectionEnd
     $suffix = [IO.File]::ReadAllText((Join-Path $installRoot 'retired-suffix.txt'))
     if ($suffix -notmatch '^-?\d+-[1-9]\d*$') { throw "invalid retirement identity: $suffix" }
     if (!(Test-Path -LiteralPath ($bridge + '.old-' + $suffix))) { throw 'old running image was not retired' }
-    Write-Output "PASS: locked legacy overwrite rejected; production Rename macro installed new bytes. Artifacts: $testRoot"
+    Stop-Process -Id $child.Id
+    $child.WaitForExit()
+    Copy-Item -LiteralPath ($bridge + '.old-' + $suffix) -Destination $bridge -Force
+    Copy-Item -LiteralPath $newImage -Destination (Join-Path $installRoot 'vellum-proxy-desktop.exe')
+    # Unlike an executable image, this handle expressly denies FILE_SHARE_DELETE.
+    $locked = [IO.File]::Open($bridge, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $setup = Start-Process -FilePath $installer -ArgumentList @('/S', ('/D=' + $installRoot)) -WindowStyle Hidden -PassThru
+    # -Wait also waits for descendants, but the relaunched desktop must remain alive.
+    if (!$setup.WaitForExit(10000)) { throw 'failed installer did not exit' }
+    if ($setup.ExitCode -eq 0) { throw 'unrenamable image should stop installation' }
+    if ((Get-FileHash -LiteralPath $bridge).Hash -ne $oldHash) { throw 'aborted install changed locked image' }
+    $pidFile = Join-Path $installRoot 'relaunched-pid.txt'
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (!(Test-Path -LiteralPath $pidFile)) {
+        if ([DateTime]::UtcNow -gt $deadline) { throw 'aborted installer did not relaunch the existing desktop' }
+        Start-Sleep -Milliseconds 20
+    }
+    $relaunched = Get-Process -Id ([int][IO.File]::ReadAllText($pidFile))
+    if ($relaunched.HasExited) { throw 'relaunched fake desktop is not running' }
+    Write-Output "PASS: locked overwrite rejected; Rename installed new bytes; failed Rename relaunched the existing desktop. Artifacts: $testRoot"
 } finally {
+    if ($locked) { $locked.Dispose() }
+    if ($relaunched -and !$relaunched.HasExited) { Stop-Process -Id $relaunched.Id; $relaunched.WaitForExit() }
     if ($child -and !$child.HasExited) { Stop-Process -Id $child.Id; $child.WaitForExit() }
 }

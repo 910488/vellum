@@ -389,12 +389,11 @@ impl UpdateEngine {
             let current = currents.of(item);
             let record = Self::layer_mut(&mut state, item, current);
             let was_applied = record.phase == UpdatePhase::Applied;
-            // A release check must not hide an incomplete installation.
-            if item == UpdateComponent::Desktop
-                && record.failure_reason.as_deref() == Some("desktopInstallIncomplete")
-            {
-                continue;
-            }
+            // Preserve repair state unless a strictly newer release supersedes
+            // the failed target; failure must never disable future checks.
+            let incomplete = (item == UpdateComponent::Desktop
+                && record.failure_reason.as_deref() == Some("desktopInstallIncomplete"))
+            .then(|| record.clone());
             record.phase =
                 transition(record.phase, &UpdateEvent::StartCheck).unwrap_or(UpdatePhase::Checking);
             record.operation_id = Some(op.operation_id.clone());
@@ -403,6 +402,10 @@ impl UpdateEngine {
                 .list_releases(item.github_repo(), None)
                 .map_err(AppError::Message)?;
             if listed.rate_limited {
+                if let Some(incomplete) = incomplete {
+                    *record = incomplete;
+                    continue;
+                }
                 record.failure_reason = Some("githubRateLimited".into());
                 record.phase = UpdatePhase::Blocked;
                 continue;
@@ -457,7 +460,20 @@ impl UpdateEngine {
             let ctx = SelectContext {
                 component: item,
                 channel: state.preferences.channel,
-                current_version: current,
+                current_version: incomplete
+                    .as_ref()
+                    .and_then(|record| {
+                        record
+                            .target_version
+                            .as_deref()
+                            .or(record.staged_version.as_deref())
+                    })
+                    .filter(|target| {
+                        super::manifest::parse_version(target)
+                            .zip(super::manifest::parse_version(current))
+                            .is_some_and(|(target, current)| target > current)
+                    })
+                    .unwrap_or(current),
                 platform: current_platform(),
                 arch: current_arch(),
                 installed_desktop: currents.desktop,
@@ -503,6 +519,10 @@ impl UpdateEngine {
                 record.failure_reason = None;
             } else {
                 let record = Self::layer_mut(&mut state, item, current);
+                if let Some(incomplete) = incomplete {
+                    *record = incomplete;
+                    continue;
+                }
                 record.phase = if was_applied {
                     UpdatePhase::Applied
                 } else {
@@ -2037,6 +2057,85 @@ mod tests {
             engine.snapshot("0.3.1", "0.2.9", "bundled").desktop.phase,
             UpdatePhase::WaitingForRestart
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_desktop_install_can_be_superseded_only_by_a_newer_release() {
+        for running in ["0.2.9", "0.3.1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let executor = Arc::new(RecordingExecutor::default());
+            let (engine, currents) = fixture_engine(
+                dir.path(),
+                UpdateComponent::Desktop,
+                "0.3.1",
+                b"old installer",
+                executor.clone(),
+            );
+            engine
+                .check(Some(UpdateComponent::Desktop), currents)
+                .await
+                .unwrap();
+            engine
+                .download(UpdateComponent::Desktop, currents, Vec::new())
+                .await
+                .unwrap();
+            engine
+                .apply(
+                    UpdateComponent::Desktop,
+                    ApplyDecision::Allow,
+                    currents,
+                    None,
+                    None,
+                )
+                .unwrap();
+            engine
+                .reconcile_desktop_with_integrity("0.3.1", Err("stale bridge".into()))
+                .unwrap();
+            let current = Currents {
+                desktop: running,
+                ..currents
+            };
+            for published in ["0.3.0", "0.3.1", "0.3.2"] {
+                let (next, _) = fixture_engine(
+                    dir.path(),
+                    UpdateComponent::Desktop,
+                    published,
+                    b"new installer",
+                    executor.clone(),
+                );
+                next.check(Some(UpdateComponent::Desktop), current)
+                    .await
+                    .unwrap();
+                let desktop = next.snapshot(running, "0.2.9", "bundled").desktop;
+                if published != "0.3.2" {
+                    assert_eq!(desktop.phase, UpdatePhase::Failed);
+                    assert_eq!(
+                        desktop.failure_reason.as_deref(),
+                        Some("desktopInstallIncomplete")
+                    );
+                    assert_eq!(desktop.staged_version.as_deref(), Some("0.3.1"));
+                } else {
+                    assert_eq!(desktop.phase, UpdatePhase::Available);
+                    assert_eq!(desktop.target_version.as_deref(), Some("0.3.2"));
+                    assert!(desktop.failure_reason.is_none());
+                    next.prepare_cached_desktop_repair().unwrap();
+                    assert_eq!(
+                        next.snapshot(running, "0.2.9", "bundled").desktop.phase,
+                        UpdatePhase::Available
+                    );
+                    next.download(UpdateComponent::Desktop, current, Vec::new())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        next.snapshot(running, "0.2.9", "bundled")
+                            .desktop
+                            .staged_version
+                            .as_deref(),
+                        Some("0.3.2")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
