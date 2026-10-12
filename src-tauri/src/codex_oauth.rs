@@ -2262,6 +2262,10 @@ mod tests {
 
     #[tokio::test]
     async fn quota_pool_routes_across_users_and_workspaces() {
+        // Rank routing has no session affinity or migration hysteresis.
+        // The seeded offline snapshots must not expire while settings are
+        // persisted: after opening pool-c, pool-b remains exactly at its
+        // weekly floor and pool-a remains paused, so only pool-c is usable.
         let temp = tempfile::tempdir().unwrap();
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         let mut members = Vec::new();
