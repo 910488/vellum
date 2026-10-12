@@ -51,6 +51,7 @@ pub mod lifecycle;
 pub mod live_attribution;
 pub mod official_auth;
 pub mod official_identity;
+mod official_replay;
 pub mod opencode;
 pub mod outbound;
 pub mod profile_adapter;

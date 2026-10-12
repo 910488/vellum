@@ -2021,6 +2021,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_p".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2041,6 +2042,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_c".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2139,6 +2141,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_conf".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2176,6 +2179,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_no_meta".into(),
                 received_at_ms: 1000,
                 review_run_id: None,

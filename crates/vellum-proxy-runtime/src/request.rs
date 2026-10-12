@@ -45,10 +45,19 @@ pub struct IncomingAuthContext {
     pub openai_account: Option<String>,
 }
 
+/// Explicit cache-affinity headers, distinct from authorization and turn identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialCacheAffinity {
+    pub session_id: Option<String>,
+    pub session_id_legacy: Option<String>,
+}
+
 /// Per-request metadata for diagnostics and telemetry. Never carries secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestMetadata {
+    #[serde(default)]
+    pub official_cache_affinity: OfficialCacheAffinity,
     pub request_id: String,
     pub received_at_ms: u64,
     /// Auto Review run id when this request is a guardian execution (M9);
@@ -183,6 +192,7 @@ mod tests {
             },
             execution_environment: ExecutionEnvironment::posix_reference(),
             metadata: RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req-1".into(),
                 received_at_ms: 1_700_000_000_000,
                 review_run_id: None,
@@ -215,6 +225,7 @@ mod tests {
         };
 
         let metadata = RequestMetadata {
+            official_cache_affinity: Default::default(),
             request_id: "req-2".into(),
             received_at_ms: 1_700_000_000_000,
             review_run_id: None,

@@ -379,6 +379,7 @@ pub struct ProxyRuntime {
     lifecycle: Arc<dyn RequestLifecycle>,
     transport: Arc<dyn UpstreamTransport>,
     history: Arc<dyn HistoryStore>,
+    official_replay: Arc<crate::official_replay::OfficialReplayCache>,
     /// Shared Grok session/turn-index registry (moved out of Desktop's
     /// per-caller bookkeeping ??see `crate::grok_session`). One instance per
     /// running `ProxyRuntime`, so Desktop and the headless daemon each get
@@ -835,6 +836,7 @@ impl ProxyRuntime {
             lifecycle,
             transport,
             history: Arc::new(MemoryHistoryStore::new()),
+            official_replay: Arc::new(crate::official_replay::OfficialReplayCache::default()),
             grok_sessions: Arc::new(GrokSessionRegistry::new()),
             opencode_quota: Arc::new(crate::opencode::OpenCodeQuotaCooldown::new()),
             usage: Arc::new(MemoryUsageStore::new()),
@@ -3766,6 +3768,7 @@ impl ProxyRuntime {
                 &request.body,
                 &mut execution_body,
                 official_handoff,
+                current_official_realm.as_deref(),
             )?
         };
         let portable_replay = hydration.continuation_mode
@@ -4539,6 +4542,7 @@ impl ProxyRuntime {
                         &request.body,
                         &conversation_key,
                         &encoded_body,
+                        Some(&request.metadata),
                     ),
                     body: encoded_body.clone(),
                     timeout: non_streaming_timeout(route),
@@ -4580,6 +4584,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: non_streaming_timeout(route),
@@ -4639,6 +4644,7 @@ impl ProxyRuntime {
                                         &request.body,
                                         &conversation_key,
                                         &encoded_body,
+                                        Some(&request.metadata),
                                     ),
                                     body: encoded_body.clone(),
                                     timeout: non_streaming_timeout(route),
@@ -4682,6 +4688,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: non_streaming_timeout(route),
@@ -4714,6 +4721,13 @@ impl ProxyRuntime {
             continuation_realm.as_deref(),
         )
         .map_err(RuntimeError::History)?;
+        if route.provider_kind == RuntimeProviderKind::Official {
+            let wire_body: Value = serde_json::from_slice(&encoded_body)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            self.official_replay.record(
+                &wire_body, &normalized, &route.route_id, continuation_realm.as_deref(),
+            );
+        }
         // M7: usage accounting mirrors Desktop's per-request ledger. Routed
         // through the same atomic terminal guard every streaming path uses
         // (`finish_terminal_once_with_record`), so a buffered success also
@@ -5069,6 +5083,7 @@ impl ProxyRuntime {
                         &request.body,
                         &conversation_key,
                         &encoded_body,
+                        Some(&request.metadata),
                     ),
                     body: encoded_body,
                     timeout: non_streaming_timeout(route),
@@ -5587,6 +5602,7 @@ impl ProxyRuntime {
                         &request.body,
                         &conversation_key,
                         &encoded_body,
+                        Some(&request.metadata),
                     ),
                     body: encoded_body.clone(),
                     timeout: None,
@@ -5683,6 +5699,7 @@ impl ProxyRuntime {
                 &request.body,
                 &conversation_key,
                 &encoded_body,
+                Some(&request.metadata),
             ),
             body: encoded_body.clone(),
             timeout: None,
@@ -5839,6 +5856,7 @@ impl ProxyRuntime {
                 &request.body,
                 &conversation_key,
                 &encoded_body,
+                Some(&request.metadata),
             ),
             body: encoded_body.clone(),
             // Streaming has no overall deadline; the caller enforces
@@ -5927,6 +5945,7 @@ impl ProxyRuntime {
                                     &request.body,
                                     &conversation_key,
                                     &encoded_body,
+                                    Some(&request.metadata),
                                 ),
                                 body: encoded_body.clone(),
                                 timeout: None,
@@ -5984,6 +6003,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: None,
@@ -6034,6 +6054,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: None,
@@ -6133,6 +6154,7 @@ impl ProxyRuntime {
                             &parent_request_id,
                             &execution_id,
                             request_body,
+                            dispatch_body,
                             conversation_key,
                             upstream,
                             control_account_hash,
@@ -7223,6 +7245,7 @@ impl ProxyRuntime {
         parent_request_id: &str,
         execution_id: &str,
         request_body: Value,
+        wire_body: Value,
         conversation_key: String,
         upstream: UpstreamStream,
         control_account_hash: Option<String>,
@@ -7234,6 +7257,7 @@ impl ProxyRuntime {
         agent_attribution: Option<crate::usage::AgentUsageAttribution>,
     ) -> impl futures_util::Stream<Item = Result<Bytes, RuntimeError>> + 'static {
         let history = self.history.clone();
+        let official_replay = self.official_replay.clone();
         let usage = self.usage.clone();
         let parent_cancel = Arc::clone(&self.parent_cancel);
         let parent_request_id = parent_request_id.to_string();
@@ -7282,6 +7306,7 @@ impl ProxyRuntime {
                                     continuation_realm.as_deref(),
                                 ) {
                                     Ok(_) => {
+                                        official_replay.record(&wire_body, &response, &route_id, continuation_realm.as_deref());
                                         terminal_response_recorded = true;
                                         yield ok(bytes);
                                     }
@@ -7375,6 +7400,8 @@ impl ProxyRuntime {
                     ) {
                         let message = format!("history durability failed: {error}");
                         yield ok(Bytes::from(failed_sse_event(&message)));
+                    } else {
+                        official_replay.record(&wire_body, &response, &route_id, continuation_realm.as_deref());
                     }
                 }
             }
@@ -7393,6 +7420,7 @@ impl ProxyRuntime {
         request: &Value,
         body: &mut Value,
         force_portable: bool,
+        current_official_realm: Option<&str>,
     ) -> Result<HydrationOutcome, RuntimeError> {
         // First-turn store:false / ZDR on Official must request encrypted
         // reasoning even without a previous_response_id, so a later stateless
@@ -7411,6 +7439,21 @@ impl ProxyRuntime {
         else {
             return Ok(HydrationOutcome::first_turn(input_len));
         };
+        // A bridge strips previous_response_id, but same-account replay is
+        // still a native wire contract. Durable portable projections cannot
+        // preserve its prefix (developer/image/opaque items were filtered).
+        if force_portable && route.provider_kind == RuntimeProviderKind::Official {
+            if let Some(entry) =
+                self.official_replay
+                    .get(previous, &route.route_id, current_official_realm)
+            {
+                return Ok(crate::replay::hydrate_input_with_mode(
+                    body,
+                    &[entry],
+                    ContinuationMode::PortableSemanticReplay,
+                ));
+            }
+        }
         let chain = self
             .history
             .get_chain(previous)
@@ -8424,6 +8467,7 @@ async fn open_chat_continuation_stream(
                 request_body,
                 conversation_key,
                 &encoded_body,
+                None,
             ),
             body: encoded_body,
             timeout: None,
@@ -8459,9 +8503,25 @@ fn json_upstream_headers(
     inbound_body: &Value,
     conversation_key: &str,
     upstream_body: &[u8],
+    metadata: Option<&RequestMetadata>,
 ) -> Vec<(String, String)> {
     let mut headers = auth.upstream_headers(&route.upstream_model);
     headers.push(("content-type".into(), "application/json".into()));
+    if route.provider_kind == RuntimeProviderKind::Official {
+        if let Some(metadata) = metadata {
+            for (name, value) in [
+                ("session-id", &metadata.official_cache_affinity.session_id),
+                (
+                    "session_id",
+                    &metadata.official_cache_affinity.session_id_legacy,
+                ),
+            ] {
+                if let Some(value) = value {
+                    headers.push((name.into(), value.clone()));
+                }
+            }
+        }
+    }
     if route.effective_provider_profile().is_some() {
         headers.extend(crate::opencode::identity_headers(
             inbound_body,
@@ -9400,6 +9460,7 @@ mod tests {
             &serde_json::json!({}),
             "conversation-test",
             b"{}",
+            None,
         );
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-type") && value == "application/json"
@@ -9418,6 +9479,7 @@ mod tests {
             &serde_json::json!({"model": "deepseek-v4.1-flash"}),
             raw_conversation_key,
             br#"{"model":"deepseek-v4.1-flash"}"#,
+            None,
         );
         let session = headers
             .iter()
@@ -11351,6 +11413,174 @@ mod tests {
                 && replay.contains("prior answer")
                 && replay.contains("continue")
         );
+    }
+
+    #[tokio::test]
+    async fn review_bridge_history_keeps_exact_input_prefix() {
+        for (streaming, full_history) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            run_review_bridge_cache(streaming, full_history).await;
+        }
+    }
+
+    async fn run_review_bridge_cache(streaming: bool, full_history: bool) {
+        let response = json!({"id":"resp_review_cache_1","status":"completed","output":[
+            {"type":"message","id":"msg_review_1","role":"assistant","content":[
+                {"type":"output_text","text":"{\"outcome\":\"allow\"}"}]}]});
+        let upstream_response = |response: &Value| UpstreamResponse {
+            status: 200,
+            headers: vec![],
+            body: if streaming {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":response})
+                )
+                .into_bytes()
+            } else {
+                serde_json::to_vec(response).unwrap()
+            },
+        };
+        let transport = Arc::new(RecordingTransport::new(vec![
+            upstream_response(&response),
+            upstream_response(
+                &json!({"id":"resp_review_cache_2","status":"completed","output":[]}),
+            ),
+        ]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let mut first = json!({"model":"vlm-test","prompt_cache_key":"guardian:parent", "store":false,
+            "instructions":"You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}],
+            "input":[{"type":"message","role":"developer","content":"Stable environment instructions"},
+                {"type":"reasoning","id":"rs_cache","encrypted_content":"opaque-cache-state"},
+                {"type":"message","role":"user","content":"Long stable parent transcript"}]});
+        first["stream"] = json!(streaming);
+        first["include"] = json!(["reasoning.encrypted_content"]);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("session-id", "review-session".parse().unwrap());
+        headers.insert("session_id", "review-legacy-session".parse().unwrap());
+        let mut req = request(first.clone());
+        req.metadata = crate::server::build_request_metadata(
+            &headers,
+            &first,
+            RuntimeEndpoint::Responses,
+            Some("bridge".into()),
+        );
+        if let RuntimeResponse::Sse(mut stream) =
+            runtime.execute(req, "review_cache_1").await.unwrap()
+        {
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+        }
+        let mut second = first.clone();
+        second["previous_response_id"] = json!("resp_review_cache_1");
+        let next = json!({"type":"message","role":"user","content":"Next planned action"});
+        second["input"] = if full_history {
+            let mut items = first["input"].as_array().unwrap().clone();
+            items.extend(response["output"].as_array().unwrap().iter().cloned());
+            items.push(next);
+            json!(items)
+        } else {
+            json!([next])
+        };
+        let mut req = request(second.clone());
+        req.metadata = crate::server::build_request_metadata(
+            &headers,
+            &second,
+            RuntimeEndpoint::Responses,
+            Some("bridge".into()),
+        );
+        req.metadata.force_portable_official_handoff = true;
+        if let RuntimeResponse::Sse(mut stream) =
+            runtime.execute(req, "review_cache_2").await.unwrap()
+        {
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+        }
+        let sent = transport.requests.lock().unwrap();
+        let before: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        let after: Value = serde_json::from_slice(&sent[1].body).unwrap();
+        for field in ["instructions", "tools", "prompt_cache_key"] {
+            assert_eq!(before[field], after[field]);
+        }
+        let count = before["input"].as_array().unwrap().len();
+        let prefix = &after["input"].as_array().unwrap()[..count];
+        let a = serde_json::to_vec(&before["input"]).unwrap();
+        let b = serde_json::to_vec(prefix).unwrap();
+        let mismatch = a.iter().zip(&b).position(|(a, b)| a != b);
+        assert!(
+            a == b,
+            "replayed input prefix changed at byte {mismatch:?}; lengths {} / {}",
+            a.len(),
+            b.len()
+        );
+        assert_eq!(after["input"][count], response["output"][0]);
+        assert!(after.get("previous_response_id").is_none());
+        assert_eq!(
+            after["input"].as_array().unwrap().len(),
+            count + 2,
+            "no duplicate client history"
+        );
+        for request in sent.iter() {
+            for (name, value) in [
+                ("session-id", "review-session"),
+                ("session_id", "review-legacy-session"),
+            ] {
+                assert!(request
+                    .headers
+                    .iter()
+                    .any(|pair| pair.0 == name && pair.1 == value));
+            }
+        }
+        let persisted = runtime.history.get_chain("resp_review_cache_1").unwrap();
+        assert!(
+            !serde_json::to_string(&persisted)
+                .unwrap()
+                .contains("opaque-cache-state"),
+            "wire cache must never persist opaque state"
+        );
+    }
+
+    #[tokio::test]
+    async fn official_http_keeps_only_explicit_cache_affinity_headers() {
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let body = json!({"model":"vlm-test","input":"hello","prompt_cache_key":"guardian:parent"});
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("session-id", "stable-session".parse().unwrap());
+        headers.insert("session_id", "stable-legacy-session".parse().unwrap());
+        headers.insert("x-secret-unrelated", "do-not-forward".parse().unwrap());
+        let mut req = request(body.clone());
+        req.metadata = crate::server::build_request_metadata(
+            &headers,
+            &body,
+            RuntimeEndpoint::Responses,
+            Some("ws_bridge".into()),
+        );
+        let third_party_headers = json_upstream_headers(
+            &ResolvedAuth::None, &sample_route(None), &body, "conversation", b"{}", Some(&req.metadata),
+        );
+        assert!(!third_party_headers.iter().any(|pair| pair.0 == "session-id" || pair.0 == "session_id"));
+        runtime.execute(req, "cache_headers").await.unwrap();
+        let sent = transport.requests.lock().unwrap();
+        for (name, value) in [
+            ("session-id", "stable-session"),
+            ("session_id", "stable-legacy-session"),
+        ] {
+            assert!(
+                sent[0]
+                    .headers
+                    .iter()
+                    .any(|pair| pair.0 == name && pair.1 == value),
+                "missing {name}"
+            );
+        }
+        assert!(!sent[0]
+            .headers
+            .iter()
+            .any(|pair| pair.0 == "x-secret-unrelated"));
     }
 
     #[tokio::test]
