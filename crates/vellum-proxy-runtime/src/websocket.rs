@@ -1924,7 +1924,14 @@ fn websocket_handshake_error(
     match status {
         401 | 403 => RuntimeError::ProviderUnauthorized(message),
         429 => RuntimeError::provider_quota(message, None, true),
-        400 | 408 | 409 | 425 | 426 => RuntimeError::ProviderProtocol(message),
+        400 if diagnostic.to_ascii_lowercase().contains("quota") => {
+            RuntimeError::provider_quota(message, None, true)
+        }
+        408 | 409 | 425 | 426 => RuntimeError::ProviderProtocol(message),
+        _ if (400..500).contains(&status) => RuntimeError::ProviderRequestRejected {
+            upstream_status: status,
+            message,
+        },
         500..=599 => RuntimeError::ProviderUnavailable(message),
         _ => RuntimeError::ProviderProtocol(message),
     }
@@ -2453,21 +2460,19 @@ pub async fn send_websocket_failure(client: &mut WebSocket, message: &str) -> bo
         .is_ok()
 }
 
+/// Codex parses `response.failed.error` with a string `code`; a numeric one
+/// fails that parse, so the turn surfaced only "response.failed event
+/// received" and Vellum's message was lost. Codex then retries every
+/// failure, so a request Vellum rejects as malformed (HTTP 400 on the HTTP
+/// transport, which Codex treats as fatal) carries `invalid_prompt`, the
+/// code Codex maps to the same non-retryable invalid-request error. The HTTP
+/// status stays available as `status`.
+fn runtime_failure_event(error: &RuntimeError) -> Value {
+    error.to_response_failed_event()
+}
+
 async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> bool {
-    let value = json!({
-        "type": "response.failed",
-        "sequence_number": 0,
-        "response": {
-            "object": "response",
-            "status": "failed",
-            "error": {
-                "type": "vellum_proxy_error",
-                "code": error.http_status().as_u16(),
-                "category": error.category(),
-                "message": error.to_string()
-            }
-        }
-    });
+    let value = runtime_failure_event(error);
     client
         .send(AxumWsMessage::Text(value.to_string().into()))
         .await
@@ -2487,6 +2492,48 @@ mod tests {
     use axum::Router;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn runtime_failure_code_is_a_string_and_malformed_requests_are_final() {
+        let invalid = runtime_failure_event(&RuntimeError::InvalidRequest("bad shape".into()));
+        let error = &invalid["response"]["error"];
+        assert_eq!(error["code"], "invalid_prompt");
+        assert_eq!(error["status"], 400);
+        assert_eq!(error["category"], "invalid_request");
+        assert!(error["message"].as_str().unwrap().contains("bad shape"));
+
+        let unauthorized =
+            runtime_failure_event(&RuntimeError::ProviderUnauthorized("free tier".into()));
+        let error = &unauthorized["response"]["error"];
+        assert_eq!(error["code"], "provider_unauthorized");
+        assert_eq!(error["status"], 401);
+        assert!(error["code"].is_string());
+    }
+
+    #[test]
+    fn official_handshake_rejections_keep_fatal_and_retryable_codes() {
+        for (status, message, code) in [
+            (400, "Unsupported parameter", "invalid_prompt"),
+            (422, "Invalid input", "invalid_prompt"),
+            (400, "quota exhausted", "provider_quota"),
+            (401, "denied", "provider_unauthorized"),
+            (403, "denied", "provider_unauthorized"),
+            (429, "limited", "provider_quota"),
+            (408, "try later", "provider_protocol"),
+            (409, "try later", "provider_protocol"),
+            (425, "try later", "provider_protocol"),
+            (426, "upgrade", "provider_protocol"),
+            (503, "unavailable", "provider_unavailable"),
+        ] {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(Some(message.as_bytes().to_vec()))
+                .unwrap();
+            let event = runtime_failure_event(&websocket_handshake_error(response));
+            assert_eq!(event["response"]["error"]["code"], code);
+            assert!(event["response"]["error"]["code"].is_string());
+        }
+    }
 
     #[test]
     fn response_create_discriminator_is_preserved_for_route_selection() {
@@ -4955,14 +5002,22 @@ mod tests {
         upstream_task.abort();
     }
 
-    #[tokio::test]
-    async fn third_party_websocket_surfaces_http_426_as_response_failed() {
+    async fn assert_portable_upstream_rejection(
+        status: u16,
+        expected_status: u16,
+        expected_code: &str,
+    ) {
         use axum::http::StatusCode;
         use axum::routing::post;
 
         let upstream = Router::new().route(
             "/v1/responses",
-            post(|| async { StatusCode::from_u16(426).expect("426") }),
+            post(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    axum::Json(json!({"error": {"message": "Unsupported parameter: previous_response_id"}})),
+                )
+            }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = upstream_listener.local_addr().unwrap();
@@ -5031,7 +5086,7 @@ mod tests {
             .unwrap();
         let failed = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
             .await
-            .expect("426 must fail the turn immediately")
+            .expect("upstream rejection must fail the turn immediately")
             .unwrap()
             .unwrap();
         let TungsteniteMessage::Text(text) = failed else {
@@ -5039,24 +5094,75 @@ mod tests {
         };
         let event: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(event["type"], "response.failed");
+        assert_eq!(event["response"]["error"]["code"], expected_code);
+        assert!(event["response"]["error"]["code"].is_string());
+        assert_eq!(event["response"]["error"]["status"], expected_status);
+        if expected_status == 400 {
+            assert_eq!(event["response"]["error"]["upstream_status"], status);
+        }
         assert_eq!(event["response"]["error"]["category"], "provider_protocol");
         assert!(
             event["response"]["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("426")),
+                .is_some_and(|message| message.contains(&status.to_string())),
             "{event}"
         );
         let records = runtime.usage_records().unwrap();
         assert!(
             records.iter().any(|record| {
-                record.route_id == "grok-cli" && record.status == 502 && record.error.is_some()
+                record.route_id == "grok-cli"
+                    && record.status == expected_status
+                    && record.error.is_some()
             }),
             "failed Grok turns must land in usage: {records:?}"
         );
 
+        let http = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .json(&json!({"model": "vlm-grok", "input": [{"role": "user", "content": "hi"}], "stream": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(http.status().as_u16(), expected_status);
+        let payload: Value = http.json().await.unwrap();
+        assert_eq!(payload["error"]["code"], expected_status);
+        assert_eq!(payload["error"]["category"], "provider_protocol");
+        if expected_status == 400 {
+            assert_eq!(payload["error"]["upstream_status"], status);
+        }
+        let streaming = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .json(&json!({"model": "vlm-grok", "input": [{"role": "user", "content": "hi"}], "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(streaming.status().as_u16(), 200);
+        let transcript = streaming.text().await.unwrap();
+        let event: Value = transcript
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["type"] == "response.failed")
+            .expect("terminal failure event");
+        assert_eq!(event["response"]["error"]["code"], expected_code);
+        assert!(event["response"]["error"]["code"].is_string());
+        assert_eq!(event["response"]["error"]["status"], expected_status);
         let _ = client.close(None).await;
         proxy_task.abort();
         upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn third_party_websocket_upstream_400_is_a_string_invalid_prompt_and_http_400() {
+        assert_portable_upstream_rejection(400, 400, "invalid_prompt").await;
+        assert_portable_upstream_rejection(422, 400, "invalid_prompt").await;
+    }
+
+    #[tokio::test]
+    async fn third_party_websocket_surfaces_http_426_as_response_failed() {
+        for status in [408, 409, 425, 426] {
+            assert_portable_upstream_rejection(status, 502, "provider_protocol").await;
+        }
     }
 
     #[tokio::test]

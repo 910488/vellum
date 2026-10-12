@@ -9018,12 +9018,19 @@ fn provider_error_for_status_with_retry(
                     upstream_attempted,
                 )
             } else {
-                RuntimeError::ProviderProtocol(format!("upstream HTTP {status}: {diagnostic}"))
+                RuntimeError::ProviderRequestRejected {
+                    upstream_status: status,
+                    message: diagnostic,
+                }
             }
         }
         408 | 409 | 425 | 426 => {
             RuntimeError::ProviderProtocol(format!("upstream HTTP {status}: {diagnostic}"))
         }
+        _ if (400..500).contains(&status) => RuntimeError::ProviderRequestRejected {
+            upstream_status: status,
+            message: diagnostic,
+        },
         _ if (500..600).contains(&status) => RuntimeError::ProviderUnavailable(diagnostic),
         _ => RuntimeError::ProviderProtocol(format!("upstream HTTP {status}: {diagnostic}")),
     }
@@ -10733,6 +10740,43 @@ mod tests {
         assert!(message.contains("bad request"), "{message}");
         assert!(message.contains("invalid"), "{message}");
         assert!(message.contains("Input must be a list"), "{message}");
+    }
+
+    #[test]
+    fn upstream_rejections_preserve_fatal_and_retryable_classes() {
+        for status in [400, 404, 405, 413, 415, 422] {
+            let error =
+                provider_error_for_status(status, "Unsupported parameter: previous_response_id");
+            assert!(
+                matches!(error, RuntimeError::ProviderRequestRejected { upstream_status, .. } if upstream_status == status)
+            );
+            assert_eq!(error.http_status().as_u16(), 400);
+            assert_eq!(error.to_error_payload()["error"]["upstream_status"], status);
+            assert_eq!(error.category(), "provider_protocol");
+        }
+        for status in [408, 409, 425, 426] {
+            let error = provider_error_for_status(status, "try later");
+            assert!(matches!(error, RuntimeError::ProviderProtocol(_)));
+            assert_eq!(error.http_status().as_u16(), 502);
+        }
+        for status in [401, 403] {
+            assert!(matches!(
+                provider_error_for_status(status, "denied"),
+                RuntimeError::ProviderUnauthorized(_)
+            ));
+        }
+        for status in [400, 429] {
+            assert!(matches!(
+                provider_error_for_status(status, "quota exhausted"),
+                RuntimeError::ProviderQuota { .. }
+            ));
+        }
+        for status in [500, 502, 503] {
+            assert_eq!(
+                provider_error_for_status(status, "failed").category(),
+                "provider_unavailable"
+            );
+        }
     }
 
     #[test]
