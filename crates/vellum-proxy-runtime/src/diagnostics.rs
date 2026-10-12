@@ -163,6 +163,18 @@ pub enum OfficialReasoningSummaryAction {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialRequestPrepared {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tool_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tool_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tools_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tool_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tool_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tools_hash: Option<String>,
     pub request_id: String,
     pub route_id: String,
     pub catalog_id: String,

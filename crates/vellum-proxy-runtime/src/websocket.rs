@@ -3160,11 +3160,18 @@ mod tests {
                 2,
             );
         }
+        let tools = json!([serde_json::from_str::<Value>(
+            include_str!("../tests/fixtures/code-mode-exec.json")).unwrap()]);
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
+                    "tools": tools, "tool_choice":"auto", "parallel_tool_calls":true,
+                    "include":["reasoning.encrypted_content"],
+                    "text":{"format":{"type":"text"}},
+                    "reasoning":{"effort":"high","summary":"auto"},
+                    "prompt_cache_key":"account-switch-contract",
                     "previous_response_id": if mode == "missing" { "resp_not_in_history" } else { "resp_account_a" },
                     "instructions": if mode.starts_with("bridge") {
                         "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
@@ -3240,6 +3247,19 @@ mod tests {
             "old account response id must not reach the new account: {}",
             requests[0].1
         );
+        if mode != "missing" {
+            let body = &requests[0].1;
+            assert_eq!(body["tools"], tools, "mode={mode}");
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["parallel_tool_calls"], true);
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(body["text"], json!({"format":{"type":"text"}}));
+            assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+            assert_eq!(body["prompt_cache_key"], "account-switch-contract");
+            assert_eq!(body["instructions"], if mode.starts_with("bridge") {
+                "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
+            } else { "be brief" });
+        }
         let rows = runtime.usage_records().unwrap();
         let row = rows.last().unwrap();
         assert_eq!(row.upstream_attempted, Some(true));
@@ -3849,6 +3869,10 @@ mod tests {
             }
         }
 
+        let tools = json!([serde_json::from_str::<Value>(include_str!(
+            "../tests/fixtures/code-mode-exec.json"
+        ))
+        .unwrap()]);
         let warmup = send_and_complete(
             &mut client,
             json!({
@@ -3857,6 +3881,7 @@ mod tests {
                 "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
                 "input": [{"role": "user", "content": "first"}],
                 "stream": false,
+                "tools": [], "tool_choice": "none",
                 "generate": false
             }),
         )
@@ -3875,7 +3900,14 @@ mod tests {
                 "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
                 "previous_response_id": warmup_id,
                 "input": [{"role": "user", "content": "second"}],
-                "stream": false
+                "stream": false,
+                "tools": tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": true,
+                "include": ["reasoning.encrypted_content"],
+                "text": {"format":{"type":"text"}},
+                "reasoning": {"effort":"high","summary":"auto"},
+                "prompt_cache_key":"bridge-contract"
             }),
         )
         .await;
@@ -3884,6 +3916,23 @@ mod tests {
         let bodies = bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 1, "{bodies:?}");
         let upstream_body = &bodies[0];
+        if official {
+            assert_eq!(upstream_body["tools"], tools);
+            assert_eq!(upstream_body["tool_choice"], "auto");
+            assert_eq!(upstream_body["parallel_tool_calls"], true);
+            assert_eq!(
+                upstream_body["include"],
+                json!(["reasoning.encrypted_content"])
+            );
+            assert_eq!(upstream_body["text"], json!({"format":{"type":"text"}}));
+            assert_eq!(
+                upstream_body["reasoning"],
+                json!({"effort":"high","summary":"auto"})
+            );
+            assert_eq!(upstream_body["prompt_cache_key"], "bridge-contract");
+            assert_eq!(upstream_body["instructions"],
+                "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy");
+        }
         assert!(upstream_body.get("generate").is_none(), "{upstream_body}");
         assert!(
             upstream_body.get("previous_response_id").is_none(),

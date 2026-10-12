@@ -1325,8 +1325,26 @@ impl ProxyRuntime {
         let effective_reasoning_summary = official_reasoning_summary_label(effective_body);
         let summary_omitted = requested_reasoning_summary.as_deref() == Some("none")
             && effective_reasoning_summary.is_none();
+        // Capture the actual inbound declaration, before hydrate/sanitize.
+        // Counts, byte lengths and hashes reveal contract loss without logging
+        // descriptions, schemas, instructions, credentials or prompt text.
+        let tools_manifest = |body: &Value| {
+            body.get("tools").map(|tools| {
+                let encoded = serde_json::to_string(tools).unwrap_or_default();
+                (tools.as_array().map_or(0, |tools| tools.len() as u64),
+                 encoded.len() as u64, sha256_hex(&encoded))
+            })
+        };
+        let requested_tools = tools_manifest(&request.body);
+        let effective_tools = tools_manifest(effective_body);
         self.record_diagnostic(DiagnosticEvent::OfficialRequestPrepared(
             OfficialRequestPrepared {
+                requested_tool_count: requested_tools.as_ref().map(|tools| tools.0),
+                requested_tool_bytes: requested_tools.as_ref().map(|tools| tools.1),
+                requested_tools_hash: requested_tools.as_ref().map(|tools| tools.2.clone()),
+                effective_tool_count: effective_tools.as_ref().map(|tools| tools.0),
+                effective_tool_bytes: effective_tools.as_ref().map(|tools| tools.1),
+                effective_tools_hash: effective_tools.as_ref().map(|tools| tools.2.clone()),
                 request_id: request.metadata.request_id.clone(),
                 route_id: route.route_id.clone(),
                 catalog_id: route.catalog_id.clone(),
@@ -3757,7 +3775,12 @@ impl ProxyRuntime {
         let mut replay = hydration.replay_context();
         if official_handoff {
             let before = crate::request::request_input_items(&execution_body);
-            sanitize_for_official(&mut execution_body);
+            // Only conversation items cross the continuation realm. Request
+            // controls and tool schemas are caller-owned, even when schema
+            // properties happen to share names with provider-owned fields.
+            if let Some(input) = execution_body.get_mut("input") {
+                sanitize_for_official(input);
+            }
             let after = crate::request::request_input_items(&execution_body);
             realign_identities_after_item_filter(&mut replay, &before, &after)?;
         }
@@ -11327,6 +11350,117 @@ mod tests {
             replay.contains("original task")
                 && replay.contains("prior answer")
                 && replay.contains("continue")
+        );
+    }
+
+    #[tokio::test]
+    async fn official_handoff_preserves_desktop_tool_contract() {
+        for (force, code_mode) in [(false, false), (true, false), (false, true), (true, true)] {
+            let history = Arc::new(MemoryHistoryStore::new());
+            history.record_exchange_with_context(
+                &json!({"model":"vlm-test","instructions":"obsolete instructions", "tools":[], "tool_choice":"none", "input":[{"role":"user","content":"original task"}]}),
+                &json!({"id":"resp_contract_old","output":[{"role":"assistant","content":"prior answer"}]}),
+                "route-1", None, Some("old-account-realm")).unwrap();
+            let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+            let events = Arc::new(RecordingStore::new());
+            let runtime = official_runtime_with_transport(transport.clone())
+                .with_history_store(history)
+                .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
+            let mut original = json!({
+                "model":"vlm-test", "previous_response_id":"resp_contract_old",
+                "instructions":"Keep using the declared tools to complete the task.",
+                "tools":[
+                    {"type":"function","name":"exec_command","description":"Run a shell command",
+                     "parameters":{"type":"object","properties":{"cmd":{"type":"string"},
+                         "reasoning_content":{"type":"string"}},"required":["cmd"],"additionalProperties":false}},
+                    {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
+                    {"type":"namespace","name":"mcp","description":"Connected tools", "tools":[
+                        {"type":"function","name":"read","parameters":{"type":"object","properties":{}}}]},
+                    {"type":"web_search","search_context_size":"medium"}
+                ],
+                "tool_choice":"auto", "parallel_tool_calls":true,
+                "include":["reasoning.encrypted_content"],
+                "text":{"format":{"type":"text"}}, "reasoning":{"effort":"high","summary":"auto"},
+                "prompt_cache_key":"desktop-thread", "store":false,
+                "input":[{"type":"reasoning","id":"rs_valid","encrypted_content":"opaque-ciphertext"},
+                    {"type":"reasoning","id":"foreign_reasoning","summary":[{"type":"summary_text","text":"foreign summary"}]},
+                    {"type":"message","role":"user","content":"continue"}]
+            });
+            if code_mode {
+                original["tools"] = json!([serde_json::from_str::<Value>(include_str!(
+                    "../tests/fixtures/code-mode-exec.json"
+                ))
+                .unwrap()]);
+            }
+            let mut req = request(original.clone());
+            req.metadata.force_portable_official_handoff = force;
+            assert!(matches!(
+                runtime.prepare_websocket_turn(&req).await.unwrap().dispatch,
+                WebSocketTurnDispatch::PortableReplay {
+                    force_official_handoff: true
+                }
+            ));
+            runtime.execute(req, "handoff_contract").await.unwrap();
+            let sent = transport.requests.lock().unwrap();
+            let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+            for (key, value) in original.as_object().unwrap() {
+                if !["model", "input", "previous_response_id"].contains(&key.as_str()) {
+                    assert_eq!(&body[key], value, "handoff force={force}, field={key}");
+                }
+            }
+            assert!(body.get("previous_response_id").is_none());
+            assert!(body["input"].to_string().contains("original task"));
+            assert!(body["input"].as_array().unwrap().iter().any(|item|
+                item["id"] == "rs_valid" && item["encrypted_content"] == "opaque-ciphertext"));
+            assert!(!body["input"].to_string().contains("foreign summary"));
+            let recorded = events.events.lock().unwrap();
+            let manifest = recorded.iter().rev().find_map(|event| match event {
+                DiagnosticEvent::OfficialRequestPrepared(prepared) => Some(prepared),
+                _ => None,
+            }).unwrap();
+            let tools = original["tools"].to_string();
+            assert_eq!(manifest.requested_tool_count, Some(if code_mode {1} else {4}));
+            assert_eq!(manifest.requested_tool_count, manifest.effective_tool_count);
+            assert_eq!(manifest.requested_tool_bytes, Some(tools.len() as u64));
+            assert_eq!(manifest.requested_tool_bytes, manifest.effective_tool_bytes);
+            assert_eq!(manifest.requested_tools_hash, Some(sha256_hex(&tools)));
+            assert_eq!(manifest.requested_tools_hash, manifest.effective_tools_hash);
+
+        }
+    }
+
+    #[tokio::test]
+    async fn official_capacity_429_does_not_retry_or_change_execution_account() {
+        let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+            status: 429,
+            headers: vec![("retry-after".into(), "3".into())],
+            body: br#"{"error":{"message":"Codex is at capacity, please try again later","code":"turn_rate_limit_exceeded"}}"#.to_vec(),
+        }, scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let error = runtime
+            .execute(
+                request(json!({"model":"vlm-test","input":"first"})),
+                "capacity_first",
+            )
+            .await
+            .unwrap_err();
+        // ProviderQuota includes transient upstream rate limits; it does not
+        // mark an Official account exhausted or install OpenCode cooldowns.
+        assert_eq!(error.http_status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.retry_after_secs(), Some(3));
+        assert!(error.to_string().contains("turn_rate_limit_exceeded"));
+        runtime
+            .execute(
+                request(json!({"model":"vlm-test","input":"retry"})),
+                "capacity_retry",
+            )
+            .await
+            .unwrap();
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 2, "one upstream attempt per downstream request");
+        assert_eq!(
+            sent[0].headers, sent[1].headers,
+            "same authorization snapshot"
         );
     }
 
