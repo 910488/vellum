@@ -13,15 +13,21 @@ import matplotlib.pyplot as plt
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--replay-exe", required=True)
-    parser.add_argument("--database", required=True)
+    parser.add_argument("--replay-exe")
+    parser.add_argument("--input-json", type=Path)
+    parser.add_argument("--database")
     parser.add_argument("--model")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    command = [args.replay_exe, args.database]
-    if args.model:
-        command.append(args.model)
-    results = json.loads(subprocess.check_output(command))
+    if args.input_json:
+        results = json.loads(args.input_json.read_text(encoding="utf-8"))
+    else:
+        if not args.replay_exe or not args.database:
+            parser.error("provide --input-json or both --replay-exe and --database")
+        command = [args.replay_exe, args.database]
+        if args.model:
+            command.append(args.model)
+        results = json.loads(subprocess.check_output(command))
     args.output.mkdir(parents=True, exist_ok=True)
     # Contains only aggregate counters and hourly dispersion, no identities,
     # request times, per-request token counts, or original account hashes.
