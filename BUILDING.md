@@ -197,8 +197,9 @@ cannot drift to different Enhanced Core commits during one release run.
 
 Windows self-updates launch NSIS with `/P /UPDATE /R` (passive progress, then
 relaunch). The preinstall hook retires bridge/core/relay images with unique
-`.old-*` names before writing their replacements; a failed rename aborts the
-installation after relaunching the existing Desktop so the user is not left
+`.old-*` names before writing their replacements; a failed rename restores
+this run's retired images in reverse order, then aborts the installation
+after relaunching the existing Desktop so the user is not left
 without Vellum. Startup checks the packaged bridge against this host's embedded
 digest before marking the Desktop update applied. An incomplete install stays
 failed across background checks unless a strictly newer release supersedes the

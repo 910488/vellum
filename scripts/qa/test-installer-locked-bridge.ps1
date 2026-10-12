@@ -62,7 +62,7 @@ Section
   FileOpen `$R2 "`$INSTDIR\retired-suffix.txt" w
   FileWrite `$R2 "`$R0-`$R1"
   FileClose `$R2
-  !insertmacro VELLUM_RETIRE_IMAGE "binaries\vellum-codex-app-server.exe"
+  !insertmacro VELLUM_RETIRE_SIDECARS
   SetOutPath "`$INSTDIR\binaries"
   File /oname=vellum-codex-app-server.exe "$newImage"
   IfErrors 0 +3
@@ -98,7 +98,35 @@ SectionEnd
     }
     $relaunched = Get-Process -Id ([int][IO.File]::ReadAllText($pidFile))
     if ($relaunched.HasExited) { throw 'relaunched fake desktop is not running' }
-    Write-Output "PASS: locked overwrite rejected; Rename installed new bytes; failed Rename relaunched the existing desktop. Artifacts: $testRoot"
+    $locked.Dispose()
+    $locked = $null
+    Stop-Process -Id $relaunched.Id
+    $relaunched.WaitForExit()
+    $partialRoot = Join-Path $testRoot 'partial-install'
+    $partialBin = Join-Path $partialRoot 'binaries'
+    New-Item -ItemType Directory -Path $partialBin | Out-Null
+    $partialBridge = Join-Path $partialBin 'vellum-codex-app-server.exe'
+    $partialCore = Join-Path $partialBin 'vellum-enhanced-codex.exe'
+    Copy-Item -LiteralPath $bridge -Destination $partialBridge
+    Copy-Item -LiteralPath $newImage -Destination (Join-Path $partialRoot 'vellum-proxy-desktop.exe')
+    [IO.File]::WriteAllBytes($partialCore, [byte[]](1, 2, 3))
+    $coreHash = (Get-FileHash -LiteralPath $partialCore).Hash
+    $locked = [IO.File]::Open($partialCore, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $setup = Start-Process -FilePath $installer -ArgumentList @('/S', ('/D=' + $partialRoot)) -WindowStyle Hidden -PassThru
+    if (!$setup.WaitForExit(10000)) { throw 'partial-retirement installer did not exit' }
+    if ($setup.ExitCode -eq 0) { throw 'second locked image should stop installation' }
+    if ((Get-FileHash -LiteralPath $partialBridge).Hash -ne $oldHash) { throw 'first retired bridge was not restored' }
+    if ((Get-FileHash -LiteralPath $partialCore).Hash -ne $coreHash) { throw 'second original changed' }
+    if (Get-ChildItem -LiteralPath $partialBin -Filter '*.old-*') { throw 'partial retirement left old images behind' }
+    $pidFile = Join-Path $partialRoot 'relaunched-pid.txt'
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (!(Test-Path -LiteralPath $pidFile)) {
+        if ([DateTime]::UtcNow -gt $deadline) { throw 'partial rollback did not relaunch desktop' }
+        Start-Sleep -Milliseconds 20
+    }
+    $relaunched = Get-Process -Id ([int][IO.File]::ReadAllText($pidFile))
+    if ($relaunched.HasExited) { throw 'partial rollback left desktop stopped' }
+    Write-Output "PASS: locked overwrite rejected; successful retirement installs new bytes; failed first/second Rename restores originals and relaunches desktop. Artifacts: $testRoot"
 } finally {
     if ($locked) { $locked.Dispose() }
     if ($relaunched -and !$relaunched.HasExited) { Stop-Process -Id $relaunched.Id; $relaunched.WaitForExit() }
