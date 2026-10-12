@@ -735,6 +735,13 @@ just like the top-level error envelope. In contrast,
 Codex recognizes the preserved code and reconnects instead of treating it as
 an invalid prompt. The proxy does not silently replay an expired turn.
 
+Portable Official sanitization applies only to conversation `input` items.
+The current request owns `tools`, `instructions`, `tool_choice`, and other
+top-level controls; historical request controls never replace them. Tool
+schemas, freeform grammars, and code-mode descriptions are preserved verbatim.
+Official preparation diagnostics compare inbound and effective tool counts,
+serialized byte lengths, and SHA-256 hashes without storing tool definitions.
+
 Include only a bounded, sanitized provider diagnostic. Never replace distinct
 failures with a generic high-demand message, and never expose secrets or an
 unbounded upstream body.
