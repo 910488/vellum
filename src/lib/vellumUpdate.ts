@@ -29,6 +29,12 @@ export function vellumUpdateState(
 ): VellumUpdateState {
   const { desktop, core } = snapshot;
   if (!snapshot.liveAutoUpdate) return { kind: "unsigned" };
+  if (desktop.phase === "failed" && desktop.failureReason === "desktopInstallIncomplete") {
+    return { kind: "failed", version: desktop.stagedVersion ?? desktop.targetVersion, reason: desktop.failureReason };
+  }
+  if ([desktop, core].some((layer) => layer.phase === "applying" || layer.phase === "validating")) {
+    return { kind: "installing", version: desktop.stagedVersion ?? desktop.targetVersion ?? desktop.currentVersion };
+  }
 
   const schedule = snapshot.restartSchedule;
   if (schedule) {
@@ -42,12 +48,15 @@ export function vellumUpdateState(
 
   const downloading = [desktop, core].filter((layer) => DOWNLOADING.includes(layer.phase));
   if (downloading.length) {
-    const total = downloading.reduce((sum, layer) => sum + layer.downloadTotal, 0);
-    const bytes = downloading.reduce((sum, layer) => sum + layer.downloadBytes, 0);
+    const batch = [desktop, core].filter((layer) => [...DOWNLOADING, ...READY, "available"].includes(layer.phase));
+    const total = batch.reduce((sum, layer) => sum + layer.downloadTotal, 0);
+    const bytes = batch.reduce((sum, layer) => sum + layer.downloadBytes, 0);
     return {
       kind: "downloading",
       version: DOWNLOADING.includes(desktop.phase) ? desktop.targetVersion ?? "" : "",
       percent: total > 0 ? Math.min(100, (bytes / total) * 100) : 0,
+      bytes,
+      total,
     };
   }
 
@@ -71,6 +80,8 @@ export function vellumUpdateState(
   if (desktop.phase === "available" && desktop.availableVersion) {
     return { kind: "available", version: desktop.availableVersion };
   }
+
+  if (desktop.phase === "applied") return { kind: "updated", version: desktop.currentVersion, corePending: READY.includes(core.phase) };
 
   return {
     kind: "current",

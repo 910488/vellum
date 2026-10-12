@@ -125,10 +125,10 @@ pub fn plan_desktop_install(
         let install_dir = install_dir_from_exe(current_exe);
         return Ok(DesktopInstallPlan::Nsis {
             installer: staged.to_path_buf(),
-            // `/S` also makes the Tauri NSIS template stop a still-running
-            // Vellum instead of prompting; `/R` relaunches it after install.
+            // Passive mode displays NSIS progress without wizard prompts.
+            // `/R` relaunches Vellum after install; /D must remain last.
             args: vec![
-                "/S".into(),
+                "/P".into(),
                 "/UPDATE".into(),
                 "/R".into(),
                 format!("/D={}", install_dir.display()),
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn nsis_plan_uses_silent_update_relaunch_and_install_dir() {
+    fn nsis_plan_uses_passive_update_relaunch_and_install_dir() {
         let plan = plan_desktop_install(
             Path::new("C:/cache/Vellum_0.3.0_x64-setup.exe"),
             Path::new("C:/Program Files/Vellum/vellum-proxy-desktop.exe"),
@@ -262,7 +262,8 @@ mod tests {
         .unwrap();
         match plan {
             DesktopInstallPlan::Nsis { args, .. } => {
-                assert!(args.iter().any(|arg| arg == "/S"));
+                assert!(args.iter().any(|arg| arg == "/P"));
+                assert!(!args.iter().any(|arg| arg == "/S"));
                 assert!(args.iter().any(|arg| arg == "/UPDATE"));
                 assert!(
                     args.iter().any(|arg| arg == "/R"),
@@ -317,7 +318,7 @@ mod tests {
             1,
             "close-time apply must exec the NSIS installer"
         );
-        assert!(spawns[0].1.iter().any(|arg| arg == "/S"));
+        assert!(spawns[0].1.iter().any(|arg| arg == "/P"));
         assert!(spawns[0].1.iter().any(|arg| arg == "/UPDATE"));
     }
 

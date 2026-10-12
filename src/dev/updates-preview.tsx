@@ -37,6 +37,9 @@ const SCENES = {
   checking: "檢查中",
   available: "有新版（自動更新關著）",
   downloading: "下載中",
+  installing: "安裝中",
+  updated: "已更新",
+  incomplete: "安裝不完整",
   ready: "已下載，等重啟",
   scheduled: "已排定（對話還在跑）",
   failed: "失敗",
@@ -71,7 +74,10 @@ function stateFor(scene: Scene, early: boolean): VellumUpdateState {
     case "available":
       return { kind: "available", version };
     case "downloading":
-      return { kind: "downloading", version, percent: 62 };
+      return { kind: "downloading", version, percent: 62, bytes: 110_360_000, total: 178_000_000 };
+    case "installing": return { kind: "installing", version };
+    case "updated": return { kind: "updated", version, corePending: false };
+    case "incomplete": return { kind: "failed", version, reason: "desktopInstallIncomplete" };
     case "ready":
       return { kind: "ready", version };
     case "scheduled":
@@ -156,7 +162,7 @@ function Harness() {
           <Card>
               <VellumUpdate
                 view={{
-                  current: CURRENT,
+                  current: scene === "updated" || scene === "incomplete" ? (earlyAccess ? NIGHTLY : NEXT) : CURRENT,
                   state: stateFor(scene, earlyAccess),
                   autoUpdate,
                   earlyAccess,
@@ -170,7 +176,9 @@ function Harness() {
                   onCancel: () => go("current", "取消下載：留在目前版本"),
                   onRestart: () => go("scheduled", "重新啟動：有 2 段對話還在跑，改成排定"),
                   onUnschedule: () => go("ready", "取消排定：回到已下載"),
-                  onRetry: () => go("downloading", "重試：已保留的安裝檔直接重用"),
+                  onRetry: () => scene === "incomplete"
+                    ? go("installing", "修復：重用快取安裝檔", { scene: "updated", ms: 1500 })
+                    : go("downloading", "重試：已保留的安裝檔直接重用"),
                   onOpenDownloads: () => setLog("開啟 GitHub Releases 下載頁"),
                   onAutoUpdate: (next) => {
                     setAutoUpdate(next);

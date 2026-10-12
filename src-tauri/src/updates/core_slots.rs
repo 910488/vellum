@@ -293,7 +293,7 @@ pub fn signed_core_identity_with(
     })
 }
 
-fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) -> bool {
+pub(super) fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) -> bool {
     let Some((raw, signature)) = load_signed_core_trust(root, &slot.version) else {
         return false;
     };
@@ -375,6 +375,22 @@ fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) -> bool {
         && files_match
         && super::manifest::verify_asset_file(&executable, expected).is_ok()
         && expected_helpers.iter().all(|helper| helper.is_file())
+}
+
+pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
+    !slot.files.is_empty()
+        && slot.files.iter().all(|file| {
+            let candidate = if file.path == slot.path {
+                bundled.to_path_buf()
+            } else {
+                let Some(name) = file.path.file_name() else {
+                    return false;
+                };
+                bundled.parent().unwrap_or(bundled).join(name)
+            };
+            std::fs::metadata(&candidate).is_ok_and(|meta| meta.len() == file.size)
+                && super::manifest::verify_asset_file(&candidate, &file.sha256).is_ok()
+        })
 }
 
 fn verify_tree_against_signed_target(root: &Path, target: &CoreTarget) -> Result<(), String> {

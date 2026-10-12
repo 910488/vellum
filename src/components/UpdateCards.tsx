@@ -129,7 +129,7 @@ export function UpdateCards({
       <VellumUpdate
         view={{
           current: snapshot.desktop.currentVersion,
-          state,
+          state: busy === "restarting" ? { kind: "installing", version: snapshot.desktop.stagedVersion ?? snapshot.desktop.targetVersion ?? snapshot.desktop.currentVersion } : state,
           autoUpdate: auto,
           earlyAccess: snapshot.preferences.channel === "preview",
           hosts: vellumUpdateHosts(snapshot.remote),
@@ -144,7 +144,9 @@ export function UpdateCards({
             void run(async () => onChanged(auto ? await api.updateVellum() : await api.checkUpdates()));
           },
           onUpdate: () => void update(),
-          onRetry: () => void update(),
+          onRetry: () => snapshot.desktop.failureReason === "desktopInstallIncomplete"
+            ? void run(async () => { await api.restartToUpdate(); await refresh(); }, "restarting")
+            : void update(),
           onCancel: () =>
             void run(async () => {
               for (const component of ["desktop", "core"] as const) {

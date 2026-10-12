@@ -174,6 +174,7 @@ pub async fn restart_to_update(
     state: State<'_, AppState>,
 ) -> AppResult<RestartToUpdate> {
     let state = (*state).clone();
+    crate::updates::engine(&state.data_root()).prepare_cached_desktop_repair()?;
     let desktop = crate::updates::get_status(&state).desktop;
     if !desktop_is_staged(desktop.phase) {
         return Err(AppError::Message("nothingStaged".into()));
