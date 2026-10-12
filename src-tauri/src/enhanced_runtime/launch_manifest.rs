@@ -220,6 +220,16 @@ struct DigestCacheEntry {
 
 static DIGEST_CACHE: OnceLock<Mutex<Vec<DigestCacheEntry>>> = OnceLock::new();
 
+// Coarse filesystems can assign one mtime to consecutive same-size writes.
+// Only reuse hashes computed outside that timestamp's possible write window.
+const DIGEST_MTIME_SETTLE_TIME: Duration = Duration::from_secs(2);
+
+fn digest_metadata_is_settled(modified: Option<SystemTime>, now: SystemTime) -> bool {
+    modified
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > DIGEST_MTIME_SETTLE_TIME)
+}
+
 pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     let metadata = std::fs::metadata(path).map_err(|error| LaunchManifestError::Read {
         path: path.to_path_buf(),
@@ -227,10 +237,14 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     })?;
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let modified = metadata.modified().ok();
+    // Decide before reading: a slow hash must not make a racy observation
+    // eligible for caching merely because the timestamp aged during the read.
+    let cacheable = digest_metadata_is_settled(modified, SystemTime::now());
     let cache = DIGEST_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(entries) = cache.lock() {
         if let Some(entry) = entries.iter().find(|entry| {
-            entry.path == canonical
+            cacheable
+                && entry.path == canonical
                 && entry.len == metadata.len()
                 && entry.modified == modified
                 && entry.checked_at.elapsed() <= Duration::from_secs(300)
@@ -258,13 +272,15 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
     if let Ok(mut entries) = cache.lock() {
         entries.retain(|entry| entry.path != canonical);
-        entries.push(DigestCacheEntry {
-            path: canonical,
-            len: metadata.len(),
-            modified,
-            digest: digest.clone(),
-            checked_at: Instant::now(),
-        });
+        if cacheable {
+            entries.push(DigestCacheEntry {
+                path: canonical,
+                len: metadata.len(),
+                modified,
+                digest: digest.clone(),
+                checked_at: Instant::now(),
+            });
+        }
         if entries.len() > 16 {
             entries.remove(0);
         }
@@ -306,6 +322,25 @@ impl From<serde_json::Error> for LaunchManifestError {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn digest_cache_requires_a_settled_known_timestamp() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        assert!(!digest_metadata_is_settled(None, now));
+        assert!(!digest_metadata_is_settled(
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
+        assert!(!digest_metadata_is_settled(Some(now), now));
+        assert!(!digest_metadata_is_settled(
+            Some(now - DIGEST_MTIME_SETTLE_TIME),
+            now
+        ));
+        assert!(digest_metadata_is_settled(
+            Some(now - Duration::from_secs(3)),
+            now
+        ));
+    }
 
     fn identity(root: &Path, name: &str) -> RuntimeBinaryIdentity {
         let executable = root.join(format!("{name}.exe"));
