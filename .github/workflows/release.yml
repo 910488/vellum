@@ -118,7 +118,10 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+          # A workflow_call inherits the caller's event name, so "Manual bundled
+          # releases" arrives here as workflow_dispatch too. Only a direct
+          # dispatch lacks a tag; a caller always passes one.
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ -z "$REQUESTED_TAG" ]; then
             COMPONENT="$REQUESTED_COMPONENT"
             case "$COMPONENT" in
               desktop|remote|core) ;;
