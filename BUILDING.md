@@ -177,6 +177,19 @@ version. `source_ref` selects the Vellum source, and `enhanced_core_release`
 can pin an explicit `vellum-core-<40-hex>` release instead of resolving the
 latest one. Turning off `publish` leaves both signed releases as drafts.
 
+The entry workflow resolves `source_ref` to one full `source_sha` before either
+component release starts. Core and Desktop receive the same SHA; every build
+and signing checkout is pinned to that commit. The signing job verifies HEAD
+against the resolved SHA, release notes end at it, and the manifest records the
+actual checkout HEAD rather than the workflow event's `GITHUB_SHA`. New release
+tags also target that SHA.
+
+To verify on the next authorized release run, dispatch with a branch source,
+record resolve's SHA, then push a harmless commit to that branch while builds
+are running. All platform and signing checkouts, manifest `sourceCommit`, and
+release tag must still name the original SHA; generated notes must omit the
+later commit. The bundled core/Desktop pair must report the same source SHA.
+
 For testing or publishing one hot-update surface independently, run the
 `Publish signed hot update` Action. Its `component` selector maps directly to
 the three updater streams: `desktop` builds the Vellum app, `remote` builds the
