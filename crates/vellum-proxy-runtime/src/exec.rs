@@ -7338,6 +7338,25 @@ impl ProxyRuntime {
             }
             let completed = tracker.completed_response();
             let terminal_error = tracker.terminal_error();
+            if completed.is_none() {
+                let failure = tracker.terminal_error_event().as_ref()
+                    .map(provider_error_from_terminal_event)
+                    .unwrap_or_else(|| RuntimeError::ProviderProtocol(stream_error.clone()
+                        .unwrap_or_else(|| "Upstream stream ended without response.completed".into())));
+                finish_terminal_once_with_record_raw(&parent_cancel, &diagnostics, &usage, &execution_id, outcome_for_error(&failure), UsageRecord {
+                    route_id: route_id.clone(), provider: provider.clone(), model: model.clone(),
+                    status: failure.http_status().as_u16(), error: Some(failure.to_string()),
+                    error_category: Some(failure.category().into()), outcome: Some(outcome_for_error(&failure).into()),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    first_byte_ms, first_event_ms: first_byte_ms,
+                    request_id: Some(parent_request_id.clone()),
+                    conversation_identity: Some(conversation_key.clone()),
+                    control_account_hash: control_account_hash.clone(), execution_account_hash: execution_account_hash.clone(),
+                    selection_revision, upstream_attempted: Some(true),
+                    review_run_id: guardian.run_id.clone(), review_role: guardian.role.clone(), review_reason: guardian.reason.clone(),
+                    agent_attribution: agent_attribution.clone(), ..Default::default()
+                });
+            }
             if completed.is_none() && terminal_error.is_none() && stream_error.is_none() {
                 let message = "Upstream stream ended without response.completed".to_string();
                 yield ok(Bytes::from(failed_sse_event(&message)));
@@ -9115,6 +9134,14 @@ fn decode_non_streaming_response(
     let body: Value = serde_json::from_slice(&response.body).map_err(|error| {
         RuntimeError::ProviderProtocol(format!("upstream returned a non-JSON body: {error}"))
     })?;
+    if body.get("error").is_some_and(Value::is_object)
+        || matches!(
+            body.get("type").and_then(Value::as_str),
+            Some("response.failed" | "error")
+        )
+    {
+        return Err(provider_error_from_terminal_event(&body));
+    }
     if route.provider_kind == RuntimeProviderKind::Official {
         Ok(body)
     } else {
@@ -9161,6 +9188,20 @@ fn provider_error_from_upstream(
     body: &[u8],
     headers: &[(String, String)],
 ) -> RuntimeError {
+    // HTTP status remains authoritative for client/auth/quota errors.
+    if !(400..500).contains(&status)
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|body| {
+                body.pointer("/response/error")
+                    .or_else(|| body.get("error"))
+                    .cloned()
+            })
+            .as_ref()
+            .is_some_and(crate::error::is_upstream_server_error)
+    {
+        return RuntimeError::ProviderUnavailable(provider_error_message(body, status));
+    }
     let message = provider_error_message(body, status);
     let retry_after = if status == 429 {
         crate::opencode::parse_retry_after(headers)
@@ -9169,6 +9210,32 @@ fn provider_error_from_upstream(
         crate::opencode::parse_retry_after(headers)
     };
     provider_error_for_status_with_retry(status, &message, retry_after, true)
+}
+
+fn provider_error_from_terminal_event(event: &Value) -> RuntimeError {
+    let error = event
+        .pointer("/response/error")
+        .or_else(|| event.get("error"));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream Responses failure");
+    if error.is_some_and(crate::error::is_upstream_server_error) {
+        return RuntimeError::ProviderUnavailable(message.into());
+    }
+    let status = match error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("invalid_request_error") => 400,
+        Some("authentication_error") => 401,
+        Some("insufficient_quota" | "rate_limit_error" | "usage_limit_reached") => 429,
+        _ => match event.get("status").and_then(Value::as_u64).and_then(|status| u16::try_from(status).ok()) {
+            Some(status) => status,
+            None => return RuntimeError::ProviderProtocol(message.into()),
+        },
+    };
+    provider_error_for_status(status, message)
 }
 
 fn provider_error_for_status_with_retry(
@@ -10834,6 +10901,119 @@ mod tests {
             RuntimeResponse::Sse(_) | RuntimeResponse::Raw { .. } => {
                 unreachable!("non-streaming dispatch returned a non-JSON response")
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn official_http_server_failures_record_retryable_availability() {
+        for status in [200, 500, 502, 503] {
+            let body =
+                json!({"error":{"type":"server_error","message":"You can retry your request."}});
+            let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+                status,
+                headers: vec![],
+                body: serde_json::to_vec(&body).unwrap(),
+            }]));
+            let runtime = official_runtime_with_transport(transport);
+            let error = runtime
+                .execute(
+                    request(json!({"model":"vlm-test","input":"hi"})),
+                    "http-server-failure",
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.http_status().as_u16(), 503);
+            assert_eq!(error.category(), "provider_unavailable");
+            assert_eq!(
+                error.to_response_failed_event()["response"]["error"]["code"],
+                "provider_unavailable"
+            );
+            let records = runtime.usage_records().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, 503);
+            assert_eq!(
+                records[0].error_category.as_deref(),
+                Some("provider_unavailable")
+            );
+            assert_eq!(records[0].outcome.as_deref(), Some("provider_failure"));
+        }
+    }
+
+    #[test]
+    fn http_server_markers_do_not_override_client_or_quota_status() {
+        let body = br#"{"error":{"type":"server_error","message":"rejected"}}"#;
+        let invalid = provider_error_from_upstream(400, body, &[]);
+        assert_eq!(invalid.http_status().as_u16(), 400);
+        assert_eq!(invalid.to_response_failed_event()["response"]["error"]["code"], "invalid_prompt");
+        let quota = provider_error_from_upstream(429, body, &[]);
+        assert_eq!(quota.http_status().as_u16(), 429);
+        assert_eq!(quota.category(), "provider_quota");
+    }
+
+    #[tokio::test]
+    async fn official_http_stream_terminal_failure_keeps_type_and_code_for_accounting() {
+        for (error, status, category) in [
+            (
+                json!({"type":"server_error","message":"You can retry your request."}),
+                503,
+                "provider_unavailable",
+            ),
+            (
+                json!({"code":"internal_error","message":"You can retry your request."}),
+                503,
+                "provider_unavailable",
+            ),
+            (
+                json!({"type":"invalid_request_error","message":"Invalid prompt"}),
+                400,
+                "provider_protocol",
+            ),
+            (
+                json!({"type":"usage_limit_reached","message":"usage exhausted"}),
+                429,
+                "provider_quota",
+            ),
+        ] {
+            let event = json!({"type":"response.failed","response":{"error":error}});
+            let wire = format!("data: {event}\n\n");
+            let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: wire.as_bytes().to_vec(),
+            }]));
+            let runtime = official_runtime_with_transport(transport);
+            let RuntimeResponse::Sse(mut stream) = runtime
+                .execute(
+                    request(json!({"model":"vlm-test","input":"hi","stream":true})),
+                    "http-sse-failure",
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected SSE");
+            };
+            let mut downstream = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                downstream.extend_from_slice(&chunk.unwrap());
+            }
+            assert!(
+                String::from_utf8(downstream)
+                    .unwrap()
+                    .contains(&event.to_string()),
+                "upstream retry semantics must survive unchanged"
+            );
+            let records = runtime.usage_records().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, status);
+            assert_eq!(records[0].error_category.as_deref(), Some(category));
+            assert_eq!(
+                records[0].outcome.as_deref(),
+                Some(if status == 400 {
+                    "protocol_failure"
+                } else {
+                    "provider_failure"
+                })
+            );
         }
     }
 

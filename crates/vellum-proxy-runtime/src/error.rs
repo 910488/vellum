@@ -15,6 +15,17 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+/// Structured upstream server failures, independent of envelope/transport.
+/// Do not infer retryability from localized message text.
+pub(crate) fn is_upstream_server_error(error: &Value) -> bool {
+    ["type", "code"].iter().any(|field| {
+        matches!(
+            error.get(*field).and_then(Value::as_str),
+            Some("server_error" | "api_error" | "internal_error" | "service_unavailable")
+        )
+    })
+}
+
 /// One failure mode of the proxy runtime.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {

@@ -1693,6 +1693,9 @@ fn official_websocket_failure_category(event: &Value) -> &str {
     let error = event
         .pointer("/response/error")
         .or_else(|| event.get("error"));
+    if error.is_some_and(crate::error::is_upstream_server_error) {
+        return "provider_unavailable";
+    }
     // Codex recognizes this upstream code and reconnects. Preserve the frame
     // verbatim, but record the expired transport as a retryable availability
     // failure rather than a fatal prompt error.
@@ -5040,6 +5043,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_server_error_type_and_code_are_retryable_provider_failures() {
+        for (field, value) in [
+            ("type", "server_error"),
+            ("type", "api_error"),
+            ("type", "internal_error"),
+            ("type", "service_unavailable"),
+            ("code", "server_error"),
+            ("code", "internal_error"),
+        ] {
+            let mut error = json!({"message":"An error occurred while processing your request. You can retry your request."});
+            error[field] = json!(value);
+            for event in [
+                json!({"type":"error","error":error.clone()}),
+                json!({"type":"response.failed","response":{"error":error.clone()}}),
+            ] {
+                run_official_error_frame(event, "provider_unavailable", 503).await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn official_websocket_top_level_error_is_terminal_invalid_request() {
         run_official_error_frame(
             json!({"type":"error","status":400,"error":{
@@ -5191,6 +5215,16 @@ mod tests {
             .find(|record| record.error_category.as_deref() == Some(category))
             .unwrap();
         assert_eq!(record.status, status, "{record:?}");
+        assert_eq!(
+            record.outcome.as_deref(),
+            Some(
+                if category == "provider_protocol" || category == "invalid_request" {
+                    "protocol_failure"
+                } else {
+                    "provider_failure"
+                }
+            )
+        );
         assert_eq!(record.upstream_attempted, Some(true));
         assert_eq!(
             attempts.load(Ordering::SeqCst),

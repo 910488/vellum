@@ -728,6 +728,13 @@ The HTTP error envelope keeps its numeric client-facing code and adds
 Quota-bearing 400s remain quota failures, transient 4xx remain retryable,
 and 5xx remain provider-unavailable failures.
 
+Explicit upstream `server_error`, `api_error`, `internal_error`, and
+`service_unavailable` markers in either error type or code are availability
+failures, including Responses terminal events under HTTP 200. Record them as
+503 / `provider_unavailable` / `provider_failure`; native WS and Official SSE
+retain the upstream error frame and its retry semantics. Buffered HTTP client,
+authentication, and quota statuses remain authoritative over body markers.
+
 Official WebSocket-to-HTTP bridges always expand local continuation history
 and remove `previous_response_id`; HTTP cannot consume the WebSocket-only id.
 Account or selection-revision changes also force portable replay on a live

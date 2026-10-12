@@ -539,6 +539,7 @@ pub struct SseCompletionTracker {
     completed_items: Vec<Value>,
     completed_response: Option<Value>,
     terminal_error: Option<String>,
+    terminal_error_event: Option<Value>,
     just_completed: bool,
 }
 
@@ -582,6 +583,7 @@ impl SseCompletionTracker {
                 self.just_completed = true;
             }
             Some("response.failed" | "error") => {
+                self.terminal_error_event = Some(value.clone());
                 self.terminal_error = value
                     .pointer("/response/error/message")
                     .or_else(|| value.pointer("/error/message"))
@@ -617,6 +619,10 @@ impl SseCompletionTracker {
 
     pub fn terminal_error(&self) -> Option<String> {
         self.terminal_error.clone()
+    }
+
+    pub(crate) fn terminal_error_event(&self) -> Option<Value> {
+        self.terminal_error_event.clone()
     }
 }
 
