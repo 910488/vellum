@@ -163,8 +163,8 @@ export function Pill({
 
 /* ---------- 狀態列 ---------- */
 
-export function Rows({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <div className={`rows${className ? ` ${className}` : ""}`}>{children}</div>;
+export function Rows({ children }: { children: ReactNode }) {
+  return <div className="rows">{children}</div>;
 }
 
 export function Row({ label, children }: { label: ReactNode; children: ReactNode }) {
