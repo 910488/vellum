@@ -258,7 +258,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 managed_account_changed(
                                     &segment.connection_key,
                                     &plan.connection_key,
-                                )
+                                ) || segment.selection_revision != plan.selection_revision
                             })
                 );
                 if live_account_handoff {
@@ -649,6 +649,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
 /// Official natively pipelines multiple in-flight turns on one socket, so
 /// completions are matched front-to-back.
 struct OfficialSegment {
+    selection_revision: Option<u64>,
     connection_key: OfficialWebSocketConnectionKey,
     write: futures_util::stream::SplitSink<OfficialUpstreamSocket, TungsteniteMessage>,
     read: futures_util::stream::SplitStream<OfficialUpstreamSocket>,
@@ -1066,6 +1067,7 @@ async fn open_official_segment(
     };
     let (write, read) = upstream.split();
     Some(OfficialSegment {
+        selection_revision: plan.selection_revision,
         connection_key: plan.connection_key.clone(),
         write,
         read,
@@ -1157,6 +1159,7 @@ async fn send_official_turn(
         .stages
         .request_forwarded_ms
         .get_or_insert(segment.started.elapsed().as_millis() as u64);
+    segment.selection_revision = plan.selection_revision;
     let mut turn = OfficialPendingTurn::new(
         plan,
         request_for_history(request),
@@ -1563,7 +1566,11 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             if send_runtime_failure(client, &error).await {
                 *frames_out += 1;
             }
-            TurnOutcome::Stop(error.to_string())
+            if matches!(error, RuntimeError::PreviousResponseNotFound(_)) {
+                TurnOutcome::Continue
+            } else {
+                TurnOutcome::Stop(error.to_string())
+            }
         }
     }
 }
@@ -2118,21 +2125,35 @@ fn record_official_pending_outcome(
     let Some(plan) = turn.plan.as_ref() else {
         return;
     };
-    runtime.finish_terminal_once(
+    let status = match (outcome, error_category) {
+        ("client_cancel" | "client_disconnect", _) => 499,
+        ("protocol_failure", Some("invalid_request")) => 400,
+        _ => 502,
+    };
+    runtime.finish_terminal_once_with_record(
         &turn.execution_id,
-        &plan.route_id,
-        &plan.provider_name,
-        &plan.upstream_model,
-        &turn.request_id,
-        Some(connection_id),
-        turn.started.elapsed().as_millis() as u64,
-        turn.first_byte_ms,
-        turn.first_byte_ms,
-        turn.first_downstream_ms,
         outcome,
-        error_category,
-        error,
-        Some(stages.for_turn(turn)),
+        UsageRecord {
+            route_id: plan.route_id.clone(),
+            provider: plan.provider_name.clone(),
+            model: plan.upstream_model.clone(),
+            status,
+            request_id: Some(turn.request_id.clone()),
+            connection_id: Some(connection_id.to_string()),
+            duration_ms: turn.started.elapsed().as_millis() as u64,
+            first_byte_ms: turn.first_byte_ms,
+            first_event_ms: turn.first_byte_ms,
+            first_downstream_frame_ms: turn.first_downstream_ms,
+            outcome: Some(outcome.to_string()),
+            error_category: error_category.map(str::to_string),
+            error: error.map(str::to_string),
+            stage_times_ms: Some(stages.for_turn(turn)),
+            control_account_hash: plan.control_account_hash.clone(),
+            execution_account_hash: plan.execution_account_hash.clone(),
+            selection_revision: plan.selection_revision,
+            upstream_attempted: Some(true),
+            ..Default::default()
+        },
     );
 }
 
@@ -2468,6 +2489,17 @@ pub async fn send_websocket_failure(client: &mut WebSocket, message: &str) -> bo
 /// code Codex maps to the same non-retryable invalid-request error. The HTTP
 /// status stays available as `status`.
 fn runtime_failure_event(error: &RuntimeError) -> Value {
+    if matches!(error, RuntimeError::PreviousResponseNotFound(_)) {
+        // Codex recognizes this wrapped WS error before parsing Responses
+        // events, discards its incremental request and retries full input.
+        return json!({
+            "type": "error", "status": 400,
+            "error": {
+                "type": "invalid_request_error", "code": "previous_response_not_found",
+                "message": error.to_string()
+            }
+        });
+    }
     error.to_response_failed_event()
 }
 
@@ -2864,15 +2896,35 @@ mod tests {
 
     #[tokio::test]
     async fn official_websocket_account_switch_replays_portable_history_on_new_account() {
-        run_official_websocket_account_switch(false).await;
+        run_official_websocket_account_switch(false, "switch").await;
     }
 
     #[tokio::test]
     async fn official_websocket_switches_users_in_the_same_workspace() {
-        run_official_websocket_account_switch(true).await;
+        run_official_websocket_account_switch(true, "switch").await;
     }
 
-    async fn run_official_websocket_account_switch(shared_workspace: bool) {
+    #[tokio::test]
+    async fn official_websocket_bridge_replays_same_account_history() {
+        run_official_websocket_account_switch(false, "bridge").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_switch_missing_history_requests_full_input_retry() {
+        run_official_websocket_account_switch(false, "missing").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_selection_revision_change_replays_history() {
+        run_official_websocket_account_switch(false, "revision").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_streaming_bridge_replays_history_and_records_account() {
+        run_official_websocket_account_switch(false, "bridge_stream").await;
+    }
+
+    async fn run_official_websocket_account_switch(shared_workspace: bool, mode: &str) {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
 
@@ -3011,8 +3063,9 @@ mod tests {
                     let capture = post_capture.clone();
                     async move {
                         let account = execution_from_headers(&headers);
+                        let streaming = body["stream"] == true;
                         capture.http_requests.lock().unwrap().push((account, body));
-                        axum::Json(json!({
+                        let response = json!({
                             "id": "resp_account_b",
                             "object": "response",
                             "status": "completed",
@@ -3021,7 +3074,18 @@ mod tests {
                                 "role": "assistant",
                                 "content": [{"type": "output_text", "text": "answer from B"}]
                             }]
-                        }))
+                        });
+                        if streaming {
+                            axum::response::IntoResponse::into_response((
+                                [("content-type", "text/event-stream")],
+                                format!(
+                                    "data: {}\n\n",
+                                    json!({"type": "response.completed", "response": response})
+                                ),
+                            ))
+                        } else {
+                            axum::response::IntoResponse::into_response(axum::Json(response))
+                        }
                     }
                 },
             ),
@@ -3044,6 +3108,7 @@ mod tests {
         let mut state = StaticProxyState::from_config(config).unwrap();
         state.mark_listener_ready();
         let state = Arc::new(state);
+        let runtime = state.proxy_runtime();
         let proxy = build_headless_router(
             Arc::clone(&state),
             InboundAccessPolicy::test_only_disabled(),
@@ -3084,15 +3149,28 @@ mod tests {
             "response.completed"
         );
 
-        select_account(&auth_root, &identity_b, 2);
+        if !mode.starts_with("bridge") {
+            select_account(
+                &auth_root,
+                if mode == "revision" {
+                    &identity_a
+                } else {
+                    &identity_b
+                },
+                2,
+            );
+        }
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
-                    "previous_response_id": "resp_account_a",
+                    "previous_response_id": if mode == "missing" { "resp_not_in_history" } else { "resp_account_a" },
+                    "instructions": if mode.starts_with("bridge") {
+                        "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
+                    } else { "be brief" },
                     "input": [{"role": "user", "content": "follow-up question"}],
-                    "stream": false
+                    "stream": mode == "bridge_stream"
                 })
                 .to_string()
                 .into(),
@@ -3107,6 +3185,27 @@ mod tests {
                 .unwrap();
             if let TungsteniteMessage::Text(text) = frame {
                 let event: Value = serde_json::from_str(&text).unwrap();
+                if event["type"] == "error" || event["type"] == "response.failed" {
+                    assert_eq!(mode, "missing", "unexpected failure: {event}");
+                    assert_eq!(event["error"]["code"], "previous_response_not_found");
+                    assert!(capture.http_requests.lock().unwrap().is_empty());
+                    let rows = runtime.usage_records().unwrap();
+                    let row = rows.last().unwrap();
+                    assert_eq!(row.upstream_attempted, Some(false));
+                    assert_eq!(
+                        row.execution_account_hash.as_deref(),
+                        Some(format!("sha256:{}", account_hash(&identity_b)).as_str())
+                    );
+                    client.send(TungsteniteMessage::Text(json!({
+                        "type": "response.create", "model": "vellum-official",
+                        "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
+                        "input": [{"role": "user", "content": "first question"},
+                            {"role": "assistant", "content": "answer from A"},
+                            {"role": "user", "content": "follow-up question"}],
+                        "stream": false
+                    }).to_string().into())).await.unwrap();
+                    continue;
+                }
                 if event["type"] == "response.completed" {
                     assert_eq!(
                         event["response"]["id"],
@@ -3121,18 +3220,32 @@ mod tests {
         }
 
         let websocket_accounts = capture.websocket_accounts.lock().unwrap().clone();
-        assert_eq!(websocket_accounts, [identity_a]);
+        assert_eq!(websocket_accounts, [identity_a.clone()]);
         let requests = capture.http_requests.lock().unwrap().clone();
         assert_eq!(
             requests.len(),
             1,
             "account handoff must use one portable POST"
         );
-        assert_eq!(requests[0].0, identity_b);
+        assert_eq!(
+            requests[0].0,
+            if mode.starts_with("bridge") || mode == "revision" {
+                identity_a.clone()
+            } else {
+                identity_b.clone()
+            }
+        );
         assert!(
             requests[0].1.get("previous_response_id").is_none(),
             "old account response id must not reach the new account: {}",
             requests[0].1
+        );
+        let rows = runtime.usage_records().unwrap();
+        let row = rows.last().unwrap();
+        assert_eq!(row.upstream_attempted, Some(true));
+        assert_eq!(
+            row.execution_account_hash.as_deref(),
+            Some(format!("sha256:{}", account_hash(&requests[0].0)).as_str())
         );
         let input_text = requests[0].1["input"].to_string();
         assert!(input_text.contains("first question"), "{input_text}");
@@ -3623,6 +3736,15 @@ mod tests {
     /// `generate`, and the prewarm id exists nowhere upstream.
     #[tokio::test]
     async fn portable_websocket_answers_prewarm_locally_and_restores_its_input() {
+        run_portable_prewarm(false).await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_bridge_answers_prewarm_locally() {
+        run_portable_prewarm(true).await;
+    }
+
+    async fn run_portable_prewarm(official: bool) {
         use axum::extract::Json;
         use axum::routing::post;
 
@@ -3654,7 +3776,11 @@ mod tests {
             catalog_id: "vlm-third-party".into(),
             name: "ThirdParty".into(),
             base_url: format!("http://{upstream_address}/v1"),
-            provider_kind: RuntimeProviderKind::OpenAiCompatible,
+            provider_kind: if official {
+                RuntimeProviderKind::Official
+            } else {
+                RuntimeProviderKind::OpenAiCompatible
+            },
             auth_kind: RuntimeAuthKind::None,
             wire: RuntimeWireFormat::Responses,
             server_side_resume: false,
@@ -3728,7 +3854,7 @@ mod tests {
             json!({
                 "type": "response.create",
                 "model": "vlm-third-party",
-                "instructions": "be brief",
+                "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
                 "input": [{"role": "user", "content": "first"}],
                 "stream": false,
                 "generate": false
@@ -3746,7 +3872,7 @@ mod tests {
             json!({
                 "type": "response.create",
                 "model": "vlm-third-party",
-                "instructions": "be brief",
+                "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
                 "previous_response_id": warmup_id,
                 "input": [{"role": "user", "content": "second"}],
                 "stream": false

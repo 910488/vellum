@@ -481,8 +481,17 @@ struct PendingSubagentSpawn {
 /// without bound for the lifetime of the process. They now carry the same
 /// `created` timestamp every other entry does, and `prune` retains all four
 /// maps by both a TTL and a hard capacity cap.
+#[derive(Clone)]
+struct OfficialAttemptUsage {
+    control_account_hash: Option<String>,
+    execution_account_hash: Option<String>,
+    selection_revision: Option<u64>,
+    upstream_attempted: bool,
+}
+
 struct TimestampedSender {
     sender: watch::Sender<bool>,
+    official_attempt: Option<OfficialAttemptUsage>,
     created: tokio::time::Instant,
 }
 
@@ -636,6 +645,27 @@ fn claim_terminal_once_raw(
     won
 }
 
+// Read before the terminal claim releases the registration. Both buffered
+// and streaming collectors share this context; early hydration failures keep
+// the selected account and explicitly record that no upstream was attempted.
+fn enrich_official_attempt_usage(
+    registry: &Arc<Mutex<ParentCancelRegistry>>,
+    execution_id: &str,
+    record: &mut UsageRecord,
+) {
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(context) = registry
+        .sockets
+        .get(execution_id)
+        .and_then(|entry| entry.official_attempt.as_ref())
+    {
+        record.control_account_hash = context.control_account_hash.clone();
+        record.execution_account_hash = context.execution_account_hash.clone();
+        record.selection_revision = context.selection_revision;
+        record.upstream_attempted = Some(context.upstream_attempted);
+    }
+}
+
 /// Free-function counterpart to
 /// [`ProxyRuntime::finish_terminal_once_with_record`], for stream-collector
 /// closures (see [`claim_terminal_once_raw`]).
@@ -645,8 +675,9 @@ fn finish_terminal_once_with_record_raw(
     usage: &Arc<dyn UsageStore>,
     execution_id: &str,
     outcome: &str,
-    record: UsageRecord,
+    mut record: UsageRecord,
 ) -> bool {
+    enrich_official_attempt_usage(registry, execution_id, &mut record);
     if !claim_terminal_once_raw(registry, execution_id, outcome) {
         return false;
     }
@@ -941,16 +972,13 @@ impl ProxyRuntime {
         error: Option<&str>,
         stage_times_ms: Option<Value>,
     ) -> bool {
-        if !self.claim_terminal_once(execution_id, outcome) {
-            return false;
-        }
         let status = match (outcome, error_category) {
             ("success", _) => 200,
             ("client_cancel" | "client_disconnect" | "user_stopped_proxy", _) => 499,
             ("protocol_failure", Some("invalid_request")) => 400,
             _ => 502,
         };
-        let record = UsageRecord {
+        let mut record = UsageRecord {
             route_id: route_id.to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -968,6 +996,10 @@ impl ProxyRuntime {
             agent_attribution: self.agent_attribution_for_execution(execution_id),
             ..Default::default()
         };
+        enrich_official_attempt_usage(&self.parent_cancel, execution_id, &mut record);
+        if !self.claim_terminal_once(execution_id, outcome) {
+            return false;
+        }
         let result = self.usage.record(&record);
         if let Err(message) = result {
             // The terminal claim is deliberately kept (INV-CANCEL-1): a lost
@@ -1060,6 +1092,7 @@ impl ProxyRuntime {
         outcome: &str,
         mut record: UsageRecord,
     ) -> bool {
+        enrich_official_attempt_usage(&self.parent_cancel, execution_id, &mut record);
         if !self.claim_terminal_once(execution_id, outcome) {
             return false;
         }
@@ -1518,6 +1551,7 @@ impl ProxyRuntime {
             execution_id.to_string(),
             TimestampedSender {
                 sender,
+                official_attempt: None,
                 created: tokio::time::Instant::now(),
             },
         );
@@ -2473,7 +2507,9 @@ impl ProxyRuntime {
             return Ok(WebSocketTurnPlan {
                 route_id: route.route_id,
                 dispatch: WebSocketTurnDispatch::PortableReplay {
-                    force_official_handoff: false,
+                    // HTTP Responses cannot consume WS continuation ids, even
+                    // on the same account (notably Auto Review).
+                    force_official_handoff: route.provider_kind == RuntimeProviderKind::Official,
                 },
             });
         }
@@ -2671,6 +2707,7 @@ impl ProxyRuntime {
                 control_account_hash: plan.control_account_hash.clone(),
                 execution_account_hash: plan.execution_account_hash.clone(),
                 selection_revision: plan.selection_revision,
+                upstream_attempted: Some(true),
                 stage_times_ms,
                 ..Default::default()
             },
@@ -3503,6 +3540,25 @@ impl ProxyRuntime {
             .map_err(RuntimeError::LifecycleDraining)
     }
 
+    fn note_official_attempt(
+        &self,
+        execution_id: &str,
+        request: &RuntimeRequest,
+        auth: &ResolvedAuth,
+        upstream_attempted: bool,
+    ) {
+        let (control_account_hash, execution_account_hash) = official_usage_identity(auth, request);
+        let mut registry = self.parent_cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = registry.sockets.get_mut(execution_id) {
+            entry.official_attempt = Some(OfficialAttemptUsage {
+                control_account_hash,
+                execution_account_hash,
+                selection_revision: official_selection_revision(auth),
+                upstream_attempted,
+            });
+        }
+    }
+
     async fn execute_upstream(
         &self,
         request: UpstreamRequest,
@@ -3643,6 +3699,9 @@ impl ProxyRuntime {
         } else {
             None
         };
+        if let Some(auth) = resolved_official_auth.as_ref() {
+            self.note_official_attempt(execution_id, request, auth, false);
+        }
         // Bookmarks are cumulative. Separate account/quota authorization
         // from history hydration so cold routing reads are attributable.
         stages.mark("auth_resolved");
@@ -3664,7 +3723,8 @@ impl ProxyRuntime {
         // the foreign chain has to become portable visible history first.
         let official_route_switch =
             self.is_cross_route_official_continuation(route, &request.body)?;
-        let official_account_switch = request.metadata.force_portable_official_handoff
+        let official_account_switch = (route.provider_kind == RuntimeProviderKind::Official
+            && request.metadata.force_portable_official_handoff)
             || self.is_cross_realm_official_continuation(
                 route,
                 &request.body,
@@ -4441,6 +4501,9 @@ impl ProxyRuntime {
                     reasoning_replay_retry_body,
                 )
                 .await;
+        }
+        if route.provider_kind == RuntimeProviderKind::Official {
+            self.note_official_attempt(execution_id, request, &auth, true);
         }
         let mut response = match self
             .execute_upstream(
@@ -5779,6 +5842,9 @@ impl ProxyRuntime {
             return Err(error);
         }
         let send_started = std::time::Instant::now();
+        if route.provider_kind == RuntimeProviderKind::Official {
+            self.note_official_attempt(execution_id, request, &auth, true);
+        }
         let mut upstream = match self.open_upstream_stream(&upstream_request).await {
             Ok(upstream) => upstream,
             Err(error) => {
@@ -5901,12 +5967,7 @@ impl ProxyRuntime {
                             max_response_bytes: None,
                         })
                         .await?;
-                    self.note_opencode_quota(
-                        route,
-                        upstream.status,
-                        &upstream.headers,
-                        &[],
-                    );
+                    self.note_opencode_quota(route, upstream.status, &upstream.headers, &[]);
                     if !(200..300).contains(&upstream.status) {
                         let retry_status = upstream.status;
                         let retry_error_body = drain_upstream_error_body(&mut upstream).await?;
@@ -7349,10 +7410,7 @@ impl ProxyRuntime {
             ContinuationMode::StatelessEncryptedReplay
             | ContinuationMode::PortableSemanticReplay => {
                 if chain.is_empty() {
-                    return Err(RuntimeError::Continuation(format!(
-                        "cannot continue conversation: previous_response_id `{previous}` has no local history (mode={:?})",
-                        decision.mode
-                    )));
+                    return Err(RuntimeError::PreviousResponseNotFound(previous.to_string()));
                 }
                 let mut outcome =
                     crate::replay::hydrate_input_with_mode(body, &chain, decision.mode);
@@ -11067,10 +11125,9 @@ mod tests {
     #[tokio::test]
     async fn official_websocket_plan_records_safe_effective_request_diagnostics() {
         let events = Arc::new(RecordingStore::new());
-        let runtime = official_runtime_with_transport(Arc::new(RecordingTransport::new(
-            Vec::new(),
-        )))
-        .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
+        let runtime =
+            official_runtime_with_transport(Arc::new(RecordingTransport::new(Vec::new())))
+                .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
         let request = request(json!({
             "type": "response.create",
             "model": "vlm-test",
@@ -11246,8 +11303,15 @@ mod tests {
     #[test]
     fn official_shared_workspace_identity_keeps_refresh_but_separates_users() {
         use base64::Engine as _;
-        let token = |user: &str, revision: u32| format!("header.{}.signature", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            json!({ "sub": user, "chatgpt_account_id": "shared", "iat": revision }).to_string()));
+        let token = |user: &str, revision: u32| {
+            format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    json!({ "sub": user, "chatgpt_account_id": "shared", "iat": revision })
+                        .to_string()
+                )
+            )
+        };
         let authorization = |user: &str, revision: u32| OfficialAuthorization {
             access_token: token(user, revision), account_id: Some("shared".into()),
             selection_revision: Some(3), selection_verified: true,
@@ -13180,8 +13244,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, RuntimeError::Continuation(message) if message.contains("no local history")),
-            "expected fail-closed Continuation, got {error:?}"
+            matches!(&error, RuntimeError::PreviousResponseNotFound(id) if id == "resp_ghost"),
+            "expected recoverable missing response, got {error:?}"
         );
         assert_eq!(
             transport.requests.lock().unwrap().len(),
@@ -15940,6 +16004,7 @@ mod tests {
                     id.clone(),
                     TimestampedSender {
                         sender,
+                        official_attempt: None,
                         created: tokio::time::Instant::now(),
                     },
                 );
