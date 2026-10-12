@@ -221,6 +221,41 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
         // whenever the client doesn't tag it.
         match request.get("type").and_then(Value::as_str) {
             Some("response.create") | None => {
+                // Warmup requests do not generate inference. Never forward them
+                // into the native pending queue, where an unanswered warmup can
+                // otherwise live until disconnect and become a phantom failure.
+                if request.get("generate").and_then(Value::as_bool) == Some(false) {
+                    if official
+                        .as_ref()
+                        .is_some_and(|segment| !segment.pending.is_empty())
+                    {
+                        // Preserve terminal ordering: finish the running turn
+                        // before emitting the local warmup completion.
+                        deferred_account_handoffs.push_back(request);
+                        continue;
+                    }
+                    match execute_portable_turn(
+                        &mut client,
+                        &state,
+                        runtime.as_ref(),
+                        &headers,
+                        request,
+                        &connection_id,
+                        &mut queued,
+                        &mut frames_out,
+                        false,
+                        &mut portable_warmup,
+                    )
+                    .await
+                    {
+                        TurnOutcome::Continue => {}
+                        TurnOutcome::Stop(stop_reason) => {
+                            reason = stop_reason;
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 turns += 1;
                 if preplanned_runtime_request.is_none() {
                     resume_portable_warmup(&mut request, &mut portable_warmup);
@@ -1655,13 +1690,29 @@ fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
 }
 
 fn official_websocket_failure_category(event: &Value) -> &str {
+    let error = event
+        .pointer("/response/error")
+        .or_else(|| event.get("error"));
+    // Codex recognizes this upstream code and reconnects. Preserve the frame
+    // verbatim, but record the expired transport as a retryable availability
+    // failure rather than a fatal prompt error.
+    if error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        == Some("websocket_connection_limit_reached")
+    {
+        return "provider_unavailable";
+    }
     if let Some(category) = event
         .pointer("/response/error/category")
         .and_then(Value::as_str)
     {
         return category;
     }
-    match event.pointer("/error/type").and_then(Value::as_str) {
+    match error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
         Some("invalid_request_error") => "invalid_request",
         Some("authentication_error") => "provider_auth",
         Some("insufficient_quota") | Some("rate_limit_error") => "provider_quota",
@@ -2129,6 +2180,7 @@ fn record_official_pending_outcome(
     let status = match (outcome, error_category) {
         ("client_cancel" | "client_disconnect", _) => 499,
         ("protocol_failure", Some("invalid_request")) => 400,
+        (_, Some("provider_unavailable")) => 503,
         _ => 502,
     };
     runtime.finish_terminal_once_with_record(
@@ -4787,35 +4839,263 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn official_websocket_top_level_error_is_terminal_invalid_request() {
+    async fn native_prewarm_during_inference_never_becomes_phantom_usage() {
+        run_native_prewarm_during_inference(false).await;
+    }
+
+    #[tokio::test]
+    async fn native_prewarm_during_inference_does_not_block_next_real_turn() {
+        run_native_prewarm_during_inference(true).await;
+    }
+
+    async fn run_native_prewarm_during_inference(next_turn: bool) {
+        let first_seen = Arc::new(tokio::sync::Notify::new());
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(AtomicUsize::new(0));
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
-            get(|ws: WebSocketUpgrade| async move {
-                ws.on_upgrade(|mut socket| async move {
-                    while let Some(Ok(message)) = socket.recv().await {
-                        let AxumWsMessage::Text(text) = message else {
-                            continue;
-                        };
-                        let value: Value = serde_json::from_str(&text).unwrap();
-                        if value.get("type").and_then(Value::as_str) == Some("response.create") {
+            get({
+                let first_seen = first_seen.clone();
+                let closed = closed.clone();
+                let seen = seen.clone();
+                move |ws: WebSocketUpgrade| {
+                    let first_seen = first_seen.clone();
+                    let closed = closed.clone();
+                    let seen = seen.clone();
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            let Some(Ok(AxumWsMessage::Text(_))) = socket.recv().await else {
+                                return;
+                            };
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            first_seen.notify_one();
+                            // Keep inference in flight while the client sends prewarm.
+                            // This upstream deliberately never answers a warmup frame.
+                            if let Ok(Some(Ok(AxumWsMessage::Text(_)))) = tokio::time::timeout(
+                                std::time::Duration::from_millis(100),
+                                socket.recv(),
+                            )
+                            .await
+                            {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                            }
                             socket
                                 .send(AxumWsMessage::Text(
-                                    json!({
-                                        "type": "error",
-                                        "status": 400,
-                                        "error": {
-                                            "type": "invalid_request_error",
-                                            "message": "Invalid `previous_response_id`."
-                                        }
-                                    })
+                                    json!({"type":"response.completed","response":{
+                        "id":"resp_real","status":"completed","output":[]}})
                                     .to_string()
                                     .into(),
                                 ))
                                 .await
                                 .unwrap();
-                        }
+                            if next_turn {
+                                let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await
+                                else {
+                                    panic!("missing next real turn");
+                                };
+                                let body: Value = serde_json::from_str(&text).unwrap();
+                                assert!(body.get("generate").is_none());
+                                assert!(body.get("previous_response_id").is_none());
+                                assert_eq!(
+                                    body["input"],
+                                    json!([
+                                        {"role":"user","content":"warmup"},
+                                        {"role":"user","content":"next turn"}
+                                    ])
+                                );
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                socket
+                                    .send(AxumWsMessage::Text(
+                                        json!({"type":"response.completed","response":{
+                            "id":"resp_next","status":"completed","output":[]}})
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
+                            socket.send(AxumWsMessage::Close(None)).await.unwrap();
+                            closed.notify_one();
+                        })
                     }
-                })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let mut state = StaticProxyState::from_config(ProxyRuntimeConfig {
+            models: vec![official_route_config(format!(
+                "http://{address}/backend-api/codex"
+            ))],
+            ..Default::default()
+        })
+        .unwrap();
+        state.mark_listener_ready();
+        let state = Arc::new(state);
+        let runtime = state.proxy_runtime();
+        let proxy = build_headless_router(state, InboundAccessPolicy::test_only_disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, proxy).await;
+        });
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/v1/responses"))
+                .await
+                .unwrap();
+        client
+            .send(TungsteniteMessage::Text(
+                json!({"type":"response.create","model":"vellum-official",
+            "input":[{"role":"user","content":"real turn"}],"stream":true})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_seen.notified())
+            .await
+            .unwrap();
+        client
+            .send(TungsteniteMessage::Text(
+                json!({"type":"response.create","model":"vellum-official",
+            "input":[{"role":"user","content":"warmup"}],"generate":false})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let TungsteniteMessage::Text(text) = frame {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event.pointer("/response/id").and_then(Value::as_str) == Some("resp_real") {
+                    break;
+                }
+            }
+        }
+        if next_turn {
+            let warmup_id = loop {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if let TungsteniteMessage::Text(text) = frame {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "response.completed" {
+                        break event["response"]["id"].as_str().unwrap().to_owned();
+                    }
+                }
+            };
+            client
+                .send(TungsteniteMessage::Text(
+                    json!({"type":"response.create","model":"vellum-official",
+                "previous_response_id":warmup_id,"input":[{"role":"user","content":"next turn"}],
+                "stream":true})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(frame) = client.next().await {
+                if matches!(frame.unwrap(), TungsteniteMessage::Close(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), closed.notified())
+            .await
+            .unwrap();
+        let rows = runtime.usage_records().unwrap();
+        let expected_turns = if next_turn { 2 } else { 1 };
+        assert_eq!(
+            rows.len(),
+            expected_turns,
+            "prewarm must not create a failed usage row: {rows:?}"
+        );
+        assert!(rows.iter().all(|row| row.status == 200), "{rows:?}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            expected_turns,
+            "prewarm must stay local"
+        );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn official_websocket_top_level_error_is_terminal_invalid_request() {
+        run_official_error_frame(
+            json!({"type":"error","status":400,"error":{
+            "type":"invalid_request_error","message":"Invalid `previous_response_id`."}}),
+            "invalid_request",
+            400,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn official_content_policy_rejection_is_fatal_without_frame_rewriting() {
+        run_official_error_frame(
+            json!({"type":"response.failed","response":{"error":{
+            "type":"invalid_request_error","code":"content_policy_violation",
+            "message":"This content was flagged for possible cybersecurity risk."}}}),
+            "invalid_request",
+            400,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn official_connection_lifetime_limit_keeps_codex_retry_code() {
+        run_official_error_frame(
+            json!({"type":"error","status":400,"error":{
+            "type":"invalid_request_error","code":"websocket_connection_limit_reached",
+            "message":"Responses websocket connection limit reached (60 minutes)"}}),
+            "provider_unavailable",
+            503,
+        )
+        .await;
+    }
+
+    async fn run_official_error_frame(expected: Value, category: &str, status: u16) {
+        let frame = expected.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let upstream_attempts = attempts.clone();
+        let upstream = Router::new().route(
+            "/backend-api/codex/responses",
+            get(move |ws: WebSocketUpgrade| {
+                let frame = frame.clone();
+                let attempts = upstream_attempts.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let AxumWsMessage::Text(text) = message else {
+                                continue;
+                            };
+                            let value: Value = serde_json::from_str(&text).unwrap();
+                            if value.get("type").and_then(Value::as_str) == Some("response.create")
+                            {
+                                attempts.fetch_add(1, Ordering::SeqCst);
+                                socket
+                                    .send(AxumWsMessage::Text(frame.to_string().into()))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    })
+                }
             }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4870,14 +5150,16 @@ mod tests {
             panic!("expected top-level error text, got {frame:?}");
         };
         let event: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(event["type"], "error");
+        assert_eq!(event, expected, "upstream frame must survive verbatim");
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if runtime.usage_records().unwrap().iter().any(|record| {
-                    record.outcome.as_deref() == Some("protocol_failure")
-                        && record.error_category.as_deref() == Some("invalid_request")
-                }) {
+                if runtime
+                    .usage_records()
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.error_category.as_deref() == Some(category))
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -4889,17 +5171,15 @@ mod tests {
             .usage_records()
             .unwrap()
             .into_iter()
-            .find(|record| record.error_category.as_deref() == Some("invalid_request"))
+            .find(|record| record.error_category.as_deref() == Some(category))
             .unwrap();
-        assert_eq!(record.status, 400, "{record:?}");
-        assert!(
-            record
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("previous_response_id")),
-            "{record:?}"
+        assert_eq!(record.status, status, "{record:?}");
+        assert_eq!(record.upstream_attempted, Some(true));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "native errors must not trigger a hidden retry or account change"
         );
-
         let _ = client.close(None).await;
         proxy_task.abort();
         upstream_task.abort();

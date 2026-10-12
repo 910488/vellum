@@ -11584,6 +11584,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_content_policy_http_rejection_is_not_retried() {
+        let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+            status: 400,
+            headers: vec![],
+            body: br#"{"error":{"type":"invalid_request_error","code":"content_policy_violation","message":"This content was flagged for possible cybersecurity risk"}}"#.to_vec(),
+        }, scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let error = runtime
+            .execute(
+                request(json!({"model":"vlm-test","input":"policy rejection"})),
+                "policy_rejected",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::ProviderRequestRejected {
+                upstream_status: 400,
+                ..
+            }
+        ));
+        assert_eq!(error.http_status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "a deterministic rejection must not retry or fail over"
+        );
+    }
+
+    #[tokio::test]
     async fn official_handoff_preserves_desktop_tool_contract() {
         for (force, code_mode) in [(false, false), (true, false), (false, true), (true, true)] {
             let history = Arc::new(MemoryHistoryStore::new());

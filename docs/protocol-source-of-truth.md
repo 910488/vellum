@@ -723,7 +723,17 @@ with string code `previous_response_not_found` and status 400, which
 recognizes as a full-request retry. It is not a fatal `invalid_prompt`.
 Local hydration rejection records the selected account and
 `upstream_attempted=false`; dispatched native and bridged exchanges record
-`upstream_attempted=true`. Portable `generate=false` prewarms remain local.
+`upstream_attempted=true`. All `generate=false` prewarms remain local, including those received while a
+native inference is in flight. Their completion waits for the running turn,
+and they never enter the upstream pending queue or create inference usage.
+The next request chained to the local warmup id restores its input.
+
+Native error frames preserve upstream codes and payloads verbatim. Nested
+`response.error.type=invalid_request_error` is a fatal request rejection (400),
+just like the top-level error envelope. In contrast,
+`websocket_connection_limit_reached` is recorded as provider-unavailable (503):
+Codex recognizes the preserved code and reconnects instead of treating it as
+an invalid prompt. The proxy does not silently replay an expired turn.
 
 Official HTTP dispatch preserves the explicit `session-id` and `session_id`
 cache-affinity headers from the HTTP request or WebSocket handshake, including
