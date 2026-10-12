@@ -80,6 +80,10 @@ pub struct ThreadExecutionBinding {
     pub request_id: String,
     pub thread: CodexThreadKey,
     pub turn_id: Option<CodexOpaqueId>,
+    /// Root turn of this request. Codex starts a new root turn for every user
+    /// turn, so it belongs to the execution; the node keeps only the first.
+    #[serde(default)]
+    pub root_turn_id: Option<CodexOpaqueId>,
     pub context_window_id: Option<CodexOpaqueId>,
     pub connection_id: Option<String>,
     pub route_id: String,
@@ -349,6 +353,7 @@ impl SubagentGraphRegistry {
             request_id: observation.request_id.clone(),
             thread: current_key.clone(),
             turn_id: identity.turn_id.clone(),
+            root_turn_id: identity.root_turn_id.clone(),
             context_window_id: identity.context_window_id.clone(),
             connection_id: observation.connection_id,
             route_id: observation.route_id,
@@ -809,6 +814,29 @@ mod tests {
             model: "test-model".into(),
             observed_at_ms: 1000,
         }
+    }
+
+    #[test]
+    fn each_execution_keeps_its_own_root_turn() {
+        let mut registry = SubagentGraphRegistry::new();
+        for (exec, root) in [("exec_1", "TURN_1"), ("exec_2", "TURN_2")] {
+            let identity = CodexTurnIdentity {
+                root_turn_id: Some(CodexOpaqueId::new("root_turn_id", root).unwrap()),
+                ..dummy_turn_identity("S1", "T_ROOT", None)
+            };
+            registry
+                .observe_turn(&identity, dummy_obs(exec, exec))
+                .unwrap();
+        }
+
+        let root_of = |exec: &str| {
+            registry
+                .execution_binding(exec)
+                .and_then(|binding| binding.root_turn_id.as_ref())
+                .map(|id| id.as_str().to_string())
+        };
+        assert_eq!(root_of("exec_1").as_deref(), Some("TURN_1"));
+        assert_eq!(root_of("exec_2").as_deref(), Some("TURN_2"));
     }
 
     #[test]

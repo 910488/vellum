@@ -202,11 +202,27 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let official = temp.path().join("CodexCLI");
         fs::write(&official, b"v1").unwrap();
+        // Force the same timestamp regardless of the filesystem's resolution.
+        // A future timestamp keeps the racy window open even on a slow runner.
+        let modified = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let set_modified = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&official)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        };
+        set_modified();
+        let before = fs::metadata(&official).unwrap();
         let manifest = manifest(temp.path(), official.clone());
         fs::write(&official, b"v2").unwrap();
+        set_modified();
+        let after = fs::metadata(&official).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
 
-        let (resolved, drifted) =
-            resolve_official_with(&manifest, vec![official.clone()]).unwrap();
+        let (resolved, drifted) = resolve_official_with(&manifest, vec![official.clone()]).unwrap();
         assert!(drifted);
         assert_eq!(resolved.executable, official);
         assert_ne!(resolved.artifact_sha256, manifest.official.artifact_sha256);
