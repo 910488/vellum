@@ -761,6 +761,13 @@ and canonical encrypted reasoning items. The cache holds at most 256 snapshots
 and 32 MiB of serialized payload, expires entries after 20 minutes, and never
 writes ciphertext to durable history. On expiry, eviction, missing realm, or
 account/route changes, existing durable portable replay remains the fallback.
+
+The Official durable conversation projection retains caller system/developer
+messages in their original order; the compaction/trajectory projection may
+exclude those messages and must not be reused for conversation persistence.
+Durable history never stores encrypted reasoning. Official replay outside the
+wire cache removes stored provider item IDs while preserving tool `call_id`
+pairing, so a new account receives the caller context without foreign handles.
 Client-carried complete history uses the existing provider-output/id overlap
 gate; repeated user text alone is never deduplicated.
 
