@@ -1715,7 +1715,11 @@ fn official_websocket_failure_category(event: &Value) -> &str {
     {
         Some("invalid_request_error") => "invalid_request",
         Some("authentication_error") => "provider_auth",
-        Some("insufficient_quota") | Some("rate_limit_error") => "provider_quota",
+        // Codex maps the verbatim usage_limit_reached frame to its own
+        // usage-limit error; Vellum only has to account for it as quota.
+        Some("insufficient_quota") | Some("rate_limit_error") | Some("usage_limit_reached") => {
+            "provider_quota"
+        }
         Some(_) | None => "provider_protocol",
     }
 }
@@ -2181,6 +2185,7 @@ fn record_official_pending_outcome(
         ("client_cancel" | "client_disconnect", _) => 499,
         ("protocol_failure", Some("invalid_request")) => 400,
         (_, Some("provider_unavailable")) => 503,
+        (_, Some("provider_quota")) => 429,
         _ => 502,
     };
     runtime.finish_terminal_once_with_record(
@@ -5065,6 +5070,18 @@ mod tests {
             "message":"Responses websocket connection limit reached (60 minutes)"}}),
             "provider_unavailable",
             503,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn official_usage_limit_frame_is_recorded_as_quota() {
+        run_official_error_frame(
+            json!({"type":"error","status":429,"error":{
+            "type":"usage_limit_reached","plan_type":"plus","resets_at":1_791_900_000_i64,
+            "message":"The usage limit has been reached"}}),
+            "provider_quota",
+            429,
         )
         .await;
     }
