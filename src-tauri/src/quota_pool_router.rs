@@ -19,7 +19,8 @@ const BALANCE_HORIZON_SECONDS: f64 = 6.0 * 3600.0;
 // simultaneous usage calibration replaces this prior as observations arrive.
 const FIVE_HOUR_CAPACITY_RATIO: f64 = 1.0 / 12.0;
 const FIVE_HOUR_BALANCE_SECONDS: f64 = 3600.0;
-pub(crate) const DEFAULT_LAMBDA: f64 = 0.1;
+const RECOVERY_FIVE_HOUR_SHARE: f64 = 0.5;
+pub(crate) const DEFAULT_LAMBDA: f64 = 0.2;
 
 #[derive(Clone, Default)]
 pub(crate) struct Candidate {
@@ -48,11 +49,28 @@ struct Calibration {
     anchor_used: Option<f64>,
     tokens_since: f64,
     tokens_per_point: Option<f64>,
+    external_points: f64,
 }
 impl Calibration {
-    fn update(&mut self, used: f64) {
+    fn update(&mut self, used: f64, prior: f64) {
         match self.anchor_used {
             Some(anchor) if used + 0.5 < anchor => {
+                self.anchor_used = Some(used);
+                self.tokens_since = 0.0;
+            }
+            Some(anchor)
+                if used - anchor >= 2.0
+                    && (self.tokens_per_point.is_some() || self.tokens_since == 0.0)
+                    && self.tokens_since / (used - anchor)
+                        < self.tokens_per_point.unwrap_or(prior) * 0.5 =>
+            {
+                // Pool observations cannot explain this quota jump. Retain the
+                // capacity estimate and advance the anchor; otherwise external
+                // spending would lower both weekly and 5h capacity. A first
+                // nonzero sample can still replace an inaccurate plan prior.
+                self.external_points +=
+                    (used - anchor - self.tokens_since / self.tokens_per_point.unwrap_or(prior))
+                        .max(0.0);
                 self.anchor_used = Some(used);
                 self.tokens_since = 0.0;
             }
@@ -105,6 +123,7 @@ struct Session {
     review: bool,
     observations: u32,
     latest_request: String,
+    cached_fraction: f64,
 }
 struct RequestBinding {
     session: String,
@@ -195,7 +214,7 @@ impl SmartRouter {
             .map(|c| {
                 let cal = self.calibration.entry(c.account_id.clone()).or_default();
                 if let Some(used) = c.weekly_used {
-                    cal.update(used);
+                    cal.update(used, PRIOR_TOKENS_PER_POINT * c.capacity_prior.max(0.01));
                 }
                 let capacity = cal
                     .tokens_per_point
@@ -209,13 +228,14 @@ impl SmartRouter {
                 // rather than letting the reset horizon postpone correction.
                 let recovery =
                     (remaining - mean_remaining) * capacity / until.min(BALANCE_HORIZON_SECONDS);
+                let until_week = until;
                 let mut fair = remaining * capacity / until + recovery;
                 if let Some(used) = c.five_hour_used {
                     let five = self
                         .five_calibration
                         .entry(c.account_id.clone())
                         .or_default();
-                    five.update(used);
+                    five.update(used, capacity * FIVE_HOUR_CAPACITY_RATIO);
                     let left = (95.0 - used).max(0.0);
                     let size = five
                         .tokens_per_point
@@ -226,6 +246,16 @@ impl SmartRouter {
                         .max(60.0);
                     let five_recovery =
                         (left - mean_five) * size / until.min(FIVE_HOUR_BALANCE_SECONDS);
+                    // A positive weekly correction may spend only a fraction
+                    // of the sustainable full-window 5h surplus after its weekly
+                    // base share, leaving spare rather than racing the most
+                    // underused account straight to its reserve.
+                    if recovery > 0.0 {
+                        let base = remaining * capacity / until_week;
+                        let sustainable = 95.0 * size / 18000.0;
+                        fair = fair
+                            .min(base + RECOVERY_FIVE_HOUR_SHARE * (sustainable - base).max(0.0));
+                    }
                     // Recovery can tighten the 5h budget, never raise its S/T cap.
                     fair = fair.min(left * size / until + five_recovery.min(0.0));
                 }
@@ -271,7 +301,7 @@ impl SmartRouter {
             return (0, "unidentified_session_rank");
         };
         let previous = self.sessions.get(key);
-        let incumbent =
+        let available_incumbent =
             previous.and_then(|s| candidates.iter().position(|c| c.account_id == s.account_id));
         let review = key.starts_with("review:");
         let rho = previous.map_or_else(|| self.prior(review), |s| s.rate.at(now).max(0.01));
@@ -285,10 +315,43 @@ impl SmartRouter {
         } else {
             0.9 * tokens as f64 * cache_heat(gap)
         };
-        let mut best = incumbent.unwrap_or(0);
+        // Admission must include this request, rather than waiting for its
+        // response to push the account over a reserve. A new realm pays full
+        // input; the incumbent uses observed cache fraction and cache survival.
+        let fits = |i: usize| {
+            let cached = if Some(i) == available_incumbent && !compressed {
+                previous.map_or(0.0, |s| s.cached_fraction) * cache_heat(gap)
+            } else {
+                0.0
+            };
+            let expected = context.estimated_input_tokens as f64 * (1.0 - 0.9 * cached);
+            let weekly = candidates[i]
+                .weekly_headroom
+                .unwrap_or(candidates[i].headroom)
+                * fair[i].1;
+            let five = candidates[i]
+                .five_hour_used
+                .map(|used| {
+                    let size = self
+                        .five_calibration
+                        .get(&candidates[i].account_id)
+                        .and_then(|c| c.tokens_per_point)
+                        .unwrap_or(fair[i].1 * FIVE_HOUR_CAPACITY_RATIO);
+                    (95.0 - used).max(0.0) * size
+                })
+                .unwrap_or(f64::INFINITY);
+            expected <= weekly.min(five)
+        };
+        let any_fits = (0..candidates.len()).any(fits);
+        let incumbent = available_incumbent.filter(|i| !any_fits || fits(*i));
+        let mut best =
+            incumbent.unwrap_or_else(|| (0..candidates.len()).find(|i| fits(*i)).unwrap_or(0));
         let projected =
             |i: usize| (loads[i] + if Some(i) == incumbent { 0.0 } else { rho }) / fair[i].0;
         for i in 0..candidates.len() {
+            if any_fits && !fits(i) {
+                continue;
+            }
             if projected(i) < projected(best) * (1.0 - 1e-9) {
                 best = i;
             }
@@ -297,7 +360,9 @@ impl SmartRouter {
         let (selected, reason) = match incumbent {
             None => (
                 best,
-                if previous.is_some() {
+                if available_incumbent.is_some() && incumbent.is_none() && any_fits {
+                    "gate_request_budget"
+                } else if previous.is_some() {
                     "gate"
                 } else {
                     "new_session_min_util"
@@ -403,8 +468,12 @@ impl SmartRouter {
             review,
             observations: 0,
             latest_request: String::new(),
+            cached_fraction: 0.0,
         });
         session.account_id = candidates[selected].account_id.clone();
+        if changed || compressed {
+            session.cached_fraction = 0.0;
+        }
         if changed {
             session.migrated = Some(now);
         }
@@ -452,11 +521,11 @@ impl SmartRouter {
         );
         let candidates = candidates.iter().enumerate().map(|(i,c)| {
             let id=format!("{:x}",Sha256::digest(c.account_id.as_bytes()));
-            format!("account={} headroom={:.3} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} L={:.3} f={:.3} u={:.3}",
+            format!("account={} headroom={:.3} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} external_week_est={:.3} external_five_est={:.3} L={:.3} f={:.3} u={:.3}",
                 &id[..12],c.weekly_headroom.unwrap_or(c.headroom),c.weekly_used,fair[i].1,
                 if fair[i].2 {"measured"} else {"prior"},c.five_hour_used,
                 self.five_calibration.get(&c.account_id).and_then(|c|c.tokens_per_point).unwrap_or(fair[i].1*FIVE_HOUR_CAPACITY_RATIO),
-                if self.five_calibration.get(&c.account_id).is_some_and(|c|c.tokens_per_point.is_some()) {"measured"} else {"prior"},loads[i],fair[i].0,loads[i]/fair[i].0)
+                if self.five_calibration.get(&c.account_id).is_some_and(|c|c.tokens_per_point.is_some()) {"measured"} else {"prior"},self.calibration.get(&c.account_id).map_or(0.0, |c| c.external_points),self.five_calibration.get(&c.account_id).map_or(0.0, |c| c.external_points),loads[i],fair[i].0,loads[i]/fair[i].0)
         }).collect::<Vec<_>>().join("; ");
         log::info!("[QuotaPool] strategy=balanced candidates=[{}] rho={:.3} X={} gap_ms={} cost={:.3} benefit={:.3} selected_rank={} selected_account={} reason={}",
             candidates,session.0,session.1,session.2,session.3,session.4,selected+1,&selected_hash[..12],reason);
@@ -487,6 +556,7 @@ impl SmartRouter {
             // must not mutate a newer request's context or migrated forecast.
             if s.account_id == binding.account_id && s.latest_request == request_id {
                 s.tokens = input;
+                s.cached_fraction = cached as f64 / input as f64;
                 s.rate.add(billed * DECAY, binding.touched);
                 s.measured.add(billed * DECAY, binding.touched);
                 s.observations += 1;
@@ -566,6 +636,149 @@ mod tests {
         assert!(fair[0].0 < fair[1].0);
         assert!((fair[0].0 - 85.0 * 10_000.0 / 12.0 / 18000.0).abs() < 1e-8);
         assert!(router.five_calibration["a"].tokens_per_point.is_none());
+    }
+    #[test]
+    fn external_usage_preserves_weekly_and_five_hour_capacity() {
+        for capacity in [600_000.0, 50_000.0] {
+            let mut cal = Calibration::default();
+            cal.update(10.0, capacity);
+            cal.tokens_since = 2.0 * capacity;
+            cal.update(12.0, capacity);
+            assert_eq!(cal.tokens_per_point, Some(capacity));
+            // Two pool points plus twenty externally consumed points.
+            cal.tokens_since = 2.0 * capacity;
+            cal.update(34.0, capacity);
+            assert!(cal.tokens_per_point.unwrap() >= 0.9 * capacity);
+            assert!((cal.external_points - 20.0).abs() < 1e-9);
+            assert_eq!(cal.anchor_used, Some(34.0));
+            assert_eq!(cal.tokens_since, 0.0);
+            // Discarding the contaminated anchor must allow normal learning.
+            cal.tokens_since = 2.0 * capacity;
+            cal.update(36.0, capacity);
+            assert_eq!(cal.tokens_per_point, Some(capacity));
+            cal.update(0.0, capacity);
+            assert_eq!(cal.tokens_per_point, Some(capacity));
+        }
+    }
+    #[test]
+    fn first_capacity_sample_can_replace_an_overstated_prior() {
+        let mut cal = Calibration::default();
+        cal.update(10.0, 200_000.0);
+        cal.tokens_since = 40_000.0;
+        cal.update(18.0, 200_000.0);
+        assert_eq!(cal.tokens_per_point, Some(5000.0));
+        assert_eq!(cal.external_points, 0.0);
+    }
+    #[test]
+    fn external_jump_without_pool_tokens_advances_anchor_not_capacity() {
+        let mut cal = Calibration {
+            anchor_used: Some(10.0),
+            tokens_per_point: Some(600_000.0),
+            ..Default::default()
+        };
+        cal.update(30.0, 200_000.0);
+        assert_eq!(cal.tokens_per_point, Some(600_000.0));
+        assert_eq!(cal.external_points, 20.0);
+        assert_eq!(cal.anchor_used, Some(30.0));
+    }
+    #[test]
+    fn unequal_start_recovery_leaves_sustainable_five_hour_spare() {
+        let mut router = SmartRouter::default();
+        let accounts = [10.0, 35.0, 60.0, 80.0].map(|used| {
+            let id = used.to_string();
+            router.calibration.insert(
+                id.clone(),
+                Calibration {
+                    tokens_per_point: Some(1_200_000.0),
+                    ..Default::default()
+                },
+            );
+            router.five_calibration.insert(
+                id.clone(),
+                Calibration {
+                    tokens_per_point: Some(50_000.0),
+                    ..Default::default()
+                },
+            );
+            Candidate {
+                account_id: id,
+                headroom: 95.0 - used,
+                weekly_headroom: Some(95.0 - used),
+                weekly_used: Some(used),
+                weekly_reset_at: Some(604_800_001),
+                five_hour_used: Some(0.0),
+                five_hour_reset_at: Some(18_000_001),
+                capacity_prior: 20.0,
+            }
+        });
+        let fair = router.fair_rates(&accounts, 1)[0].0;
+        let base = 85.0 * 1_200_000.0 / 604_800.0;
+        let sustainable = 95.0 * 50_000.0 / 18000.0;
+        assert!((fair - base - RECOVERY_FIVE_HOUR_SHARE * (sustainable - base)).abs() < 1e-8);
+        assert!(
+            fair * 18000.0 < 95.0 * 50_000.0,
+            "weekly recovery must leave spare below the 5h reserve"
+        );
+        // An absent 5h window imposes no artificial cap.
+        let mut without = accounts;
+        for c in &mut without {
+            c.five_hour_used = None;
+        }
+        assert!(router.fair_rates(&without, 1)[0].0 > sustainable);
+    }
+    #[test]
+    fn request_budget_moves_before_five_hour_reserve_is_crossed() {
+        let mut router = SmartRouter::default();
+        let mut accounts = [candidate("a", 80.0), candidate("b", 80.0)];
+        for c in &mut accounts {
+            c.five_hour_used = Some(0.0);
+            router.five_calibration.insert(
+                c.account_id.clone(),
+                Calibration {
+                    tokens_per_point: Some(50_000.0),
+                    ..Default::default()
+                },
+            );
+        }
+        let first = context("s", 1, 1000);
+        assert_eq!(router.choose(&accounts, &first, 1).0, 0);
+        router.observe(&first.request_id, 100_000, 100_000, 200);
+        accounts[0].five_hour_used = Some(94.9);
+        router.sessions.get_mut("s").unwrap().migrated = Some(1);
+        // Its next hot-cache request needs about 14.5k effective tokens,
+        // exceeding 5k left. A normal migration is still in hysteresis.
+        assert_eq!(
+            router.choose(&accounts, &context("s", 2, 100_000), 2),
+            (1, "gate_request_budget")
+        );
+        assert_eq!(router.sessions["s"].cached_fraction, 0.0);
+    }
+    #[test]
+    fn request_budget_retains_cache_affinity_and_handles_no_fitting_account() {
+        let mut router = SmartRouter::default();
+        let mut accounts = [candidate("a", 80.0), candidate("b", 80.0)];
+        for c in &mut accounts {
+            c.five_hour_used = Some(0.0);
+            router.five_calibration.insert(
+                c.account_id.clone(),
+                Calibration {
+                    tokens_per_point: Some(50_000.0),
+                    ..Default::default()
+                },
+            );
+        }
+        let first = context("s", 1, 1000);
+        router.choose(&accounts, &first, 1);
+        router.observe(&first.request_id, 100_000, 100_000, 200);
+        accounts[0].five_hour_used = Some(94.4); // 30k left: cached fits, full does not.
+        assert_eq!(router.choose(&accounts, &context("s", 2, 100_000), 2).0, 0);
+        // If every candidate is too small, do not repeatedly force a realm
+        // change from an estimate alone. Real gates retain their old fallback.
+        accounts[1].five_hour_used = Some(94.4);
+        assert_eq!(
+            router.choose(&accounts, &context("s", 3, 1_000_000), 3).0,
+            0
+        );
     }
     #[test]
     fn concurrent_new_sessions_reserve_load_before_usage_arrives() {
@@ -730,11 +943,11 @@ mod tests {
     #[test]
     fn calibration_uses_effective_tokens_and_resets_baseline() {
         let mut cal = Calibration::default();
-        cal.update(10.0);
+        cal.update(10.0, 10_000.0);
         cal.tokens_since = 400_000.0;
-        cal.update(18.0);
+        cal.update(18.0, 10_000.0);
         assert_eq!(cal.tokens_per_point, Some(50_000.0));
-        cal.update(1.0);
+        cal.update(1.0, 10_000.0);
         assert_eq!(cal.tokens_per_point, Some(50_000.0));
         assert_eq!(cal.tokens_since, 0.0);
     }

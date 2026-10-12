@@ -13,6 +13,10 @@ mod router;
 #[path = "quota_pool_previous.rs"]
 mod previous_router;
 
+#[allow(dead_code)]
+#[path = "quota_pool_review08.rs"]
+mod review08;
+
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -118,6 +122,8 @@ struct ResultRow {
     reserve_hours: f64,
     all_gated_requests: u64,
     timeline: Vec<Point>,
+    quota_events: Vec<serde_json::Value>,
+    calibration_snapshots: Vec<serde_json::Value>,
 }
 struct DecisionLogger(std::sync::Mutex<String>);
 static DECISION_LOGGER: DecisionLogger = DecisionLogger(std::sync::Mutex::new(String::new()));
@@ -214,6 +220,21 @@ fn dispersion(accounts: &[Account]) -> (f64, f64) {
     )
 }
 fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRow {
+    simulate_events(rows, models, kind, lambda, &[])
+}
+#[derive(Clone, Serialize)]
+struct ExternalEvent {
+    at: u64,
+    account: usize,
+    weekly_points: f64,
+}
+fn simulate_events(
+    rows: &[Row],
+    models: &[Model],
+    kind: &str,
+    lambda: f64,
+    events: &[ExternalEvent],
+) -> ResultRow {
     let first = rows[0].at;
     let mut accounts = models
         .iter()
@@ -221,6 +242,7 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
         .map(|m| Account::new(m, first))
         .collect::<Vec<_>>();
     let mut smart = router::SmartRouter::for_replay(lambda, kind == "placement_only");
+    let mut baseline = review08::SmartRouter::for_replay(lambda, false);
     let mut old = legacy::SmartRouter::default();
     let mut prior = previous_router::SmartRouter::for_replay(lambda, kind == "previous_placement");
     let mut previous = HashMap::<String, usize>::new();
@@ -233,7 +255,23 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
     let mut time_metrics = TimeDispersion::default();
     let mut last_at = first;
     let mut diagnostics = Vec::new();
+    let mut quota_events = Vec::new();
+    let mut calibration_snapshots = Vec::new();
+    let mut snapshot_hour = u64::MAX;
+    let mut event_index = 0;
     for (n, row) in rows.iter().enumerate() {
+        while event_index < events.len() && events[event_index].at <= row.at {
+            let e = &events[event_index];
+            advance_accounts(&mut accounts, last_at, e.at, &mut time_metrics);
+            last_at = e.at;
+            let a = &mut accounts[e.account];
+            a.spend(e.weekly_points * a.model.weekly_capacity / 100.0);
+            // An upstream 5h observation is bounded at 100%; external spend
+            // includes activity outside the replay's pool, not billed pool input.
+            a.five = a.five.min(100.0);
+            quota_events.push(serde_json::json!({"event":"external_burst", "hour":(e.at-first) as f64/3_600_000.0,"account":e.account,"weekly_points":e.weekly_points}));
+            event_index += 1;
+        }
         advance_accounts(&mut accounts, last_at, row.at, &mut time_metrics);
         last_at = row.at;
         let before_sd = dispersion(&accounts).0;
@@ -295,6 +333,21 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
                 })
                 .collect::<Vec<_>>();
             old.choose(&c, &context, row.at)
+        } else if kind == "review08" {
+            let c = candidates
+                .iter()
+                .map(|c| review08::Candidate {
+                    account_id: c.account_id.clone(),
+                    headroom: c.headroom,
+                    capacity_prior: c.capacity_prior,
+                    weekly_used: c.weekly_used,
+                    weekly_headroom: c.weekly_headroom,
+                    weekly_reset_at: c.weekly_reset_at,
+                    five_hour_used: c.five_hour_used,
+                    five_hour_reset_at: c.five_hour_reset_at,
+                })
+                .collect::<Vec<_>>();
+            baseline.choose(&c, &context, row.at)
         } else if kind.starts_with("previous_") {
             let c = candidates
                 .iter()
@@ -313,6 +366,11 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
         } else {
             smart.choose(&candidates, &context, row.at)
         };
+        let hour = (row.at - first) / 3_600_000;
+        if snapshot_hour != hour && kind != "legacy" {
+            snapshot_hour = hour;
+            calibration_snapshots.push(serde_json::json!({"hour":hour,"decision_log":DECISION_LOGGER.0.lock().unwrap().clone()}));
+        }
         let account = eligible[selected];
         let moved = previous
             .get(&row.session)
@@ -320,10 +378,22 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
         migrations += u64::from(moved);
         let cached = if moved { 0 } else { row.cached.min(row.input) };
         let effective = (row.input - cached) as f64 + 0.1 * cached as f64;
+        let before_five = accounts[account].five;
         accounts[account].spend(effective);
+        if before_five < 95.0 && accounts[account].five >= 95.0 {
+            quota_events.push(serde_json::json!({"event":"pool_reserve", "hour":(row.at-first) as f64/3_600_000.0,"account":account,"weekly_used":accounts[account].weekly,"five_used":accounts[account].five,"decision_log": if kind=="legacy" {String::new()} else {DECISION_LOGGER.0.lock().unwrap().clone()}}));
+        }
+        if event_index > 0
+            && row.at.saturating_sub(events[event_index - 1].at) <= 600_000
+            && n % 10 == 0
+        {
+            quota_events.push(serde_json::json!({"event":"post_external_calibration","hour":(row.at-first) as f64/3_600_000.0,"decision_log":if kind=="legacy" {String::new()} else {DECISION_LOGGER.0.lock().unwrap().clone()}}));
+        }
         effective_tokens += effective;
         if kind == "legacy" {
             old.observe(&context.request_id, row.input, cached, 200);
+        } else if kind == "review08" {
+            baseline.observe(&context.request_id, row.input, cached, 200);
         } else if kind.starts_with("previous_") {
             prior.observe(&context.request_id, row.input, cached, 200);
         } else {
@@ -385,6 +455,8 @@ fn simulate(rows: &[Row], models: &[Model], kind: &str, lambda: f64) -> ResultRo
             .sum(),
         all_gated_requests: all_gated,
         timeline,
+        quota_events,
+        calibration_snapshots,
     }
 }
 fn seeded_models(base: &[Model], scenario: &str, seed: u64) -> Vec<Model> {
@@ -425,6 +497,23 @@ fn seeded_models(base: &[Model], scenario: &str, seed: u64) -> Vec<Model> {
         m.five_hour_reset_seconds = phase;
     }
     models
+}
+fn external_events(first: u64, last: u64, count: usize, seed: u64) -> Vec<ExternalEvent> {
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        state
+    };
+    let duration = last.saturating_sub(first);
+    let mut events = (0..1 + seed % 2)
+        .map(|i| ExternalEvent {
+            at: first + duration / 5 + next() % (duration / 2).max(1),
+            account: (seed as usize + i as usize) % count,
+            weekly_points: 10.0 + (next() % 2001) as f64 / 100.0,
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|e| e.at);
+    events
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::set_logger(&DECISION_LOGGER).map_err(|_| "decision logger already installed")?;
@@ -513,27 +602,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         simulate(&rows, &models, "legacy", 0.0),
         simulate(&rows, &models, "previous_placement", 0.0),
         simulate(&rows, &models, "previous_full", 0.1),
+        simulate(&rows, &models, "review08", 0.1),
     ];
     for lambda in [0.05, 0.1, 0.2, 0.5, 1.0] {
         results.push(simulate(&rows, &models, "full", lambda));
     }
     let mut suite = Vec::new();
     if args.iter().any(|a| a == "--suite") {
-        for scenario in ["equal", "unequal_start", "staggered_reset", "heterogeneous"] {
-            for seed in [17, 29, 43] {
-                let models = seeded_models(&models, scenario, seed);
-                let mut comparisons = vec![simulate(&rows, &models, "legacy", 0.0)];
-                for lambda in [0.05, 0.1, 0.2, 0.5, 1.0] {
-                    comparisons.push(simulate(&rows, &models, "full", lambda));
+        for scenario in [
+            "equal",
+            "unequal_start",
+            "staggered_reset",
+            "heterogeneous",
+            "external_burst",
+        ] {
+            for seed in [17, 29, 43, 59, 71] {
+                if scenario != "unequal_start" && seed > 43 {
+                    continue;
                 }
-                suite.push(serde_json::json!({"scenario":scenario,"seed":seed,"models":models,"results":comparisons}));
+                let models = seeded_models(&models, scenario, seed);
+                let events = if scenario == "external_burst" {
+                    external_events(rows[0].at, rows.last().unwrap().at, models.len(), seed)
+                } else {
+                    vec![]
+                };
+                let mut comparisons = vec![
+                    simulate_events(&rows, &models, "legacy", 0.0, &events),
+                    simulate_events(&rows, &models, "review08", 0.1, &events),
+                ];
+                for lambda in [0.05, 0.1, 0.2, 0.5, 1.0] {
+                    comparisons.push(simulate_events(&rows, &models, "full", lambda, &events));
+                }
+                suite.push(serde_json::json!({"scenario":scenario,"seed":seed,"models":models,"external_events":events.iter().map(|e| serde_json::json!({"hour":(e.at-rows[0].at) as f64/3_600_000.0,"account":e.account,"weekly_points":e.weekly_points})).collect::<Vec<_>>(),"results":comparisons}));
             }
         }
     }
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"requests":rows.len(),"same_account_within_30s":short,
+            &serde_json::json!({"requests":rows.len(),"default_lambda":router::DEFAULT_LAMBDA,"same_account_within_30s":short,
         "low_reuse_within_30s":low,"low_reuse_percent":100.0*low as f64/(short.max(1) as f64),"results":results,"suite":suite})
         )?
     );
@@ -597,6 +704,56 @@ mod replay_tests {
             let result = simulate(&rows, &[model(100_000.0), model(100_000.0)], kind, 0.1);
             assert_eq!(result.migrations, 1);
             assert_eq!(result.effective_tokens, 1_190_000.0);
+        }
+    }
+    #[test]
+    fn external_burst_changes_quota_but_not_pool_billing() {
+        let rows = [
+            Row {
+                at: 1,
+                session: "main:s".into(),
+                model: "sol".into(),
+                input: 100,
+                cached: 0,
+                original_account: "a".into(),
+            },
+            Row {
+                at: 3_600_001,
+                session: "main:s".into(),
+                model: "sol".into(),
+                input: 100,
+                cached: 0,
+                original_account: "a".into(),
+            },
+        ];
+        let mut a = model(1_000_000.0);
+        a.five_hour_capacity = Some(100_000.0);
+        let events = [ExternalEvent {
+            at: 1_800_001,
+            account: 0,
+            weekly_points: 20.0,
+        }];
+        for kind in ["legacy", "review08", "full"] {
+            let result = simulate_events(&rows, &[a.clone()], kind, 0.2, &events);
+            assert_eq!(result.effective_tokens, 200.0);
+            assert!((result.reserve_hours - 0.5).abs() < 1e-9);
+            assert!(result.time_mean_sd.abs() < 1e-9);
+            assert_eq!(result.quota_events[0]["event"], "external_burst");
+        }
+    }
+    #[test]
+    fn external_bursts_are_deterministic_and_inside_trace() {
+        for seed in [17, 29, 43] {
+            let events = external_events(1, 604_800_001, 4, seed);
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                serde_json::to_value(&events).unwrap(),
+                serde_json::to_value(external_events(1, 604_800_001, 4, seed)).unwrap()
+            );
+            assert!(events.iter().all(|e| e.at > 1
+                && e.at < 604_800_001
+                && (10.0..=30.0).contains(&e.weekly_points)));
+            assert_ne!(events[0].account, events[1].account);
         }
     }
     #[test]
