@@ -2449,10 +2449,37 @@ html[data-performance="low"] .card {
   align-items: center;
   justify-content: end;
 }
-.acct--official {
-  grid-template-columns: 7.6em minmax(13em, 16em) 15em 8.2em 5.4em;
+/* All Official rows share content-sized tracks: label, state, quota,
+   5h auto, Reset, and actions. No translated button receives a fixed width. */
+.rows--official {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) minmax(0, max-content) minmax(0, 1fr) repeat(4, max-content);
+  column-gap: 12px;
 }
-.acct--official .acct__resets { width: 15em; flex: 0 0 15em; }
+.rows--official > .rows__item {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: start;
+}
+.rows--official .rows__key { overflow-wrap: anywhere; }
+.rows--official .rows__val {
+  display: grid;
+  grid-column: 2 / -1;
+  grid-template-columns: subgrid;
+}
+.acct--official {
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: start;
+}
+.acct--official .acct__resets {
+  grid-column: 3 / span 2;
+  grid-template-columns: subgrid;
+  width: auto;
+}
+.acct--official .acct__resets > :not(:last-child) { justify-self: start; }
+.acct--official .acct__resets > :last-child { justify-self: end; }
 .acct__actions {
   display: contents;
 }
@@ -2474,9 +2501,8 @@ html[data-performance="low"] .card {
   gap: 10px;
   min-width: 0;
 }
-/* Keep the weekly window first in every Official row. The second track
-   maintains vertical alignment without rendering an absent 5h window. */
-.acct__quota--official { grid-template-rows: 4.5rem 3rem; }
+/* Weekly starts at the same row origin; descriptions grow naturally. */
+.acct__quota--official { align-self: start; align-content: start; }
 /* 數字一欄、量條一欄，說明字掛在量條那一欄：讀數的左緣對齊量條的左緣，
    不從百分比底下開始 —— 數字靠右貼著量條，說明字要是從欄位最左邊起頭，
    三樣東西就有兩條不同的左緣。 */
@@ -2650,6 +2676,30 @@ html[data-performance="low"] .card {
   .acct__actions > .acct__quota {
     flex: 1 1 15em;
   }
+}
+
+@media (max-width: 1120px) {
+  .rows--official { grid-template-columns: max-content minmax(0, 1fr) max-content max-content; }
+  .rows--official .rows__val, .rows--official .acct--official,
+  .rows--official .acct__actions { display: contents; }
+  .rows--official .rows__key { grid-column: 1; grid-row: 1; }
+  .rows--official .state { grid-column: 2 / -1; grid-row: 1; justify-self: end; }
+  .rows--official .acct__quota,
+  .rows--official .acct__actions > .pill:first-child { grid-column: 1 / -1; grid-row: 2; }
+  .rows--official .acct__resets { grid-column: 1 / 3; grid-row: 3; }
+  .rows--official .acct__actions > .btn,
+  .rows--official .acct__actions > .pill:not(:first-child) { grid-column: 3; grid-row: 3; }
+  .rows--official .acct__actions > .btn:last-child { grid-column: 4; }
+  .rows--official .resets { grid-column: 1 / -1; }
+}
+@media (max-width: 600px) {
+  .rows--official { grid-template-columns: minmax(0, 1fr) max-content; }
+  .rows--official .acct__rank { flex-wrap: wrap; }
+  .rows--official .state { grid-column: 2; }
+  .rows--official .acct__resets { grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr) max-content; }
+  .rows--official .acct__actions > .btn,
+  .rows--official .acct__actions > .pill:not(:first-child) { grid-column: 1; grid-row: 4; justify-self: start; }
+  .rows--official .acct__actions > .btn:last-child { grid-column: 2; justify-self: end; }
 }
 
 /* ---------- 監看板 ----------

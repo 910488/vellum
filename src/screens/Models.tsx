@@ -1618,7 +1618,7 @@ export function Models({
 
         {oauth?.accounts.length ? (
           normalizedQuotaPool.enabled ? (
-            <Rows>
+            <Rows className="rows--official">
               {pooledAccounts.map((entry) => {
                 const account = entry.account;
                 const accountLabel = codexAccountLabel(account);
@@ -1861,7 +1861,7 @@ export function Models({
               })}
             </Rows>
           ) : (
-          <Rows>
+          <Rows className="rows--official">
             {oauth.accounts.map((account) => {
               const accountLabel = codexAccountLabel(account);
               const credits = resetCredits[account.accountId];
