@@ -2453,10 +2453,10 @@ html[data-performance="low"] .card {
   display: contents;
 }
 .acct > .state {
-  /* 底線跟著字走、字一律靠左：撐滿整格又靠右時，「待命」的底線會比字長
-     一大截，跟上下幾列的起筆對不齊。 */
-  justify-self: start;
-  text-align: left;
+  /* 底線跟著字走、字一律靠右貼著額度條：撐滿整格時「待命」的底線會比字
+     長一大截；靠左時長短不一的右緣又緊鄰額度條，看起來是歪的。 */
+  justify-self: end;
+  text-align: right;
   min-width: 0;
   white-space: normal;
   overflow-wrap: anywhere;
