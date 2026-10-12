@@ -14,6 +14,7 @@ default-members = [
   "crates/vellum-enhanced-codex",
 ]
 members = [
+  "crates/vellum-quota-pool-replay",
   "src-tauri",
   "crates/vellum-codex-app-server",
   "crates/vellum-codex-gate-child",

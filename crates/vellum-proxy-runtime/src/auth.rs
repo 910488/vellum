@@ -441,7 +441,16 @@ mod tests {
             ) -> Result<OfficialAuthDecision, String> {
                 assert_eq!(account, Some("review-account"));
                 assert_eq!(context.request_id, "req-auth");
-                assert_eq!(context.session_key.as_ref().unwrap().len(), 64);
+                assert_eq!(
+                    context
+                        .session_key
+                        .as_ref()
+                        .unwrap()
+                        .strip_prefix("review:")
+                        .unwrap()
+                        .len(),
+                    64
+                );
                 assert!(context.estimated_input_tokens > 100);
                 assert_eq!(context.context_window, Some(128_000));
                 Ok(OfficialAuthDecision::Managed(
@@ -486,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn official_context_separates_models_threads_and_conflicting_identity() {
+    fn official_context_preserves_model_affinity_but_separates_threads_and_conflicts() {
         use crate::codex_metadata::{CodexIdentityTrust, CodexOpaqueId, CodexTurnIdentity};
         use crate::official_auth::OfficialRoutingContext;
         let mut model = route(RuntimeAuthKind::ChatGpt, None);
@@ -508,7 +517,7 @@ mod tests {
             OfficialRoutingContext::from_request(&model, &request).session_key
         );
         model.upstream_model = "other-model".into();
-        assert_ne!(
+        assert_eq!(
             first.session_key,
             OfficialRoutingContext::from_request(&model, &request).session_key
         );

@@ -11243,6 +11243,52 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn balanced_account_migration_replays_history_without_cross_account_previous_id() {
+        let history = Arc::new(MemoryHistoryStore::new());
+        history.record_exchange_with_context(
+            &json!({"model":"vlm-test","input":[{"role":"user","content":"original task"}]}),
+            &json!({"id":"resp_old_account","output":[{"role":"assistant","content":"prior answer"}]}),
+            "route-1",None,Some("old-account-realm")).unwrap();
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime =
+            official_runtime_with_transport(transport.clone()).with_history_store(history);
+        let req = request(json!({"type":"response.create","model":"vlm-test",
+            "previous_response_id":"resp_old_account","input":[{"role":"user","content":"continue"}]}));
+        assert!(matches!(
+            runtime.prepare_websocket_turn(&req).await.unwrap().dispatch,
+            WebSocketTurnDispatch::PortableReplay {
+                force_official_handoff: true
+            }
+        ));
+        runtime.execute(req, "balanced_migration").await.unwrap();
+        let sent = transport.requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("previous_response_id").is_none());
+        let replay = body["input"].to_string();
+        assert!(
+            replay.contains("original task")
+                && replay.contains("prior answer")
+                && replay.contains("continue")
+        );
+    }
+
+    #[test]
+    fn official_session_identity_keeps_model_switch_affinity_and_separates_review() {
+        let mut route = sample_route(None);
+        let req = request(json!({"model":"sol","prompt_cache_key":"same-thread","input":"hi"}));
+        let before = crate::official_auth::OfficialRoutingContext::from_request(&route, &req);
+        route.upstream_model = "luna".into();
+        let after = crate::official_auth::OfficialRoutingContext::from_request(&route, &req);
+        assert_eq!(before.session_key, after.session_key);
+        let review = request(
+            json!({"model":"codex-auto-review","prompt_cache_key":"same-thread","input":"hi"}),
+        );
+        let review = crate::official_auth::OfficialRoutingContext::from_request(&route, &review);
+        assert_ne!(before.session_key, review.session_key);
+        assert!(review.session_key.unwrap().starts_with("review:"));
+    }
+
     #[test]
     fn official_shared_workspace_identity_keeps_refresh_but_separates_users() {
         use base64::Engine as _;
