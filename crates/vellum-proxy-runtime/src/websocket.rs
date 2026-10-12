@@ -104,6 +104,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
     let mut deferred_official: VecDeque<DeferredOfficialTurn> = VecDeque::new();
     let mut deferred_account_handoffs: VecDeque<Value> = VecDeque::new();
     let mut cancelled_response_ids: VecDeque<String> = VecDeque::new();
+    let mut portable_warmup: Option<PortableWarmup> = None;
     let mut turns = 0_u64;
     let mut frames_in = 0_u64;
     let mut frames_out = 0_u64;
@@ -199,7 +200,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
             }
         };
 
-        let (request, preplanned_runtime_request, preplanned_plan, preplanned_execution_id) =
+        let (mut request, preplanned_runtime_request, preplanned_plan, preplanned_execution_id) =
             match work {
                 WebSocketWork::New(request) => (request, None, None, None),
                 WebSocketWork::Deferred(turn) => (
@@ -221,6 +222,9 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
         match request.get("type").and_then(Value::as_str) {
             Some("response.create") | None => {
                 turns += 1;
+                if preplanned_runtime_request.is_none() {
+                    resume_portable_warmup(&mut request, &mut portable_warmup);
+                }
                 let was_deferred = preplanned_plan.is_some();
                 let mut runtime_request = preplanned_runtime_request.clone().unwrap_or_else(|| {
                     runtime_request_from_body(&state, &headers, &request, &connection_id)
@@ -461,6 +465,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                             &mut queued,
                             &mut frames_out,
                             force_official_handoff,
+                            &mut portable_warmup,
                         )
                         .await
                         {
@@ -1346,6 +1351,7 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
     queued: &mut VecDeque<Value>,
     frames_out: &mut u64,
     force_official_handoff: bool,
+    portable_warmup: &mut Option<PortableWarmup>,
 ) -> TurnOutcome {
     // The HTTP Responses body has no WebSocket event discriminator.
     if request.get("type").and_then(Value::as_str) == Some("response.create") {
@@ -1353,6 +1359,26 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             .as_object_mut()
             .expect("response.create is a JSON object")
             .remove("type");
+    }
+    // `generate` is a WebSocket-only field: HTTP Responses rejects it with
+    // `Unsupported parameter: generate`. A `generate=false` prewarm is
+    // connection setup, not inference, so it is answered here and its input
+    // is folded into the next turn that chains onto it.
+    if let Some(generate) = request.as_object_mut().and_then(|object| object.remove("generate")) {
+        if generate == Value::Bool(false) {
+            let (warmup, response) = portable_warmup_response(&request);
+            *portable_warmup = Some(warmup);
+            let turn_started = std::time::Instant::now();
+            return match send_buffered_response_as_websocket_events(client, response, turn_started)
+                .await
+            {
+                Ok(sent) => {
+                    *frames_out += sent.frames_out;
+                    TurnOutcome::Continue
+                }
+                Err(()) => TurnOutcome::Stop("client send failed".into()),
+            };
+        }
     }
     let mut runtime_request = runtime_request_from_body(state, headers, &request, connection_id);
     runtime_request.metadata.force_portable_official_handoff = force_official_handoff;
@@ -1540,6 +1566,58 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             TurnOutcome::Stop(error.to_string())
         }
     }
+}
+
+/// A `generate=false` prewarm answered locally on the portable path. Codex
+/// chains its next `response.create` onto this id and sends only the input
+/// added since, so the prewarm input must be restored before that turn runs.
+#[derive(Debug)]
+struct PortableWarmup {
+    response_id: String,
+    input: Value,
+}
+
+fn portable_warmup_response(request: &Value) -> (PortableWarmup, Value) {
+    let response_id = format!("resp_vellum_warmup_{}", ulid::Ulid::new());
+    let response = json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "model": request.get("model").cloned().unwrap_or(Value::Null),
+        "output": [],
+    });
+    let warmup = PortableWarmup {
+        response_id,
+        input: request.get("input").cloned().unwrap_or_else(|| json!([])),
+    };
+    (warmup, response)
+}
+
+/// Rewrite a turn chained onto a locally answered prewarm into a standalone
+/// request: the prewarm id exists nowhere upstream or in history. Any other
+/// turn discards the pending prewarm, since Codex only chains the next one.
+fn resume_portable_warmup(request: &mut Value, warmup: &mut Option<PortableWarmup>) {
+    let Some(warmup) = warmup.take() else {
+        return;
+    };
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    if object.get("previous_response_id").and_then(Value::as_str)
+        != Some(warmup.response_id.as_str())
+    {
+        return;
+    }
+    let Value::Array(mut input) = warmup.input else {
+        return;
+    };
+    match object.get("input") {
+        Some(Value::Array(delta)) => input.extend(delta.iter().cloned()),
+        None => {}
+        Some(_) => return,
+    }
+    object.remove("previous_response_id");
+    object.insert("input".into(), Value::Array(input));
 }
 
 fn request_for_history(mut value: Value) -> Value {
@@ -3501,6 +3579,198 @@ mod tests {
         proxy_task.abort();
         official_task.abort();
         third_party_task.abort();
+    }
+
+    #[test]
+    fn portable_warmup_only_resumes_the_turn_chained_onto_it() {
+        let (warmup, response) = portable_warmup_response(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": "a"}],
+            "generate": false
+        }));
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"], json!([]));
+
+        let mut pending = Some(warmup);
+        let mut unrelated = json!({"previous_response_id": "resp_other", "input": []});
+        resume_portable_warmup(&mut unrelated, &mut pending);
+        assert!(pending.is_none(), "a non-chained turn discards the prewarm");
+        assert_eq!(unrelated["previous_response_id"], "resp_other");
+
+        let (warmup, _) = portable_warmup_response(&json!({
+            "input": [{"role": "user", "content": "a"}]
+        }));
+        assert_ne!(response["id"], warmup.response_id.as_str());
+        let mut chained = json!({
+            "previous_response_id": warmup.response_id,
+            "input": [{"role": "user", "content": "b"}]
+        });
+        let mut pending = Some(warmup);
+        resume_portable_warmup(&mut chained, &mut pending);
+        assert!(chained.get("previous_response_id").is_none());
+        assert_eq!(
+            chained["input"],
+            json!([
+                {"role": "user", "content": "a"},
+                {"role": "user", "content": "b"}
+            ])
+        );
+    }
+
+    /// Codex prewarms a WebSocket turn with `generate=false`, then chains the
+    /// real turn onto the prewarm id with only the new input. On the portable
+    /// HTTP path neither field may reach the provider: HTTP Responses rejects
+    /// `generate`, and the prewarm id exists nowhere upstream.
+    #[tokio::test]
+    async fn portable_websocket_answers_prewarm_locally_and_restores_its_input() {
+        use axum::extract::Json;
+        use axum::routing::post;
+
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let bodies_srv = Arc::clone(&bodies);
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let bodies = Arc::clone(&bodies_srv);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    axum::Json(json!({
+                        "id": "resp_third_party",
+                        "object": "response",
+                        "status": "completed",
+                        "output": []
+                    }))
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream).await;
+        });
+
+        let route = RuntimeRouteConfig {
+            route_id: "third-party".into(),
+            catalog_id: "vlm-third-party".into(),
+            name: "ThirdParty".into(),
+            base_url: format!("http://{upstream_address}/v1"),
+            provider_kind: RuntimeProviderKind::OpenAiCompatible,
+            auth_kind: RuntimeAuthKind::None,
+            wire: RuntimeWireFormat::Responses,
+            server_side_resume: false,
+            streaming: false,
+            reasoning: true,
+            vision: false,
+            upstream_model: "third-party-upstream".into(),
+            context_window: Some(128_000),
+            reasoning_capabilities: Default::default(),
+            compaction_capabilities: Default::default(),
+            compaction_policy: Default::default(),
+            tool_capabilities: Default::default(),
+            credential_id: None,
+            catalog_entry: None,
+            chat_capabilities: Default::default(),
+            insecure_http_policy: Default::default(),
+            access_mode: None,
+        };
+        let config = ProxyRuntimeConfig {
+            models: vec![route],
+            ..ProxyRuntimeConfig::default()
+        };
+        let mut state = StaticProxyState::from_config(config).unwrap();
+        state.mark_listener_ready();
+        let state = Arc::new(state);
+        let proxy = build_headless_router(
+            Arc::clone(&state),
+            InboundAccessPolicy::test_only_disabled(),
+        );
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, proxy).await;
+        });
+
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{proxy_address}/v1/responses"))
+                .await
+                .unwrap();
+        async fn send_and_complete(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            frame: Value,
+        ) -> Value {
+            client
+                .send(TungsteniteMessage::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+            loop {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                let TungsteniteMessage::Text(text) = message else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(&text).unwrap();
+                match event["type"].as_str() {
+                    Some("response.completed") => return event,
+                    Some("response.failed") => panic!("turn failed: {event}"),
+                    _ => {}
+                }
+            }
+        }
+
+        let warmup = send_and_complete(
+            &mut client,
+            json!({
+                "type": "response.create",
+                "model": "vlm-third-party",
+                "instructions": "be brief",
+                "input": [{"role": "user", "content": "first"}],
+                "stream": false,
+                "generate": false
+            }),
+        )
+        .await;
+        let warmup_id = warmup["response"]["id"].as_str().unwrap().to_string();
+        assert!(
+            bodies.lock().unwrap().is_empty(),
+            "prewarm must not reach upstream"
+        );
+
+        let turn = send_and_complete(
+            &mut client,
+            json!({
+                "type": "response.create",
+                "model": "vlm-third-party",
+                "instructions": "be brief",
+                "previous_response_id": warmup_id,
+                "input": [{"role": "user", "content": "second"}],
+                "stream": false
+            }),
+        )
+        .await;
+        assert_eq!(turn["response"]["id"], "resp_third_party");
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let upstream_body = &bodies[0];
+        assert!(upstream_body.get("generate").is_none(), "{upstream_body}");
+        assert!(
+            upstream_body.get("previous_response_id").is_none(),
+            "{upstream_body}"
+        );
+        let text = upstream_body["input"].to_string();
+        let first = text.find("first").expect("prewarm input restored");
+        let second = text.find("second").expect("turn input kept");
+        assert!(first < second, "{text}");
+
+        let _ = client.close(None).await;
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]
