@@ -3624,6 +3624,7 @@ impl ProxyRuntime {
             self.harness_options,
             self.delegation_runtime_wired,
         );
+        stages.mark("routed");
         // Official continuation realm is account-scoped. Resolve its auth
         // snapshot before deciding whether `previous_response_id` may remain
         // native; the same snapshot is retained for the eventual dispatch.
@@ -3642,6 +3643,9 @@ impl ProxyRuntime {
         } else {
             None
         };
+        // Bookmarks are cumulative. Separate account/quota authorization
+        // from history hydration so cold routing reads are attributable.
+        stages.mark("auth_resolved");
         let current_official_realm = resolved_official_auth
             .as_ref()
             .and_then(|auth| official_continuation_realm(route, auth));
