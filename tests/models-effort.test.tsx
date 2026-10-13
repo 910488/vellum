@@ -193,6 +193,10 @@ describe("Models screen Effort probe status", () => {
     apiMocks.setCodexQuotaPool.mockImplementation(async (settings) => ({ ...settings, activeAccountId: null }));
     renderModels();
     const slider = (await screen.findAllByRole("slider"))[0]!;
+    // Secondary account actions stay available without crowding the row.
+    const menu = screen.getAllByLabelText(t("tabPolish.moreActions"))[0]!.closest("details")!;
+    expect(menu.open).toBe(false);
+    expect(within(menu).getByRole("button", { name: t("models.ui.pool.pause"), hidden: true })).toBeTruthy();
     fireEvent.change(slider, { target: { value: "35" } });
     expect(apiMocks.setCodexQuotaPool).not.toHaveBeenCalled();
     fireEvent.pointerUp(slider);

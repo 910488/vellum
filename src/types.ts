@@ -1575,6 +1575,7 @@ export interface UpdateStatusSnapshot {
   desktop: LayerStatus;
   remote: LayerStatus;
   core: LayerStatus;
+  coreRuntime?: { activeVersion: string | null; pendingVersion: string | null; missing: boolean };
   preferences: UpdatePreferences;
   liveAutoUpdate: boolean;
   attention: UpdateAttention;

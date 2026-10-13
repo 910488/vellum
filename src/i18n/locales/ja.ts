@@ -2,6 +2,59 @@ import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
   "bridgeFallback": { "active": "Enhanced core がありません。送信ボタンの保護とアカウント切り替えは公式 bridge を通じて有効です。", "prepared": "Enhanced core がありません。公式 bridge は準備済みで、Codex が接続すると保護が有効になります。", "failed": "Enhanced core がなく、bridge の保護も有効ではありません。詳細を確認してインストールを修復してください。" },
+  "tabPolish": {
+    "details": "詳細",
+    "loginExpired": "このホストのログインが期限切れです。再度ログインしてください。",
+    "rateLimited": "Grok は一時的なレート制限中（429）です。後ほど自動的に再試行します。",
+    "genericError": "操作が完了しませんでした。詳細を確認して再試行してください。",
+    "settingsTitle": "設定",
+    "settingsIndex": "設定の分類",
+    "groups": {
+      "general": "一般と表示",
+      "integration": "Codex 連携",
+      "network": "接続とネットワーク",
+      "diagnostics": "診断と復元"
+    },
+    "restoreHost": "ホストを元の構成に戻す",
+    "remoteControl": "リモート操作",
+    "logLead": "使用量の推移、リクエストの結果、実行履歴を確認します。",
+    "time": {
+      "hoursMinutes": "{{hours}} 時間 {{minutes}} 分",
+      "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
+      "seconds": "{{seconds}} 秒"
+    },
+    "headers": {
+      "time": "時刻",
+      "model": "プロバイダー／モデル",
+      "tokens": "入力 → 出力",
+      "cache": "キャッシュ",
+      "duration": "所要時間",
+      "status": "結果"
+    },
+    "moreActions": "アカウントのその他の操作",
+    "fiveHourOn": "5 時間枠の自動リセット：オン",
+    "fiveHourOff": "5 時間枠の自動リセット：オフ",
+    "domainRules": "ドメインアクセス規則：{{count}} 件",
+    "allowed": "許可：{{domains}}",
+    "blocked": "ブロック：{{domains}}",
+    "anyDomain": "すべてのドメイン",
+    "noBlocked": "なし",
+    "dashboardHint": "これらの設定は現況ページのプロバイダーカードにのみ反映されます。",
+    "core": {
+      "label": "Enhanced core",
+      "active": "使用中 · {{version}}",
+      "pending": "使用中：{{version}} · 適用待ち：{{pending}}",
+      "missing": "Enhanced core がありません",
+      "bundled": "インストールに含まれる版",
+      "repair": "core を修復"
+    },
+    "qualified": "検証済み",
+    "launchReady": "起動設定の準備完了",
+    "conversation": "会話 {{index}}",
+    "parentConversation": "子会話",
+    "technical": "技術情報",
+    "account": "ChatGPT アカウント {{index}}"
+  },
   "enhanced": {"heading":"Enhanced ランタイムの状態","lead":"各ルートの実行先、互換性検査の結果、モバイル接続の状態を表示します。","title":"Enhanced Core","subtitle":"実行先、互換性の証拠、モバイル接続","serving":"Enhanced Core は稼働中です","notServing":"Enhanced Core は稼働していません","sessions":"確認できたセッション","running":"実行中のターン","freshness":"データの時刻","restartRequired":"新しい起動構成が準備できています。実行中のターンが終わってから再起動してください。","launchCoreDrift":"Codex Desktop がコアを更新しました。ターンがアイドルになると Vellum が Proxy を自動再起動します。その後 Codex を再起動してください。","now": "現在", "runningTurns_one": "{{count}} 件のターンが実行中", "runningTurns_other": "{{count}} 件のターンが実行中", "sessionCount_one": "{{count}} 件のセッション", "sessionCount_other": "{{count}} 件のセッション", "verdict": {"serving": "Codex Desktop は Enhanced Core を経由しています。", "servingOtherLaunch": "Enhanced は稼働していますが、前回の起動構成のままです。Codex を再起動すると現在の構成に移ります。", "stoppedAt": "起動シーケンスが「{{link}}」ステージで停止しています。", "disabled": "Enhanced Core は無効です。Codex Desktop は自身のコアで動いています。"}, "chain": {"title": "起動シーケンス", "artifact": "コンポーネント検証", "armed": "パスの引き継ぎ", "adopted": "Bridge の引き受け", "inPlace": "実行確認"}, "mark": {"blocked": "失敗", "waiting": "待機中", "inPlace": "有効"}, "whyStopped": "「{{link}}」ステージで停止した理由", "whyNoted": "実行中、ただし注意点あり", "protocol": {"verified": "検証済み", "unverified": "未検証", "incompatible": "非互換"}, "protocolUnrun": "比較が実行されませんでした", "unverifiedNote": "この Codex Desktop は検証されていません。ルーティング対象のメソッドはすべて通りますが、差分は実在し未検証です —— 使えますが正しさは保証されません。", "missingHelpers": "公式インストールにあって Enhanced コアにないヘルパー：{{list}}。チャットとルーティングは影響を受けませんが、サンドボックス実行は失敗します。", "routed": "ルーティング対象", "delta": {"methodUnservable": "このメソッドは提供できません", "methodUnknownToDesktop": "Desktop がこのメソッドを知りません", "fieldNewlyRequired": "必須になったフィールドがあります", "fieldRemoved": "フィールドが削除されました"}, "environment": {"leaseValueMissing": "消去済み・復元中", "leased": "保持中", "released": "返却済み", "orphanedBridge": "取り残された bridge", "foreignValue": "他のツールが保持", "unreadable": "読み取れません"}, "bridgeProcess": "Bridge プロセス", "bridgeState": "Bridge の状態", "children": "子プロセス", "launch": "起動", "relayNote": "スマートフォンの接続は、ハンドシェイク・タスク一覧・メッセージ読み込み・ライブイベント・タスク制御の 5 段すべてを通過して初めて成立します。通らなかった段が接続できない理由です。", "staleWarning":"表示しているのは最後に確認した時点の情報で、古くなっている可能性があります。","compatibility":"バージョンと互換性","activeRuntime":"稼働中の runtime","candidateRuntime":"次回起動の runtime","structure":"Schema 比較","qualification":"直近の検証","notObserved":"未確認","observed":"確認済み","evidenceNote":"Schema の一致は構造上の証拠です。Desktop やモバイルの実機検証を意味しません。","differences":"差分と阻害要因","relay":"Relay 状態","clients":"接続中クライアントのバージョン","handshake":"ハンドシェイク","list":"タスク一覧","history":"メッセージ読み込み","stream":"ライブイベント","control":"タスク操作","failureStage":"直近の失敗段階","plane":"実行先","all":"すべて","empty":"今回の起動ではまだセッションを確認できていません。過去の紐付けは現在の接続ではありません。","session":"セッション","state":"状態","lastActivity":"最終アクティビティ","parent":"親タスク","diagnostics":"診断","recheck":"互換性を再確認","export":"診断をエクスポート","exported":"保存しました","states":{"starting":"起動中", "ready":"準備完了", "degraded":"機能低下", "stopped":"停止", "transportReady":"転送準備完了", "unknown":"不明","current":"最新","stale":"古い","offline":"オフライン","unavailable":"取得できません","running":"実行中","idle":"待機中","approval":"承認待ち","unloaded":"アンロード済み","observed":"確認済み","attached":"接続済み","failed":"失敗"}},
   "common": { "expiresAt": "失効：{{month}}月{{day}}日 {{time}}（{{zone}}）", "expiredAlready": "失効済み", "expiresInMinutes": "残り {{value}} 分", "expiresInHours": "残り {{value}} 時間", "expiresInDays": "残り {{value}} 日","emDash": "—", "none": "—", "listSeparator": "、", "itemSeparator": "、", "loading": "読み込み中…", "processing": "処理中…", "refreshing": "更新中…", "refresh": "更新", "reorganize": "整理し直す", "save": "保存", "cancel": "キャンセル", "confirm": "確認", "close": "閉じる", "remove": "削除", "enabled": "有効", "disabled": "無効", "yes": "はい", "no": "いいえ", "on": "オン", "off": "オフ", "unknown": "不明", "provider": "Provider", "model": "モデル", "proxy": "Proxy", "codexCatalog": "Codex モデルカタログ", "justNow": "たった今", "minutesAgo": "{{count}} 分前", "hoursAgo": "{{count}} 時間前", "daysAgo": "{{count}} 日前", "resetAt": "{{month}}月{{day}}日 {{time}} にリセット", "previousPage": "前のページ", "nextPage": "次のページ", "pageOf": "{{page}} / {{total}} ページ", "shortcutTitle": "{{label}}（Ctrl+{{n}}）", "statusUpdateFailed": "状態の更新に失敗しました：{{detail}}", "errorWithDetail": "{{message}}：{{detail}}", "connectionFailed": "接続に失敗しました", "operationFailed": "操作に失敗しました", "loadFailed": "読み込みに失敗しました", "saveFailed": "保存に失敗しました", "visible": "表示", "hidden": "非表示", "totalItems_one": "全 {{count}} 件", "totalItems_other": "全 {{count}} 件", "itemsNeedAttention_one": "件の対応が必要です", "itemsNeedAttention_other": "件の対応が必要です", "notice": {"info": "補足", "warn": "注意", "error": "失敗"}, "dismiss": "閉じる"},
   "navigation": {
@@ -27,7 +80,7 @@ const ja: ResourceTree = {
       "blurb": "実行先と互換性の状態"
     },
     "remote": {
-      "label": "リモート",
+      "label": "リモートマネージャー",
       "title": "リモートマネージャー",
       "blurb": "Codex App SSH ホストとネイティブ daemon"
     },
@@ -722,7 +775,7 @@ const ja: ResourceTree = {
       "select": "選択",
       "remove": "削除",
       "removeSelected": "選択中の独立実行アカウントを削除",
-      "namePlaceholder": "Official アカウントの表示名",
+      "namePlaceholder": "アカウント表示名",
       "loginHint": "Official デバイスログインを完了："
     },
     "maintenance": {

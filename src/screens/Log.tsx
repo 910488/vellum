@@ -16,6 +16,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, getInvokeRing, type InvokeRingEntry } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { tokens } from "@/lib/format";
+import { humanDuration } from "@/lib/humanDuration";
+import { operationalErrorKey } from "@/lib/operationalError";
 import { noticeText } from "@/lib/notice";
 import {
   HEAT_MODES,
@@ -376,8 +378,9 @@ export function Log({
         </div>
       </div>
 
+      <p className="note">{t("tabPolish.logLead")}</p>
       {boot ? (
-        <p className="note">
+        <details className="log-boot-details"><summary>{t("tabPolish.technical")}</summary><p className="note">
           {boot.previousStartedAt
             ? t("log.boot", {
                 count: boot.bootCount,
@@ -385,7 +388,7 @@ export function Log({
                 time: bootTime(boot.previousStartedAt),
               })
             : t("log.bootFirst", { pid: boot.pid })}
-        </p>
+        </p></details>
       ) : null}
 
       {error ? <p className="note">{error}</p> : null}
@@ -409,7 +412,7 @@ export function Log({
           <div className="stats__cell">
             <div className="stats__num">
               {activity.longestTaskDurationMs
-                ? `${(activity.longestTaskDurationMs / 1000).toFixed(1)}s`
+                ? humanDuration(activity.longestTaskDurationMs, t)
                 : "—"}
             </div>
             <div className="stats__label">{t("log.stats.longestRequest")}</div>
@@ -569,7 +572,8 @@ export function Log({
           <Empty>{t("log.requests.empty")}</Empty>
         ) : (
           <>
-            <div style={{ marginTop: 8 }}>
+            <div className="req-table" role="table" aria-label={t("log.requests.title")} style={{ marginTop: 8 }}>
+              <div className="req req--header" role="row">{["time","model","tokens","cache","duration","status"].map((key) => <span role="columnheader" key={key}>{t(`tabPolish.headers.${key}`)}</span>)}<span role="columnheader">{t("tabPolish.details")}</span></div>
               {shown.map((entry) => {
                 const bad = entry.status >= 400;
                 const children =
@@ -579,31 +583,26 @@ export function Log({
                     : []);
                 const childCount = children.length;
                 return (
-                  <div className="req" key={entry.id} id={`req-${entry.id}`}>
-                    <span className="req__time">{clock(entry.createdAt)}</span>
-                    <span className="req__who">
+                  <div className="req" role="row" key={entry.id} id={`req-${entry.id}`}>
+                    <span className="req__time" role="cell">{clock(entry.createdAt)}</span>
+                    <span className="req__who" role="cell">
                       {entry.provider}
                       <span className="req__model">{entry.model}</span>
                     </span>
-                    <span className="req__tok">
+                    <span className="req__tok" role="cell">
                       {tokens(entry.inputTokens)} → {tokens(entry.outputTokens)}
-                      {cachedRatio(entry.cachedInputTokens, entry.inputTokens) != null ? (
-                        <span className="req__cached">
-                          {t("log.requests.cached", {
-                            percent: cachedRatio(entry.cachedInputTokens, entry.inputTokens),
-                          })}
-                        </span>
-                      ) : null}
                     </span>
-                    <span className="req__dur">
-                      {(entry.durationMs / 1000).toFixed(1)}s
+                    <span className="req__cache" role="cell" title={t("log.requests.cached", { percent: cachedRatio(entry.cachedInputTokens, entry.inputTokens) ?? 0 })}>{cachedRatio(entry.cachedInputTokens, entry.inputTokens) != null ? `${cachedRatio(entry.cachedInputTokens, entry.inputTokens)}%` : "—"}</span>
+                    <span className="req__dur" role="cell">
+                      {humanDuration(entry.durationMs, t)}
                     </span>
                     <span
                       className={`req__status req__status--${bad ? "bad" : "ok"}`}
+                      role="cell"
                     >
                       {entry.status}
                     </span>
-                    {entry.streamQuality ||
+                    {entry.error || entry.streamQuality ||
                     entry.connectionId ||
                     entry.controlAccountHash ||
                     entry.executionAccountHash ||
@@ -611,7 +610,7 @@ export function Log({
                       /* 品質徽章、connection、帳號 A·B、子代理數 —— 都是掃視時
                          偶爾才需要的短資訊，擠在同一個 flex 群組裡跟主要欄位共用
                          這一行，擠不下才換行；不再每一項各自另起一整行。 */
-                      <span className="req__extra">
+                      <div className="req__extra" role="cell">
                         {entry.streamQuality ? (
                           <span
                             className={`req__quality req__quality--${entry.streamQuality}`}
@@ -624,25 +623,11 @@ export function Log({
                             {t(`log.requests.streamQuality.${entry.streamQuality}`)}
                           </span>
                         ) : null}
-                        {entry.connectionId ? (
-                          <span className="req__meta" title={entry.connectionId}>
-                            {t("log.requests.connection", { id: shortId(entry.connectionId) })}
-                          </span>
-                        ) : null}
-                        {entry.controlAccountHash || entry.executionAccountHash ? (
-                          <span
-                            className="req__meta"
-                            title={t("log.requests.accountIdentityTitle")}
-                          >
-                            {entry.controlAccountHash
-                              ? `A ${shortId(entry.controlAccountHash.replace("sha256:", ""))}`
-                              : "A —"}
-                            {" · "}
-                            {entry.executionAccountHash
-                              ? `B ${shortId(entry.executionAccountHash.replace("sha256:", ""))}`
-                              : "B —"}
-                          </span>
-                        ) : null}
+                        {entry.error || entry.connectionId || entry.controlAccountHash || entry.executionAccountHash ? <details className="req__technical"><summary>{t("tabPolish.technical")}</summary>
+                          {entry.connectionId ? <p>{t("log.requests.connection", { id: entry.connectionId })}</p> : null}
+                          {entry.controlAccountHash || entry.executionAccountHash ? <p>A: {entry.controlAccountHash ?? "—"}<br />B: {entry.executionAccountHash ?? "—"}</p> : null}
+                          {entry.error ? <pre>{entry.error}</pre> : null}
+                        </details> : null}
                         {childCount > 0 ? (
                           <button
                             type="button"
@@ -653,12 +638,12 @@ export function Log({
                             {t("log.requests.subagentChildren", { count: childCount })}
                           </button>
                         ) : null}
-                      </span>
-                    ) : null}
+                      </div>
+                    ) : <span role="cell" />}
                     {/* 錯誤自己一行。上游的錯誤字串可以很長，塞回同一行就會撐爆。 */}
                     {entry.error ? (
-                      <span className="req__err" title={entry.error}>
-                        {entry.error}
+                      <span className="req__err" role="cell">
+                        {t(operationalErrorKey(entry.error))}
                       </span>
                     ) : null}
                   </div>
@@ -1012,7 +997,7 @@ function subagentTimeline(run: SubagentRun, t: Translate): SubagentTimelineStep[
 }
 
 function cachedRatio(cached: number | undefined, input: number): number | null {
-  if (cached == null || cached <= 0 || input <= 0) return null;
+  if (cached == null || cached < 0 || input <= 0) return null;
   return Math.round((cached / input) * 100);
 }
 

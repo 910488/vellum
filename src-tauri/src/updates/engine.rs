@@ -242,10 +242,22 @@ impl UpdateEngine {
         let remote = self.layer_status(&state, UpdateComponent::Remote, current_remote, live);
         let core = self.layer_status(&state, UpdateComponent::Core, current_core, live);
         let attention = attention_from([&desktop, &remote, &core]);
+        // The command already resolves and verifies current_core. Do not hash
+        // the runtime again on each progress poll. Pending is a staged candidate,
+        // not an attestation that it is running; launch still verifies its tree.
+        let pending = CoreSlots::load(&self.root)
+            .pending
+            .filter(|slot| slot.path.is_file());
+        let core_runtime = super::CoreRuntimeStatus {
+            missing: current_core == "0.0.0",
+            active_version: (current_core != "0.0.0").then(|| current_core.to_string()),
+            pending_version: pending.map(|slot| slot.version),
+        };
         UpdateStatusSnapshot {
             desktop,
             remote,
             core,
+            core_runtime,
             preferences: state.preferences,
             live_auto_update: live,
             attention,
@@ -1526,10 +1538,15 @@ fn current_versions(core: &str) -> Currents<'_> {
 }
 
 fn current_core_version(state: &AppState) -> String {
-    super::resolve_enhanced_runtime(&state.data_root())
-        .map(|runtime| runtime.version)
-        .filter(|version| super::manifest::parse_version(version).is_some())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    match super::resolve_enhanced_runtime(&state.data_root()) {
+        Some(runtime) if super::manifest::parse_version(&runtime.version).is_some() => {
+            runtime.version
+        }
+        Some(_) => env!("CARGO_PKG_VERSION").to_string(),
+        // Missing is not the installed Desktop version. Offer the compatible
+        // core release even when it matches the current Desktop version.
+        None => "0.0.0".into(),
+    }
 }
 
 pub fn progress_from(op: &UpdateOperation) -> UpdateProgress {
@@ -1567,6 +1584,23 @@ mod tests {
             UpdateComponent::Desktop if cfg!(target_os = "macos") => "Vellum.app.tar.gz",
             UpdateComponent::Desktop => "Vellum_x64-setup.exe",
         }
+    }
+
+    #[test]
+    fn missing_core_is_reported_in_the_update_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.2",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        let snapshot = engine.snapshot("0.3.1", "0.3.1", "0.0.0");
+        assert!(snapshot.core_runtime.missing);
+        assert!(snapshot.core_runtime.active_version.is_none());
+        assert!(snapshot.core_runtime.pending_version.is_none());
+        assert_eq!(snapshot.core.current_version, "0.0.0");
     }
 
     fn signed_fixture(
@@ -1745,12 +1779,19 @@ mod tests {
         assert_eq!(snap.core.current_version, "bundled");
         assert_eq!(snap.core.staged_version.as_deref(), Some("0.2.0"));
         assert_eq!(snap.core.available_version.as_deref(), Some("0.2.0"));
+        assert_eq!(snap.core_runtime.pending_version.as_deref(), Some("0.2.0"));
 
         super::super::core_slots::promote_pending(dir.path()).unwrap();
         let promoted = engine.snapshot("0.2.9", "0.2.9", "0.2.0");
         assert_eq!(promoted.core.phase, UpdatePhase::Applied);
         assert_eq!(promoted.core.current_version, "0.2.0");
         assert!(promoted.core.available_version.is_none());
+        assert!(!promoted.core_runtime.missing);
+        assert_eq!(
+            promoted.core_runtime.active_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert!(promoted.core_runtime.pending_version.is_none());
     }
 
     #[tokio::test]
