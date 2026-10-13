@@ -392,19 +392,38 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building vellum")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                cleanup_on_loop_exit(app);
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                EXIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            tauri::RunEvent::Exit => {
+                cleanup_on_loop_exit(app);
+                // `app.exit` always announces itself with `ExitRequested`; an
+                // `Exit` without one is the OS ending the session. tao would
+                // next handle another window's `WM_ENDSESSION`, hit
+                // `(Destroyed, _) => panic!` and abort with 0xC0000409, which
+                // reads as a crash in the logs and in Windows Error Reporting.
+                // Vellum has nothing left to do, so leave before that.
+                if !EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                    log::info!("[Vellum] session ending; exiting after teardown");
+                    app.cleanup_before_exit();
+                    std::process::exit(0);
+                }
+            }
+            _ => {}
         });
 }
+
+/// Set once Tauri announces an app-initiated exit; see the `Exit` arm above.
+static EXIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Windows ends the event loop directly on `WM_ENDSESSION` (shutdown,
 /// restart, sign-out): no window is closed and no Vellum exit command runs,
 /// so without this the Codex config, the CODEX_CLI_PATH lease and the
-/// Enhanced sidecars all outlive Vellum. tao then panics on the next window's
-/// `WM_ENDSESSION` ("cannot move state from Destroyed") and the process
-/// aborts, so this is the last point where Vellum can still restore Codex.
+/// Enhanced sidecars all outlive Vellum. Left alone, tao then panics on the
+/// next window's `WM_ENDSESSION` ("cannot move state from Destroyed") and the
+/// process aborts, so this is the last point where Vellum can still restore
+/// Codex.
 ///
 /// Every explicit exit path has already run the same teardown, which is
 /// idempotent; repeating it there costs a few file checks. Windows allows a
