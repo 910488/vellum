@@ -739,17 +739,28 @@ export function Settings({
 
   return (
     <>
-      <div className="canvas__head">
-        <div>
-          <p className="eyebrow">{t("settings.title")}</p>
-          <h2 className="canvas__title">{t("tabPolish.settingsTitle")}</h2>
-        </div>
-      </div>
+      {/* 頁名只說一次。原本眉標「設定」、大標又一次「設定」，下面再接一條
+          實心白底的分頁列——一頁三層頂部家具，其中兩層是同一個字。
+          這裡把索引本身當標題：四個分組以標題字級排成一行，所在的那一組
+          是墨，其餘是刮過的舊字，捲動時跟著換。 */}
+      <h2 className="sr-only">{t("tabPolish.settingsTitle")}</h2>
+      <nav className="settings-index" aria-label={t("tabPolish.settingsIndex")}>
+        {["general", "integration", "network", "diagnostics"].map((group) => (
+          <a
+            key={group}
+            href={`#settings-${group}`}
+            aria-current={settingsGroup === group ? "location" : undefined}
+            onClick={() => setSettingsGroup(group)}
+          >
+            {t(`tabPolish.groups.${group}`)}
+          </a>
+        ))}
+      </nav>
 
       {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : null}
-      <nav className="settings-index" aria-label={t("tabPolish.settingsIndex")}>{["general","integration","network","diagnostics"].map((group) => <a key={group} href={`#settings-${group}`} aria-current={settingsGroup === group ? "location" : undefined} onClick={() => setSettingsGroup(group)}>{t(`tabPolish.groups.${group}`)}</a>)}</nav>
       <section id="settings-general" className="settings-group" data-settings-group="general">
-        <h3>{t("tabPolish.groups.general")}</h3>
+        {/* 頁首索引此刻正亮著這一組，緊接著再寫一次就是重複。 */}
+        <h3 className="sr-only">{t("tabPolish.groups.general")}</h3>
 
       {/* 語言與外觀是頁面級偏好，各只有一個控制項。放進 grid2 會讓它們吃掉 1.35fr
           的主欄，把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成同一張

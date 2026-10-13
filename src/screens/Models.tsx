@@ -215,7 +215,8 @@ function AccountQuota({
   );
   return (
     <span className="acct__quota">
-      {[...windows].sort((a, b) => Number(isWeeklyQuota(b)) - Number(isWeeklyQuota(a))).map((window) => {
+      {/* 順序由 accountQuotaWindows 決定：短的在上，5 小時窗在每週窗上面。 */}
+      {windows.map((window) => {
         // 閘門只設在每週窗。5 小時窗與每週窗的換算會改，拿它當設定值等於把
         // 一個會變的比例寫進使用者的設定裡；每週窗才是硬標準。
         const gated = gate && isWeeklyQuota(window) ? gate : null;

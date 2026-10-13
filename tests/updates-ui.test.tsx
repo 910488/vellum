@@ -48,12 +48,15 @@ describe("update icon", () => {
     for (const state of [
       { kind: "ready", version: "0.3.1" },
       { kind: "installing", version: "0.3.1" },
-      { kind: "updated", version: "0.3.1", corePending: false },
+      { kind: "updated", version: "0.3.1", corePending: true },
       { kind: "failed", version: "0.3.1", reason: "desktopInstallIncomplete" },
     ] as const) {
       rerender(<UpdateIndicator state={state} onClick={open} />);
       expect(screen.getByRole("button").getAttribute("aria-label")).not.toContain("settings.page");
     }
+    // A finished update is not a pending task: no lingering checkmark.
+    rerender(<UpdateIndicator state={{ kind: "updated", version: "0.3.1", corePending: false }} onClick={open} />);
+    expect(screen.queryByRole("button")).toBeNull();
     rerender(<UpdateIndicator state={{ kind: "current", checkedAt: null }} onClick={open} />);
     expect(screen.queryByRole("button")).toBeNull();
     expect(container.querySelector(".update-indicator-slot")).not.toBeNull();
