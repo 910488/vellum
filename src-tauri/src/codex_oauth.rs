@@ -909,9 +909,7 @@ impl CodexOAuthManager {
         let mut routing_members = settings.members.iter().collect::<Vec<_>>();
         if settings.strategy == QuotaPoolStrategy::Rank {
             if let Some(affinity) = context.socket_affinity.as_ref() {
-                routing_members.sort_by_key(|member| {
-                    !affinity.is_account(&member.account_id)
-                });
+                routing_members.sort_by_key(|member| !affinity.is_account(&member.account_id));
             }
         }
         for member in routing_members {
