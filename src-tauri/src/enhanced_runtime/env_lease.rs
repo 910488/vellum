@@ -231,7 +231,11 @@ fn release_file(lease_path: &Path) -> Result<ReleaseOutcome, EnvironmentLeaseErr
 
 /// Reads the per-user (not process) value of `variable`.
 pub fn read_user_environment(variable: &str) -> Result<Option<String>, EnvironmentLeaseError> {
-    #[cfg(target_os = "windows")]
+    #[cfg(test)]
+    {
+        Ok(test_environment::read(variable))
+    }
+    #[cfg(all(not(test), target_os = "windows"))]
     {
         let script = format!(
             "$value = [Environment]::GetEnvironmentVariable('{variable}','User'); if ($null -eq $value) {{ Write-Output '<unset>' }} else {{ Write-Output $value }}"
@@ -239,7 +243,7 @@ pub fn read_user_environment(variable: &str) -> Result<Option<String>, Environme
         let output = powershell(&script)?;
         Ok((output != "<unset>").then_some(output))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(not(test), target_os = "macos"))]
     {
         let mut command = crate::process::background_command("launchctl");
         command.args(["getenv", variable]);
@@ -252,7 +256,7 @@ pub fn read_user_environment(variable: &str) -> Result<Option<String>, Environme
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok((!value.is_empty()).then_some(value))
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(all(not(test), not(any(target_os = "windows", target_os = "macos"))))]
     {
         let _ = variable;
         Err(EnvironmentLeaseError::Unsupported)
@@ -263,7 +267,12 @@ fn write_user_environment(
     variable: &str,
     value: Option<&str>,
 ) -> Result<(), EnvironmentLeaseError> {
-    #[cfg(target_os = "windows")]
+    #[cfg(test)]
+    {
+        test_environment::write(variable, value);
+        Ok(())
+    }
+    #[cfg(all(not(test), target_os = "windows"))]
     {
         let script = match value {
             Some(value) => format!(
@@ -275,7 +284,7 @@ fn write_user_environment(
         powershell(&script)?;
         Ok(())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(not(test), target_os = "macos"))]
     {
         let mut command = crate::process::background_command("launchctl");
         match value {
@@ -293,7 +302,7 @@ fn write_user_environment(
             )))
         }
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(all(not(test), not(any(target_os = "windows", target_os = "macos"))))]
     {
         let _ = (variable, value);
         Err(EnvironmentLeaseError::Unsupported)
@@ -303,7 +312,7 @@ fn write_user_environment(
 /// Tells already running processes, including a packaged app about to be
 /// started by the shell, that the user environment changed.
 pub fn broadcast_environment_change() {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(not(test), target_os = "windows"))]
     {
         use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -322,6 +331,36 @@ pub fn broadcast_environment_change() {
                 std::ptr::null_mut(),
             );
         }
+    }
+}
+
+/// Unit tests get a per-thread stand-in for the per-user environment.
+///
+/// The real one is shared with the developer's own Codex Desktop. A test that
+/// disabled Enhanced in a temp data root found no lease there, read the real
+/// `CODEX_CLI_PATH`, saw a Vellum bridge, and deleted it, so `cargo test`
+/// quietly disarmed the Vellum the developer was running.
+#[cfg(test)]
+pub(crate) mod test_environment {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static VALUES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn read(variable: &str) -> Option<String> {
+        VALUES.with(|values| values.borrow().get(variable).cloned())
+    }
+
+    pub fn write(variable: &str, value: Option<&str>) {
+        VALUES.with(|values| {
+            let mut values = values.borrow_mut();
+            match value {
+                Some(value) => values.insert(variable.to_string(), value.to_string()),
+                None => values.remove(variable),
+            };
+        });
     }
 }
 
@@ -630,6 +669,40 @@ mod tests {
             plan_previous_value_for_acquire(None, Some("C:/other-tool/codex.exe"), CURRENT),
             Some("C:/other-tool/codex.exe".to_string())
         );
+    }
+
+    /// Disabling in a temp data root has no lease to read, so it falls back to
+    /// the user environment. Under test that must be the stand-in: the real
+    /// value belongs to whatever Vellum the developer is running.
+    #[test]
+    fn tests_release_the_stand_in_not_the_real_user_environment() {
+        let real_before = real_user_environment(CODEX_CLI_PATH);
+        let temp = tempfile::tempdir().unwrap();
+        let bridge = temp.path().join("vellum-codex-app-server.exe");
+        test_environment::write(CODEX_CLI_PATH, Some(&bridge.to_string_lossy()));
+
+        let outcome = release_configured_bridge(temp.path(), &bridge).unwrap();
+
+        assert_eq!(outcome, ReleaseOutcome::OrphanedBridgeRemoved);
+        assert_eq!(read_user_environment(CODEX_CLI_PATH).unwrap(), None);
+        assert_eq!(real_user_environment(CODEX_CLI_PATH), real_before);
+    }
+
+    /// Reads the per-user value straight from the OS, bypassing the stand-in.
+    fn real_user_environment(variable: &str) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        {
+            powershell(&format!(
+                "[Environment]::GetEnvironmentVariable('{variable}','User')"
+            ))
+            .ok()
+            .filter(|value| !value.is_empty())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = variable;
+            None
+        }
     }
 
     #[test]
