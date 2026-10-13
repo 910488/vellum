@@ -21,7 +21,7 @@ const apiMocks = vi.hoisted(() => ({
   getEnhancedDesktopRuntimeStatus: vi.fn(),
   getOverview: vi.fn(),
   getUpdateStatus: vi.fn(),
-  getRemoteManagerFeatureFlags: vi.fn().mockResolvedValue({ showInSidebar: false, sidebarForced: false }),
+  getRemoteManagerFeatureFlags: vi.fn().mockResolvedValue({ showInSidebar: false, sidebarMode: "auto" }),
   subscribeProxyLifecycle: vi.fn(),
 }));
 
@@ -338,7 +338,7 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
 
   beforeEach(() => {
     emitLifecycle = null;
-    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarForced: false });
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarMode: "auto" });
     apiMocks.getProviderOverviews.mockResolvedValue([]);
     apiMocks.listRoutes.mockResolvedValue([]);
     apiMocks.listSessions.mockResolvedValue([]);
@@ -372,11 +372,11 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
   });
 
   it("unmounts a hidden Remote tab and falls back to Today", async () => {
-    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: true, sidebarForced: false });
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: true, sidebarMode: "auto" });
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: i18n.t("navigation.remote.label") }));
     expect(await screen.findByRole("heading", { name: "Remote fixture" })).toBeTruthy();
-    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarForced: false });
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarMode: "auto" });
     window.dispatchEvent(new Event("vellum:remote-sidebar-changed"));
     await waitFor(() => expect(screen.queryByRole("heading", { name: "Remote fixture" })).toBeNull());
     expect(screen.queryByRole("button", { name: i18n.t("navigation.remote.label") })).toBeNull();

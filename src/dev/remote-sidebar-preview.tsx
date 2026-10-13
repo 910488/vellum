@@ -6,6 +6,7 @@ import { Rail } from "@/components/Rail";
 import { RemoteSidebarPreference } from "@/components/RemoteSidebarPreference";
 import { Card } from "@/components/ui";
 import { accessibleScreen, type ScreenId } from "@/screens/registry";
+import type { RemoteSidebarMode } from "@/lib/api";
 import "@/styles/tokens.css";
 import "@/styles/base.css";
 import "@/styles/components.css";
@@ -17,9 +18,9 @@ function Preview() {
   const [locale, setLocale] = useState("zh-TW");
   const [theme, setTheme] = useState("light");
   const [hosts, setHosts] = useState(false);
-  const [forced, setForced] = useState(false);
+  const [mode, setMode] = useState<RemoteSidebarMode>("auto");
   const [screen, setScreen] = useState<ScreenId>("settings");
-  const remoteVisible = baseline || hosts || forced;
+  const remoteVisible = baseline || (mode === "auto" ? hosts : mode === "show");
   useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
   return <>
     <div className="devbar">
@@ -29,7 +30,7 @@ function Preview() {
     </div>
     <div className="shell" style={{ paddingTop: 40 }}>
       <Rail active={accessibleScreen(screen,remoteVisible)} remoteVisible={remoteVisible} onNavigate={setScreen} onOpenUpdates={() => {}} attention={{}} updateAttention={false} />
-      <main className="canvas"><h2>{t(`navigation.${accessibleScreen(screen,remoteVisible)}.label`)}</h2>{baseline ? <p>{t("settings.language.blurb")}</p> : <Card quiet className="prefstrips"><RemoteSidebarPreference forced={forced} onChange={setForced} /></Card>}</main>
+      <main className="canvas"><h2>{t(`navigation.${accessibleScreen(screen,remoteVisible)}.label`)}</h2>{baseline ? <p>{t("settings.language.blurb")}</p> : <Card quiet className="prefstrips"><RemoteSidebarPreference mode={mode} onChange={setMode} /></Card>}</main>
     </div>
   </>;
 }

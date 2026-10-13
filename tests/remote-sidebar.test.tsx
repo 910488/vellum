@@ -19,12 +19,17 @@ describe("Remote sidebar", () => {
     expect(props.onNavigate).toHaveBeenCalledWith("remote");
     expect(accessibleScreen("remote",true)).toBe("remote");
   });
-  it("makes first-time setup visible through an explicit preference", async () => {
+  it("offers automatic, always-show and hide, and explains the current choice", async () => {
     await i18n.changeLanguage("en");
     const change = vi.fn();
-    render(<RemoteSidebarPreference forced={false} onChange={change} />);
-    fireEvent.click(screen.getByRole("switch",{name:i18n.t("settings.remoteSidebar.label")}));
-    expect(change).toHaveBeenCalledWith(true);
-    expect(screen.getByText(i18n.t("settings.remoteSidebar.hint"))).toBeTruthy();
+    const view = render(<RemoteSidebarPreference mode="auto" onChange={change} />);
+    expect(screen.getByRole("button",{name:i18n.t("settings.remoteSidebar.mode.auto")}).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByText(i18n.t("settings.remoteSidebar.hint.auto"))).toBeTruthy();
+    fireEvent.click(screen.getByRole("button",{name:i18n.t("settings.remoteSidebar.mode.show")}));
+    expect(change).toHaveBeenCalledWith("show");
+    fireEvent.click(screen.getByRole("button",{name:i18n.t("settings.remoteSidebar.mode.hide")}));
+    expect(change).toHaveBeenCalledWith("hide");
+    view.rerender(<RemoteSidebarPreference mode="hide" onChange={change} />);
+    expect(screen.getByText(i18n.t("settings.remoteSidebar.hint.hide"))).toBeTruthy();
   });
 });
