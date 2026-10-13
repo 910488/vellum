@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
+  "bridgeFallback": { "active": "Enhanced core 缺失，送出鍵保護與帳號切換仍透過官方 bridge 生效。", "prepared": "Enhanced core 缺失。官方 bridge 已準備好，Codex 接上後保護才會生效。", "failed": "Enhanced core 缺失，bridge 保護未生效。請查看詳細資料並修復安裝。" },
   "tabPolish": {
     "details": "詳細資料",
     "loginExpired": "這台主機的登入已失效，請重新登入。",

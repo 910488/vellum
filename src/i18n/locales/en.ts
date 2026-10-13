@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "bridgeFallback": { "active": "Enhanced core is missing. Send-button protection and account switching remain active through the Official bridge.", "prepared": "Enhanced core is missing. The Official bridge is prepared; protection takes effect when Codex adopts it.", "failed": "Enhanced core is missing and bridge protection is not active. See the details and repair the installation." },
   "tabPolish": {
     "details": "Details",
     "loginExpired": "This host's sign-in has expired. Sign in again.",

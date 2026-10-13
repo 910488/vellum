@@ -20,9 +20,10 @@ import {
   supportsQuota,
 } from "@/lib/vocabulary";
 import { Sparkline } from "@/components/Sparkline";
-import { Btn, Cap, Card, Empty, FindingCard, Meter, Metric, Row, Rows, State, Tray } from "@/components/ui";
+import { Btn, Cap, Card, Empty, FindingCard, Meter, Metric, Notice, Row, Rows, State, Tray } from "@/components/ui";
 import type {
   ContextBudget,
+  EnhancedDesktopRuntimeStatus,
   Overview,
   ProviderOverview,
   ProxyStatus,
@@ -37,6 +38,7 @@ import type { ScreenId } from "./registry";
 const SESSIONS_SHOWN = 10;
 
 export function Today({
+  enhancedRuntime,
   proxy,
   overview,
   onNavigate,
@@ -46,6 +48,7 @@ export function Today({
   onRefreshComplete,
   active = true,
 }: {
+  enhancedRuntime?: EnhancedDesktopRuntimeStatus | null;
   proxy: ProxyStatus | null;
   overview: Overview | null;
   onNavigate: (id: ScreenId) => void;
@@ -277,6 +280,7 @@ export function Today({
 
   return (
     <>
+      {enhancedRuntime?.enhancedCore === "missing" ? <Notice tone="warn" raw={enhancedRuntime.blockers.join("\n")}>{t(enhancedRuntime.bridgeProtectionActive ? "bridgeFallback.active" : enhancedRuntime.bridgePrepared ? "bridgeFallback.prepared" : "bridgeFallback.failed")}</Notice> : null}
       <div className="canvas__head">
         <div>
           <p className="eyebrow">{t("today.title")}</p>

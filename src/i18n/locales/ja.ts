@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
+  "bridgeFallback": { "active": "Enhanced core がありません。送信ボタンの保護とアカウント切り替えは公式 bridge を通じて有効です。", "prepared": "Enhanced core がありません。公式 bridge は準備済みで、Codex が接続すると保護が有効になります。", "failed": "Enhanced core がなく、bridge の保護も有効ではありません。詳細を確認してインストールを修復してください。" },
   "tabPolish": {
     "details": "詳細",
     "loginExpired": "このホストのログインが期限切れです。再度ログインしてください。",

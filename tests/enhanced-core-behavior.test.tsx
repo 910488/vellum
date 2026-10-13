@@ -9,6 +9,18 @@ import { EMPTY_OBSERVATIONS } from "@/lib/enhanced";
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("Enhanced Core observed state", () => {
+  it("distinguishes a protected Official bridge from a failed degradation", async () => {
+    await i18n.changeLanguage("en");
+    const status = await api.getEnhancedDesktopRuntimeStatus();
+    vi.spyOn(api, "getEnhancedRuntimeObservations").mockResolvedValue(EMPTY_OBSERVATIONS);
+    const props = { refreshVersion: 0, onRefreshComplete: () => undefined };
+    const missing = { ...status, coreAvailable: false, enhancedCore: "missing" as const, bridgePrepared: true, bridgeProtectionActive: true, ready: false, serving: false };
+    const view = render(<EnhancedCore {...props} status={missing} />);
+    expect(screen.getByText(i18n.t("bridgeFallback.active"))).toBeTruthy();
+    expect(screen.queryByText(i18n.t("enhanced.verdict.serving"))).toBeNull();
+    view.rerender(<EnhancedCore {...props} status={{ ...missing, bridgePrepared: false, bridgeProtectionActive: false }} />);
+    expect(screen.getByText(i18n.t("bridgeFallback.failed"))).toBeTruthy();
+  });
   it("explains a missing core and opens the update repair panel", async () => {
     await i18n.changeLanguage("en");
     const status = await api.getEnhancedDesktopRuntimeStatus();

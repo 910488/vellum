@@ -548,6 +548,7 @@ export function App() {
           {mountedScreens.has("today") ? (
             <div className="screen-slot" hidden={screen !== "today"}>
             <Today
+              enhancedRuntime={status.enhancedRuntime ?? null}
               proxy={status.proxy}
               overview={status.overview}
               onNavigate={navigate}

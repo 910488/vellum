@@ -161,7 +161,10 @@ impl Core {
         let manifest = &config.manifest;
         let identity = match plane {
             ExecutionPlane::OfficialCodex => &manifest.official,
-            ExecutionPlane::EnhancedCodex => &manifest.enhanced,
+            ExecutionPlane::EnhancedCodex => manifest
+                .enhanced
+                .as_ref()
+                .ok_or_else(|| BridgeError::Protocol("Enhanced core is unavailable".into()))?,
         };
         let mut entropy = [0u8; 32];
         getrandom::fill(&mut entropy)
@@ -373,7 +376,11 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         .try_lock_exclusive()
         .map_err(|_| BridgeError::Protocol("Remote Control owner conflict".into()))?;
     let mut official = Core::start(&config, ExecutionPlane::OfficialCodex).await?;
-    let mut enhanced = Core::start(&config, ExecutionPlane::EnhancedCodex).await?;
+    let mut enhanced = if m.enhanced.is_some() {
+        Some(Core::start(&config, ExecutionPlane::EnhancedCodex).await?)
+    } else {
+        None
+    };
     let mut attestation = AttestationWriter::new(
         m.attestation_path.clone(),
         m.launch_id.clone(),
@@ -384,29 +391,24 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
             runtime_digest: m.official.runtime_digest.clone(),
             ..Default::default()
         },
-        ChildAttestation {
-            binary_sha256: m.enhanced.artifact_sha256.clone(),
-            runtime_digest: m.enhanced.runtime_digest.clone(),
-            ..Default::default()
-        },
+        enhanced_child_attestation(m),
     );
     attestation.set_child_pid(
         ExecutionPlane::OfficialCodex,
         official.process.id().unwrap(),
     );
-    attestation.set_child_pid(
-        ExecutionPlane::EnhancedCodex,
-        enhanced.process.id().unwrap(),
-    );
+    if let Some(enhanced) = enhanced.as_ref() {
+        attestation.set_child_pid(
+            ExecutionPlane::EnhancedCodex,
+            enhanced.process.id().unwrap(),
+        );
+    }
     attestation.flush().map_err(std::io::Error::other)?;
     let mut state = BridgeState::new(
         ThreadRuntimeBindingStore::open(&m.binding_db)?,
-        TrustedProviderSet::new(
-            m.official_provider_ids.clone(),
-            m.third_party_provider_ids.clone(),
-        ),
+        m.providers(),
         m.official.runtime_digest.clone(),
-        m.enhanced.runtime_digest.clone(),
+        m.enhanced_digest(),
         config.model_provider_map.clone(),
         attestation,
         QualificationJournal::new(m.qualification_journal_path.clone(), m.launch_id.clone()),
@@ -477,7 +479,7 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         let event = tokio::select! {
             event = rx.recv() => { let Some(event) = event else { break }; event }
             _ = heartbeat.tick() => {
-                for (plane,core) in [(ExecutionPlane::OfficialCodex,&mut official),(ExecutionPlane::EnhancedCodex,&mut enhanced)] {
+                for (plane,core) in std::iter::once((ExecutionPlane::OfficialCodex,&mut official)).chain(enhanced.as_mut().map(|core| (ExecutionPlane::EnhancedCodex,core))) {
                     if core.process.try_wait()?.is_some() { state.mark_child_exited(plane,"core exited"); }
                 }
                 let _ = observations.write(&observation_path);
@@ -648,7 +650,11 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                     {
                         let core = match plane {
                             ExecutionPlane::OfficialCodex => &official,
-                            ExecutionPlane::EnhancedCodex => &enhanced,
+                            ExecutionPlane::EnhancedCodex => {
+                                enhanced.as_ref().ok_or_else(|| {
+                                    BridgeError::Protocol("Enhanced core is unavailable".into())
+                                })?
+                            }
                         };
                         match core.connect(client, plane, tx.clone()).await {
                             Ok(socket) => {
@@ -735,7 +741,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     }
     let _ = relay.kill().await;
     let _ = official.process.kill().await;
-    let _ = enhanced.process.kill().await;
+    if let Some(enhanced) = enhanced.as_mut() {
+        let _ = enhanced.process.kill().await;
+    }
     state.attestation.mark_stopped();
     let _ = state.attestation.flush();
     observations.remote.state = "stopped".into();
@@ -867,5 +875,35 @@ mod tests {
         assert_eq!(origin(0, "account/read"), "https://localhost");
         assert_eq!(origin(1, "account/read"), "https://chatgpt.com");
         assert_eq!(origin(0, "config/read"), "https://chatgpt.com");
+    }
+
+    #[test]
+    fn bridge_only_multiplex_keeps_desktop_backend_routing() {
+        // Both transports share BridgeState. No Enhanced child or identity is
+        // needed for the Desktop-only account/read rewrite used by multiplex.
+        let temp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        crate::enhanced_runtime::backend_relay::advertise(
+            temp.path(),
+            &crate::enhanced_runtime::backend_relay::RelayAdvertisement {
+                origin: "https://localhost".into(),
+                port: listener.local_addr().unwrap().port(),
+                certificate_sha256: "00".into(),
+            },
+        )
+        .unwrap();
+        let mut response = json!({"id":1,"result":{"account":{"type":"chatgpt"},"workspaceRouting":{"chatgptAccountId":"fixture","backendOrigin":"https://chatgpt.com"}}});
+        route_desktop_account_read(
+            0,
+            Some("account/read"),
+            Some(&crate::enhanced_runtime::backend_relay::advertisement_path(
+                temp.path(),
+            )),
+            &mut response,
+        );
+        assert_eq!(
+            response["result"]["workspaceRouting"]["backendOrigin"],
+            "https://localhost"
+        );
     }
 }
