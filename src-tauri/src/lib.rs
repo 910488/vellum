@@ -7,6 +7,7 @@ pub mod boot;
 pub mod budget;
 pub mod catalog;
 pub mod codex;
+mod codex_restart;
 pub mod codex_oauth;
 pub mod codex_profile;
 pub mod codex_quota;

@@ -6,6 +6,56 @@
 
 use std::path::PathBuf;
 
+pub(crate) fn started_at(pid: u32) -> Option<std::time::SystemTime> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut created: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            let ok = GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user);
+            CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+            let ticks =
+                (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            let since_epoch = ticks.checked_sub(116_444_736_000_000_000)?;
+            Some(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_nanos(since_epoch.checked_mul(100)?),
+            )
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let naive =
+            chrono::NaiveDateTime::parse_from_str(text.trim(), "%a %b %e %H:%M:%S %Y").ok()?;
+        use chrono::TimeZone;
+        let date = chrono::Local.from_local_datetime(&naive).single()?;
+        let seconds = u64::try_from(date.timestamp()).ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+    }
+}
+
 /// True when a process with this id currently exists.
 pub fn pid_is_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]

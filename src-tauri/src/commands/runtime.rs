@@ -1302,7 +1302,11 @@ fn process_start_time(pid: u32) -> Option<String> {
 fn launch_target_identity(_target: &CodexLaunchTarget) -> String {
     #[cfg(target_os = "windows")]
     {
-        format!("pid:{}", _target.pid)
+        let started = crate::enhanced_runtime::process_info::started_at(_target.pid)
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|time| time.as_nanos().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        format!("pid:{};started:{started}", _target.pid)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1323,7 +1327,7 @@ pub(crate) fn codex_process_identity() -> Option<String> {
     discover_codex_process()
         .ok()
         .flatten()
-        .map(|target| format!("pid:{}", target.pid))
+        .map(|target| launch_target_identity(&target))
 }
 
 #[cfg(target_os = "macos")]
