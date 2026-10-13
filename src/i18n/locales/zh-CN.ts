@@ -1,6 +1,59 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "tabPolish": {
+    "details": "详细信息",
+    "loginExpired": "这台主机的登录已失效，请重新登录。",
+    "rateLimited": "Grok 暂时限流（429），稍后会自动重试。",
+    "genericError": "操作未完成，请查看详细信息后重试。",
+    "settingsTitle": "设置",
+    "settingsIndex": "设置分类",
+    "groups": {
+      "general": "常规与显示",
+      "integration": "Codex 集成",
+      "network": "连接与网络",
+      "diagnostics": "诊断与恢复"
+    },
+    "restoreHost": "恢复主机原本的运行方式",
+    "remoteControl": "远程控制",
+    "logLead": "查看用量趋势、请求结果和执行记录。",
+    "time": {
+      "hoursMinutes": "{{hours}} 小时 {{minutes}} 分",
+      "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
+      "seconds": "{{seconds}} 秒"
+    },
+    "headers": {
+      "time": "时间",
+      "model": "服务商／模型",
+      "tokens": "输入 → 输出",
+      "cache": "缓存",
+      "duration": "耗时",
+      "status": "结果"
+    },
+    "moreActions": "更多账号操作",
+    "fiveHourOn": "5 小时窗口自动重置：开",
+    "fiveHourOff": "5 小时窗口自动重置：关",
+    "domainRules": "{{count}} 条域名访问规则",
+    "allowed": "允许：{{domains}}",
+    "blocked": "阻止：{{domains}}",
+    "anyDomain": "所有域名",
+    "noBlocked": "无",
+    "dashboardHint": "这些选项只影响“现况”页的服务商卡片。",
+    "core": {
+      "label": "Enhanced core",
+      "active": "使用中 · {{version}}",
+      "pending": "使用中：{{version}} · 等待应用：{{pending}}",
+      "missing": "Enhanced core 缺失",
+      "bundled": "随安装提供",
+      "repair": "修复 core"
+    },
+    "qualified": "已验证",
+    "launchReady": "启动配置已准备好",
+    "conversation": "对话 {{index}}",
+    "parentConversation": "子对话",
+    "technical": "技术信息",
+    "account": "ChatGPT 账号 {{index}}"
+  },
   "enhanced": {"heading":"Enhanced 运行状态","lead":"显示每条路由的执行者、兼容性检查结果，以及手机连接状态。","title":"Enhanced Core","subtitle":"执行者、兼容性证据与手机连接","serving":"Enhanced Core 运行中","notServing":"Enhanced Core 未运行","sessions":"已观察到的会话","running":"运行中的回合","freshness":"数据时间","restartRequired":"已准备好新的启动配置。请在运行中的回合结束后再安全重启。","launchCoreDrift":"Codex Desktop 已更新内核。Vellum 会在回合空闲时自动重启 Proxy；完成后请重新启动 Codex。","now": "现在", "runningTurns_one": "{{count}} 个回合执行中", "runningTurns_other": "{{count}} 个回合执行中", "sessionCount_one": "{{count}} 个会话", "sessionCount_other": "{{count}} 个会话", "verdict": {"serving": "Codex Desktop 目前经由 Enhanced Core 运行。", "servingOtherLaunch": "Enhanced 仍在运行，但沿用上一次启动的配置。重启 Codex 后才会切换为这次的配置。", "stoppedAt": "启动流程停在「{{link}}」阶段。", "disabled": "Enhanced Core 已停用，Codex Desktop 正在使用原生内核。"}, "chain": {"title": "启动流程", "artifact": "组件验证", "armed": "路径接管", "adopted": "Bridge 接手", "inPlace": "运行确认"}, "mark": {"blocked": "未通过", "waiting": "等待中", "inPlace": "已生效"}, "whyStopped": "在「{{link}}」阶段停下的原因", "whyNoted": "运行中，但有几点需要注意", "protocol": {"verified": "已验证", "unverified": "未验证", "incompatible": "不兼容"}, "protocolUnrun": "比对尚未执行", "unverifiedNote": "这个 Codex Desktop 版本没有经过验证。路由会用到的方法都还在，所以路由没有问题；下面列出的差异确实存在，但未经测试 —— 可以用，但不保证正确。", "missingHelpers": "Enhanced 内核少了官方安装中有的辅助程序：{{list}}。对话与路由不受影响，只有沙箱命令执行会失败。", "routed": "路由所需", "delta": {"methodUnservable": "此方法无法提供", "methodUnknownToDesktop": "Desktop 未声明此方法", "fieldNewlyRequired": "字段变成必填", "fieldRemoved": "字段已移除"}, "environment": {"leaseValueMissing": "已被清除，正在恢复", "leased": "持有中", "released": "已交还", "orphanedBridge": "残留的旧 Bridge", "foreignValue": "由其他工具设置", "unreadable": "无法读取"}, "bridgeProcess": "Bridge 进程", "bridgeState": "Bridge 状态", "children": "子进程", "launch": "启动", "relayNote": "手机要连上，必须通过握手、任务列表、消息加载、实时事件与任务控制五个阶段；哪一关没过，就是连不上的原因。", "staleWarning":"显示的是最后一次观察结果，可能已经过期。","compatibility":"版本与兼容性","activeRuntime":"当前实际使用的 runtime","candidateRuntime":"下次启动使用的 runtime","structure":"Schema 比较","qualification":"最近验证","notObserved":"尚未观察","observed":"已观察","evidenceNote":"Schema 一致只能算是结构上的证据，不能证明 Desktop 或手机的行为已经验证过。","differences":"差异与阻碍","relay":"Relay 状态","clients":"已连接的客户端版本","handshake":"握手","list":"任务列表","history":"消息加载","stream":"实时事件","control":"任务控制","failureStage":"最后一次失败的阶段","plane":"执行者","all":"全部","empty":"这次启动还没有观察到任何会话。过去的绑定不等于当前的连接。","session":"会话","state":"状态","lastActivity":"最后活动时间","parent":"父任务","diagnostics":"诊断","recheck":"重新检查兼容性","export":"导出诊断","exported":"已保存","states":{"starting":"启动中", "ready":"就绪", "degraded":"降级", "stopped":"已停止", "transportReady":"传输就绪", "unknown":"未知","current":"最新","stale":"已过期","offline":"离线","unavailable":"没有数据","running":"运行中","idle":"空闲","approval":"等待批准","unloaded":"已卸载","observed":"已观察","attached":"已连接","failed":"失败"}},
   "common": { "expiresAt": "到期时间：{{month}}月{{day}}日 {{time}}（{{zone}}）", "expiredAlready": "已过期", "expiresInMinutes": "剩 {{value}} 分钟", "expiresInHours": "剩 {{value}} 小时", "expiresInDays": "剩 {{value}} 天","emDash": "—", "none": "—", "listSeparator": "；", "itemSeparator": "、", "loading": "读取中…", "processing": "处理中…", "refreshing": "更新中…", "refresh": "刷新", "reorganize": "重新整理", "save": "保存", "cancel": "取消", "confirm": "确认", "close": "关闭", "remove": "移除", "enabled": "启用", "disabled": "停用", "yes": "是", "no": "否", "on": "开", "off": "关", "unknown": "未知", "provider": "Provider", "model": "模型", "proxy": "Proxy", "codexCatalog": "Codex 模型菜单", "justNow": "刚刚", "minutesAgo": "{{count}} 分钟前", "hoursAgo": "{{count}} 小时前", "daysAgo": "{{count}} 天前", "resetAt": "{{month}}月{{day}}日 {{time}} 重置", "previousPage": "上一页", "nextPage": "下一页", "pageOf": "第 {{page}} / {{total}} 页", "shortcutTitle": "{{label}}（Ctrl+{{n}}）", "statusUpdateFailed": "状态更新失败：{{detail}}", "errorWithDetail": "{{message}}：{{detail}}", "connectionFailed": "连接失败", "operationFailed": "操作失败", "loadFailed": "加载失败", "saveFailed": "保存失败", "visible": "显示", "hidden": "隐藏", "totalItems_one": "共 {{count}} 条", "totalItems_other": "共 {{count}} 条", "itemsNeedAttention_one": "个项目需要处理", "itemsNeedAttention_other": "个项目需要处理", "notice": {"info": "提示", "warn": "注意", "error": "失败"}, "dismiss": "知道了"},
   "navigation": {
@@ -26,7 +79,7 @@ const zhCN: ResourceTree = {
       "blurb": "执行者与兼容性状态"
     },
     "remote": {
-      "label": "远程",
+      "label": "远程管理器",
       "title": "远程总管",
       "blurb": "Codex App SSH 主机与原生 daemon"
     },
@@ -701,7 +754,7 @@ const zhCN: ResourceTree = {
       "grokStarting": "正在等待 Grok CLI…"
     },
     "control": {
-      "title": "Remote 控制",
+      "title": "远程控制",
       "identity": "使用账号",
       "status": "凭证状态",
       "choose": "选择 Remote Control 账号",
@@ -721,7 +774,7 @@ const zhCN: ResourceTree = {
       "select": "选择",
       "remove": "移除",
       "removeSelected": "移除当前的独立执行账号",
-      "namePlaceholder": "这个 Official 账号的显示名称",
+      "namePlaceholder": "账号显示名称",
       "loginHint": "完成 Official 设备登录："
     },
     "maintenance": {
