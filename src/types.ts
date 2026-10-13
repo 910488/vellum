@@ -937,6 +937,8 @@ export interface RequestLogEntry {
   cachedInputTokens?: number;
   status: number;
   error: string | null;
+  errorCategory?: string | null;
+  retryAfter?: number | null;
   durationMs: number;
   firstByteMs: number | null;
   createdAt: number;

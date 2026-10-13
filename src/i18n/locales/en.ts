@@ -1,6 +1,8 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "requestErrors": {"quota": "Quota is exhausted or requests are rate limited.", "auth": "Sign-in was rejected. Sign in again.", "cancelled": "The request was cancelled or its connection closed.", "protocol": "The upstream response could not be read.", "rejected": "The upstream rejected the request.", "unavailable": "The upstream service is temporarily unavailable.", "other": "The request failed. Check the technical details.", "retryAfter": "Wait at least {{time}} before retrying.", "retries": "Already retried {{count}} times.", "reasons": {"unsupported": "A request option is not supported.", "tools": "A tool definition does not match the required format.", "continuation": "The previous response is unavailable.", "context": "The conversation exceeds the context limit.", "policy": "The content was refused by the upstream policy."}},
+  "quotaActions": {"resetCount": "Resets: {{count}}", "resetHint": "Show available reset credits. Opening the list does not spend a credit.", "fiveHourHint": "Toggle automatic management of the 5-hour window. It does not spend a reset credit."},
   "tabPolish": {
     "details": "Details",
     "loginExpired": "This host's sign-in has expired. Sign in again.",
@@ -41,9 +43,9 @@ const en: ResourceTree = {
     "dashboardHint": "These options affect provider cards on the Today page only.",
     "core": {
       "label": "Enhanced core",
-      "active": "Active · {{version}}",
-      "pending": "Active: {{version}} · Pending: {{pending}}",
-      "missing": "Enhanced core is missing",
+      "active": "v{{version}} · Active",
+      "pending": "v{{pending}} · Waiting to activate (current: {{version}})",
+      "missing": "Missing",
       "bundled": "Included with installation",
       "repair": "Repair core"
     },

@@ -56,6 +56,22 @@ describe("Log runtime notices", () => {
     apiMocks.getInvokeRing.mockReturnValue([]);
   });
 
+  it("explains quota and retry evidence while keeping raw errors in closed details", async () => {
+    mockReadyLog({providers:[], entries:[
+      {id:1,routeId:"official",provider:"Official",model:"fixture",inputTokens:100,outputTokens:0,
+       status:429,errorCategory:"provider_quota",retryAfter:60,error:"private raw upstream identifier",
+       durationMs:100,firstByteMs:null,createdAt:1_700_000_000},
+      {id:2,routeId:"official",provider:"Official",model:"fixture",inputTokens:100,outputTokens:0,
+       status:503,errorCategory:"provider_unavailable",error:"upstream failed after 2 retries",
+       durationMs:100,firstByteMs:null,createdAt:1_700_000_000},
+    ]});
+    render(<Log refreshVersion={0} onRefreshComplete={() => {}} />);
+    await screen.findByText(`${i18n.t("requestErrors.quota")} ${i18n.t("requestErrors.retryAfter", {time:i18n.t("tabPolish.time.minutesSeconds",{minutes:1,seconds:0})})}`);
+    expect(screen.getByText(`${i18n.t("requestErrors.unavailable")} ${i18n.t("requestErrors.retries",{count:2})}`)).toBeTruthy();
+    const raw = screen.getByText("private raw upstream identifier").closest("details") as HTMLDetailsElement;
+    expect(raw.open).toBe(false);
+  });
+
   /* 這張卡回答的是「誰吃掉我的量」。以下三件事只要壞一件，它就答錯：
      順序、分母、以及尾巴收不收。 */
   it("ranks providers by share and makes the shares add up", async () => {

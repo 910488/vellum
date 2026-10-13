@@ -5472,7 +5472,8 @@ html[data-performance="low"] .card {
 .official-account-list .rows__val, .official-account-list .acct, .official-account-list .acct__actions { display: contents; }
 .official-account-list .rows__key { min-width: 0; overflow-wrap: anywhere; text-align: left; }
 .official-account-list .acct__quota { min-width: 0; align-self: start; text-align: left; }
-.official-account-list .acct__resets { display: flex; align-items: start; justify-content: flex-end; gap: 8px; width: auto; flex: initial; }
+.official-account-list .acct__resets { display: flex; flex-direction: column; align-items: flex-end; justify-content: flex-start; gap: 8px; width: auto; flex: initial; }
+.acct__resets > .btn, .acct__resets > .pill { white-space: nowrap; }
 .official-account-list .resets { grid-column: 1 / -1; }
 .quota-pool__head > label { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
 .empty-inline { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--ink-soft); }

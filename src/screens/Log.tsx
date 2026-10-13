@@ -17,7 +17,7 @@ import { api, getInvokeRing, type InvokeRingEntry } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { tokens } from "@/lib/format";
 import { humanDuration } from "@/lib/humanDuration";
-import { operationalErrorKey } from "@/lib/operationalError";
+import { requestErrorSummary } from "@/lib/requestErrorSummary";
 import { noticeText } from "@/lib/notice";
 import {
   HEAT_MODES,
@@ -641,9 +641,9 @@ export function Log({
                       </div>
                     ) : <span role="cell" />}
                     {/* 錯誤自己一行。上游的錯誤字串可以很長，塞回同一行就會撐爆。 */}
-                    {entry.error ? (
+                    {entry.error || entry.status >= 400 ? (
                       <span className="req__err" role="cell">
-                        {t(operationalErrorKey(entry.error))}
+                        {requestErrorSummary(entry, t)}
                       </span>
                     ) : null}
                   </div>

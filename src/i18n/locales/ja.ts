@@ -1,6 +1,8 @@
 import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
+  "requestErrors": {"quota": "利用枠を使い切ったか、リクエストが制限されています。", "auth": "認証が拒否されました。再度ログインしてください。", "cancelled": "リクエストが取り消されたか、接続が終了しました。", "protocol": "上流の応答を読み取れませんでした。", "rejected": "上流がリクエストを拒否しました。", "unavailable": "上流サービスで一時的な障害が発生しています。", "other": "リクエストに失敗しました。技術情報を確認してください。", "retryAfter": "再試行まで少なくとも {{time}} 待ってください。", "retries": "すでに {{count}} 回再試行しました。", "reasons": {"unsupported": "対応していないリクエスト設定があります。", "tools": "ツール定義が必要な形式と一致しません。", "continuation": "前の応答が見つかりません。", "context": "会話がコンテキストの上限を超えています。", "policy": "上流のポリシーにより内容が拒否されました。"}},
+  "quotaActions": {"resetCount": "リセット回数：{{count}}", "resetHint": "利用可能なリセット券を表示します。表示だけでは券を消費しません。", "fiveHourHint": "5時間枠の自動管理を切り替えます。リセット券はすぐには消費しません。"},
   "tabPolish": {
     "details": "詳細",
     "loginExpired": "このホストのログインが期限切れです。再度ログインしてください。",
@@ -41,9 +43,9 @@ const ja: ResourceTree = {
     "dashboardHint": "これらの設定は現況ページのプロバイダーカードにのみ反映されます。",
     "core": {
       "label": "Enhanced core",
-      "active": "使用中 · {{version}}",
-      "pending": "使用中：{{version}} · 適用待ち：{{pending}}",
-      "missing": "Enhanced core がありません",
+      "active": "v{{version}} · 使用中",
+      "pending": "v{{pending}} · 有効化待ち（現在：{{version}}）",
+      "missing": "未配置",
       "bundled": "インストールに含まれる版",
       "repair": "core を修復"
     },
