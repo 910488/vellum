@@ -113,10 +113,27 @@ pub struct RequestMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfficialSocketAffinity {
+    /// Full SHA-256 hex of the execution credential id, without the
+    /// `sha256:` prefix the usage records carry. Compare with `is_account`;
+    /// the diagnostic `account_hash` is a different, truncated form.
     pub account_hash: String,
     pub turn_in_progress: bool,
     pub input_tokens: u64,
     pub quota_exhausted: bool,
+}
+
+impl OfficialSocketAffinity {
+    pub fn hash_account(account_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(account_id.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn is_account(&self, account_id: &str) -> bool {
+        self.account_hash == Self::hash_account(account_id)
+    }
 }
 
 impl RequestMetadata {

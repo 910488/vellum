@@ -412,7 +412,7 @@ impl SmartRouter {
         let previous = self.sessions.get(key);
         let socket_incumbent = context.socket_affinity.as_ref().and_then(|affinity| {
             candidates.iter().position(|c| {
-                vellum_proxy_runtime::account_hash(&c.account_id) == affinity.account_hash
+                affinity.is_account(&c.account_id)
             })
         });
         let available_incumbent = socket_incumbent.or_else(|| {
@@ -726,7 +726,7 @@ mod tests {
         let candidates = [candidate("busy", 10.0), candidate("idle", 90.0)];
         let mut request = context("existing-thread", 1, 300_000);
         request.socket_affinity = Some(vellum_proxy_runtime::request::OfficialSocketAffinity {
-            account_hash: vellum_proxy_runtime::account_hash("busy"),
+            account_hash: vellum_proxy_runtime::request::OfficialSocketAffinity::hash_account("busy"),
             turn_in_progress: true,
             input_tokens: 300_000,
             quota_exhausted: false,
