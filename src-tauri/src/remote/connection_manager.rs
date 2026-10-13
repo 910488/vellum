@@ -161,6 +161,10 @@ impl RemoteClientManager {
         self.cache.list_hosts()
     }
 
+    pub fn has_hosts(&self) -> AppResult<bool> {
+        self.cache.has_hosts()
+    }
+
     pub fn active_host(&self) -> AppResult<Option<String>> {
         self.cache.active_host()
     }

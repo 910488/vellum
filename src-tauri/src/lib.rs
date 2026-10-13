@@ -348,6 +348,7 @@ pub fn run() {
             commands::probe_web_search,
             commands::get_subagent_capability,
             remote::commands::get_remote_manager_feature_flags,
+            remote::commands::set_remote_sidebar_forced,
             remote::commands::get_remote_release_status,
             remote::commands::get_desktop_codex_compatibility,
             remote::commands::update_remote_codex_for_desktop,

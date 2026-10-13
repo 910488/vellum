@@ -25,7 +25,7 @@ import {
 import { Settings } from "@/screens/Settings";
 import { Today } from "@/screens/Today";
 import { EnhancedCore } from "@/screens/EnhancedCore";
-import { SCREENS, type ScreenId } from "@/screens/registry";
+import { accessibleScreen, visibleScreens, type ScreenId } from "@/screens/registry";
 import { noticeText } from "@/lib/notice";
 import { shouldApplyProxyLifecycle } from "@/lib/proxyLifecycle";
 import type { ProxyStatus } from "@/types";
@@ -49,6 +49,8 @@ const MAX_WARM_SCREENS = 3;
 export function App() {
   const { t } = useTranslation();
   const [screen, setScreen] = useState<ScreenId>("today");
+  const [remoteVisible, setRemoteVisible] = useState(false);
+  const [remoteSidebarForced, setRemoteSidebarForced] = useState(false);
   const [mountedScreens, setMountedScreens] = useState<Set<ScreenId>>(
     () => new Set<ScreenId>(["today"]),
   );
@@ -74,7 +76,8 @@ export function App() {
   const grokPollGeneration = useRef(0);
   const grokLoginId = useRef<string | null>(null);
 
-  const navigate = useCallback((next: ScreenId) => {
+  const navigate = useCallback((requested: ScreenId) => {
+    const next = accessibleScreen(requested, remoteVisible);
     if (next === screen) return;
     const startedAt = performance.now();
     setMountedScreens((current) => {
@@ -101,7 +104,31 @@ export function App() {
         performance.now() - startedAt,
       );
     });
-  }, [screen]);
+  }, [screen, remoteVisible]);
+
+  useEffect(() => {
+    if (remoteVisible) return;
+    if (screen === "remote") navigate("today");
+    setMountedScreens((current) => {
+      if (!current.has("remote")) return current;
+      const next = new Set(current); next.delete("remote"); return next;
+    });
+  }, [remoteVisible, screen, navigate]);
+
+  useEffect(() => {
+    let active = true;
+    const refreshFlags = () => {
+      void api.getRemoteManagerFeatureFlags().then((flags) => {
+        if (!active) return;
+        setRemoteVisible(Boolean(flags.showInSidebar));
+        setRemoteSidebarForced(Boolean(flags.sidebarForced));
+      }).catch(() => {});
+    };
+    refreshFlags();
+    const timer = window.setInterval(refreshFlags, 5000);
+    window.addEventListener("vellum:remote-sidebar-changed", refreshFlags);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("vellum:remote-sidebar-changed", refreshFlags); };
+  }, []);
 
   const reloadOnboardingConnections = useCallback(async () => {
     const statusGeneration = ++statusLoadGeneration.current;
@@ -432,14 +459,14 @@ export function App() {
       if (!event.ctrlKey && !event.metaKey) return;
       const index = Number(event.key) - 1;
       if (!Number.isInteger(index)) return;
-      const target = SCREENS[index];
+      const target = visibleScreens(remoteVisible)[index];
       if (!target) return;
       event.preventDefault();
       navigate(target.id);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navigate]);
+  }, [navigate, remoteVisible]);
 
   if (!onboardingComplete) {
     return (
@@ -513,6 +540,7 @@ export function App() {
           onOpenUpdates={() => setUpdatesOpen(true)}
           attention={attention(status)}
           updateAttention={(status.updates?.attention ?? "none") !== "none"}
+          remoteVisible={remoteVisible}
         />
 
         <main className="canvas">
@@ -549,7 +577,7 @@ export function App() {
             />
             </div>
           ) : null}
-          {mountedScreens.has("remote") ? (
+          {remoteVisible && mountedScreens.has("remote") ? (
             <div className="screen-slot" hidden={screen !== "remote"}>
             <Remote
               refreshVersion={refreshVersions.remote ?? 0}
@@ -579,6 +607,13 @@ export function App() {
               refreshVersion={refreshVersions.settings ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "settings"}
+              remoteSidebarForced={remoteSidebarForced}
+              onRemoteSidebarForced={(forced) => {
+                void api.setRemoteSidebarForced(forced).then((flags) => {
+                  setRemoteVisible(flags.showInSidebar);
+                  setRemoteSidebarForced(flags.sidebarForced);
+                }).catch(() => setRefreshError(t("common.saveFailed")));
+              }}
             />
             </div>
           ) : null}
@@ -591,7 +626,7 @@ export function App() {
           onClose={() => setUpdatesOpen(false)}
           onOpenHosts={() => {
             setUpdatesOpen(false);
-            navigate("remote");
+            navigate(remoteVisible ? "remote" : "settings");
           }}
         />
 

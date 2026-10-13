@@ -21,10 +21,12 @@ const apiMocks = vi.hoisted(() => ({
   getEnhancedDesktopRuntimeStatus: vi.fn(),
   getOverview: vi.fn(),
   getUpdateStatus: vi.fn(),
+  getRemoteManagerFeatureFlags: vi.fn().mockResolvedValue({ showInSidebar: false, sidebarForced: false }),
   subscribeProxyLifecycle: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({ api: apiMocks }));
+vi.mock("@/lib/api", () => ({ api: apiMocks, recordInvokeResult: vi.fn() }));
+vi.mock("@/screens/Remote", () => ({ Remote: () => <h2>Remote fixture</h2> }));
 
 const stopped: ProxyStatus = {
   running: false,
@@ -311,6 +313,7 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
 
   beforeEach(() => {
     emitLifecycle = null;
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarForced: false });
     apiMocks.getProviderOverviews.mockResolvedValue([]);
     apiMocks.listRoutes.mockResolvedValue([]);
     apiMocks.listSessions.mockResolvedValue([]);
@@ -341,6 +344,18 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it("unmounts a hidden Remote tab and falls back to Today", async () => {
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: true, sidebarForced: false });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: i18n.t("navigation.remote.label") }));
+    expect(await screen.findByRole("heading", { name: "Remote fixture" })).toBeTruthy();
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarForced: false });
+    window.dispatchEvent(new Event("vellum:remote-sidebar-changed"));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Remote fixture" })).toBeNull());
+    expect(screen.queryByRole("button", { name: i18n.t("navigation.remote.label") })).toBeNull();
+    expect(screen.getByRole("button", { name: new RegExp(i18n.t("navigation.today.label")) }).getAttribute("aria-current")).toBe("page");
   });
 
   it("shows preparing stages from events while the start command is still in flight", async () => {
