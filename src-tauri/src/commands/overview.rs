@@ -758,23 +758,27 @@ pub async fn get_provider_overviews(
         .collect::<std::collections::HashSet<_>>();
     let usage_store = state.usage_store();
     let mut result = Vec::with_capacity(routes.len());
+    // Each quota read can be an upstream round trip. Asked one route after
+    // another, the dashboard waited for the sum of them before it could
+    // show anything; asked together it waits for the slowest one.
+    let force_refresh = force_refresh.unwrap_or(false);
+    let app: &AppState = &state;
+    let quotas = futures_util::future::join_all(routes.iter().map(|route| async move {
+        match route.provider_kind {
+            ProviderKind::Official => openai_quota_windows(app, &route.id, force_refresh).await,
+            ProviderKind::GrokCli => grok_quota_windows(app, &route.id, force_refresh).await,
+            ProviderKind::OpenAiCompatible => (Vec::new(), None),
+        }
+    }))
+    .await;
 
-    for route in routes {
+    for (route, (quota_windows, quota_error)) in routes.into_iter().zip(quotas) {
         let mut route_for_catalog = route.clone();
         route_for_catalog.enabled = true;
         let route_models = crate::catalog::model_routes_with_official_catalog(
             &[route_for_catalog],
             official_catalog.as_ref(),
         );
-        let (quota_windows, quota_error) = match route.provider_kind {
-            ProviderKind::Official => {
-                openai_quota_windows(&state, &route.id, force_refresh.unwrap_or(false)).await
-            }
-            ProviderKind::GrokCli => {
-                grok_quota_windows(&state, &route.id, force_refresh.unwrap_or(false)).await
-            }
-            ProviderKind::OpenAiCompatible => (Vec::new(), None),
-        };
         let quota = quota_windows.first().cloned();
         let usage = usage_store.summary(&route.id)?;
         let provider_models = route_models
