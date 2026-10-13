@@ -87,6 +87,9 @@ pub struct RequestMetadata {
     /// client socket by the Responses WebSocket bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<String>,
+    /// Proxy-owned socket affinity, never populated from caller JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_socket_affinity: Option<OfficialSocketAffinity>,
     /// Normalized Codex turn and subagent identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_identity: Option<CodexTurnIdentity>,
@@ -106,6 +109,14 @@ pub struct RequestMetadata {
     /// identifier the accounts list already shows in the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_official_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialSocketAffinity {
+    pub account_hash: String,
+    pub turn_in_progress: bool,
+    pub input_tokens: u64,
+    pub quota_exhausted: bool,
 }
 
 impl RequestMetadata {
@@ -200,6 +211,7 @@ mod tests {
                 guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
+                official_socket_affinity: None,
                 codex_identity: None,
                 codex_capabilities: None,
                 force_portable_official_handoff: false,
@@ -233,6 +245,7 @@ mod tests {
             guardian_dispatch: false,
             primary_failure_reason: None,
             connection_id: None,
+            official_socket_affinity: None,
             codex_identity: Some(identity),
             codex_capabilities: None,
             force_portable_official_handoff: false,

@@ -331,6 +331,7 @@ mod tests {
     use super::*;
     fn context(session: &str, tokens: u64, window: &str) -> OfficialRoutingContext {
         OfficialRoutingContext {
+            socket_affinity: None,
             session_key: Some(session.into()),
             context_window_key: Some(window.into()),
             request_id: format!("{session}-{window}"),

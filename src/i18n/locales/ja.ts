@@ -3,6 +3,7 @@ import type { ResourceTree } from "../resources";
 const ja: ResourceTree = {
   "requestErrors": {"quota": "利用枠を使い切ったか、リクエストが制限されています。", "auth": "認証が拒否されました。再度ログインしてください。", "cancelled": "リクエストが取り消されたか、接続が終了しました。", "protocol": "上流の応答を読み取れませんでした。", "rejected": "上流がリクエストを拒否しました。", "unavailable": "上流サービスで一時的な障害が発生しています。", "other": "リクエストに失敗しました。技術情報を確認してください。", "retryAfter": "再試行まで少なくとも {{time}} 待ってください。", "retries": "すでに {{count}} 回再試行しました。", "reasons": {"unsupported": "対応していないリクエスト設定があります。", "tools": "ツール定義が必要な形式と一致しません。", "continuation": "前の応答が見つかりません。", "context": "会話がコンテキストの上限を超えています。", "policy": "上流のポリシーにより内容が拒否されました。"}},
   "quotaActions": {"resetCount": "リセット回数：{{count}}", "resetHint": "利用可能なリセット券を表示します。表示だけでは券を消費しません。", "fiveHourHint": "5時間枠の自動管理を切り替えます。リセット券はすぐには消費しません。"},
+  "bridgeFallback": { "active": "Enhanced core がありません。送信ボタンの保護とアカウント切り替えは公式 bridge を通じて有効です。", "prepared": "Enhanced core がありません。公式 bridge は準備済みで、Codex が接続すると保護が有効になります。", "failed": "Enhanced core がなく、bridge の保護も有効ではありません。詳細を確認してインストールを修復してください。" },
   "tabPolish": {
     "details": "詳細",
     "loginExpired": "このホストのログインが期限切れです。再度ログインしてください。",

@@ -206,8 +206,8 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete, onOpen
       {exportPath ? <Notice>{t("enhanced.exported")}: <code>{exportPath}</code></Notice> : null}
       {error ? <Notice tone="warn" raw={error}>{t("enhanced.staleWarning")}</Notice> : null}
       {runtime?.unverified ? <Notice tone="warn">{t("enhanced.unverifiedNote")}</Notice> : null}
-      {runtime && !runtime.coreAvailable ? <Notice tone="warn">
-        {t("settings.page.enhancedRuntime.inject.blocked.noCore")}
+      {runtime && (!runtime.coreAvailable || runtime.enhancedCore === "missing") ? <Notice tone="warn">
+        {runtime.enhancedCore === "missing" ? t(runtime.bridgeProtectionActive ? "bridgeFallback.active" : runtime.bridgePrepared ? "bridgeFallback.prepared" : "bridgeFallback.failed") : t("settings.page.enhancedRuntime.inject.blocked.noCore")}
         {onOpenUpdates ? <Btn soft mini onClick={onOpenUpdates}>{t("settings.page.updates.title")}</Btn> : null}
       </Notice> : null}
       {runtime?.missingHelpers.length ? (

@@ -3,6 +3,7 @@ import type { ResourceTree } from "../resources";
 const zhTW: ResourceTree = {
   "requestErrors": {"quota": "額度用完或請求被限流。", "auth": "登入驗證遭拒，請重新登入。", "cancelled": "請求已取消或連線已關閉。", "protocol": "無法讀取上游回應。", "rejected": "請求被上游拒絕。", "unavailable": "上游服務暫時故障。", "other": "請求失敗，請查看技術資料。", "retryAfter": "至少等待 {{time}} 後再重試。", "retries": "已重試 {{count}} 次。", "reasons": {"unsupported": "含有不支援的請求選項。", "tools": "工具定義不符合要求的格式。", "continuation": "找不到上一筆回應。", "context": "對話超過上下文限制。", "policy": "內容遭上游政策拒絕。"}},
   "quotaActions": {"resetCount": "重置次數：{{count}}", "resetHint": "展開可用的重置券；查看清單不會消耗券。", "fiveHourHint": "切換 5 小時窗自動管理；不會立即消耗重置券。"},
+  "bridgeFallback": { "active": "Enhanced core 缺失，送出鍵保護與帳號切換仍透過官方 bridge 生效。", "prepared": "Enhanced core 缺失。官方 bridge 已準備好，Codex 接上後保護才會生效。", "failed": "Enhanced core 缺失，bridge 保護未生效。請查看詳細資料並修復安裝。" },
   "tabPolish": {
     "details": "詳細資料",
     "loginExpired": "這台主機的登入已失效，請重新登入。",

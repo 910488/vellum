@@ -274,7 +274,12 @@ async fn execute(
         .is_some_and(|binding| binding.plane == ExecutionPlane::OfficialCodex)
         && third_party_binding.as_ref().is_some_and(|binding| {
             binding.plane == ExecutionPlane::EnhancedCodex
-                && binding.runtime_digest == manifest.enhanced.runtime_digest
+                && binding.runtime_digest
+                    == manifest
+                        .enhanced
+                        .as_ref()
+                        .expect("Enhanced launch")
+                        .runtime_digest
         });
     report.record(CaseResult::new(
         "official-control-task-and-third-party-smoke-task-route-correctly",
@@ -333,7 +338,12 @@ async fn execute(
                 .flatten()
                 .filter(|binding| {
                     binding.plane == ExecutionPlane::EnhancedCodex
-                        && binding.runtime_digest == reloaded.enhanced.runtime_digest
+                        && binding.runtime_digest
+                            == reloaded
+                                .enhanced
+                                .as_ref()
+                                .expect("Enhanced launch")
+                                .runtime_digest
                 });
             same_thread && binding.is_some() && second_attestation.enhanced.pid.is_some()
         }
@@ -344,7 +354,12 @@ async fn execute(
         resume_ok,
         format!(
             "digest={} launch={}",
-            reloaded.enhanced.runtime_digest, reloaded.launch_id
+            reloaded
+                .enhanced
+                .as_ref()
+                .expect("Enhanced launch")
+                .runtime_digest,
+            reloaded.launch_id
         ),
     ));
 

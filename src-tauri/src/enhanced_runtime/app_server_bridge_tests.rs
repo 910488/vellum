@@ -52,9 +52,16 @@ fn guardian_config_is_normalized_on_the_real_third_party_route() {
     let BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, forwarded) = &actions[0] else {
         panic!("third-party thread must use Enhanced")
     };
-    assert_eq!(forwarded["params"]["config"]["features.guardianv2"], json!({"enabled":true,"review_threshold":0.7}));
-    bridge.on_child_line(ExecutionPlane::EnhancedCodex,
-        &json!({"id":101,"result":{"thread":{"id":"guardian-thread"}}}).to_string()).unwrap();
+    assert_eq!(
+        forwarded["params"]["config"]["features.guardianv2"],
+        json!({"enabled":true,"review_threshold":0.7})
+    );
+    bridge
+        .on_child_line(
+            ExecutionPlane::EnhancedCodex,
+            &json!({"id":101,"result":{"thread":{"id":"guardian-thread"}}}).to_string(),
+        )
+        .unwrap();
     for method in ["thread/resume", "thread/fork"] {
         let request = json!({"id":102,"method":method,"params":{"threadId":"guardian-thread",
             "config":{"features.guardianv2":{"enabled":true,"thread_context":true,"review_threshold":0.7}}}});
@@ -183,8 +190,8 @@ fn desktop_feature_flags_map_to_the_session_loader_profile() {
         "a custom JSON feature set must not be overwritten by an E0 compatibility selector"
     );
 }
-use crate::enhanced_runtime::qualification::{JournalEntry, ENHANCED_EVENT_NOTIFICATION};
 use crate::enhanced_runtime::backend_relay;
+use crate::enhanced_runtime::qualification::{JournalEntry, ENHANCED_EVENT_NOTIFICATION};
 use crate::enhanced_runtime::ModelProviderRoute;
 
 fn state(temp: &tempfile::TempDir) -> BridgeState {
@@ -1287,5 +1294,60 @@ fn account_read_names_the_live_relay_as_desktops_backend() {
     assert_eq!(
         response["result"]["workspaceRouting"]["backendOrigin"],
         "https://chatgpt.com"
+    );
+}
+
+#[test]
+fn bridge_without_enhanced_routes_all_models_to_official_and_preserves_backend_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = state(&temp);
+    bridge.enhanced_digest.clear();
+    bridge.providers = TrustedProviderSet::new(vec!["openai".into(), "qwen".into()], Vec::new());
+    bridge
+        .attestation
+        .mark_exited(ExecutionPlane::EnhancedCodex);
+    let initialize = bridge
+        .on_client_line(r#"{"id":1,"method":"initialize","params":{}}"#)
+        .unwrap();
+    assert_eq!(initialize.len(), 1);
+    assert!(matches!(
+        initialize[0],
+        BridgeAction::ToChild(ExecutionPlane::OfficialCodex, _)
+    ));
+    bridge
+        .on_child_line(ExecutionPlane::OfficialCodex, r#"{"id":1,"result":{}}"#)
+        .unwrap();
+    assert_eq!(
+        bridge.attestation.snapshot().state,
+        crate::enhanced_runtime::BridgeLifecycle::Degraded
+    );
+    for (id, provider) in [(2, "openai"), (3, "qwen")] {
+        let actions = bridge.on_client_line(&json!({"id":id,"method":"thread/start","params":{"model":"model","modelProvider":provider}}).to_string()).unwrap();
+        assert!(matches!(
+            actions[0],
+            BridgeAction::ToChild(ExecutionPlane::OfficialCodex, _)
+        ));
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    backend_relay::advertise(
+        temp.path(),
+        &backend_relay::RelayAdvertisement {
+            origin: "https://localhost".into(),
+            port: listener.local_addr().unwrap().port(),
+            certificate_sha256: "00".into(),
+        },
+    )
+    .unwrap();
+    bridge.backend_relay = Some(backend_relay::advertisement_path(temp.path()));
+    bridge
+        .on_client_line(r#"{"id":4,"method":"account/read","params":{}}"#)
+        .unwrap();
+    let actions = bridge.on_child_line(ExecutionPlane::OfficialCodex, r#"{"id":4,"result":{"account":{"type":"chatgpt"},"workspaceRouting":{"chatgptAccountId":"fixture","backendOrigin":"https://chatgpt.com"}}}"#).unwrap();
+    let BridgeAction::ToClient(response) = &actions[0] else {
+        panic!("response")
+    };
+    assert_eq!(
+        response["result"]["workspaceRouting"]["backendOrigin"],
+        "https://localhost"
     );
 }

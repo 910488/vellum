@@ -770,6 +770,48 @@ impl CodexOAuthManager {
     ) -> Result<Option<AppliedOAuth>, OAuthError> {
         let settings = self.quota_pool.read().await.clone();
         let selection_id = ulid::Ulid::new();
+        if settings.enabled {
+            if let Some(affinity) = context
+                .socket_affinity
+                .as_ref()
+                .filter(|affinity| affinity.turn_in_progress)
+            {
+                let account = self
+                    .accounts
+                    .read()
+                    .await
+                    .keys()
+                    .find(|id| pool_account_hash(id) == affinity.account_hash)
+                    .cloned();
+                if let Some(account) = account {
+                    // Register the invocation even when no quota lookup is
+                    // allowed to move this root turn. Its eventual usage must
+                    // still feed load and capacity observations.
+                    let plan = self
+                        .accounts
+                        .read()
+                        .await
+                        .get(&account)
+                        .and_then(|a| a.plan_type.clone());
+                    self.smart_router.lock().choose(
+                        &[crate::quota_pool_router::Candidate {
+                            account_id: account.clone(),
+                            capacity_prior: crate::quota_pool_router::plan_capacity_prior(
+                                plan.as_deref(),
+                            ),
+                            plan_type: plan,
+                            headroom: 100.0,
+                            ..Default::default()
+                        }],
+                        context,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
+                    log::info!("[QuotaPool] selection={selection_id} reason=active_turn_affinity account={} context_tokens={}", affinity.account_hash, context.estimated_input_tokens);
+                    return self.valid_auth_for(&account).await.map(Some);
+                }
+                return Err(OAuthError::AuthenticationFailed("the active turn's execution account is no longer available; retry at a turn boundary".into()));
+            }
+        }
         if !settings.enabled || !settings.members.iter().any(|member| member.in_pool) {
             log::info!(
                 "[QuotaPool] selection={selection_id} event=bypass reason={}",
@@ -864,11 +906,40 @@ impl CodexOAuthManager {
         let mut rank = 0;
         let mut fallback_auth = None;
         let mut eligible = Vec::new();
-        for member in &settings.members {
+        let mut routing_members = settings.members.iter().collect::<Vec<_>>();
+        if settings.strategy == QuotaPoolStrategy::Rank {
+            if let Some(affinity) = context.socket_affinity.as_ref() {
+                routing_members.sort_by_key(|member| {
+                    pool_account_hash(&member.account_id) != affinity.account_hash
+                });
+            }
+        }
+        for member in routing_members {
             if !member.in_pool {
                 continue;
             }
             rank += 1;
+            if context.socket_affinity.as_ref().is_some_and(|affinity| {
+                !affinity.turn_in_progress
+                    && affinity.quota_exhausted
+                    && pool_account_hash(&member.account_id) == affinity.account_hash
+            }) {
+                // A usage-limit frame is authoritative even while the cached
+                // quota snapshot is still below its gate. Capacity 429s do not
+                // set this marker, and the running root turn is never moved.
+                log_pool_candidate(
+                    &mut diagnostic_candidates,
+                    selection_id,
+                    "skip",
+                    &member.account_id,
+                    rank,
+                    "upstream_usage_limit",
+                );
+                if settings.strategy == QuotaPoolStrategy::Balanced && !member.paused {
+                    let _ = balanced_reads.next();
+                }
+                continue;
+            }
             if member.paused {
                 log_pool_candidate(
                     &mut diagnostic_candidates,
@@ -2502,6 +2573,150 @@ mod tests {
                 .unwrap()
                 .credential_id,
             "balanced-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_pool_enable_preserves_active_turn_and_defers_usage_limit_switch_to_boundary() {
+        use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
+        use vellum_proxy_runtime::request::OfficialSocketAffinity;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let mut members = Vec::new();
+        for (id, used) in [("midturn-a", 90.0), ("midturn-b", 10.0)] {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"sub":id,"chatgpt_account_id":id,"chatgpt_plan_type":"plus"})
+                    .to_string(),
+            );
+            let token = format!("header.{payload}.signature");
+            manager.accounts.write().await.insert(
+                id.into(),
+                AccountMetadata {
+                    account_id: id.into(),
+                    chatgpt_account_id: Some(id.into()),
+                    workspace_name: None,
+                    plan_type: Some("plus".into()),
+                    email: None,
+                    authenticated_at: 1,
+                },
+            );
+            manager.access_tokens.write().await.insert(
+                id.into(),
+                CachedToken {
+                    access_token: token.clone(),
+                    expires_at_ms: i64::MAX,
+                },
+            );
+            crate::codex_quota::seed_test_quota(
+                &token,
+                id,
+                vec![
+                    quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 10.0, None),
+                    quota_window(crate::model::QuotaPeriodUnit::Week, None, used, None),
+                ],
+            )
+            .await;
+            members.push(QuotaPoolMember {
+                account_id: id.into(),
+                in_pool: true,
+                paused: false,
+                weekly_floor: 0,
+                maintain_five_hour_window: false,
+            });
+        }
+        *manager.default_account_id.write().await = Some("midturn-a".into());
+        assert_eq!(
+            manager
+                .valid_routing_auth()
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-a"
+        );
+        let mut settings = QuotaPoolSettings {
+            enabled: true,
+            strategy: QuotaPoolStrategy::Balanced,
+            members,
+        };
+        manager.set_quota_pool(settings.clone()).await.unwrap();
+        let mut context = OfficialRoutingContext {
+            socket_affinity: Some(OfficialSocketAffinity {
+                account_hash: pool_account_hash("midturn-a"),
+                turn_in_progress: true,
+                input_tokens: 300_000,
+                quota_exhausted: false,
+            }),
+            session_key: Some("main:existing-thread".into()),
+            estimated_input_tokens: 300_000,
+            request_id: "midturn-continue".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-a"
+        );
+        context.socket_affinity.as_mut().unwrap().turn_in_progress = false;
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-a",
+            "usable accounts remain bound across roots"
+        );
+        context.socket_affinity.as_mut().unwrap().quota_exhausted = true;
+        context.socket_affinity.as_mut().unwrap().turn_in_progress = true;
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-a",
+            "an authoritative usage-limit 429 cannot move an unfinished root turn"
+        );
+        context.socket_affinity.as_mut().unwrap().turn_in_progress = false;
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-b",
+            "next root can bypass the still-warm stale quota snapshot"
+        );
+        context.socket_affinity.as_mut().unwrap().quota_exhausted = false;
+        settings.members[0].paused = true;
+        manager.set_quota_pool(settings).await.unwrap();
+        context.socket_affinity.as_mut().unwrap().turn_in_progress = true;
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-a"
+        );
+        context.socket_affinity.as_mut().unwrap().turn_in_progress = false;
+        assert_eq!(
+            manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_id,
+            "midturn-b"
         );
     }
 

@@ -100,6 +100,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
     let connection_started = std::time::Instant::now();
     let runtime = state.proxy_runtime();
     let mut official: Option<OfficialSegment> = None;
+    let mut previous_metadata: Option<crate::request::RequestMetadata> = None;
     let mut queued: VecDeque<Value> = VecDeque::new();
     let mut deferred_official: VecDeque<DeferredOfficialTurn> = VecDeque::new();
     let mut deferred_account_handoffs: VecDeque<Value> = VecDeque::new();
@@ -245,6 +246,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         &mut frames_out,
                         false,
                         &mut portable_warmup,
+                        None,
                     )
                     .await
                     {
@@ -264,6 +266,22 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                 let mut runtime_request = preplanned_runtime_request.clone().unwrap_or_else(|| {
                     runtime_request_from_body(&state, &headers, &request, &connection_id)
                 });
+                let continuation_context = previous_metadata
+                    .clone()
+                    .or_else(|| runtime.official_continuation_context(&runtime_request));
+                apply_socket_affinity(
+                    &mut runtime_request,
+                    continuation_context.as_ref(),
+                    official
+                        .as_ref()
+                        .and_then(|segment| segment.execution_account_hash.as_deref()),
+                    official
+                        .as_ref()
+                        .map_or(0, |segment| segment.last_input_tokens),
+                    official
+                        .as_ref()
+                        .is_some_and(|segment| segment.quota_exhausted),
+                );
                 let request_id = runtime_request.metadata.request_id.clone();
                 let turn_plan = if let Some(plan) = preplanned_plan {
                     WebSocketTurnPlan {
@@ -285,6 +303,12 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     route_id: next_route_id,
                     dispatch: mut turn_dispatch,
                 } = turn_plan;
+                let planned_account_hash = match &turn_dispatch {
+                    WebSocketTurnDispatch::OfficialNative(plan) => {
+                        plan.execution_account_hash.clone()
+                    }
+                    _ => None,
+                };
                 let live_account_handoff = matches!(
                     &turn_dispatch,
                     WebSocketTurnDispatch::OfficialNative(plan)
@@ -293,7 +317,8 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 managed_account_changed(
                                     &segment.connection_key,
                                     &plan.connection_key,
-                                ) || segment.selection_revision != plan.selection_revision
+                                ) || (segment.selection_revision != plan.selection_revision
+                                    && !runtime_request.metadata.official_socket_affinity.as_ref().is_some_and(|affinity| affinity.turn_in_progress))
                             })
                 );
                 if live_account_handoff {
@@ -362,6 +387,13 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         let reuse = official.as_ref().is_some_and(|segment| {
                             segment.connection_key == official_plan.connection_key
                         });
+                        if reuse
+                            || official
+                                .as_ref()
+                                .is_none_or(|segment| segment.pending.is_empty())
+                        {
+                            previous_metadata = Some(runtime_request.metadata.clone());
+                        }
                         if reuse {
                             let segment = official.as_mut().expect("checked Some above");
                             match send_official_turn(
@@ -458,6 +490,25 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     WebSocketTurnDispatch::PortableReplay {
                         force_official_handoff,
                     } => {
+                        if let Some(hash) = planned_account_hash {
+                            // The shared HTTP executor resolves auth again. Pin
+                            // that resolution to the already planned account,
+                            // and retain the new binding for later increments.
+                            runtime_request.metadata.official_socket_affinity =
+                                Some(crate::request::OfficialSocketAffinity {
+                                    account_hash: hash
+                                        .strip_prefix("sha256:")
+                                        .unwrap_or(&hash)
+                                        .to_owned(),
+                                    turn_in_progress: true,
+                                    input_tokens: runtime_request
+                                        .metadata
+                                        .official_socket_affinity
+                                        .as_ref()
+                                        .map_or(0, |a| a.input_tokens),
+                                    quota_exhausted: false,
+                                });
+                        }
                         if official
                             .as_ref()
                             .is_some_and(|segment| !segment.pending.is_empty())
@@ -479,6 +530,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         // never reaches the portable adapters — the shared
                         // execute() path only hydrates the sanitized/portable
                         // history for this route.
+                        previous_metadata = Some(runtime_request.metadata.clone());
                         close_official_segment(&mut official).await;
                         if !opened {
                             opened = true;
@@ -501,6 +553,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                             &mut frames_out,
                             force_official_handoff,
                             &mut portable_warmup,
+                            Some(runtime_request),
                         )
                         .await
                         {
@@ -684,6 +737,9 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
 /// Official natively pipelines multiple in-flight turns on one socket, so
 /// completions are matched front-to-back.
 struct OfficialSegment {
+    execution_account_hash: Option<String>,
+    last_input_tokens: u64,
+    quota_exhausted: bool,
     selection_revision: Option<u64>,
     connection_key: OfficialWebSocketConnectionKey,
     write: futures_util::stream::SplitSink<OfficialUpstreamSocket, TungsteniteMessage>,
@@ -1102,6 +1158,9 @@ async fn open_official_segment(
     };
     let (write, read) = upstream.split();
     Some(OfficialSegment {
+        execution_account_hash: plan.execution_account_hash.clone(),
+        last_input_tokens: 0,
+        quota_exhausted: false,
         selection_revision: plan.selection_revision,
         connection_key: plan.connection_key.clone(),
         write,
@@ -1292,6 +1351,11 @@ async fn handle_official_upstream_frame(
                 }
             }
             if let Some(response) = completed {
+                segment.quota_exhausted = false;
+                segment.last_input_tokens = response
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(segment.last_input_tokens);
                 segment.stages.terminal_ms = Some(segment.started.elapsed().as_millis() as u64);
                 if let Some(mut turn) = segment.pending.pop_front() {
                     if !turn.recorded {
@@ -1320,6 +1384,11 @@ async fn handle_official_upstream_frame(
                     }
                 }
             } else if let Some(failed) = failed {
+                segment.quota_exhausted |= failed
+                    .pointer("/response/error/code")
+                    .or_else(|| failed.pointer("/error/code"))
+                    .and_then(Value::as_str)
+                    == Some("usage_limit_reached");
                 segment.stages.terminal_ms = Some(segment.started.elapsed().as_millis() as u64);
                 let category = official_websocket_failure_category(&failed);
                 let message = failed
@@ -1390,6 +1459,7 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
     frames_out: &mut u64,
     force_official_handoff: bool,
     portable_warmup: &mut Option<PortableWarmup>,
+    planned_request: Option<RuntimeRequest>,
 ) -> TurnOutcome {
     // The HTTP Responses body has no WebSocket event discriminator.
     if request.get("type").and_then(Value::as_str) == Some("response.create") {
@@ -1402,7 +1472,10 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
     // `Unsupported parameter: generate`. A `generate=false` prewarm is
     // connection setup, not inference, so it is answered here and its input
     // is folded into the next turn that chains onto it.
-    if let Some(generate) = request.as_object_mut().and_then(|object| object.remove("generate")) {
+    if let Some(generate) = request
+        .as_object_mut()
+        .and_then(|object| object.remove("generate"))
+    {
         if generate == Value::Bool(false) {
             let (warmup, response) = portable_warmup_response(&request);
             *portable_warmup = Some(warmup);
@@ -1418,7 +1491,9 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             };
         }
     }
-    let mut runtime_request = runtime_request_from_body(state, headers, &request, connection_id);
+    let mut runtime_request = planned_request
+        .unwrap_or_else(|| runtime_request_from_body(state, headers, &request, connection_id));
+    runtime_request.body = request.clone();
     runtime_request.metadata.force_portable_official_handoff = force_official_handoff;
     let turn_request_id = runtime_request.metadata.request_id.clone();
     // Minted before dispatch, not read back from `execute` -- this is what
@@ -2036,6 +2111,132 @@ fn runtime_request_from_body<S: ProxyRuntimeState>(
     }
 }
 
+/// A WebSocket response terminal is only a model invocation boundary. Tool
+/// results continue the same Codex root turn, which may span many invocations.
+/// Retain trusted socket identity when an incremental frame omits it; never
+/// inherit across an explicit thread change or a conflicting identity.
+fn apply_socket_affinity(
+    request: &mut RuntimeRequest,
+    previous: Option<&crate::request::RequestMetadata>,
+    account_hash: Option<&str>,
+    input_tokens: u64,
+    quota_exhausted: bool,
+) {
+    let Some(previous) = previous else { return };
+    if request.metadata.codex_identity_conflicted() || previous.codex_identity_conflicted() {
+        return;
+    }
+    if let (Some(current), Some(prior)) =
+        (&request.metadata.codex_identity, &previous.codex_identity)
+    {
+        if current
+            .thread_id
+            .as_ref()
+            .zip(prior.thread_id.as_ref())
+            .is_some_and(|(a, b)| a != b)
+            || current
+                .session_id
+                .as_ref()
+                .zip(prior.session_id.as_ref())
+                .is_some_and(|(a, b)| a != b)
+        {
+            return;
+        }
+    }
+    let roots_present = request
+        .metadata
+        .codex_identity
+        .as_ref()
+        .is_some_and(|id| id.root_turn_id.is_some())
+        || previous
+            .codex_identity
+            .as_ref()
+            .is_some_and(|id| id.root_turn_id.is_some());
+    let current_turn = request.metadata.codex_identity.as_ref().and_then(|id| {
+        if roots_present {
+            id.root_turn_id.as_ref()
+        } else {
+            id.turn_id.as_ref()
+        }
+    });
+    let prior_turn = previous.codex_identity.as_ref().and_then(|id| {
+        if roots_present {
+            id.root_turn_id.as_ref()
+        } else {
+            id.turn_id.as_ref()
+        }
+    });
+    let turn_in_progress = match (current_turn, prior_turn) {
+        (Some(current), Some(prior)) => current == prior,
+        _ => request
+            .body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some(),
+    };
+    if let Some(prior) = &previous.codex_identity {
+        let current = request
+            .metadata
+            .codex_identity
+            .get_or_insert_with(|| prior.clone());
+        current.session_id = current
+            .session_id
+            .clone()
+            .or_else(|| prior.session_id.clone());
+        current.thread_id = current
+            .thread_id
+            .clone()
+            .or_else(|| prior.thread_id.clone());
+        if turn_in_progress {
+            current.root_turn_id = current
+                .root_turn_id
+                .clone()
+                .or_else(|| prior.root_turn_id.clone());
+            current.context_window_id = current
+                .context_window_id
+                .clone()
+                .or_else(|| prior.context_window_id.clone());
+        }
+        if current.session_id == prior.session_id && current.thread_id == prior.thread_id {
+            current.trust = prior.trust;
+        }
+    }
+    let prior = previous.official_socket_affinity.as_ref();
+    let compressed = request
+        .metadata
+        .codex_identity
+        .as_ref()
+        .and_then(|id| id.context_window_id.as_ref())
+        .zip(
+            previous
+                .codex_identity
+                .as_ref()
+                .and_then(|id| id.context_window_id.as_ref()),
+        )
+        .is_some_and(|(a, b)| a != b);
+    let live_account = account_hash.is_some();
+    if let Some(account_hash) = account_hash.or_else(|| prior.map(|a| a.account_hash.as_str())) {
+        let account_hash = account_hash.strip_prefix("sha256:").unwrap_or(account_hash);
+        let same_account = prior.is_some_and(|a| a.account_hash == account_hash);
+        request.metadata.official_socket_affinity = Some(crate::request::OfficialSocketAffinity {
+            account_hash: account_hash.to_owned(),
+            turn_in_progress,
+            input_tokens: if compressed {
+                0
+            } else if input_tokens > 0 {
+                input_tokens
+            } else {
+                prior.filter(|_| same_account).map_or(0, |a| a.input_tokens)
+            },
+            quota_exhausted: if live_account {
+                quota_exhausted
+            } else {
+                prior.is_some_and(|a| same_account && a.quota_exhausted)
+            },
+        });
+    }
+}
+
 fn websocket_upstream_host(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -2575,6 +2776,148 @@ async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socket_request(thread: Option<&str>, root: Option<&str>) -> RuntimeRequest {
+        use crate::codex_metadata::{CodexIdentityTrust, CodexOpaqueId, CodexTurnIdentity};
+        RuntimeRequest {
+            body: json!({"model":"vellum-official", "previous_response_id":"resp_previous", "input":[{"type":"function_call_output","call_id":"call_shell","output":"done"}]}),
+            endpoint: RuntimeEndpoint::Responses,
+            incoming_auth: Default::default(),
+            execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
+            metadata: crate::request::RequestMetadata {
+                connection_id: Some("socket-one".into()),
+                codex_identity: thread.or(root).map(|_| CodexTurnIdentity {
+                    session_id: thread
+                        .map(|_| CodexOpaqueId::new("session_id", "session-one").unwrap()),
+                    thread_id: thread
+                        .map(|thread| CodexOpaqueId::new("thread_id", thread).unwrap()),
+                    root_turn_id: root
+                        .map(|root| CodexOpaqueId::new("root_turn_id", root).unwrap()),
+                    trust: CodexIdentityTrust::Structured,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn incremental_socket_keeps_thread_root_and_cumulative_context() {
+        let first = socket_request(Some("thread-one"), Some("root-one"));
+        let mut next = socket_request(None, Some("root-one"));
+        apply_socket_affinity(
+            &mut next,
+            Some(&first.metadata),
+            Some("sha256:account-a"),
+            300_000,
+            false,
+        );
+        assert_eq!(
+            next.metadata.codex_thread_key(),
+            first.metadata.codex_thread_key()
+        );
+        let affinity = next.metadata.official_socket_affinity.as_ref().unwrap();
+        assert!(affinity.turn_in_progress);
+        assert_eq!(affinity.input_tokens, 300_000);
+        assert_eq!(affinity.account_hash, "account-a");
+        assert_eq!(
+            crate::history::resolve_conversation_key(&next, None).key,
+            "codex:session-one:thread-one"
+        );
+        let route = official_route_config("https://example.test".into()).to_route();
+        assert_eq!(
+            crate::official_auth::OfficialRoutingContext::from_request(&route, &next)
+                .estimated_input_tokens,
+            300_000
+        );
+
+        let previous = next.metadata.clone();
+        let mut boundary = socket_request(None, Some("root-two"));
+        apply_socket_affinity(
+            &mut boundary,
+            Some(&previous),
+            Some("account-a"),
+            300_000,
+            true,
+        );
+        assert!(
+            !boundary
+                .metadata
+                .official_socket_affinity
+                .as_ref()
+                .unwrap()
+                .turn_in_progress
+        );
+        assert!(
+            boundary
+                .metadata
+                .official_socket_affinity
+                .as_ref()
+                .unwrap()
+                .quota_exhausted
+        );
+        assert_eq!(
+            boundary.metadata.codex_thread_key(),
+            first.metadata.codex_thread_key()
+        );
+    }
+
+    #[test]
+    fn socket_affinity_does_not_cross_threads_or_conflicted_identity() {
+        let first = socket_request(Some("thread-one"), Some("root-one"));
+        for conflict in [false, true] {
+            let mut next = socket_request(Some("thread-two"), Some("root-one"));
+            if conflict {
+                next.metadata.codex_identity.as_mut().unwrap().trust =
+                    crate::codex_metadata::CodexIdentityTrust::Conflict;
+            }
+            apply_socket_affinity(
+                &mut next,
+                Some(&first.metadata),
+                Some("account-a"),
+                300_000,
+                false,
+            );
+            assert!(next.metadata.official_socket_affinity.is_none());
+            assert_eq!(
+                next.metadata
+                    .codex_identity
+                    .as_ref()
+                    .unwrap()
+                    .thread_id
+                    .as_deref(),
+                Some("thread-two")
+            );
+        }
+    }
+
+    #[test]
+    fn socket_context_can_shrink_after_compaction_and_usage_limit_is_not_permanent() {
+        let mut first = socket_request(Some("thread-one"), Some("root-one"));
+        first.metadata.official_socket_affinity = Some(crate::request::OfficialSocketAffinity {
+            account_hash: "account-a".into(),
+            turn_in_progress: true,
+            input_tokens: 300_000,
+            quota_exhausted: true,
+        });
+        let mut next = socket_request(None, Some("root-one"));
+        apply_socket_affinity(
+            &mut next,
+            Some(&first.metadata),
+            Some("account-a"),
+            20_000,
+            false,
+        );
+        let affinity = next.metadata.official_socket_affinity.unwrap();
+        assert_eq!(
+            affinity.input_tokens, 20_000,
+            "new actual usage supersedes the old large context"
+        );
+        assert!(
+            !affinity.quota_exhausted,
+            "a successful native response clears its stale quota rejection"
+        );
+    }
     use crate::config::{ProxyRuntimeConfig, RuntimeRouteConfig};
     use crate::inbound::InboundAccessPolicy;
     use crate::route::{RuntimeAuthKind, RuntimeProviderKind, RuntimeWireFormat};
@@ -2982,6 +3325,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_same_account_revision_during_root_turn_keeps_native_socket() {
+        run_official_websocket_account_switch(false, "revision_active").await;
+    }
+
+    #[tokio::test]
+    async fn official_reconnect_restores_thread_root_and_context_before_routing() {
+        run_official_websocket_account_switch(false, "revision_active_reconnect").await;
+    }
+
+    #[tokio::test]
     async fn official_websocket_streaming_bridge_replays_history_and_records_account() {
         run_official_websocket_account_switch(false, "bridge_stream").await;
     }
@@ -2989,6 +3342,18 @@ mod tests {
     async fn run_official_websocket_account_switch(shared_workspace: bool, mode: &str) {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
+
+        fn desktop_tools() -> Value {
+            json!([
+                serde_json::from_str::<Value>(include_str!("../tests/fixtures/code-mode-exec.json")).unwrap(),
+                {"type":"namespace","name":"collaboration","description":"Coordinate agents", "tools":[
+                    {"type":"function","name":"followup_task","description":"Continue an agent task", "parameters":{
+                        "type":"object", "properties":{"target":{"type":"string"},"message":{"type":"string"}},
+                        "required":["target","message"],"additionalProperties":false}},
+                    {"type":"function","name":"send_message","parameters":{"type":"object", "properties":{"target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"]}}
+                ]}
+            ])
+        }
 
         fn account_hash(account_id: &str) -> String {
             format!("{:x}", Sha256::digest(account_id.as_bytes()))
@@ -3072,11 +3437,13 @@ mod tests {
             websocket_accounts: Arc<Mutex<Vec<String>>>,
             http_requests: Arc<Mutex<Vec<(String, Value)>>>,
             http_headers: Arc<Mutex<Vec<HeaderMap>>>,
+            responses: Arc<AtomicUsize>,
         }
 
         let capture = Capture::default();
         let get_capture = capture.clone();
         let post_capture = capture.clone();
+        let check_contract = mode != "missing";
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
@@ -3095,14 +3462,17 @@ mod tests {
                             if request.get("type").and_then(Value::as_str)
                                 == Some("response.create")
                             {
+                                assert_eq!(request["tools"], desktop_tools(), "native WS contract");
+                                let turn_count = capture.responses.fetch_add(1, Ordering::SeqCst) + 1;
                                 socket
                                     .send(AxumWsMessage::Text(
                                         json!({
                                             "type": "response.completed",
                                             "response": {
-                                                "id": "resp_account_a",
+                                                "id": if turn_count == 1 { "resp_account_a" } else { "resp_account_next" },
                                                 "object": "response",
                                                 "status": "completed",
+                                                "usage":{"input_tokens":300_000,"output_tokens":10,"input_tokens_details":{"cached_tokens":297_000}},
                                                 "output": [{
                                                     "type": "message",
                                                     "role": "assistant",
@@ -3127,6 +3497,13 @@ mod tests {
                 move |headers: HeaderMap, axum::extract::Json(body): axum::extract::Json<Value>| {
                     let capture = post_capture.clone();
                     async move {
+                        if check_contract {
+                            assert_eq!(
+                                body["tools"],
+                                desktop_tools(),
+                                "HTTP resume must not flatten or replace collaboration tools"
+                            );
+                        }
                         capture.http_headers.lock().unwrap().push(headers.clone());
                         let account = execution_from_headers(&headers);
                         let streaming = body["stream"] == true;
@@ -3187,16 +3564,25 @@ mod tests {
 
         use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
         let mut handshake = format!("ws://{proxy_address}/v1/responses")
-            .into_client_request().unwrap();
-        handshake.headers_mut().insert("session-id", "bridge-affinity".parse().unwrap());
-        handshake.headers_mut().insert("session_id", "bridge-affinity-legacy".parse().unwrap());
-        let (mut client, _) = tokio_tungstenite::connect_async(handshake).await.unwrap();
+            .into_client_request()
+            .unwrap();
+        handshake
+            .headers_mut()
+            .insert("session-id", "bridge-affinity".parse().unwrap());
+        handshake
+            .headers_mut()
+            .insert("session_id", "bridge-affinity-legacy".parse().unwrap());
+        let (mut client, _) = tokio_tungstenite::connect_async(handshake.clone())
+            .await
+            .unwrap();
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
                     "input": [{"role": "user", "content": "first question"}],
+                    "tools": desktop_tools(),
+                    "client_metadata":{"x-codex-turn-metadata":{"session_id":"switch-session","thread_id":"switch-thread","root_turn_id":"root-one"}},
                     "stream": false
                 })
                 .to_string()
@@ -3217,10 +3603,16 @@ mod tests {
             "response.completed"
         );
 
+        if mode == "revision_active_reconnect" {
+            let _ = client.close(None).await;
+            let (replacement, _) = tokio_tungstenite::connect_async(handshake).await.unwrap();
+            client = replacement;
+        }
+
         if !mode.starts_with("bridge") {
             select_account(
                 &auth_root,
-                if mode == "revision" {
+                if mode.starts_with("revision") {
                     &identity_a
                 } else {
                     &identity_b
@@ -3228,14 +3620,14 @@ mod tests {
                 2,
             );
         }
-        let tools = json!([serde_json::from_str::<Value>(
-            include_str!("../tests/fixtures/code-mode-exec.json")).unwrap()]);
+        let tools = desktop_tools();
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
                     "tools": tools, "tool_choice":"auto", "parallel_tool_calls":true,
+                    "client_metadata":{"x-codex-turn-metadata":{"root_turn_id":if mode.starts_with("revision_active") {"root-one"} else {"root-two"}}},
                     "include":["reasoning.encrypted_content"],
                     "text":{"format":{"type":"text"}},
                     "reasoning":{"effort":"high","summary":"auto"},
@@ -3284,7 +3676,11 @@ mod tests {
                 if event["type"] == "response.completed" {
                     assert_eq!(
                         event["response"]["id"],
-                        "resp_account_b",
+                        if mode.starts_with("revision_active") {
+                            "resp_account_next"
+                        } else {
+                            "resp_account_b"
+                        },
                         "websocket accounts={:?}, http requests={:?}",
                         capture.websocket_accounts.lock().unwrap(),
                         capture.http_requests.lock().unwrap()
@@ -3295,8 +3691,30 @@ mod tests {
         }
 
         let websocket_accounts = capture.websocket_accounts.lock().unwrap().clone();
-        assert_eq!(websocket_accounts, [identity_a.clone()]);
+        assert_eq!(
+            websocket_accounts,
+            if mode == "revision_active_reconnect" {
+                vec![identity_a.clone(), identity_a.clone()]
+            } else {
+                vec![identity_a.clone()]
+            }
+        );
         let requests = capture.http_requests.lock().unwrap().clone();
+        if mode.starts_with("revision_active") {
+            assert!(
+                requests.is_empty(),
+                "same-account revision must not discard the running root's native continuation"
+            );
+            let rows = runtime.usage_records().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.status == 200
+                && row.conversation_identity.as_deref()
+                    == Some("codex:switch-session:switch-thread")));
+            let _ = client.close(None).await;
+            proxy_task.abort();
+            upstream_task.abort();
+            return;
+        }
         for headers in capture.http_headers.lock().unwrap().iter() {
             assert_eq!(headers["session-id"], "bridge-affinity");
             assert_eq!(headers["session_id"], "bridge-affinity-legacy");
@@ -3328,12 +3746,21 @@ mod tests {
             assert_eq!(body["text"], json!({"format":{"type":"text"}}));
             assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
             assert_eq!(body["prompt_cache_key"], "account-switch-contract");
-            assert_eq!(body["instructions"], if mode.starts_with("bridge") {
-                "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
-            } else { "be brief" });
+            assert_eq!(
+                body["instructions"],
+                if mode.starts_with("bridge") {
+                    "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
+                } else {
+                    "be brief"
+                }
+            );
         }
         let rows = runtime.usage_records().unwrap();
         let row = rows.last().unwrap();
+        assert_eq!(
+            row.conversation_identity.as_deref(),
+            Some("codex:switch-session:switch-thread")
+        );
         assert_eq!(row.upstream_attempted, Some(true));
         assert_eq!(
             row.execution_account_hash.as_deref(),

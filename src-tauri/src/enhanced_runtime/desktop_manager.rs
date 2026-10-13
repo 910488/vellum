@@ -60,6 +60,8 @@ pub(crate) fn thread_execution_planes(data_root: &Path) -> HashMap<String, Execu
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopRuntimeSettings {
+    #[serde(default)]
+    bridge_only: bool,
     enabled: bool,
     official_codex_executable: PathBuf,
     enhanced_codex_executable: PathBuf,
@@ -70,6 +72,9 @@ struct DesktopRuntimeSettings {
 #[serde(rename_all = "camelCase")]
 pub struct DesktopRuntimeStatus {
     pub configured: bool,
+    pub enhanced_core: String,
+    pub bridge_prepared: bool,
+    pub bridge_protection_active: bool,
     /// The user asked for Enhanced and the settings verified.
     pub enabled: bool,
     /// The pinned Enhanced artifact, protocol hash, and model map verified.
@@ -312,6 +317,7 @@ pub fn configure_desktop_runtime(
         })
     };
     let settings = DesktopRuntimeSettings {
+        bridge_only: false,
         enabled,
         official_codex_executable,
         enhanced_codex_executable,
@@ -565,16 +571,27 @@ pub(crate) fn sync_proxy_desktop_launch<G>(
 ) -> Result<Option<DesktopRuntimeLaunch>, DesktopRuntimeManagerError> {
     let official = crate::remote::desktop_codex::desktop_identity()
         .map_err(|error| DesktopRuntimeManagerError::DesktopProbe(error.to_string()))?;
-    let settings = DesktopRuntimeSettings {
-        enabled: true,
-        official_codex_executable: PathBuf::from(official.binary),
-        enhanced_codex_executable: crate::updates::resolve_enhanced_runtime(data_root)
-            .map(|runtime| runtime.path)
-            .ok_or(DesktopRuntimeManagerError::PackagedEnhancedUnavailable)?,
-        bridge_executable: packaged_bridge_executable()
-            .ok_or(DesktopRuntimeManagerError::PackagedBridgeUnavailable)?,
-    };
+    let enhanced = crate::updates::resolve_enhanced_runtime(data_root);
+    let settings = proxy_launch_settings(
+        PathBuf::from(official.binary),
+        enhanced.map(|runtime| runtime.path),
+        packaged_bridge_executable(),
+    )?;
     prepare_desktop_launch_guarded(data_root, routes, models, settings, commit_guard, true)
+}
+
+fn proxy_launch_settings(
+    official: PathBuf,
+    enhanced: Option<PathBuf>,
+    bridge: Option<PathBuf>,
+) -> Result<DesktopRuntimeSettings, DesktopRuntimeManagerError> {
+    Ok(DesktopRuntimeSettings {
+        enabled: true,
+        bridge_only: enhanced.is_none(),
+        official_codex_executable: official,
+        enhanced_codex_executable: enhanced.unwrap_or_default(),
+        bridge_executable: bridge.ok_or(DesktopRuntimeManagerError::PackagedBridgeUnavailable)?,
+    })
 }
 
 fn prepare_desktop_launch_guarded<G>(
@@ -586,7 +603,7 @@ fn prepare_desktop_launch_guarded<G>(
     save_settings: bool,
 ) -> Result<Option<DesktopRuntimeLaunch>, DesktopRuntimeManagerError> {
     let mut settings = settings;
-    let applying_pending = crate::updates::consume_core_pending_apply();
+    let mut applying_pending = crate::updates::consume_core_pending_apply();
     if applying_pending {
         let pending = crate::updates::pending_core(data_root)
             .ok_or(DesktopRuntimeManagerError::PendingCoreUnverified)?;
@@ -602,9 +619,13 @@ fn prepare_desktop_launch_guarded<G>(
                     user_turn_accepted: false,
                 },
             );
-            return Err(DesktopRuntimeManagerError::PendingCoreUnverified);
+            log::warn!("[Enhanced] pending core rejected kind=PendingCoreUnverified; retaining Official bridge");
+            applying_pending = false;
         }
-        settings.enhanced_codex_executable = pending.path;
+        if applying_pending {
+            settings.enhanced_codex_executable = pending.path;
+            settings.bridge_only = false;
+        }
     }
     let identity = match verify_settings(data_root, &settings) {
         Ok(identity) => identity,
@@ -619,7 +640,20 @@ fn prepare_desktop_launch_guarded<G>(
                     user_turn_accepted: false,
                 },
             );
-            return Err(error);
+            log::warn!(
+                "[Enhanced] pending runtime unavailable, trying Official bridge kind={error:?}"
+            );
+            settings.bridge_only = true;
+            settings.enhanced_codex_executable = PathBuf::new();
+            verify_settings(data_root, &settings)?
+        }
+        Err(error) if !settings.bridge_only => {
+            log::warn!(
+                "[Enhanced] full runtime unavailable, trying Official bridge kind={error:?}"
+            );
+            settings.bridge_only = true;
+            settings.enhanced_codex_executable = PathBuf::new();
+            verify_settings(data_root, &settings)?
         }
         Err(error) => return Err(error),
     };
@@ -627,7 +661,7 @@ fn prepare_desktop_launch_guarded<G>(
     let model_map_path = data_root.join(MODEL_MAP_FILE);
     let model_map_bytes = serde_json::to_vec_pretty(&model_map)?;
 
-    let official_ids = routes
+    let mut official_ids = routes
         .iter()
         .filter(|route| route.provider_kind == ProviderKind::Official)
         .map(|_| "openai-official".to_string())
@@ -637,11 +671,14 @@ fn prepare_desktop_launch_guarded<G>(
         .filter(|route| route.provider_kind != ProviderKind::Official)
         .map(|route| route.id.clone())
         .collect::<BTreeSet<_>>();
-    if third_party_ids.is_empty() {
+    if third_party_ids.is_empty() && !settings.bridge_only {
         return Err(DesktopRuntimeManagerError::NoThirdPartyProviders);
     }
-    if official_ids.is_empty() {
+    if official_ids.is_empty() && !settings.bridge_only {
         return Err(DesktopRuntimeManagerError::NoOfficialProvider);
+    }
+    if settings.bridge_only && official_ids.is_empty() {
+        official_ids.insert("openai-official".into());
     }
 
     let official_home = official_codex_home();
@@ -658,16 +695,20 @@ fn prepare_desktop_launch_guarded<G>(
             runtime_digest: identity.official_digest,
             codex_home: official_task_home,
         },
-        enhanced: RuntimeBinaryIdentity {
-            artifact_sha256: sha256_file(&settings.enhanced_codex_executable)?,
-            executable: settings.enhanced_codex_executable.clone(),
-            runtime_digest: identity.enhanced_digest,
-            // Both app-server children must publish into one task authority.
-            // Remote Control is one relay connection, so a digest-scoped
-            // second CODEX_HOME made every Enhanced thread invisible to it.
-            // The Enhanced behavior itself is selected by process env and
-            // runtime digest, not by storing task data in another home.
-            codex_home: enhanced_task_home,
+        enhanced: if settings.bridge_only {
+            None
+        } else {
+            Some(RuntimeBinaryIdentity {
+                artifact_sha256: sha256_file(&settings.enhanced_codex_executable)?,
+                executable: settings.enhanced_codex_executable.clone(),
+                runtime_digest: identity.enhanced_digest,
+                // Both app-server children must publish into one task authority.
+                // Remote Control is one relay connection, so a digest-scoped
+                // second CODEX_HOME made every Enhanced thread invisible to it.
+                // The Enhanced behavior itself is selected by process env and
+                // runtime digest, not by storing task data in another home.
+                codex_home: enhanced_task_home,
+            })
         },
         model_provider_map_sha256: format!("sha256:{:x}", Sha256::digest(&model_map_bytes)),
         model_provider_map_path: model_map_path,
@@ -865,7 +906,7 @@ struct VerifiedIdentity {
     official_digest: String,
     enhanced_digest: String,
     enhanced_commit: String,
-    protocol: ProtocolCompatibility,
+    protocol: Option<ProtocolCompatibility>,
 }
 
 /// Cache key for a protocol comparison: both binaries by path, size and mtime.
@@ -967,10 +1008,26 @@ fn adopt_discovered_official(data_root: &Path) -> Result<(), DesktopRuntimeManag
         return Ok(());
     };
     let discovered = PathBuf::from(&identity.binary);
-    if canonical(&settings.official_codex_executable) == canonical(&discovered) {
+    let recovered = settings
+        .bridge_only
+        .then(|| crate::updates::resolve_enhanced_runtime(data_root))
+        .flatten()
+        .filter(|runtime| {
+            let mut candidate = settings.clone();
+            candidate.enhanced_codex_executable = runtime.path.clone();
+            candidate.bridge_only = false;
+            verify_settings(data_root, &candidate).is_ok()
+        });
+    if canonical(&settings.official_codex_executable) == canonical(&discovered)
+        && recovered.is_none()
+    {
         return Ok(());
     }
     settings.official_codex_executable = discovered;
+    if let Some(recovered) = recovered {
+        settings.enhanced_codex_executable = recovered.path;
+        settings.bridge_only = false;
+    }
     std::fs::write(
         data_root.join(SETTINGS_FILE),
         serde_json::to_vec_pretty(&settings)?,
@@ -985,12 +1042,23 @@ fn status_for_settings(
     let mut status = empty_status(data_root, true, Vec::new());
     status.enabled = settings.enabled;
     status.official_codex_executable = Some(settings.official_codex_executable.clone());
-    status.enhanced_codex_executable = Some(settings.enhanced_codex_executable.clone());
+    status.enhanced_core = if settings.bridge_only {
+        "missing"
+    } else {
+        "available"
+    }
+    .into();
+    status.enhanced_codex_executable =
+        (!settings.bridge_only).then(|| settings.enhanced_codex_executable.clone());
     status.bridge_executable = Some(settings.bridge_executable.clone());
-    status.missing_helpers = missing_enhanced_helpers(
-        &settings.official_codex_executable,
-        &settings.enhanced_codex_executable,
-    );
+    status.missing_helpers = if settings.bridge_only {
+        Vec::new()
+    } else {
+        missing_enhanced_helpers(
+            &settings.official_codex_executable,
+            &settings.enhanced_codex_executable,
+        )
+    };
     status.launch_core_drift = apply_observed_launch(data_root, settings, &mut status)
         || apply_official_drift(data_root, &mut status);
     apply_environment_state(data_root, settings, &mut status);
@@ -1017,10 +1085,15 @@ fn status_for_settings(
     }
     match verify_settings(data_root, &verification_settings) {
         Ok(identity) => {
-            status.artifact_ready = true;
-            status.enhanced_runtime_digest = Some(identity.enhanced_digest);
-            status.unverified = identity.protocol.verdict == ProtocolVerdict::Unverified;
-            status.protocol = Some(identity.protocol);
+            status.bridge_prepared = true;
+            status.artifact_ready = !settings.bridge_only;
+            status.enhanced_runtime_digest =
+                (!identity.enhanced_digest.is_empty()).then_some(identity.enhanced_digest);
+            status.unverified = identity
+                .protocol
+                .as_ref()
+                .is_some_and(|protocol| protocol.verdict == ProtocolVerdict::Unverified);
+            status.protocol = identity.protocol;
         }
         Err(error) => {
             status.blockers.push(error.to_string());
@@ -1038,6 +1111,8 @@ fn status_for_settings(
         && status.artifact_ready
         && status.active
         && status.environment_state == "leased";
+    status.bridge_protection_active &=
+        status.bridge_prepared && status.enabled && status.environment_state == "leased";
     status.restart_required = restart_would_fix(&status);
     status.activation_state = activation_state(&status).into();
     status
@@ -1079,7 +1154,8 @@ fn restart_would_fix(status: &DesktopRuntimeStatus) -> bool {
     // artifact verified and the launch path is ours to hand Desktop.
     let adopt = status.enabled
         && !status.active
-        && status.artifact_ready
+        && (status.artifact_ready || status.bridge_prepared)
+        && !status.bridge_protection_active
         && status.environment_state == "leased";
     // Disabled while Desktop is still on the bridge: a restart returns it to
     // native Codex.
@@ -1219,7 +1295,10 @@ fn apply_observed_launch(
         .enhanced_identity
         .as_ref()
         .is_some_and(|identity| {
-            identity.runtime_digest == manifest.enhanced.runtime_digest
+            manifest
+                .enhanced
+                .as_ref()
+                .is_some_and(|enhanced| identity.runtime_digest == enhanced.runtime_digest)
                 && identity.enhanced_commit == manifest.enhanced_commit
                 && identity.qwen_tool_reliability == manifest.feature_profile.qwen_tool_reliability
                 && identity.deepseek_context_recovery
@@ -1230,7 +1309,10 @@ fn apply_observed_launch(
                 && identity.intent_continuation == manifest.feature_profile.intent_continuation
         });
     let digests_match = attestation.official.runtime_digest == manifest.official.runtime_digest
-        && attestation.enhanced.runtime_digest == manifest.enhanced.runtime_digest
+        && manifest
+            .enhanced
+            .as_ref()
+            .is_some_and(|enhanced| attestation.enhanced.runtime_digest == enhanced.runtime_digest)
         && identity_matches;
     // Two different facts, and collapsing them is what made the button read
     // "not loaded" while Enhanced was answering every turn: `serving` is
@@ -1243,7 +1325,20 @@ fn apply_observed_launch(
         && adopted
         && bridge_matches
         && digests_match;
-    if !status.active && (status.enabled || attestation.is_live()) {
+    status.bridge_protection_active = manifest.enhanced.is_none()
+        && status.bridge_observed
+        && attestation.official.initialized
+        && !attestation.official.exited
+        && attestation.official.runtime_digest == manifest.official.runtime_digest
+        && attestation
+            .official
+            .pid
+            .is_some_and(super::process_info::pid_is_alive);
+    status.bridge_protection_active &= super::backend_relay::live_relay_origin(&super::backend_relay::advertisement_path(data_root)).is_some();
+    if !status.active
+        && !status.bridge_protection_active
+        && (status.enabled || attestation.is_live())
+    {
         status
             .blockers
             .extend(attestation.blockers_for(&manifest.launch_id));
@@ -1286,19 +1381,18 @@ fn apply_observed_launch(
     // screen accounting for it. Observed on 2026-09-05: the live launch held
     // `bin\9ba750cce02d5e5c\codex.exe`, whose three sibling helpers had been
     // removed under it, while settings had already adopted the replacement.
-    let drift = [
-        (
-            "Official",
-            &manifest.official.executable,
-            &settings.official_codex_executable,
-        ),
+    let drift = std::iter::once((
+        "Official",
+        &manifest.official.executable,
+        &settings.official_codex_executable,
+    ))
+    .chain(manifest.enhanced.as_ref().map(|enhanced| {
         (
             "Enhanced",
-            &manifest.enhanced.executable,
+            &enhanced.executable,
             &settings.enhanced_codex_executable,
-        ),
-    ]
-    .into_iter()
+        )
+    }))
     .filter(|(_, launched, configured)| canonical(launched) != canonical(configured))
     .map(|(plane, launched, configured)| {
         format!(
@@ -1308,10 +1402,16 @@ fn apply_observed_launch(
         )
     })
     .collect::<Vec<_>>();
-    if !attestation.is_live() || drift.is_empty() {
+    let recovered = manifest.enhanced.is_none() && !settings.bridge_only;
+    if !attestation.is_live() || (drift.is_empty() && !recovered) {
         return false;
     }
     status.blockers.extend(drift);
+    if recovered {
+        status
+            .blockers
+            .push("Enhanced core recovered; rebuild the Official-only bridge launch".into());
+    }
     true
 }
 
@@ -1367,8 +1467,17 @@ pub fn superseded_launch_repair(
 }
 
 fn empty_status(data_root: &Path, configured: bool, blockers: Vec<String>) -> DesktopRuntimeStatus {
+    let core_available = crate::updates::resolve_enhanced_runtime(data_root).is_some();
     DesktopRuntimeStatus {
         configured,
+        enhanced_core: if core_available {
+            "available"
+        } else {
+            "missing"
+        }
+        .into(),
+        bridge_prepared: false,
+        bridge_protection_active: false,
         enabled: false,
         artifact_ready: false,
         active: false,
@@ -1390,7 +1499,7 @@ fn empty_status(data_root: &Path, configured: bool, blockers: Vec<String>) -> De
         official_codex_executable: None,
         enhanced_codex_executable: None,
         bridge_executable: None,
-        core_available: crate::updates::resolve_enhanced_runtime(data_root).is_some(),
+        core_available,
         serving: false,
         protocol: None,
         unverified: false,
@@ -1456,6 +1565,9 @@ fn verify_settings(
         ("Enhanced Codex", &settings.enhanced_codex_executable),
         ("App Server bridge", &settings.bridge_executable),
     ] {
+        if settings.bridge_only && name == "Enhanced Codex" {
+            continue;
+        }
         if !path.is_absolute() || !path.is_file() {
             return Err(DesktopRuntimeManagerError::ExecutableUnavailable {
                 name,
@@ -1475,12 +1587,6 @@ fn verify_settings(
             });
         }
     }
-    let lock = EnhancedRuntimeLockFile::parse(LOCK_BYTES)
-        .map_err(|error| DesktopRuntimeManagerError::Lock(error.to_string()))?;
-    let target = env!("VELLUM_BUILD_TARGET");
-    if !lock.identity_complete_for_target(target) {
-        return Err(DesktopRuntimeManagerError::IncompleteLock);
-    }
     let desktop_identity = crate::remote::desktop_codex::desktop_identity()
         .map_err(|error| DesktopRuntimeManagerError::DesktopProbe(error.to_string()))?;
     let discovered_official = PathBuf::from(&desktop_identity.binary);
@@ -1489,6 +1595,20 @@ fn verify_settings(
             expected: discovered_official,
             actual: settings.official_codex_executable.clone(),
         });
+    }
+    if settings.bridge_only {
+        return Ok(VerifiedIdentity {
+            official_digest: sha256_file(&settings.official_codex_executable)?,
+            enhanced_digest: String::new(),
+            enhanced_commit: String::new(),
+            protocol: None,
+        });
+    }
+    let lock = EnhancedRuntimeLockFile::parse(LOCK_BYTES)
+        .map_err(|error| DesktopRuntimeManagerError::Lock(error.to_string()))?;
+    let target = env!("VELLUM_BUILD_TARGET");
+    if !lock.identity_complete_for_target(target) {
+        return Err(DesktopRuntimeManagerError::IncompleteLock);
     }
     let enhanced_hash = format!(
         "sha256:{}",
@@ -1575,7 +1695,7 @@ fn verify_settings(
         ),
         enhanced_digest,
         enhanced_commit,
-        protocol,
+        protocol: Some(protocol),
     })
 }
 
@@ -1661,6 +1781,39 @@ pub enum DesktopRuntimeManagerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_launch_keeps_a_real_bridge_when_the_enhanced_core_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let official = temp.path().join("official.exe");
+        let bridge = temp.path().join("bridge.exe");
+        std::fs::write(&official, b"official").unwrap();
+        std::fs::write(&bridge, b"bridge").unwrap();
+        let settings = proxy_launch_settings(official.clone(), None, Some(bridge.clone())).unwrap();
+        assert!(settings.enabled && settings.bridge_only);
+        assert_eq!(settings.bridge_executable, bridge);
+        assert!(settings.enhanced_codex_executable.as_os_str().is_empty());
+        assert!(matches!(
+            proxy_launch_settings(official, None, None),
+            Err(DesktopRuntimeManagerError::PackagedBridgeUnavailable)
+        ));
+    }
+
+    #[test]
+    fn bridge_only_launch_needs_adoption_once_and_core_recovery_changes_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut status = empty_status(temp.path(), true, Vec::new());
+        status.enabled = true;
+        status.bridge_prepared = true;
+        status.environment_state = "leased".into();
+        assert!(restart_would_fix(&status));
+        status.bridge_protection_active = true;
+        assert!(!restart_would_fix(&status));
+        let full = write_minimal_launch(temp.path());
+        let mut degraded = full.clone();
+        degraded.enhanced = None;
+        assert!(!same_launch_content(&full, &degraded));
+    }
     use crate::enhanced_runtime::attestation::{AttestationWriter, ChildAttestation};
     use crate::enhanced_runtime::ExecutionPlane;
 
@@ -1830,6 +1983,7 @@ mod tests {
             .join("vellum-codex-app-server-from-an-older-build.exe");
         std::fs::write(&stale, b"an older sidecar").unwrap();
         let settings = DesktopRuntimeSettings {
+            bridge_only: false,
             enabled: true,
             official_codex_executable: temp.path().join("official.exe"),
             enhanced_codex_executable: temp.path().join("enhanced.exe"),
@@ -1861,6 +2015,7 @@ mod tests {
     fn a_stopped_proxy_releases_the_launch_lease_even_if_enhanced_is_still_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let settings = DesktopRuntimeSettings {
+            bridge_only: false,
             enabled: true,
             official_codex_executable: temp.path().join("official.exe"),
             enhanced_codex_executable: temp.path().join("enhanced.exe"),
@@ -1930,7 +2085,10 @@ mod tests {
         status.environment_state = "leaseValueMissing".into();
         assert!(!restart_would_fix(&status));
         status.active = false;
-        assert!(!restart_would_fix(&status), "a restart now would start native Codex");
+        assert!(
+            !restart_would_fix(&status),
+            "a restart now would start native Codex"
+        );
 
         status.launch_core_drift = true;
         assert!(restart_would_fix(&status));
@@ -1938,7 +2096,10 @@ mod tests {
         status.launch_core_drift = false;
         status.enabled = false;
         status.bridge_observed = true;
-        assert!(restart_would_fix(&status), "disabled but the bridge is still running");
+        assert!(
+            restart_would_fix(&status),
+            "disabled but the bridge is still running"
+        );
         status.bridge_observed = false;
         assert!(!restart_would_fix(&status), "disabled and gone");
     }
@@ -1974,6 +2135,7 @@ mod tests {
             failures: Vec::new(),
         };
         let settings = DesktopRuntimeSettings {
+            bridge_only: false,
             enabled: true,
             official_codex_executable: official,
             enhanced_codex_executable: enhanced,
@@ -2254,13 +2416,16 @@ mod tests {
         // identical in every other respect. This is the one that matters: it is
         // the artifact Codex Desktop will execute.
         let mut swapped = base.clone();
-        swapped.enhanced.artifact_sha256 = "sha256:something-else".into();
+        swapped.enhanced.as_mut().unwrap().artifact_sha256 = "sha256:something-else".into();
         assert!(!same_launch_content(&base, &swapped));
 
         for mutate in [
             (|m: &mut LaunchManifestV1| m.schema_version += 1) as fn(&mut LaunchManifestV1),
             |m| m.official.runtime_digest = "sha256:other".into(),
-            |m| m.enhanced.codex_home = PathBuf::from("elsewhere"),
+            |m| {
+                m.enhanced.as_mut().expect("Enhanced launch").codex_home =
+                    PathBuf::from("elsewhere")
+            },
             |m| m.model_provider_map_sha256 = "sha256:other".into(),
             |m| m.model_provider_map_path = PathBuf::from("elsewhere"),
             |m| m.binding_db = PathBuf::from("elsewhere"),
@@ -2296,9 +2461,15 @@ mod tests {
         let adopted = temp.path().join("official-after-desktop-update.exe");
         std::fs::write(&adopted, b"the replacement Desktop now reports").unwrap();
         let settings = DesktopRuntimeSettings {
+            bridge_only: false,
             enabled: true,
             official_codex_executable: adopted.clone(),
-            enhanced_codex_executable: manifest.enhanced.executable.clone(),
+            enhanced_codex_executable: manifest
+                .enhanced
+                .as_ref()
+                .expect("Enhanced launch")
+                .executable
+                .clone(),
             bridge_executable: binary_of_this_process(),
         };
 
@@ -2388,6 +2559,7 @@ mod tests {
         bridge: PathBuf,
     ) -> DesktopRuntimeSettings {
         DesktopRuntimeSettings {
+            bridge_only: false,
             enabled: true,
             official_codex_executable: manifest.map_or_else(
                 || root.join("official.exe"),
@@ -2395,7 +2567,13 @@ mod tests {
             ),
             enhanced_codex_executable: manifest.map_or_else(
                 || root.join("enhanced.exe"),
-                |m| m.enhanced.executable.clone(),
+                |m| {
+                    m.enhanced
+                        .as_ref()
+                        .expect("Enhanced launch")
+                        .executable
+                        .clone()
+                },
             ),
             bridge_executable: bridge,
         }
@@ -2418,12 +2596,12 @@ mod tests {
                 runtime_digest: "sha256:official".into(),
                 codex_home: root.join("official-home"),
             },
-            enhanced: RuntimeBinaryIdentity {
+            enhanced: Some(RuntimeBinaryIdentity {
                 artifact_sha256: sha256_file(&enhanced).unwrap(),
                 executable: enhanced,
                 runtime_digest: "sha256:enhanced".into(),
                 codex_home: root.join("enhanced-home"),
-            },
+            }),
             model_provider_map_sha256: sha256_file(&map).unwrap(),
             model_provider_map_path: map,
             binding_db: root.join("bindings.sqlite3"),
@@ -2448,8 +2626,18 @@ mod tests {
                 ..ChildAttestation::default()
             },
             ChildAttestation {
-                binary_sha256: manifest.enhanced.artifact_sha256.clone(),
-                runtime_digest: manifest.enhanced.runtime_digest.clone(),
+                binary_sha256: manifest
+                    .enhanced
+                    .as_ref()
+                    .expect("Enhanced launch")
+                    .artifact_sha256
+                    .clone(),
+                runtime_digest: manifest
+                    .enhanced
+                    .as_ref()
+                    .expect("Enhanced launch")
+                    .runtime_digest
+                    .clone(),
                 ..ChildAttestation::default()
             },
         );

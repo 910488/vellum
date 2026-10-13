@@ -259,7 +259,12 @@ fn drive(
         let binding = read_binding(&binding_db, &thread)?;
         let correct = binding.plane == ExecutionPlane::EnhancedCodex
             && binding.provider_id == expected_provider
-            && binding.runtime_digest == manifest.enhanced.runtime_digest;
+            && binding.runtime_digest
+                == manifest
+                    .enhanced
+                    .as_ref()
+                    .expect("Enhanced launch")
+                    .runtime_digest;
         if !correct {
             routing_ok = false;
         }
@@ -509,7 +514,12 @@ fn drive(
             == Some(deepseek_thread.as_str())
         && resumed_binding.plane == ExecutionPlane::EnhancedCodex
         && resumed_binding.provider_id == DEEPSEEK_PROVIDER
-        && resumed_binding.runtime_digest == resumed_manifest.enhanced.runtime_digest;
+        && resumed_binding.runtime_digest
+            == resumed_manifest
+                .enhanced
+                .as_ref()
+                .expect("Enhanced launch")
+                .runtime_digest;
     report.record(CaseResult::new(
         "resume-across-a-bridge-restart-keeps-thread-digest-and-plane",
         resume_ok,
@@ -582,7 +592,11 @@ fn fail_closed_configuration_case(run_root: &Path, official: &Path, enhanced: &P
             return CaseResult::new("fail-closed-configuration", false, error.to_string())
         }
     };
-    missing.enhanced.executable = run_root.join("no-such-enhanced-binary");
+    missing
+        .enhanced
+        .as_mut()
+        .expect("Enhanced launch")
+        .executable = run_root.join("no-such-enhanced-binary");
     let path = run_root.join("manifest-missing.json");
     // `write` validates identity, not existence; loading is where it must fail.
     let _ = std::fs::write(
@@ -608,7 +622,11 @@ fn fail_closed_configuration_case(run_root: &Path, official: &Path, enhanced: &P
         .append(true)
         .open(&tampered_path)
         .and_then(|mut file| file.write_all(b"tamper"));
-    tampered.enhanced.executable = tampered_path;
+    tampered
+        .enhanced
+        .as_mut()
+        .expect("Enhanced launch")
+        .executable = tampered_path;
     let path = run_root.join("manifest-tampered.json");
     let _ = std::fs::write(
         &path,
@@ -647,12 +665,12 @@ fn build_manifest(
             runtime_digest: format!("sha256:gate-official-{}", short(official)),
             codex_home: run_root.join("codex-home-official"),
         },
-        enhanced: RuntimeBinaryIdentity {
+        enhanced: Some(RuntimeBinaryIdentity {
             artifact_sha256: sha256_file(enhanced).map_err(to_app_error)?,
             executable: enhanced.to_path_buf(),
             runtime_digest: format!("sha256:gate-enhanced-{}", short(enhanced)),
             codex_home: run_root.join("codex-home-enhanced"),
-        },
+        }),
         model_provider_map_sha256: sha256_file(&model_map_path).map_err(to_app_error)?,
         model_provider_map_path: model_map_path,
         binding_db: run_root.join("thread-bindings.sqlite3"),
@@ -749,7 +767,14 @@ fn stage_real_codex_homes(manifest: &LaunchManifestV1, provider_url: &str) -> Ap
         catalog_json = catalog_json,
         base_url_json = base_url_json
     );
-    for home in [&manifest.official.codex_home, &manifest.enhanced.codex_home] {
+    for home in [
+        &manifest.official.codex_home,
+        &manifest
+            .enhanced
+            .as_ref()
+            .expect("Enhanced launch")
+            .codex_home,
+    ] {
         std::fs::create_dir_all(home)
             .map_err(|error| AppError::Message(format!("create CODEX_HOME: {error}")))?;
         std::fs::write(home.join("config.toml"), &config)
@@ -793,7 +818,12 @@ fn drive_real_binary_smoke(
         let binding = read_binding(binding_db, &thread)?;
         let correct = binding.plane == ExecutionPlane::EnhancedCodex
             && binding.provider_id == provider_id
-            && binding.runtime_digest == manifest.enhanced.runtime_digest;
+            && binding.runtime_digest
+                == manifest
+                    .enhanced
+                    .as_ref()
+                    .expect("Enhanced launch")
+                    .runtime_digest;
         routing_ok &= correct;
         routing_detail.push(format!(
             "{model}->{}:{}",

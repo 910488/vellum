@@ -410,8 +410,14 @@ impl SmartRouter {
             return (0, "unidentified_session_rank");
         };
         let previous = self.sessions.get(key);
-        let available_incumbent =
-            previous.and_then(|s| candidates.iter().position(|c| c.account_id == s.account_id));
+        let socket_incumbent = context.socket_affinity.as_ref().and_then(|affinity| {
+            candidates.iter().position(|c| {
+                vellum_proxy_runtime::account_hash(&c.account_id) == affinity.account_hash
+            })
+        });
+        let available_incumbent = socket_incumbent.or_else(|| {
+            previous.and_then(|s| candidates.iter().position(|c| c.account_id == s.account_id))
+        });
         let review = key.starts_with("review:");
         let rho = previous.map_or_else(|| self.prior(review), |s| s.rate.at(now).max(0.01));
         let gap = previous.map_or(0, |s| now.saturating_sub(s.touched));
@@ -454,8 +460,9 @@ impl SmartRouter {
         let admission = (0..candidates.len()).map(fits).collect::<Vec<_>>();
         let any_fits = admission.iter().any(|fits| *fits);
         self.last_admission = admission.clone();
-        self.budget_enforced = any_fits;
-        let incumbent = available_incumbent.filter(|i| !any_fits || admission[*i]);
+        self.budget_enforced = any_fits && socket_incumbent.is_none();
+        let incumbent = available_incumbent
+            .filter(|i| socket_incumbent == Some(*i) || !any_fits || admission[*i]);
         let mut best =
             incumbent.unwrap_or_else(|| (0..candidates.len()).find(|i| admission[*i]).unwrap_or(0));
         let projected =
@@ -470,6 +477,7 @@ impl SmartRouter {
         }
         let mut benefit = 0.0;
         let (selected, reason) = match incumbent {
+            Some(i) if socket_incumbent == Some(i) => (i, "socket_account_affinity"),
             None => (
                 best,
                 if available_incumbent.is_some() && incumbent.is_none() && any_fits {
@@ -713,6 +721,37 @@ mod tests {
         }
     }
     #[test]
+    fn enabling_pool_adopts_socket_account_and_full_context_instead_of_new_placement() {
+        let mut router = SmartRouter::default();
+        let candidates = [candidate("busy", 10.0), candidate("idle", 90.0)];
+        let mut request = context("existing-thread", 1, 300_000);
+        request.socket_affinity = Some(vellum_proxy_runtime::request::OfficialSocketAffinity {
+            account_hash: vellum_proxy_runtime::account_hash("busy"),
+            turn_in_progress: true,
+            input_tokens: 300_000,
+            quota_exhausted: false,
+        });
+        assert_eq!(
+            router.choose(&candidates, &request, 1),
+            (0, "socket_account_affinity")
+        );
+        assert_eq!(router.sessions["existing-thread"].tokens, 300_000);
+        router.observe(&request.request_id, 300_000, 297_000, 200);
+        request.socket_affinity.as_mut().unwrap().turn_in_progress = false;
+        request.request_id = "next-root-turn".into();
+        assert_eq!(
+            router.choose(&candidates, &request, 2).0,
+            0,
+            "a usable account retains its warm context at the next turn boundary"
+        );
+        assert_eq!(
+            router.choose(&candidates[1..], &request, 3).0,
+            0,
+            "an unavailable account can move at a boundary"
+        );
+        assert_eq!(router.sessions["existing-thread"].account_id, "idle");
+    }
+    #[test]
     fn accumulated_weekly_skew_changes_placement_before_new_usage_arrives() {
         let mut router = SmartRouter::default();
         let mut high = candidate("high", 70.0);
@@ -850,7 +889,11 @@ mod tests {
             cal.update_window(
                 if reset_by_time { 25.0 } else { 0.0 },
                 10_000.0,
-                Some(if reset_by_time { 100 + FIVE_HOUR_MS } else { 100 }),
+                Some(if reset_by_time {
+                    100 + FIVE_HOUR_MS
+                } else {
+                    100
+                }),
             );
             assert_eq!(cal.external_points, 0.0);
             assert_eq!(cal.tokens_since, 0.0);

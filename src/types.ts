@@ -357,6 +357,9 @@ export interface EnhancedProtocolCompatibility {
 
 export interface EnhancedDesktopRuntimeStatus {
   configured: boolean;
+  enhancedCore?: "missing" | "available";
+  bridgePrepared?: boolean;
+  bridgeProtectionActive?: boolean;
   /** The user asked for Enhanced and the settings verified. */
   enabled: boolean;
   /** The pinned artifact, protocol hash and model map verify on disk. */

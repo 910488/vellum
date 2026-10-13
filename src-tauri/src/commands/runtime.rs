@@ -132,7 +132,7 @@ async fn read_desktop_runtime_status(
         let guard = state.lifecycle_lock().try_lock();
         let status = crate::enhanced_runtime::desktop_runtime_status(&data_root);
         if guard.is_ok() {
-            state.reconcile_enhanced_adoption(status.ready && !status.restart_required);
+            state.reconcile_enhanced_adoption((status.ready || status.bridge_protection_active) && !status.restart_required);
         }
         status
     })
