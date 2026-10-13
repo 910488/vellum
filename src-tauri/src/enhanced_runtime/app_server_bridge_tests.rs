@@ -443,11 +443,13 @@ fn thread_attachments_are_answered_by_official_whatever_the_owner() {
         ("thread/attachment/remove", "thread-1"),
         ("thread/attachmentOwner/list", "never-bound"),
     ] {
-        let line =
-            json!({"id": 7, "method": method, "params": {"threadId": thread}}).to_string();
+        let line = json!({"id": 7, "method": method, "params": {"threadId": thread}}).to_string();
         let actions = state.on_client_line(&line).unwrap();
         assert!(
-            matches!(&actions[0], BridgeAction::ToChild(ExecutionPlane::OfficialCodex, _)),
+            matches!(
+                &actions[0],
+                BridgeAction::ToChild(ExecutionPlane::OfficialCodex, _)
+            ),
             "{method} for {thread} must reach the official core"
         );
     }
