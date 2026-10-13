@@ -312,7 +312,8 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                 let live_account_handoff = matches!(
                     &turn_dispatch,
                     WebSocketTurnDispatch::OfficialNative(plan)
-                        if request.get("previous_response_id").and_then(Value::as_str).is_some()
+                        if plan.cross_realm_handoff
+                            || request.get("previous_response_id").and_then(Value::as_str).is_some()
                             && official.as_ref().is_some_and(|segment| {
                                 managed_account_changed(
                                     &segment.connection_key,
@@ -329,10 +330,36 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         deferred_account_handoffs.push_back(request);
                         continue;
                     }
-                    runtime_request.metadata.force_portable_official_handoff = true;
-                    turn_dispatch = WebSocketTurnDispatch::PortableReplay {
-                        force_official_handoff: true,
+                    let hydrated = match &turn_dispatch {
+                        WebSocketTurnDispatch::OfficialNative(plan) => {
+                            runtime.hydrate_official_socket_handoff(plan, &request)
+                        }
+                        WebSocketTurnDispatch::PortableReplay { .. } => {
+                            unreachable!("live handoff is only planned for native turns")
+                        }
                     };
+                    match hydrated {
+                        Ok(body) => {
+                            log::info!(
+                                "[OfficialSocket] account handoff replayed on socket connection={connection_id} input_items={}",
+                                crate::request::request_input_items(&body).len()
+                            );
+                            request = body;
+                            runtime_request.body = request.clone();
+                        }
+                        Err(error) => {
+                            // Missing local history keeps the portable path,
+                            // which asks Codex for a full-input retry.
+                            log::warn!(
+                                "[OfficialSocket] account handoff falls back to portable replay connection={connection_id} kind={}",
+                                error.category()
+                            );
+                            runtime_request.metadata.force_portable_official_handoff = true;
+                            turn_dispatch = WebSocketTurnDispatch::PortableReplay {
+                                force_official_handoff: true,
+                            };
+                        }
+                    }
                 }
                 match turn_dispatch {
                     WebSocketTurnDispatch::OfficialNative(official_plan) => {
@@ -3305,6 +3332,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_reconnect_after_account_switch_replays_history_on_socket() {
+        run_official_websocket_account_switch(false, "switch_reconnect").await;
+    }
+
+    #[tokio::test]
     async fn official_websocket_switches_users_in_the_same_workspace() {
         run_official_websocket_account_switch(true, "switch").await;
     }
@@ -3435,6 +3467,7 @@ mod tests {
         #[derive(Clone, Default)]
         struct Capture {
             websocket_accounts: Arc<Mutex<Vec<String>>>,
+            websocket_frames: Arc<Mutex<Vec<(String, Value)>>>,
             http_requests: Arc<Mutex<Vec<(String, Value)>>>,
             http_headers: Arc<Mutex<Vec<HeaderMap>>>,
             responses: Arc<AtomicUsize>,
@@ -3451,11 +3484,8 @@ mod tests {
                 async move {
                     assert_eq!(headers["session-id"], "bridge-affinity");
                     assert_eq!(headers["session_id"], "bridge-affinity-legacy");
-                    capture
-                        .websocket_accounts
-                        .lock()
-                        .unwrap()
-                        .push(execution_from_headers(&headers));
+                    let account = execution_from_headers(&headers);
+                    capture.websocket_accounts.lock().unwrap().push(account.clone());
                     ws.on_upgrade(move |mut socket| async move {
                         while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
                             let request: Value = serde_json::from_str(&text).unwrap();
@@ -3463,6 +3493,11 @@ mod tests {
                                 == Some("response.create")
                             {
                                 assert_eq!(request["tools"], desktop_tools(), "native WS contract");
+                                capture
+                                    .websocket_frames
+                                    .lock()
+                                    .unwrap()
+                                    .push((account.clone(), request.clone()));
                                 let turn_count = capture.responses.fetch_add(1, Ordering::SeqCst) + 1;
                                 socket
                                     .send(AxumWsMessage::Text(
@@ -3603,7 +3638,7 @@ mod tests {
             "response.completed"
         );
 
-        if mode == "revision_active_reconnect" {
+        if mode == "revision_active_reconnect" || mode == "switch_reconnect" {
             let _ = client.close(None).await;
             let (replacement, _) = tokio_tungstenite::connect_async(handshake).await.unwrap();
             client = replacement;
@@ -3621,6 +3656,9 @@ mod tests {
             );
         }
         let tools = desktop_tools();
+        // An account or selection change on a live Official socket replays
+        // the history on a socket; only Auto Review keeps the HTTP bridge.
+        let socket_handoff = matches!(mode, "switch" | "switch_reconnect" | "revision");
         client
             .send(TungsteniteMessage::Text(
                 json!({
@@ -3676,7 +3714,7 @@ mod tests {
                 if event["type"] == "response.completed" {
                     assert_eq!(
                         event["response"]["id"],
-                        if mode.starts_with("revision_active") {
+                        if mode.starts_with("revision_active") || socket_handoff {
                             "resp_account_next"
                         } else {
                             "resp_account_b"
@@ -3691,6 +3729,64 @@ mod tests {
         }
 
         let websocket_accounts = capture.websocket_accounts.lock().unwrap().clone();
+        let requests = capture.http_requests.lock().unwrap().clone();
+        if socket_handoff {
+            let expected = if mode.starts_with("switch") {
+                &identity_b
+            } else {
+                &identity_a
+            };
+            assert!(
+                requests.is_empty(),
+                "handoff must not use HTTP: {requests:?}"
+            );
+            assert_eq!(websocket_accounts.last(), Some(expected));
+            let frames = capture.websocket_frames.lock().unwrap().clone();
+            assert_eq!(frames.len(), 2);
+            let (account, body) = &frames[1];
+            assert_eq!(account, expected);
+            assert!(
+                body.get("previous_response_id").is_none(),
+                "old response id must not reach the replacement socket: {body}"
+            );
+            // Only conversation items may change; every request control and
+            // the tool manifest stay exactly what Codex sent.
+            let mut original = json!({
+                "type": "response.create",
+                "model": "vellum-official",
+                "tools": tools, "tool_choice":"auto", "parallel_tool_calls":true,
+                "client_metadata":{"x-codex-turn-metadata":{"root_turn_id":"root-two"}},
+                "include":["reasoning.encrypted_content"],
+                "text":{"format":{"type":"text"}},
+                "reasoning":{"effort":"high","summary":"auto"},
+                "prompt_cache_key":"account-switch-contract",
+                "instructions": "be brief",
+                "stream": false
+            });
+            let mut sent = body.clone();
+            sent.as_object_mut().unwrap().remove("input");
+            original["model"] = sent["model"].clone();
+            assert_eq!(sent, original);
+            let input_text = body["input"].to_string();
+            assert!(input_text.contains("first question"), "{input_text}");
+            assert!(input_text.contains("answer from A"), "{input_text}");
+            assert!(input_text.contains("follow-up question"), "{input_text}");
+            let rows = runtime.usage_records().unwrap();
+            let row = rows.last().unwrap();
+            assert_eq!(row.status, 200);
+            assert_eq!(
+                row.conversation_identity.as_deref(),
+                Some("codex:switch-session:switch-thread")
+            );
+            assert_eq!(
+                row.execution_account_hash.as_deref(),
+                Some(format!("sha256:{}", account_hash(expected)).as_str())
+            );
+            let _ = client.close(None).await;
+            proxy_task.abort();
+            upstream_task.abort();
+            return;
+        }
         assert_eq!(
             websocket_accounts,
             if mode == "revision_active_reconnect" {
@@ -3699,7 +3795,6 @@ mod tests {
                 vec![identity_a.clone()]
             }
         );
-        let requests = capture.http_requests.lock().unwrap().clone();
         if mode.starts_with("revision_active") {
             assert!(
                 requests.is_empty(),

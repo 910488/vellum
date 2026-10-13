@@ -817,6 +817,9 @@ pub(crate) struct OfficialWebSocketPlan {
     pub execution_account_hash: Option<String>,
     pub selection_revision: Option<u64>,
     pub continuation_realm: Option<String>,
+    /// The request continues a response owned by another account. It must be
+    /// rebuilt as a full-input frame before it reaches this plan's socket.
+    pub cross_realm_handoff: bool,
     managed_auth: Option<OfficialAuthorization>,
     _guard: RequestGuard,
 }
@@ -1307,8 +1310,7 @@ impl ProxyRuntime {
         requested_body: &Value,
         effective_body: &Value,
     ) {
-        let (control_account_hash, execution_account_hash) =
-            official_usage_identity(auth, request);
+        let (control_account_hash, execution_account_hash) = official_usage_identity(auth, request);
         let (auth_mode, selection_revision, selection_verified) = match auth {
             ResolvedAuth::OfficialManaged {
                 selection_revision,
@@ -1334,8 +1336,11 @@ impl ProxyRuntime {
         let tools_manifest = |body: &Value| {
             body.get("tools").map(|tools| {
                 let encoded = serde_json::to_string(tools).unwrap_or_default();
-                (tools.as_array().map_or(0, |tools| tools.len() as u64),
-                 encoded.len() as u64, sha256_hex(&encoded))
+                (
+                    tools.as_array().map_or(0, |tools| tools.len() as u64),
+                    encoded.len() as u64,
+                    sha256_hex(&encoded),
+                )
             })
         };
         let requested_tools = tools_manifest(&request.body);
@@ -2506,13 +2511,16 @@ impl ProxyRuntime {
         if route.provider_kind != RuntimeProviderKind::Official {
             return None;
         }
-        if let Some(id) = request.body.get("previous_response_id").and_then(Value::as_str) {
-            self.official_replay.continuation_context(id, &route.route_id)
+        if let Some(id) = request
+            .body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+        {
+            self.official_replay
+                .continuation_context(id, &route.route_id)
         } else {
-            self.official_replay.thread_context(
-                &request.metadata.codex_thread_key()?,
-                &route.route_id,
-            )
+            self.official_replay
+                .thread_context(&request.metadata.codex_thread_key()?, &route.route_id)
         }
     }
 
@@ -2579,18 +2587,14 @@ impl ProxyRuntime {
         let (control_account_hash, execution_account_hash) =
             official_usage_identity(&auth, request);
         let continuation_realm = official_continuation_realm(&route, &auth);
-        if self.is_cross_realm_official_continuation(
+        // A response id from another account cannot be resumed here. The
+        // socket layer rebuilds the turn as one full-input frame on this
+        // account's socket (see `hydrate_official_socket_handoff`).
+        let cross_realm_handoff = self.is_cross_realm_official_continuation(
             &route,
             &request.body,
             continuation_realm.as_deref(),
-        )? {
-            return Ok(WebSocketTurnPlan {
-                route_id: route.route_id,
-                dispatch: WebSocketTurnDispatch::PortableReplay {
-                    force_official_handoff: true,
-                },
-            });
-        }
+        )?;
         let effective_body =
             crate::adapter::prepare_openai_official_native(&request.body, &route.upstream_model);
         self.record_official_request_prepared(
@@ -2627,10 +2631,61 @@ impl ProxyRuntime {
                     _ => None,
                 },
                 continuation_realm,
+                cross_realm_handoff,
                 managed_auth,
                 _guard: guard,
             }),
         })
+    }
+
+    /// Rebuild a chained Official socket turn as one standalone full-input
+    /// frame for a socket on another account or selection revision.
+    ///
+    /// A foreign `previous_response_id` cannot be resumed on this account.
+    /// Converting the turn to an HTTP Responses request instead was rejected
+    /// for every Desktop thread carrying the Codex-reserved `collaboration`
+    /// namespace (`'collaboration.followup_task' is reserved ... must match
+    /// the configured schema`), while the same manifest is accepted on the
+    /// socket. Staying on the socket keeps Codex's request controls, tool
+    /// manifest and handshake headers; only the conversation items change,
+    /// exactly as on the HTTP handoff path.
+    pub(crate) fn hydrate_official_socket_handoff(
+        &self,
+        plan: &OfficialWebSocketPlan,
+        frame: &Value,
+    ) -> Result<Value, RuntimeError> {
+        let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
+        let route = snapshot
+            .routes
+            .iter()
+            .map(|snapshot| &snapshot.route)
+            .find(|route| route.route_id == plan.route_id)
+            .ok_or_else(|| {
+                RuntimeError::RouteNotFound(format!("route not configured: {}", plan.route_id))
+            })?;
+        let mut body = frame.clone();
+        let hydration = self.hydrate_request_history(
+            route,
+            frame,
+            &mut body,
+            true,
+            plan.continuation_realm.as_deref(),
+        )?;
+        let mut replay = hydration.replay_context();
+        let before = crate::request::request_input_items(&body);
+        if let Some(input) = body.get_mut("input") {
+            sanitize_for_official(input);
+        }
+        let after = crate::request::request_input_items(&body);
+        realign_identities_after_item_filter(&mut replay, &before, &after)?;
+        self.materialize_local_compactions(
+            route.provider_kind,
+            &mut body,
+            false,
+            hydration.continuation_mode == ContinuationMode::PortableSemanticReplay,
+            &mut replay,
+        )?;
+        Ok(body)
     }
 
     /// Resolve one WebSocket connection against a captured route snapshot.
@@ -4760,7 +4815,10 @@ impl ProxyRuntime {
             let wire_body: Value = serde_json::from_slice(&encoded_body)
                 .map_err(|error| RuntimeError::Internal(error.to_string()))?;
             self.official_replay.record(
-                &wire_body, &normalized, &route.route_id, continuation_realm.as_deref(),
+                &wire_body,
+                &normalized,
+                &route.route_id,
+                continuation_realm.as_deref(),
             );
         }
         // M7: usage accounting mirrors Desktop's per-request ledger. Routed
@@ -9265,7 +9323,11 @@ fn provider_error_from_terminal_event(event: &Value) -> RuntimeError {
         Some("invalid_request_error") => 400,
         Some("authentication_error") => 401,
         Some("insufficient_quota" | "rate_limit_error" | "usage_limit_reached") => 429,
-        _ => match event.get("status").and_then(Value::as_u64).and_then(|status| u16::try_from(status).ok()) {
+        _ => match event
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+        {
             Some(status) => status,
             None => return RuntimeError::ProviderProtocol(message.into()),
         },
@@ -9347,15 +9409,12 @@ mod tests {
     #[test]
     fn official_reasoning_summary_diagnostic_is_allowlisted() {
         assert_eq!(
-            official_reasoning_summary_label(&json!({"reasoning": {"summary": "none"}}))
-                .as_deref(),
+            official_reasoning_summary_label(&json!({"reasoning": {"summary": "none"}})).as_deref(),
             Some("none")
         );
         assert_eq!(
-            official_reasoning_summary_label(
-                &json!({"reasoning": {"summary": "must-not-leak"}})
-            )
-            .as_deref(),
+            official_reasoning_summary_label(&json!({"reasoning": {"summary": "must-not-leak"}}))
+                .as_deref(),
             Some("other")
         );
         assert_eq!(
@@ -10979,7 +11038,10 @@ mod tests {
         let body = br#"{"error":{"type":"server_error","message":"rejected"}}"#;
         let invalid = provider_error_from_upstream(400, body, &[]);
         assert_eq!(invalid.http_status().as_u16(), 400);
-        assert_eq!(invalid.to_response_failed_event()["response"]["error"]["code"], "invalid_prompt");
+        assert_eq!(
+            invalid.to_response_failed_event()["response"]["error"]["code"],
+            "invalid_prompt"
+        );
         let quota = provider_error_from_upstream(429, body, &[]);
         assert_eq!(quota.http_status().as_u16(), 429);
         assert_eq!(quota.category(), "provider_quota");
@@ -11608,9 +11670,7 @@ mod tests {
                 .await
                 .unwrap()
                 .dispatch,
-            WebSocketTurnDispatch::PortableReplay {
-                force_official_handoff: true
-            }
+            WebSocketTurnDispatch::OfficialNative(plan) if plan.cross_realm_handoff
         ));
 
         let external = request(json!({
@@ -11676,9 +11736,7 @@ mod tests {
                 .await
                 .unwrap()
                 .dispatch,
-            WebSocketTurnDispatch::PortableReplay {
-                force_official_handoff: true
-            }
+            WebSocketTurnDispatch::OfficialNative(plan) if plan.cross_realm_handoff
         ));
         runtime.execute(next, "context-account-b").await.unwrap();
         let sent = transport.requests.lock().unwrap();
@@ -11746,9 +11804,7 @@ mod tests {
             "previous_response_id":"resp_old_account","input":[{"role":"user","content":"continue"}]}));
         assert!(matches!(
             runtime.prepare_websocket_turn(&req).await.unwrap().dispatch,
-            WebSocketTurnDispatch::PortableReplay {
-                force_official_handoff: true
-            }
+            WebSocketTurnDispatch::OfficialNative(plan) if plan.cross_realm_handoff
         ));
         runtime.execute(req, "balanced_migration").await.unwrap();
         let sent = transport.requests.lock().unwrap();
@@ -11907,9 +11963,16 @@ mod tests {
             Some("ws_bridge".into()),
         );
         let third_party_headers = json_upstream_headers(
-            &ResolvedAuth::None, &sample_route(None), &body, "conversation", b"{}", Some(&req.metadata),
+            &ResolvedAuth::None,
+            &sample_route(None),
+            &body,
+            "conversation",
+            b"{}",
+            Some(&req.metadata),
         );
-        assert!(!third_party_headers.iter().any(|pair| pair.0 == "session-id" || pair.0 == "session_id"));
+        assert!(!third_party_headers
+            .iter()
+            .any(|pair| pair.0 == "session-id" || pair.0 == "session_id"));
         runtime.execute(req, "cache_headers").await.unwrap();
         let sent = transport.requests.lock().unwrap();
         for (name, value) in [
@@ -12004,12 +12067,30 @@ mod tests {
             }
             let mut req = request(original.clone());
             req.metadata.force_portable_official_handoff = force;
-            assert!(matches!(
-                runtime.prepare_websocket_turn(&req).await.unwrap().dispatch,
-                WebSocketTurnDispatch::PortableReplay {
-                    force_official_handoff: true
+            let WebSocketTurnDispatch::OfficialNative(plan) =
+                runtime.prepare_websocket_turn(&req).await.unwrap().dispatch
+            else {
+                panic!("an account handoff stays on the Official socket");
+            };
+            assert!(plan.cross_realm_handoff);
+            // Socket handoff: only conversation items change.
+            let frame = runtime
+                .hydrate_official_socket_handoff(&plan, &original)
+                .unwrap();
+            for (key, value) in original.as_object().unwrap() {
+                if !["input", "previous_response_id"].contains(&key.as_str()) {
+                    assert_eq!(
+                        &frame[key], value,
+                        "socket handoff force={force}, field={key}"
+                    );
                 }
-            ));
+            }
+            assert!(frame.get("previous_response_id").is_none());
+            assert!(frame["input"].to_string().contains("original task"));
+            assert!(frame["input"].to_string().contains("prior answer"));
+            assert!(!frame["input"].to_string().contains("foreign summary"));
+            drop(plan);
+            // HTTP clients still take the portable handoff with the same contract.
             runtime.execute(req, "handoff_contract").await.unwrap();
             let sent = transport.requests.lock().unwrap();
             let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
@@ -12020,22 +12101,32 @@ mod tests {
             }
             assert!(body.get("previous_response_id").is_none());
             assert!(body["input"].to_string().contains("original task"));
-            assert!(body["input"].as_array().unwrap().iter().any(|item|
-                item["id"] == "rs_valid" && item["encrypted_content"] == "opaque-ciphertext"));
+            assert!(body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "rs_valid"
+                    && item["encrypted_content"] == "opaque-ciphertext"));
             assert!(!body["input"].to_string().contains("foreign summary"));
             let recorded = events.events.lock().unwrap();
-            let manifest = recorded.iter().rev().find_map(|event| match event {
-                DiagnosticEvent::OfficialRequestPrepared(prepared) => Some(prepared),
-                _ => None,
-            }).unwrap();
+            let manifest = recorded
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    DiagnosticEvent::OfficialRequestPrepared(prepared) => Some(prepared),
+                    _ => None,
+                })
+                .unwrap();
             let tools = original["tools"].to_string();
-            assert_eq!(manifest.requested_tool_count, Some(if code_mode {1} else {5}));
+            assert_eq!(
+                manifest.requested_tool_count,
+                Some(if code_mode { 1 } else { 5 })
+            );
             assert_eq!(manifest.requested_tool_count, manifest.effective_tool_count);
             assert_eq!(manifest.requested_tool_bytes, Some(tools.len() as u64));
             assert_eq!(manifest.requested_tool_bytes, manifest.effective_tool_bytes);
             assert_eq!(manifest.requested_tools_hash, Some(sha256_hex(&tools)));
             assert_eq!(manifest.requested_tools_hash, manifest.effective_tools_hash);
-
         }
     }
 
@@ -12056,7 +12147,10 @@ mod tests {
             .unwrap_err();
         // ProviderQuota includes transient upstream rate limits; it does not
         // mark an Official account exhausted or install OpenCode cooldowns.
-        assert_eq!(error.http_status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error.http_status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
         assert_eq!(error.retry_after_secs(), Some(3));
         assert!(error.to_string().contains("turn_rate_limit_exceeded"));
         runtime
@@ -12103,18 +12197,34 @@ mod tests {
             )
         };
         let authorization = |user: &str, revision: u32| OfficialAuthorization {
-            access_token: token(user, revision), account_id: Some("shared".into()),
-            selection_revision: Some(3), selection_verified: true,
+            access_token: token(user, revision),
+            account_id: Some("shared".into()),
+            selection_revision: Some(3),
+            selection_verified: true,
         };
-        assert!(official_refresh_matches_snapshot(&authorization("a", 1), &authorization("a", 2)));
-        assert!(!official_refresh_matches_snapshot(&authorization("a", 1), &authorization("b", 2)));
+        assert!(official_refresh_matches_snapshot(
+            &authorization("a", 1),
+            &authorization("a", 2)
+        ));
+        assert!(!official_refresh_matches_snapshot(
+            &authorization("a", 1),
+            &authorization("b", 2)
+        ));
         let auth = |user: &str| ResolvedAuth::OfficialManaged {
-            token: token(user, 1), account_id: Some("shared".into()), selection_revision: Some(3), selection_verified: true,
+            token: token(user, 1),
+            account_id: Some("shared".into()),
+            selection_revision: Some(3),
+            selection_verified: true,
         };
         let route = sample_route(None);
-        assert_ne!(official_continuation_realm(&route, &auth("a")), official_continuation_realm(&route, &auth("b")));
-        assert_ne!(official_usage_identity(&auth("a"), &request(json!({}))).1,
-            official_usage_identity(&auth("b"), &request(json!({}))).1);
+        assert_ne!(
+            official_continuation_realm(&route, &auth("a")),
+            official_continuation_realm(&route, &auth("b"))
+        );
+        assert_ne!(
+            official_usage_identity(&auth("a"), &request(json!({}))).1,
+            official_usage_identity(&auth("b"), &request(json!({}))).1
+        );
     }
 
     #[test]
