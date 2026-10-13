@@ -149,6 +149,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fetched_at_alone_never_requires_a_codex_restart() {
+        assert!(!catalog_requires_restart(br#"{"fetched_at":"2026-10-12","models":[{"slug":"sol"}]}"#, br#"{"fetched_at":"2026-10-13","models":[{"slug":"sol"}]}"#));
+    }
+
+    #[test]
     fn catalog_restart_ignores_cache_metadata_but_preserves_model_changes() {
         let original = serde_json::json!({
             "fetched_at": "old", "etag": "old", "client_version": "old",

@@ -44,8 +44,15 @@ pub(crate) fn clear_test_start_override(root: &std::path::Path) {
         .remove(root);
 }
 
-fn update_codex_restart_requirement(state: &AppState, process_identity: Option<String>) {
+fn update_codex_restart_requirement(
+    state: &AppState,
+    process_identity: Option<String>,
+    current: Option<crate::codex_restart::ProxyContract>,
+) {
     if let Some(process_identity) = process_identity {
+        if state.reconcile_codex_proxy_contract(&process_identity, current.as_ref(), false) {
+            return;
+        }
         state.mark_restart_required_for_process(
             crate::model::RuntimeNotice::new("codexRunning"),
             process_identity,
@@ -53,6 +60,18 @@ fn update_codex_restart_requirement(state: &AppState, process_identity: Option<S
     } else {
         state.clear_restart_required();
     }
+}
+
+pub(crate) fn observe_successful_codex_request(state: &AppState) {
+    if !state.has_codex_proxy_restart_reason() {
+        return;
+    }
+    let Some(identity) = crate::commands::runtime::codex_process_identity() else {
+        return;
+    };
+    let paths = CodexPaths::discover(&state.data_root());
+    let current = crate::codex_restart::ProxyContract::read(&paths);
+    state.reconcile_codex_proxy_contract(&identity, current.as_ref(), true);
 }
 
 #[tauri::command]
@@ -225,6 +244,28 @@ async fn start_proxy_transaction_on(
     });
     let started = Instant::now();
     let paths = CodexPaths::discover(&state.data_root());
+    let process_identity = crate::commands::runtime::codex_process_identity();
+    let baseline = process_identity.map(|identity| {
+        let observed = crate::codex_restart::ProxyContract::observed_before_start(
+            &paths,
+            &state.data_root(),
+            identity
+                .strip_prefix("pid:")
+                .and_then(|value| value.split(';').next())
+                .and_then(|value| value.parse().ok())
+                .and_then(crate::enhanced_runtime::process_info::started_at),
+        );
+        let contract_loaded = observed.as_ref().is_some_and(|(_, loaded)| *loaded);
+        crate::codex_restart::ProcessBaseline::capture(
+            &state.data_root(),
+            identity.clone(),
+            observed
+                .map(|(contract, _)| contract)
+                .or_else(|| crate::codex_restart::ProxyContract::read(&paths)),
+            contract_loaded,
+        )
+    });
+    state.set_codex_process_baseline(baseline);
     reconcile_lease(&paths)?;
     let lease_ms = started.elapsed().as_millis() as u64;
     state.set_proxy_stage(generation, "lease", lease_ms);
@@ -357,7 +398,11 @@ async fn start_proxy_transaction_on(
     eprintln!(
         "[start-tx] lease={lease_ms}ms bind={bind_ms}ms catalog_commit={catalog_ms}ms readiness={ready_ms}ms diversion={divert_ms}ms"
     );
-    update_codex_restart_requirement(state, crate::commands::runtime::codex_process_identity());
+    update_codex_restart_requirement(
+        state,
+        crate::commands::runtime::codex_process_identity(),
+        crate::codex_restart::ProxyContract::read(&paths),
+    );
 
     if !state.is_generation_current(generation) {
         let _ = shutdown_tx.send(());
@@ -787,16 +832,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unchanged_process_contract_clears_only_the_spurious_proxy_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(dir.path().to_path_buf());
+        let contract = crate::codex_restart::ProxyContract::from_bytes("model_provider='vellum'\n[model_providers.vellum]\nbase_url='http://127.0.0.1:15721/v1'", br#"{"models":[{"slug":"sol"}],"fetched_at":"old"}"#).unwrap();
+        state.set_codex_process_baseline(Some(crate::codex_restart::ProcessBaseline::capture(
+            dir.path(),
+            "pid:1".into(),
+            Some(contract.clone()),
+            true,
+        )));
+        update_codex_restart_requirement(&state, Some("pid:1".into()), Some(contract.clone()));
+        assert!(!state.runtime_status().restart_required);
+        state.mark_restart_required_for_process(
+            crate::model::RuntimeNotice::new("codexRunning"),
+            "pid:1".into(),
+        );
+        state.mark_restart_required_for_process(
+            crate::model::RuntimeNotice::new("routesAndCatalogUpdated"),
+            "pid:1".into(),
+        );
+        assert!(state.reconcile_codex_proxy_contract("pid:1", Some(&contract), true));
+        let reasons = state.runtime_status().restart_reasons;
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "routesAndCatalogUpdated");
+    }
+
+    #[test]
+    fn changed_endpoint_or_catalog_keeps_notice_even_after_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(dir.path().to_path_buf());
+        let build = |port, slug: &str| {
+            crate::codex_restart::ProxyContract::from_bytes(
+            &format!("model_provider='vellum'\n[model_providers.vellum]\nbase_url='http://127.0.0.1:{port}/v1'"),
+            &serde_json::to_vec(&serde_json::json!({"models":[{"slug":slug}]})).unwrap(),
+        ).unwrap()
+        };
+        let original = build(15721, "old");
+        state.set_codex_process_baseline(Some(crate::codex_restart::ProcessBaseline::capture(
+            dir.path(),
+            "pid:1".into(),
+            Some(original.clone()),
+            true,
+        )));
+        for changed in [build(15722, "old"), build(15721, "new")] {
+            update_codex_restart_requirement(&state, Some("pid:1".into()), Some(changed.clone()));
+            assert!(!state.reconcile_codex_proxy_contract("pid:1", Some(&changed), true));
+            assert!(state.runtime_status().restart_required);
+        }
+        assert!(!state.reconcile_codex_proxy_contract("pid:2", Some(&original), true));
+        assert!(state.runtime_status().restart_required);
+    }
+
+    #[test]
+    fn recent_unchanged_contract_clears_notice_after_success_from_same_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(dir.path().to_path_buf());
+        let contract = crate::codex_restart::ProxyContract::from_bytes(
+            "model_provider='vellum'",
+            br#"{"models":[]}"#,
+        )
+        .unwrap();
+        state.set_codex_process_baseline(Some(crate::codex_restart::ProcessBaseline::capture(
+            dir.path(),
+            "pid:1".into(),
+            Some(contract.clone()),
+            false,
+        )));
+        update_codex_restart_requirement(&state, Some("pid:1".into()), Some(contract.clone()));
+        assert!(state.runtime_status().restart_required);
+        assert!(state.reconcile_codex_proxy_contract("pid:1", Some(&contract), true));
+        assert!(!state.runtime_status().restart_required);
+    }
+
+    #[test]
     fn restart_is_only_required_when_codex_was_already_running() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir(temp.path().to_path_buf());
 
-        update_codex_restart_requirement(&state, None);
+        update_codex_restart_requirement(&state, None, None);
         let stopped = state.runtime_status();
         assert!(!stopped.restart_required);
         assert!(stopped.live_applied.is_empty());
 
-        update_codex_restart_requirement(&state, Some("100:1234".into()));
+        update_codex_restart_requirement(&state, Some("100:1234".into()), None);
         let running = state.runtime_status();
         assert!(running.restart_required);
         assert!(running
