@@ -241,7 +241,7 @@ export function VellumUpdate({
           <span className="vupdate__core">
             <span>{view.core.missing ? t("tabPolish.core.missing") : view.core.pendingVersion
               ? t("tabPolish.core.pending", { version: view.core.activeVersion ?? "—", pending: view.core.pendingVersion })
-              : t("tabPolish.core.active", { version: view.core.activeVersion ?? t("tabPolish.core.bundled") })}</span>
+              : view.core.activeVersion ? t("tabPolish.core.active", { version: view.core.activeVersion }) : t("tabPolish.core.bundled")}</span>
             {view.core.missing && actions.onRepairCore ? <Btn soft mini onClick={actions.onRepairCore} disabled={busy}>{t("tabPolish.core.repair")}</Btn> : null}
           </span>
         </Row> : null}

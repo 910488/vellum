@@ -1752,7 +1752,7 @@ export function Models({
                             soft
                             mini
                             disabled={quotaPoolBusy || oauthBusy}
-                            title={t(entry.member.maintainFiveHourWindow ? "tabPolish.fiveHourOn" : "tabPolish.fiveHourOff")}
+                            title={t("quotaActions.fiveHourHint")}
                             onClick={() =>
                               updatePoolMember(account.accountId, (member) => ({
                                 ...member,
@@ -1762,8 +1762,8 @@ export function Models({
                           >
                             {t(
                               entry.member.maintainFiveHourWindow
-                                ? "models.ui.fiveHour.autoOn"
-                                : "models.ui.fiveHour.autoOff",
+                                ? "tabPolish.fiveHourOn"
+                                : "tabPolish.fiveHourOff",
                             )}
                           </Btn>
                           ) : null}
@@ -1784,6 +1784,7 @@ export function Models({
                               }`}
                               aria-expanded={resetsOpen}
                               aria-controls={`resets-tray-${account.accountId}`}
+                              title={t("quotaActions.resetHint")}
                               aria-label={t(
                                 resetsOpen ? "models.ui.reset.hide" : "models.ui.reset.show",
                               )}
@@ -1793,7 +1794,7 @@ export function Models({
                                 )
                               }
                             >
-                              {`Reset ${available}`}
+                              {t("quotaActions.resetCount", { count: available })}
                               <i className="pill__caret" data-open={resetsOpen} aria-hidden="true" />
                             </button>
                           )}
@@ -1910,7 +1911,7 @@ export function Models({
                           soft
                           mini
                           disabled={quotaPoolBusy || oauthBusy}
-                          title={t(cadenceMember?.maintainFiveHourWindow ? "tabPolish.fiveHourOn" : "tabPolish.fiveHourOff")}
+                          title={t("quotaActions.fiveHourHint")}
                           onClick={() =>
                             updatePoolMember(account.accountId, (member) => ({
                               ...member,
@@ -1920,8 +1921,8 @@ export function Models({
                         >
                           {t(
                             cadenceMember?.maintainFiveHourWindow
-                              ? "models.ui.fiveHour.autoOn"
-                              : "models.ui.fiveHour.autoOff",
+                              ? "tabPolish.fiveHourOn"
+                              : "tabPolish.fiveHourOff",
                           )}
                         </Btn>
                         ) : null}
@@ -1944,6 +1945,7 @@ export function Models({
                             }`}
                             aria-expanded={resetsOpen}
                             aria-controls={`resets-tray-${account.accountId}`}
+                              title={t("quotaActions.resetHint")}
                             aria-label={t(
                               resetsOpen ? "models.ui.reset.hide" : "models.ui.reset.show",
                             )}
@@ -1953,7 +1955,7 @@ export function Models({
                               )
                             }
                           >
-                            {`Reset ${available}`}
+                            {t("quotaActions.resetCount", { count: available })}
                             <i className="pill__caret" data-open={resetsOpen} aria-hidden="true" />
                           </button>
                         )}

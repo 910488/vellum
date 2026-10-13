@@ -1044,6 +1044,10 @@ pub struct RequestLogEntry {
     pub cached_input_tokens: u64,
     pub status: u16,
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_category: Option<String>,
+    #[serde(default)]
+    pub retry_after: Option<u64>,
     pub duration_ms: u64,
     pub first_byte_ms: Option<u64>,
     pub created_at: i64,

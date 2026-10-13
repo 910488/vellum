@@ -1,6 +1,8 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "requestErrors": {"quota": "额度用完或请求被限流。", "auth": "登录验证被拒绝，请重新登录。", "cancelled": "请求已取消或连接已关闭。", "protocol": "无法读取上游响应。", "rejected": "请求被上游拒绝。", "unavailable": "上游服务暂时故障。", "other": "请求失败，请查看技术资料。", "retryAfter": "至少等待 {{time}} 后再重试。", "retries": "已重试 {{count}} 次。", "reasons": {"unsupported": "包含不支持的请求选项。", "tools": "工具定义不符合要求的格式。", "continuation": "找不到上一条响应。", "context": "对话超出上下文限制。", "policy": "内容被上游政策拒绝。"}},
+  "quotaActions": {"resetCount": "重置次数：{{count}}", "resetHint": "展开可用的重置券；查看列表不会消耗券。", "fiveHourHint": "切换 5 小时窗口自动管理；不会立即消耗重置券。"},
   "bridgeFallback": { "active": "Enhanced core 缺失，发送按钮保护与账号切换仍通过官方 bridge 生效。", "prepared": "Enhanced core 缺失。官方 bridge 已准备好，Codex 接入后保护才会生效。", "failed": "Enhanced core 缺失，bridge 保护未生效。请查看详细信息并修复安装。" },
   "tabPolish": {
     "details": "详细信息",
@@ -42,9 +44,9 @@ const zhCN: ResourceTree = {
     "dashboardHint": "这些选项只影响“现况”页的服务商卡片。",
     "core": {
       "label": "Enhanced core",
-      "active": "使用中 · {{version}}",
-      "pending": "使用中：{{version}} · 等待应用：{{pending}}",
-      "missing": "Enhanced core 缺失",
+      "active": "v{{version}} · 使用中",
+      "pending": "v{{pending}} · 等待启用（当前：{{version}}）",
+      "missing": "缺失",
       "bundled": "随安装提供",
       "repair": "修复 core"
     },

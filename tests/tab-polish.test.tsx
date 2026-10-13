@@ -42,7 +42,7 @@ describe("tab usability", () => {
     const actions = Object.fromEntries(["onCheck", "onUpdate", "onCancel", "onRestart", "onUnschedule", "onRetry", "onOpenDownloads", "onAutoUpdate", "onEarlyAccess", "onOpenHosts"].map((key) => [key, vi.fn()])) as unknown as VellumUpdateActions;
     const view = { current: "0.3.1", state: { kind: "current" as const, checkedAt: null }, autoUpdate: false, earlyAccess: false, hosts: { total: 0, pending: 0, failed: 0 }, notes: null };
     const { rerender } = render(<VellumUpdate view={{ ...view, core: { activeVersion: "0.3.1", pendingVersion: "0.3.2", missing: false } }} actions={actions} />);
-    expect(screen.getByText(/0.3.1.*0.3.2/)).toBeTruthy();
+    expect(screen.getByText(i18n.t("tabPolish.core.pending", {version:"0.3.1",pending:"0.3.2"}))).toBeTruthy();
     rerender(<VellumUpdate view={{ ...view, core: { activeVersion: null, pendingVersion: null, missing: true } }} actions={{ ...actions, onRepairCore: repair }} />);
     fireEvent.click(screen.getByRole("button", { name: i18n.t("tabPolish.core.repair") }));
     expect(repair).toHaveBeenCalledOnce();
