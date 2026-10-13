@@ -390,6 +390,34 @@ pub fn run() {
             remote::ssh_trust::remote_ssh_fetch_fingerprint,
             remote::ssh_trust::remote_ssh_confirm_fingerprint,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running vellum");
+        .build(tauri::generate_context!())
+        .expect("error while building vellum")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                cleanup_on_loop_exit(app);
+            }
+        });
+}
+
+/// Windows ends the event loop directly on `WM_ENDSESSION` (shutdown,
+/// restart, sign-out): no window is closed and no Vellum exit command runs,
+/// so without this the Codex config, the CODEX_CLI_PATH lease and the
+/// Enhanced sidecars all outlive Vellum. tao then panics on the next window's
+/// `WM_ENDSESSION` ("cannot move state from Destroyed") and the process
+/// aborts, so this is the last point where Vellum can still restore Codex.
+///
+/// Every explicit exit path has already run the same teardown, which is
+/// idempotent; repeating it there costs a few file checks. Windows allows a
+/// few seconds before it terminates the process, hence the bound.
+fn cleanup_on_loop_exit(app: &tauri::AppHandle) {
+    const SESSION_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+    let state = app.state::<AppState>().clone();
+    let finished = tauri::async_runtime::block_on(async move {
+        tokio::time::timeout(SESSION_END_BUDGET, shutdown_for_exit(&state, false))
+            .await
+            .is_ok()
+    });
+    if !finished {
+        log::warn!("[Vellum] exit teardown exceeded {SESSION_END_BUDGET:?}");
+    }
 }
