@@ -1,6 +1,59 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "tabPolish": {
+    "details": "Details",
+    "loginExpired": "This host's sign-in has expired. Sign in again.",
+    "rateLimited": "Grok is temporarily rate limited (429) and will retry automatically.",
+    "genericError": "The operation did not finish. Check the details and retry.",
+    "settingsTitle": "Settings",
+    "settingsIndex": "Settings sections",
+    "groups": {
+      "general": "General and display",
+      "integration": "Codex integration",
+      "network": "Connections and network",
+      "diagnostics": "Diagnostics and recovery"
+    },
+    "restoreHost": "Restore the host's original setup",
+    "remoteControl": "Remote control",
+    "logLead": "View usage trends, request results and execution history.",
+    "time": {
+      "hoursMinutes": "{{hours}} h {{minutes}} min",
+      "minutesSeconds": "{{minutes}} min {{seconds}} s",
+      "seconds": "{{seconds}} s"
+    },
+    "headers": {
+      "time": "Time",
+      "model": "Provider / model",
+      "tokens": "Input → output",
+      "cache": "Cache",
+      "duration": "Duration",
+      "status": "Result"
+    },
+    "moreActions": "More account actions",
+    "fiveHourOn": "5-hour window auto reset: On",
+    "fiveHourOff": "5-hour window auto reset: Off",
+    "domainRules": "{{count}} domain access rules",
+    "allowed": "Allowed: {{domains}}",
+    "blocked": "Blocked: {{domains}}",
+    "anyDomain": "All domains",
+    "noBlocked": "None",
+    "dashboardHint": "These options affect provider cards on the Today page only.",
+    "core": {
+      "label": "Enhanced core",
+      "active": "Active · {{version}}",
+      "pending": "Active: {{version}} · Pending: {{pending}}",
+      "missing": "Enhanced core is missing",
+      "bundled": "Included with installation",
+      "repair": "Repair core"
+    },
+    "qualified": "Verified",
+    "launchReady": "Launch configuration ready",
+    "conversation": "Conversation {{index}}",
+    "parentConversation": "Child conversation",
+    "technical": "Technical details",
+    "account": "ChatGPT account {{index}}"
+  },
   "enhanced": {"heading":"Enhanced runtime status","lead":"Shows the execution owner for each route, the result of the compatibility check, and the mobile connection status.","title":"Enhanced Core","subtitle":"Execution owners, compatibility evidence and mobile connections","serving":"Enhanced Core is serving","notServing":"Enhanced Core is not serving","sessions":"Observed sessions","running":"Running turns","freshness":"Observation","restartRequired":"A new launch is prepared. Restart safely after active turns finish.","launchCoreDrift":"Codex Desktop updated its core. Vellum will restart the Proxy when turns are idle; restart Codex afterwards.","now": "Right now", "runningTurns_one": "{{count}} turn running", "runningTurns_other": "{{count}} turns running", "sessionCount_one": "{{count}} session", "sessionCount_other": "{{count}} sessions", "verdict": {"serving": "Codex Desktop is going through the Enhanced Core.", "servingOtherLaunch": "Enhanced is serving, but on the previous launch's configuration — restart Codex to move it onto this one.", "stoppedAt": "Startup stopped at the “{{link}}” stage.", "disabled": "Enhanced Core is off; Codex Desktop is running its own core."}, "chain": {"title": "Startup sequence", "artifact": "Component verification", "armed": "Path takeover", "adopted": "Bridge adoption", "inPlace": "Runtime confirmed"}, "mark": {"blocked": "Failed", "waiting": "Waiting", "inPlace": "Active"}, "whyStopped": "Reason the startup stopped at “{{link}}”", "whyNoted": "Running with items to note", "protocol": {"verified": "Verified", "unverified": "Unverified", "incompatible": "Incompatible"}, "protocolUnrun": "The comparison did not run", "unverifiedNote": "This Codex Desktop was never qualified against. Every routed method passes; the differences are real and unproven — usable, correctness not guaranteed.", "missingHelpers": "Helpers the official install has and the Enhanced core does not: {{list}}. Chat and routing are unaffected; sandboxed command execution fails.", "routed": "routed", "delta": {"methodUnservable": "this method cannot be served", "methodUnknownToDesktop": "Desktop does not know this method", "fieldNewlyRequired": "a field became required", "fieldRemoved": "a field was removed"}, "environment": {"leaseValueMissing": "Cleared — restoring", "leased": "Held", "released": "Handed back", "orphanedBridge": "Orphaned bridge", "foreignValue": "Held by something else", "unreadable": "Unreadable"}, "bridgeProcess": "Bridge process", "bridgeState": "Bridge state", "children": "Children", "launch": "Launch", "relayNote": "A phone connects only after handshake, task list, message load, live events and task control all complete; whichever one did not is the reason it cannot connect.", "staleWarning":"The last observation may be out of date.","compatibility":"Versions and compatibility","activeRuntime":"Serving runtime","candidateRuntime":"Next launch runtime","structure":"Schema comparison","qualification":"Latest qualification","notObserved":"Not observed","observed":"Observed","evidenceNote":"Schema equality is structural evidence. It does not certify Desktop or mobile behavior.","differences":"Differences and blockers","relay":"Relay state","clients":"Connected client versions","handshake":"Handshake","list":"Task list","history":"Message loading","stream":"Live events","control":"Task control","failureStage":"Last failure stage","plane":"Execution owner","all":"All","empty":"No sessions observed in this launch. Historical bindings are not live connections.","session":"Session","state":"State","lastActivity":"Last activity","parent":"Parent","diagnostics":"Diagnostics","recheck":"Recheck compatibility","export":"Export diagnostics","exported":"Saved","states":{"starting":"Starting", "ready":"Ready", "degraded":"Degraded", "stopped":"Stopped", "transportReady":"Transport ready", "unknown":"Unknown","current":"Current","stale":"Stale","offline":"Offline","unavailable":"Unavailable","running":"Running","idle":"Idle","approval":"Awaiting approval","unloaded":"Unloaded","observed":"Observed","attached":"Attached","failed":"Failed"}},
   "common": { "expiresAt": "Expires {{month}}/{{day}} {{time}} ({{zone}})", "expiredAlready": "Expired", "expiresInMinutes": "{{value}} min left", "expiresInHours": "{{value}} h left", "expiresInDays": "{{value}} d left","emDash": "—", "none": "—", "listSeparator": "; ", "itemSeparator": ", ", "loading": "Loading…", "processing": "Processing…", "refreshing": "Refreshing…", "refresh": "Refresh", "reorganize": "Refresh", "save": "Save", "cancel": "Cancel", "confirm": "Confirm", "close": "Close", "remove": "Remove", "enabled": "Enabled", "disabled": "Disabled", "yes": "Yes", "no": "No", "on": "On", "off": "Off", "unknown": "Unknown", "provider": "Provider", "model": "Model", "proxy": "Proxy", "codexCatalog": "Codex model catalog", "justNow": "Just now", "minutesAgo": "{{count}} min ago", "hoursAgo": "{{count}} h ago", "daysAgo": "{{count}} d ago", "resetAt": "Resets {{month}}/{{day}} {{time}}", "previousPage": "Previous page", "nextPage": "Next page", "pageOf": "Page {{page}} / {{total}}", "shortcutTitle": "{{label}} (Ctrl+{{n}})", "statusUpdateFailed": "Status update failed: {{detail}}", "errorWithDetail": "{{message}}: {{detail}}", "connectionFailed": "Connection failed", "operationFailed": "Operation failed", "loadFailed": "Failed to load", "saveFailed": "Failed to save", "visible": "Visible", "hidden": "Hidden", "totalItems_one": "{{count}} item", "totalItems_other": "{{count}} items", "itemsNeedAttention_one": "item needs attention", "itemsNeedAttention_other": "items need attention", "notice": {"info": "Note", "warn": "Heads up", "error": "Failed"}, "dismiss": "Dismiss"},
   "navigation": {
@@ -26,7 +79,7 @@ const en: ResourceTree = {
       "blurb": "Execution owner and compatibility status"
     },
     "remote": {
-      "label": "Remote",
+      "label": "Remote Manager",
       "title": "Remote Manager",
       "blurb": "Codex App SSH hosts and native daemon"
     },
@@ -751,7 +804,7 @@ const en: ResourceTree = {
       "select": "Select",
       "remove": "Remove",
       "removeSelected": "Remove the selected independent account",
-      "namePlaceholder": "Display name for this Official account",
+      "namePlaceholder": "Account display name",
       "loginHint": "Complete Official device login:"
     },
     "maintenance": {

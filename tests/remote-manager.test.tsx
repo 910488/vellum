@@ -987,7 +987,7 @@ describe("Remote Manager operations UI", () => {
     ]);
     renderRemote();
 
-    expect(await screen.findByText("Remote 控制")).toBeTruthy();
+    expect(await screen.findByText("遠端控制")).toBeTruthy();
     expect(screen.getByText(/Desktop 與手機必須使用相同/)).toBeTruthy();
     expect(screen.getByText("Official B1")).toBeTruthy();
     expect(screen.getByText("Official B2")).toBeTruthy();
@@ -1017,7 +1017,7 @@ describe("Remote Manager operations UI", () => {
       renderRemote();
       await screen.findAllByText("Jetson");
 
-      const nameInput = (await screen.findByPlaceholderText("這個 Official 帳號的顯示名稱")) as HTMLInputElement;
+      const nameInput = (await screen.findByPlaceholderText("帳號顯示名稱")) as HTMLInputElement;
       fireEvent.change(nameInput, { target: { value: "Official B" } });
       fireEvent.click(screen.getByText("新增 Official 執行帳號"));
 

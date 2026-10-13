@@ -13,10 +13,12 @@
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { Log } from "@/screens/Log";
 import type { RequestLog, UsageActivity } from "@/types";
+import { paginatePreviewLog } from "@/dev/paginatePreviewLog";
 
 import "@/styles/tokens.css";
 import "@/styles/base.css";
@@ -131,11 +133,11 @@ function usageActivity(scene: Scene): UsageActivity {
 }
 
 function installFixture(sceneOf: () => Scene) {
-  const invoke = async (cmd: string): Promise<unknown> => {
+  const invoke = async (cmd: string, args?: Parameters<typeof paginatePreviewLog>[1]): Promise<unknown> => {
     const scene = sceneOf();
     switch (cmd) {
       case "get_request_log":
-        return requestLog(scene);
+        return paginatePreviewLog(requestLog(scene), args);
       case "get_usage_activity":
         return usageActivity(scene);
       case "get_boot_telemetry":
@@ -150,6 +152,7 @@ function installFixture(sceneOf: () => Scene) {
 const THEMES = ["dark", "light"] as const;
 
 function Harness() {
+  usePreviewCaptureReady();
   const [scene, setScene] = useState<Scene>("busy");
   const [pref, setPref] = useState<LocalePreference>(getLocalePreference());
   const [theme, setTheme] = useState<(typeof THEMES)[number]>("light");

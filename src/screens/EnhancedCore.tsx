@@ -70,13 +70,6 @@ function linkState(key: LinkKey, chain: Record<LinkKey, boolean>, open: LinkKey 
   return key === open ? "open" : "pending";
 }
 
-/** 只讀短碼。完整 digest 在證據列裡，這裡是給掃視用的。 */
-function shortDigest(digest: string | null): string | null {
-  if (!digest) return null;
-  const bare = digest.replace(/^sha256:/, "");
-  return bare.length > 12 ? `${bare.slice(0, 12)}…` : bare;
-}
-
 /** 路徑只留最後兩段。完整路徑進 title —— 卡片寬度容不下 Windows 的絕對路徑，
  *  而會辨識的人認的是尾巴那個 hash 目錄。 */
 function tailOf(path: string | null): string | null {
@@ -234,7 +227,7 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
         >
           <Rows>
             <Row label={t("enhanced.candidateRuntime")}>
-              <code title={runtime?.enhancedRuntimeDigest ?? undefined}>{shortDigest(runtime?.enhancedRuntimeDigest ?? null) ?? t("common.emDash")}</code>
+              <span title={runtime?.enhancedRuntimeDigest ?? undefined}>{runtime?.artifactReady ? t("tabPolish.qualified") : runtime?.coreAvailable ? t("tabPolish.core.label") : t("tabPolish.core.missing")}</span>
             </Row>
             <Row label={t("enhanced.structure")}>
               {runtime?.protocol
@@ -243,8 +236,8 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
             </Row>
             <Row label={t("enhanced.qualification")}>
               {runtime?.lastQualification
-                ? <Pill tone={runtime.lastQualification.passed ? "ok" : "crit"}>
-                    {runtime.lastQualification.mode} · {runtime.lastQualification.passed ? "PASS" : "FAIL"}
+                ? <Pill tone={runtime.lastQualification.passed ? "ok" : "crit"} title={runtime.lastQualification.mode}>
+                    {runtime.lastQualification.passed ? t("tabPolish.qualified") : t("enhanced.states.failed")}
                   </Pill>
                 : <span className="rows__hint">{t("enhanced.notObserved")}</span>}
             </Row>
@@ -321,10 +314,10 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
                 : <span className="rows__hint">{t("enhanced.notObserved")}</span>}
             </Row>
             <Row label={t("enhanced.activeRuntime")}>
-              <code title={runtime?.activeRuntimeDigest ?? undefined}>{shortDigest(runtime?.activeRuntimeDigest ?? null) ?? t("common.emDash")}</code>
+              <span title={runtime?.activeRuntimeDigest ?? undefined}>{runtime?.serving ? t("enhanced.mark.inPlace") : t("common.none")}</span>
             </Row>
             {runtime?.launchId ? (
-              <Row label={t("enhanced.launch")}><code>{runtime.launchId}</code></Row>
+              <Row label={t("enhanced.launch")}><span title={runtime.launchId}>{t("tabPolish.launchReady")}</span></Row>
             ) : null}
           </Rows>
         </SeamLink>
@@ -338,13 +331,13 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
           <p className="enhanced-core__why-cap">
             {open ? t("enhanced.whyStopped", { link: t(`enhanced.chain.${open}`) }) : t("enhanced.whyNoted")}
           </p>
-          <ul>{runtime.blockers.map((blocker, index) => <li key={index}>{blocker}</li>)}</ul>
+          <Notice tone="warn" raw={runtime.blockers.join("\n")}>{t("enhanced.staleWarning")}</Notice>
         </div>
       ) : null}
     </Card>
 
     <Card>
-      <Cap>Remote Control</Cap>
+      <Cap>{t("tabPolish.remoteControl")}</Cap>
       <p className="card__sub" style={{ margin: "0 0 14px" }}>{t("enhanced.relayNote")}</p>
       <Rows>
         <Row label={t("enhanced.relay")}>
@@ -355,7 +348,7 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
         </Row>
         <Row label={t("enhanced.clients")}>
           {Object.keys(remote?.clients ?? {}).length
-            ? Object.entries(remote!.clients).map(([name, state]) => <Pill key={name} tone={state === "connected" ? "ok" : "quiet"}>{name}</Pill>)
+            ? <span className="enhanced-client-list">{Object.entries(remote!.clients).map(([name, state], index) => <span key={name}><Pill tone={state === "connected" ? "ok" : "quiet"}>{name}</Pill>{index < Object.keys(remote!.clients).length - 1 ? <span className="sr-only">{t("common.itemSeparator")}</span> : null}</span>)}</span>
             : <span className="rows__hint">{t("common.none")}</span>}
         </Row>
       </Rows>
@@ -397,10 +390,10 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
           一屏看得完整批，看不完的往下捲一段就到，卡片外的版面不動。 */}
       {!rows.length ? <Empty>{t("enhanced.empty")}</Empty> : (
         <div className="sessions">
-          {rows.map((row) => (
+          {rows.map((row, index) => (
             <div className={`sessions__row sessions__row--${row.plane}`} key={row.threadId}>
               <span className="sessions__plane">{row.plane === "enhanced-codex" ? "Enhanced" : "Official"}</span>
-              <code className="sessions__id" title={row.threadId}>{row.threadId}</code>
+              <span className="sessions__id" title={row.threadId}>{t("tabPolish.conversation", { index: index + 1 })}</span>
               <span className="sessions__model">{row.model ?? t("common.emDash")}</span>
               <span className={`sessions__state sessions__state--${row.state}`}>
                 {t(`enhanced.states.${row.state}`, { defaultValue: row.state })}
@@ -408,7 +401,7 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
               <span className="sessions__when">{new Date(row.lastActivity * 1000).toLocaleString()}</span>
               {row.parentThreadId ? (
                 <span className="sessions__parent" title={row.parentThreadId}>
-                  {t("enhanced.parent")} <code>{row.parentThreadId.slice(0, 12)}…</code>
+                  {t("tabPolish.parentConversation")}
                 </span>
               ) : null}
             </div>

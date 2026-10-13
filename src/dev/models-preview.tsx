@@ -13,6 +13,7 @@
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { api } from "@/lib/api";
@@ -198,6 +199,7 @@ function installFixture(scene: () => Scene) {
 const THEMES = ["light", "dark"] as const;
 
 function Harness() {
+  usePreviewCaptureReady();
   const [scene, setScene] = useState<Scene>("pool");
   const [pref, setPref] = useState<LocalePreference>(getLocalePreference());
   const [theme, setTheme] = useState<(typeof THEMES)[number]>("light");

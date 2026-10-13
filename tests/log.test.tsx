@@ -150,7 +150,7 @@ describe("Log runtime notices", () => {
     });
   });
 
-  it("shows a cached-token ratio and a short connection id", async () => {
+  it("shows cache in its own column and keeps connection identity in closed details", async () => {
     const connectionId = "01JABCDEFGHIJKLMNOPQRSTUV";
     mockReadyLog({
       entries: [
@@ -176,13 +176,14 @@ describe("Log runtime notices", () => {
     render(<Log refreshVersion={0} onRefreshComplete={() => {}} />);
 
     await waitFor(() => {
-      expect(screen.getByText("快取 40%")).toBeTruthy();
+      expect(screen.getByText("40%")).toBeTruthy();
     });
-    expect(screen.getByText("conn 01JABCDE")).toBeTruthy();
-    expect(screen.queryByText(connectionId)).toBeNull();
+    const technical = screen.getByText(`conn ${connectionId}`).closest("details")!;
+    expect(technical.open).toBe(false);
+    expect(screen.getByRole("columnheader", { name: "快取" })).toBeTruthy();
   });
 
-  it("shows only shortened hashes for control A and execution B", async () => {
+  it("keeps account hashes in closed technical details", async () => {
     const control = `sha256:${"a".repeat(64)}`;
     const execution = `sha256:${"b".repeat(64)}`;
     mockReadyLog({
@@ -206,9 +207,9 @@ describe("Log runtime notices", () => {
 
     render(<Log refreshVersion={0} onRefreshComplete={() => {}} />);
 
-    expect(await screen.findByText("A aaaaaaaa · B bbbbbbbb")).toBeTruthy();
-    expect(screen.queryByText(control)).toBeNull();
-    expect(screen.queryByText(execution)).toBeNull();
+    const technical = (await screen.findByText(/A: sha256:aaaa/)).closest("details")!;
+    expect(technical.open).toBe(false);
+    expect(technical.textContent).toContain(execution);
   });
 
   it("keeps compaction and subagent runs on separate facets of the same card", async () => {

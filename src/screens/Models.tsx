@@ -1,5 +1,7 @@
 import { useLocaleFormat } from "@/i18n/useLocaleFormat";
 import { useTranslation } from "react-i18next";
+import { operationalErrorKey } from "@/lib/operationalError";
+import { Notice } from "@/components/ui";
 /**
  * 模型 —— 換 Codex 用的模型，以及加供應商。
  *
@@ -213,7 +215,7 @@ function AccountQuota({
   );
   return (
     <span className="acct__quota">
-      {windows.map((window) => {
+      {[...windows].sort((a, b) => Number(isWeeklyQuota(b)) - Number(isWeeklyQuota(a))).map((window) => {
         // 閘門只設在每週窗。5 小時窗與每週窗的換算會改，拿它當設定值等於把
         // 一個會變的比例寫進使用者的設定裡；每週窗才是硬標準。
         const gated = gate && isWeeklyQuota(window) ? gate : null;
@@ -1481,7 +1483,7 @@ export function Models({
         </div>
       </div>
 
-      {error ? <p className="note">{error}</p> : null}
+      {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : null}
 
       <Card>
         <Cap>{t("models.ui.chatgpt.title")}</Cap>
@@ -1616,7 +1618,7 @@ export function Models({
 
         {oauth?.accounts.length ? (
           normalizedQuotaPool.enabled ? (
-            <Rows>
+            <Rows className="official-account-list">
               {pooledAccounts.map((entry) => {
                 const account = entry.account;
                 const accountLabel = codexAccountLabel(account);
@@ -1750,7 +1752,7 @@ export function Models({
                             soft
                             mini
                             disabled={quotaPoolBusy || oauthBusy}
-                            title={t("models.ui.fiveHour.autoHint")}
+                            title={t(entry.member.maintainFiveHourWindow ? "tabPolish.fiveHourOn" : "tabPolish.fiveHourOff")}
                             onClick={() =>
                               updatePoolMember(account.accountId, (member) => ({
                                 ...member,
@@ -1764,13 +1766,7 @@ export function Models({
                                 : "models.ui.fiveHour.autoOff",
                             )}
                           </Btn>
-                          ) : (
-                            // 沒有 5 小時窗的帳號也占著這一格：各列是各自的 grid，少一顆
-                            // 按鈕整列就往右偏，量條和狀態都對不齊。用同一句字撐出同寬。
-                            <span className="acct__slot-placeholder" aria-hidden="true">
-                              <Btn soft mini disabled>{t("models.ui.fiveHour.autoOff")}</Btn>
-                            </span>
-                          )}
+                          ) : null}
                           {resetError || !credits ? (
                             <Pill tone={resetError ? "warn" : "quiet"}>
                               {resetError ? t("models.ui.reset.failed") : t("models.ui.reset.loading")}
@@ -1803,7 +1799,9 @@ export function Models({
                           )}
                         </span>
                         {entry.member.inPool ? (
-                          <>
+                          <details className="acct-menu">
+                            <summary aria-label={t("tabPolish.moreActions")}>⋯</summary>
+                            <div className="acct-menu__items">
                             <Btn
                               soft
                               mini
@@ -1831,7 +1829,8 @@ export function Models({
                             >
                               {t("models.ui.pool.remove")}
                             </Btn>
-                          </>
+                            </div>
+                          </details>
                         ) : (
                           <Btn
                             soft
@@ -1911,7 +1910,7 @@ export function Models({
                           soft
                           mini
                           disabled={quotaPoolBusy || oauthBusy}
-                          title={t("models.ui.fiveHour.autoHint")}
+                          title={t(cadenceMember?.maintainFiveHourWindow ? "tabPolish.fiveHourOn" : "tabPolish.fiveHourOff")}
                           onClick={() =>
                             updatePoolMember(account.accountId, (member) => ({
                               ...member,
@@ -1925,13 +1924,7 @@ export function Models({
                               : "models.ui.fiveHour.autoOff",
                           )}
                         </Btn>
-                        ) : (
-                          // 沒有 5 小時窗的帳號也占著這一格：各列是各自的 grid，少一顆
-                          // 按鈕整列就往右偏，量條和狀態都對不齊。用同一句字撐出同寬。
-                          <span className="acct__slot-placeholder" aria-hidden="true">
-                            <Btn soft mini disabled>{t("models.ui.fiveHour.autoOff")}</Btn>
-                          </span>
-                        )}
+                        ) : null}
                         {resetError || !credits ? (
                           <Pill tone={resetError ? "warn" : "quiet"}>
                             {resetError
@@ -2052,9 +2045,7 @@ export function Models({
       {grokRoute ? (
         <Card>
           <Cap>{t("models.ui.grok.title")}</Cap>
-          <p className="prose" style={{ marginTop: 12 }}>
-            {t("models.ui.grok.description")}
-          </p>
+          {grokAccounts?.accounts.length ? <p className="prose" style={{ marginTop: 12 }}>{t("models.ui.grok.description")}</p> : null}
 
           {grokLogin?.state === "waiting" ? (
             <div className="detect" style={{ marginTop: 16 }}>
@@ -2127,10 +2118,10 @@ export function Models({
               })}
             </Rows>
           ) : (
-            <Empty>{t("models.ui.grok.empty")}</Empty>
+            <div className="empty-inline"><span>{t("models.ui.grok.empty")}</span><Btn soft mini disabled={grokBusy !== null} onClick={() => void startGrokLogin()}>{t("models.ui.grok.add")}</Btn></div>
           )}
 
-          <div className="rowline" style={{ marginTop: 16 }}>
+          {grokAccounts?.accounts.length ? <div className="rowline" style={{ marginTop: 16 }}>
             <Btn disabled={grokBusy !== null} onClick={() => void startGrokLogin()}>
               {grokBusy === "login" ? t("models.ui.oauth.waiting") : t("models.ui.grok.add")}
             </Btn>
@@ -2141,7 +2132,7 @@ export function Models({
             >
               {grokBusy === "models" ? t("common.processing") : t("models.ui.grok.refreshModels")}
             </Btn>
-          </div>
+          </div> : null}
         </Card>
       ) : null}
 
@@ -2559,6 +2550,9 @@ export function Models({
         <div>
           <Cap>{t("models.ui.modelCatalog.title")}</Cap>
         </div>
+        {routes.some((route) => providerState({ enabled: route.enabled, proxyRunning: catalogStatus.proxyRunning,
+          applied: modelRoutes.some((model) => model.routeId === route.id && catalogStatus.injectedModelIds.includes(model.catalogId)) }).state === "pending")
+          ? <Notice tone="warn">{t("models.ui.modelCatalog.footerNote")}</Notice> : null}
         <p className="rows__hint" style={{ marginTop: 8 }}>
           {t("models.ui.modelCatalog.hint")}
         </p>
@@ -3020,9 +3014,6 @@ export function Models({
           </div>
         )}
       </Card>
-      <p className="note">
-        {t("models.ui.modelCatalog.footerNote")}
-      </p>
 
       {pendingConfirm ? (
         <Confirm

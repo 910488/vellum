@@ -13,6 +13,7 @@
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { useTranslation } from "react-i18next";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
@@ -40,6 +41,7 @@ const SCENES = {
   installing: "安裝中",
   updated: "已更新",
   incomplete: "安裝不完整",
+  coreMissing: "Enhanced core 缺失",
   ready: "已下載，等重啟",
   scheduled: "已排定（對話還在跑）",
   failed: "失敗",
@@ -68,6 +70,7 @@ function stateFor(scene: Scene, early: boolean): VellumUpdateState {
     case "current":
       return { kind: "current", checkedAt: new Date(Date.now() - 42 * 60_000).toISOString() };
     case "neverChecked":
+    case "coreMissing":
       return { kind: "current", checkedAt: null };
     case "checking":
       return { kind: "checking" };
@@ -90,6 +93,7 @@ function stateFor(scene: Scene, early: boolean): VellumUpdateState {
 }
 
 function Harness() {
+  usePreviewCaptureReady();
   const { t } = useTranslation();
   const [scene, setScene] = useState<Scene>("ready");
   const [hosts, setHosts] = useState<Hosts>("pending");
@@ -155,7 +159,6 @@ function Harness() {
           <div className="update-panel__head">
             <div>
               <h2 className="dialog__title">{t("settings.page.updates.title")}</h2>
-              <p className="note">{t("settings.page.updates.panelHint")}</p>
             </div>
             <Btn soft onClick={() => setLog("關閉面板")}>{t("common.close")}</Btn>
           </div>
@@ -167,9 +170,11 @@ function Harness() {
                   autoUpdate,
                   earlyAccess,
                   hosts: HOSTS[hosts].value,
+                  core: { activeVersion: scene === "coreMissing" ? null : scene === "updated" ? (earlyAccess ? NIGHTLY : NEXT) : CURRENT, pendingVersion: scene === "ready" ? NEXT : null, missing: scene === "coreMissing" },
                   notes: NOTES,
                 }}
                 actions={{
+                  onRepairCore: () => go("downloading", "修復缺失的 core"),
                   onCheck: () =>
                     go("checking", "檢查更新", { scene: autoUpdate ? "downloading" : "available", ms: 1200 }),
                   onUpdate: () => go("downloading", "下載並更新：update_vellum"),

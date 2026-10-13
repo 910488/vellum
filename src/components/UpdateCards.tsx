@@ -45,7 +45,6 @@ export function UpdatePanel({
         <div className="update-panel__head">
           <div>
             <h2 className="dialog__title" id={titleId}>{t("settings.page.updates.title")}</h2>
-            <p className="note">{t("settings.page.updates.panelHint")}</p>
           </div>
           <Btn soft onClick={onClose}>{t("common.close")}</Btn>
         </div>
@@ -133,11 +132,13 @@ export function UpdateCards({
           autoUpdate: auto,
           earlyAccess: snapshot.preferences.channel === "preview",
           hosts: vellumUpdateHosts(snapshot.remote),
+          core: snapshot.coreRuntime ?? { activeVersion: snapshot.core.currentVersion, pendingVersion: snapshot.core.stagedVersion, missing: false },
           notes: snapshot.desktop.releaseNotes,
           busy: busy === "restarting" ? "restarting" : busy !== false && state.kind !== "checking",
           error,
         }}
         actions={{
+          onRepairCore: () => snapshot.liveAutoUpdate ? void run(async () => onChanged(await api.updateVellum())) : void window.open(RELEASES_URL, "_blank", "noopener,noreferrer"),
           onCheck: () => {
             setChecking(true);
             // 自動更新開著時，檢查到新版就直接下載，和背景排程做的事一樣。
