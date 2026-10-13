@@ -5474,6 +5474,21 @@ html[data-performance="low"] .card {
 .official-account-list .acct__quota { min-width: 0; align-self: start; text-align: left; }
 .official-account-list .acct__resets { display: flex; flex-direction: column; align-items: flex-end; justify-content: flex-start; gap: 8px; width: auto; flex: initial; }
 .acct__resets > .btn, .acct__resets > .pill { white-space: nowrap; }
+/* 5 小時窗開關和重置次數是同一欄的兩格：一顆是按鈕、一顆是藥丸，原本各自
+   照自己的字長、字級和內距長大，疊起來寬窄高低都不一樣，靠右對齊後左緣也
+   歪掉。這裡讓兩格撐滿同一欄、同高同字級，字置中。 */
+.official-account-list .acct__resets { align-items: stretch; }
+.official-account-list .acct__resets > .btn,
+.official-account-list .acct__resets > .pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 14px;
+  font-size: 12px;
+  line-height: 1.2;
+}
 .official-account-list .resets { grid-column: 1 / -1; }
 .quota-pool__head > label { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
 .empty-inline { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--ink-soft); }
@@ -5553,6 +5568,8 @@ html[data-performance="low"] .settings-index {
   .req-table .req__cache, .req-table .req__dur, .req-table .req__status { grid-column: 2; }
   .official-account-list { grid-template-columns: minmax(0, 1fr) max-content; }
   .official-account-list .acct__quota, .official-account-list .acct__resets { grid-column: 1 / -1; }
+  .official-account-list .acct__resets { flex-direction: row; }
+  .official-account-list .acct__resets > .btn, .official-account-list .acct__resets > .pill { flex: 1 1 0; }
   .official-account-list .acct-menu { grid-column: 2; }
   .remote-maintenance-list { grid-template-columns: minmax(0, 1fr) max-content; }
   .remote-maintenance-list > div > small { grid-column: 1; }
