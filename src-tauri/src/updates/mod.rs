@@ -104,7 +104,8 @@ use crate::model::UPDATES_PROGRESS_EVENT;
 use crate::state::AppState;
 
 const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-const AUTO_CHECK_JITTER_SECS: u64 = 30 * 60;
+const PREVIEW_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const AUTO_CHECK_JITTER_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -258,10 +259,23 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
     tauri::async_runtime::spawn(async move {
         // Startup check after a short delay so window paint is not blocked.
         tokio::time::sleep(Duration::from_secs(8)).await;
+        let mut last_attempt = None;
+        let mut jitter = auto_check_jitter_secs();
         loop {
             let state = (*app.state::<AppState>()).clone();
-            let preferences = get_status(&state).preferences;
-            if should_auto_check(live_auto_update_enabled(), &preferences) {
+            let snapshot = get_status(&state);
+            let preferences = snapshot.preferences;
+            let now = unix_seconds();
+            // Re-read the channel each minute instead of retaining a six-hour
+            // sleep after the user switches from Stable to Preview. A local
+            // attempt also bounds retries when a network error prevents the
+            // persisted successful-check timestamp from advancing.
+            let due = last_attempt.is_none()
+                || now.saturating_sub(last_attempt.max(snapshot.checked_at).unwrap_or(now))
+                    >= (auto_check_interval(preferences.channel).as_secs() + jitter) as i64;
+            if should_auto_check(live_auto_update_enabled(), &preferences) && due {
+                last_attempt = Some(now);
+                jitter = auto_check_jitter_secs();
                 let result = if preferences.auto_download {
                     update_vellum(&state).await
                 } else {
@@ -271,8 +285,7 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
                     let _ = app.emit(UPDATES_PROGRESS_EVENT, &snapshot.attention);
                 }
             }
-            let jitter = auto_check_jitter_secs();
-            tokio::time::sleep(AUTO_CHECK_INTERVAL + Duration::from_secs(jitter)).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
     let _ = data_root;
@@ -330,6 +343,50 @@ fn should_auto_check(live_enabled: bool, preferences: &UpdatePreferences) -> boo
     live_enabled && preferences.auto_check
 }
 
+fn auto_check_interval(channel: Channel) -> Duration {
+    match channel {
+        Channel::Preview => PREVIEW_CHECK_INTERVAL,
+        Channel::Stable => AUTO_CHECK_INTERVAL,
+    }
+}
+
+fn focus_check_due(checked_at: Option<i64>, now: i64) -> bool {
+    checked_at.is_some_and(|last| now.saturating_sub(last) >= 15 * 60)
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub fn check_on_focus(app: &AppHandle) {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    static FOCUS_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+    static LAST_FOCUS_ATTEMPT: AtomicI64 = AtomicI64::new(0);
+    let state = (*app.state::<AppState>()).clone();
+    let snapshot = get_status(&state);
+    let now = unix_seconds();
+    if should_auto_check(snapshot.live_auto_update, &snapshot.preferences)
+        && focus_check_due(snapshot.checked_at, now)
+        && now.saturating_sub(LAST_FOCUS_ATTEMPT.load(Ordering::Acquire)) >= 15 * 60
+        && !FOCUS_CHECK_RUNNING.swap(true, Ordering::AcqRel)
+    {
+        LAST_FOCUS_ATTEMPT.store(now, Ordering::Release);
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = if snapshot.preferences.auto_download {
+                update_vellum(&state).await
+            } else {
+                check_updates(&state, None).await
+            } {
+                log::warn!("[Updates] focus check failed: {error}");
+            }
+            FOCUS_CHECK_RUNNING.store(false, Ordering::Release);
+        });
+    }
+}
+
 fn auto_check_jitter_secs() -> u64 {
     use sha2::{Digest, Sha256};
     let now = std::time::SystemTime::now()
@@ -337,7 +394,8 @@ fn auto_check_jitter_secs() -> u64 {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let digest = Sha256::digest(now.to_le_bytes());
-    u64::from(digest[0]) % (AUTO_CHECK_JITTER_SECS + 1)
+    u64::from_le_bytes(digest[..8].try_into().expect("digest prefix"))
+        % (AUTO_CHECK_JITTER_SECS + 1)
 }
 
 pub(crate) fn engine(data_root: &std::path::Path) -> UpdateEngine {
@@ -351,6 +409,27 @@ pub(crate) fn engine(data_root: &std::path::Path) -> UpdateEngine {
 #[cfg(test)]
 mod auto_check_tests {
     use super::*;
+
+    #[test]
+    fn preview_checks_often_without_changing_stable_interval() {
+        assert_eq!(
+            auto_check_interval(Channel::Preview),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            auto_check_interval(Channel::Stable),
+            Duration::from_secs(21600)
+        );
+        assert!(auto_check_jitter_secs() <= 300);
+    }
+
+    #[test]
+    fn focus_checks_wait_fifteen_minutes_and_leave_first_check_to_startup() {
+        assert!(!focus_check_due(None, 1000));
+        assert!(!focus_check_due(Some(100), 999));
+        assert!(focus_check_due(Some(100), 1000));
+        assert!(!focus_check_due(Some(1000), 100));
+    }
 
     #[test]
     fn preference_disables_scheduled_checks() {

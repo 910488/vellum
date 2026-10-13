@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { Btn, Card } from "@/components/ui";
+import { UpdateIndicator } from "@/components/UpdateIndicator";
 import {
   VellumUpdate,
   type VellumUpdateHosts,
@@ -160,6 +161,9 @@ function Harness() {
             <Btn soft onClick={() => setLog("關閉面板")}>{t("common.close")}</Btn>
           </div>
           <Card>
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <UpdateIndicator state={stateFor(scene, earlyAccess)} onClick={() => setLog("開啟更新面板")} />
+              </div>
               <VellumUpdate
                 view={{
                   current: scene === "updated" || scene === "incomplete" ? (earlyAccess ? NIGHTLY : NEXT) : CURRENT,
