@@ -3,7 +3,7 @@
  */
 import { useTranslation } from "react-i18next";
 import type { ScreenId } from "@/screens/registry";
-import { SCREENS } from "@/screens/registry";
+import { visibleScreens } from "@/screens/registry";
 
 export function Rail({
   active,
@@ -11,17 +11,19 @@ export function Rail({
   onOpenUpdates,
   attention,
   updateAttention,
+  remoteVisible = true,
 }: {
   active: ScreenId;
   onNavigate: (id: ScreenId) => void;
   onOpenUpdates: () => void;
   attention: Partial<Record<ScreenId, number>>;
   updateAttention: boolean;
+  remoteVisible?: boolean;
 }) {
   const { t } = useTranslation();
   return (
     <nav className="rail" aria-label={t("navigation.mainAria")}>
-      {SCREENS.map((screen, index) => {
+      {visibleScreens(remoteVisible).map((screen, index) => {
         const count = attention[screen.id] ?? 0;
         const current = screen.id === active;
         const label = t(screen.labelKey);

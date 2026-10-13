@@ -12,6 +12,7 @@ import { useLocaleFormat } from "@/i18n/useLocaleFormat";
  */
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { RemoteSidebarPreference } from "@/components/RemoteSidebarPreference";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { I18N_LANGUAGE_SELECTOR_ENABLED, type LocalePreference } from "@/i18n/locale";
 import { readThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
@@ -66,12 +67,16 @@ export function Settings({
   refreshVersion,
   onRefreshComplete,
   active = true,
+  remoteSidebarForced = false,
+  onRemoteSidebarForced,
 }: {
   onChanged: () => void;
   onOpenOnboarding: () => void;
   refreshVersion: number;
   onRefreshComplete: (version: number) => void;
   active?: boolean;
+  remoteSidebarForced?: boolean;
+  onRemoteSidebarForced?: (forced: boolean) => void;
 }) {
   const { t } = useTranslation();
   const { sinceLabel } = useLocaleFormat();
@@ -734,6 +739,7 @@ export function Settings({
           的主欄，把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成同一張
           卡裡的兩條橫幅。 */}
       <Card quiet className="prefstrips">
+        {onRemoteSidebarForced ? <RemoteSidebarPreference forced={remoteSidebarForced} onChange={onRemoteSidebarForced} /> : null}
       {I18N_LANGUAGE_SELECTOR_ENABLED ? (
         <div className="prefstrip">
           <div className="prefstrip__copy">

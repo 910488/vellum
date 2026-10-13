@@ -117,6 +117,8 @@ struct Inner {
     /// Proxy apply and hot-updates them while the Proxy is running.
     #[serde(default)]
     subagent: SubagentSettings,
+    #[serde(default)]
+    remote_sidebar_forced: bool,
 }
 
 pub struct ActiveRequestGuard {
@@ -208,6 +210,7 @@ impl AppState {
             findings: Vec::new(),
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
+            remote_sidebar_forced: false,
         });
         let migrated = migrate_seeded_route_names(&mut inner.routes)
             | migrate_opencode_access_modes(&mut inner.routes)
@@ -936,6 +939,21 @@ impl AppState {
 
     pub fn subagent_settings(&self) -> SubagentSettings {
         self.inner.lock().expect("state poisoned").subagent.clone()
+    }
+
+    pub(crate) fn remote_sidebar_forced(&self) -> bool {
+        self.inner.lock().expect("app state poisoned").remote_sidebar_forced
+    }
+
+    pub(crate) fn set_remote_sidebar_forced(&self, forced: bool) -> AppResult<()> {
+        let mut inner = self.inner.lock().expect("app state poisoned");
+        let previous = inner.remote_sidebar_forced;
+        inner.remote_sidebar_forced = forced;
+        if let Err(error) = try_persist_inner(&self.data_root, &inner) {
+            inner.remote_sidebar_forced = previous;
+            return Err(AppError::Message(error));
+        }
+        Ok(())
     }
 
     /// Validate and persist sub-agent defaults.
@@ -2501,6 +2519,7 @@ mod tests {
             findings: Vec::new(),
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
+            remote_sidebar_forced: false,
         };
         inner
             .routes

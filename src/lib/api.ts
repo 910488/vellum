@@ -221,18 +221,26 @@ function previewEnhancedRuntimeStatus(): EnhancedDesktopRuntimeStatus {
   };
 }
 
+let previewRemoteSidebarForced = false;
 export const api = {
   getRemoteManagerFeatureFlags(): Promise<{
     nativeCodexRemoteManager: boolean;
+    showInSidebar?: boolean;
+    sidebarForced?: boolean;
     legacyBrokerHostsDropped?: string[];
   }> {
-    if (!hasTauri()) return delay({ nativeCodexRemoteManager: false, legacyBrokerHostsDropped: [] });
+    if (!hasTauri()) return delay({ nativeCodexRemoteManager: true, showInSidebar: previewRemoteSidebarForced, sidebarForced: previewRemoteSidebarForced, legacyBrokerHostsDropped: [] });
     return call("get_remote_manager_feature_flags");
+  },
+
+  setRemoteSidebarForced(forced: boolean): Promise<{ showInSidebar: boolean; sidebarForced: boolean }> {
+    if (!hasTauri()) { previewRemoteSidebarForced = forced; return delay({ showInSidebar: forced, sidebarForced: forced }); }
+    return afterSettingsChange(call<{ showInSidebar: boolean; sidebarForced: boolean }>("set_remote_sidebar_forced", { forced })).then((flags) => { window.dispatchEvent(new Event("vellum:remote-sidebar-changed")); return flags; });
   },
 
   discoverRemoteConnections(): Promise<RemoteHostCandidate[]> {
     if (!hasTauri()) return delay([]);
-    return call<RemoteHostCandidate[]>("discover_remote_connections");
+    return call<RemoteHostCandidate[]>("discover_remote_connections").then((hosts) => { window.dispatchEvent(new Event("vellum:remote-sidebar-changed")); return hosts; });
   },
 
   inspectRemoteHost(hostId: string): Promise<RemoteHostStatus> {
