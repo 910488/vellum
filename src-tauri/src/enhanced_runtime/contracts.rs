@@ -54,6 +54,13 @@ pub fn is_global_official(method: &str) -> bool {
     matches!(method, "model/list" | "account/read" | "config/read")
 }
 
+/// Thread attachments are Desktop metadata that only the official core knows
+/// about; the pinned Enhanced core rejects them as an unknown variant. They
+/// never run a turn, so the thread's execution owner does not matter.
+pub fn is_official_thread_metadata(method: &str) -> bool {
+    method.starts_with("thread/attachment/") || method.starts_with("thread/attachmentOwner/")
+}
+
 /// These methods must never reach a runtime without a thread owner.
 pub fn requires_thread(method: &str) -> bool {
     method.starts_with("turn/")

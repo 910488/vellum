@@ -428,6 +428,39 @@ fn a_thread_bound_to_official_resumes_on_official_for_any_frontend() {
     }
 }
 
+/// Desktop lists attachments for every visible thread. The Enhanced core does
+/// not know the method, and unbound threads have no owner to ask, so both go
+/// to the official core instead of failing.
+#[test]
+fn thread_attachments_are_answered_by_official_whatever_the_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    start_enhanced_thread(&mut state, "qwen", "qwen3-coder", "thread-1");
+    for (method, thread) in [
+        ("thread/attachment/list", "thread-1"),
+        ("thread/attachment/list", "never-bound"),
+        ("thread/attachment/add", "thread-1"),
+        ("thread/attachment/remove", "thread-1"),
+        ("thread/attachmentOwner/list", "never-bound"),
+    ] {
+        let line = json!({"id": 7, "method": method, "params": {"threadId": thread}}).to_string();
+        let actions = state.on_client_line(&line).unwrap();
+        assert!(
+            matches!(
+                &actions[0],
+                BridgeAction::ToChild(ExecutionPlane::OfficialCodex, _)
+            ),
+            "{method} for {thread} must reach the official core"
+        );
+    }
+    let turn = json!({"id": 8, "method": "turn/start", "params": {"threadId": "thread-1"}});
+    let actions = state.on_client_line(&turn.to_string()).unwrap();
+    assert!(matches!(
+        &actions[0],
+        BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, _)
+    ));
+}
+
 /// Resuming a thread whose owner is unknown must say so. Trying each core in
 /// turn is what creates the second writer.
 #[test]
