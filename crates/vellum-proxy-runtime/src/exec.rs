@@ -805,6 +805,7 @@ pub(crate) struct WebSocketTurnPlan {
 /// turn may reuse an already-open segment; `upstream_model`/`route_id` are
 /// per-turn and never gate reuse on their own.
 pub(crate) struct OfficialWebSocketPlan {
+    request_metadata: crate::request::RequestMetadata,
     pub connection_key: OfficialWebSocketConnectionKey,
     pub upstream_url: String,
     pub upstream_model: String,
@@ -2496,6 +2497,25 @@ impl ProxyRuntime {
         self
     }
 
+    pub(crate) fn official_continuation_context(
+        &self,
+        request: &RuntimeRequest,
+    ) -> Option<RequestMetadata> {
+        let model = request_model(request).ok()?;
+        let route = self.catalog.resolve_model(model)?.route;
+        if route.provider_kind != RuntimeProviderKind::Official {
+            return None;
+        }
+        if let Some(id) = request.body.get("previous_response_id").and_then(Value::as_str) {
+            self.official_replay.continuation_context(id, &route.route_id)
+        } else {
+            self.official_replay.thread_context(
+                &request.metadata.codex_thread_key()?,
+                &route.route_id,
+            )
+        }
+    }
+
     /// Resolve one WebSocket `response.create` against a fresh catalog
     /// snapshot. Every turn is routed independently: the selected model is
     /// this turn's only routing authority, and there is no connection-level
@@ -2590,6 +2610,7 @@ impl ProxyRuntime {
         Ok(WebSocketTurnPlan {
             route_id: route.route_id.clone(),
             dispatch: WebSocketTurnDispatch::OfficialNative(OfficialWebSocketPlan {
+                request_metadata: request.metadata.clone(),
                 connection_key,
                 upstream_url,
                 upstream_model: route.upstream_model.clone(),
@@ -2693,6 +2714,20 @@ impl ProxyRuntime {
         .map_err(RuntimeError::History)?;
         self.record_subagent_spawn_requests(parent_request_id, execution_id, response);
         let details = usage_details_from_response(response);
+        if let (Some(id), Some(hash)) = (
+            response.get("id").and_then(Value::as_str),
+            plan.execution_account_hash.as_deref(),
+        ) {
+            let mut metadata = plan.request_metadata.clone();
+            metadata.official_socket_affinity = Some(crate::request::OfficialSocketAffinity {
+                account_hash: hash.strip_prefix("sha256:").unwrap_or(hash).into(),
+                turn_in_progress: true,
+                input_tokens: details.input_tokens,
+                quota_exhausted: false,
+            });
+            self.official_replay
+                .remember_context(id, &plan.route_id, metadata);
+        }
         // Routed through the same atomic terminal guard as every other
         // path (P0): an Official native completion racing a parent cancel
         // or a client disconnect can no longer double-write this turn's
@@ -11948,6 +11983,9 @@ mod tests {
                     {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
                     {"type":"namespace","name":"mcp","description":"Connected tools", "tools":[
                         {"type":"function","name":"read","parameters":{"type":"object","properties":{}}}]},
+                    {"type":"namespace","name":"collaboration","tools":[
+                        {"type":"function","name":"followup_task","parameters":{"type":"object","properties":{
+                            "target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"],"additionalProperties":false}}]},
                     {"type":"web_search","search_context_size":"medium"}
                 ],
                 "tool_choice":"auto", "parallel_tool_calls":true,
@@ -11991,7 +12029,7 @@ mod tests {
                 _ => None,
             }).unwrap();
             let tools = original["tools"].to_string();
-            assert_eq!(manifest.requested_tool_count, Some(if code_mode {1} else {4}));
+            assert_eq!(manifest.requested_tool_count, Some(if code_mode {1} else {5}));
             assert_eq!(manifest.requested_tool_count, manifest.effective_tool_count);
             assert_eq!(manifest.requested_tool_bytes, Some(tools.len() as u64));
             assert_eq!(manifest.requested_tool_bytes, manifest.effective_tool_bytes);

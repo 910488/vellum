@@ -63,6 +63,7 @@ pub enum OfficialAuthDecision {
 /// namespaced by route and session class and hashed before crossing the host boundary.
 #[derive(Debug, Clone, Default)]
 pub struct OfficialRoutingContext {
+    pub socket_affinity: Option<crate::request::OfficialSocketAffinity>,
     pub session_key: Option<String>,
     pub context_window_key: Option<String>,
     pub request_id: String,
@@ -134,10 +135,17 @@ impl OfficialRoutingContext {
                 &request.body,
             ));
         Self {
+            socket_affinity: request.metadata.official_socket_affinity.clone(),
             session_key,
             context_window_key,
             request_id: request.metadata.request_id.clone(),
-            estimated_input_tokens,
+            estimated_input_tokens: estimated_input_tokens.max(
+                request
+                    .metadata
+                    .official_socket_affinity
+                    .as_ref()
+                    .map_or(0, |affinity| affinity.input_tokens),
+            ),
             context_window: route.context_window,
         }
     }

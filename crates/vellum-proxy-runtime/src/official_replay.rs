@@ -1,4 +1,5 @@
-//! Bounded, volatile Official wire history. Never persisted or used across realms.
+//! Bounded, volatile Official wire history and routing-only continuation hints.
+//! Wire content is never persisted or used across realms.
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -19,9 +20,73 @@ struct Snapshot {
 }
 
 #[derive(Default)]
-pub(crate) struct OfficialReplayCache(Mutex<VecDeque<Snapshot>>);
+pub(crate) struct OfficialReplayCache(
+    Mutex<VecDeque<Snapshot>>,
+    Mutex<VecDeque<ContinuationContext>>,
+);
+
+struct ContinuationContext {
+    response_id: String,
+    route: String,
+    metadata: crate::request::RequestMetadata,
+    created: Instant,
+}
 
 impl OfficialReplayCache {
+    /// Routing metadata contains no opaque input or credentials and can survive
+    /// a downstream reconnect. Wire content remains strictly realm scoped.
+    pub(crate) fn remember_context(
+        &self,
+        id: &str,
+        route: &str,
+        metadata: crate::request::RequestMetadata,
+    ) {
+        let Ok(mut contexts) = self.1.lock() else {
+            return;
+        };
+        contexts.retain(|c| {
+            c.created.elapsed() < Duration::from_secs(7200)
+                && !(c.response_id == id && c.route == route)
+        });
+        while contexts.len() >= 1024 {
+            contexts.pop_front();
+        }
+        contexts.push_back(ContinuationContext {
+            response_id: id.into(),
+            route: route.into(),
+            metadata,
+            created: Instant::now(),
+        });
+    }
+
+    pub(crate) fn continuation_context(
+        &self,
+        id: &str,
+        route: &str,
+    ) -> Option<crate::request::RequestMetadata> {
+        let mut contexts = self.1.lock().ok()?;
+        contexts.retain(|c| c.created.elapsed() < Duration::from_secs(7200));
+        contexts
+            .iter()
+            .rev()
+            .find(|c| c.response_id == id && c.route == route)
+            .map(|c| c.metadata.clone())
+    }
+
+    pub(crate) fn thread_context(
+        &self,
+        key: &crate::subagent_graph::CodexThreadKey,
+        route: &str,
+    ) -> Option<crate::request::RequestMetadata> {
+        let mut contexts = self.1.lock().ok()?;
+        contexts.retain(|c| c.created.elapsed() < Duration::from_secs(7200));
+        contexts
+            .iter()
+            .rev()
+            .find(|c| c.route == route && c.metadata.codex_thread_key().as_ref() == Some(key))
+            .map(|c| c.metadata.clone())
+    }
+
     pub(crate) fn get(&self, id: &str, route: &str, realm: Option<&str>) -> Option<HistoryEntry> {
         let realm = realm?;
         let mut entries = self.0.lock().ok()?;
@@ -88,6 +153,72 @@ impl OfficialReplayCache {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn continuation_metadata_is_route_scoped_and_bounded_without_exposing_wire_content() {
+        let cache = OfficialReplayCache::default();
+        for n in 0..=1024 {
+            cache.remember_context(
+                &format!("resp_{n}"),
+                "official",
+                crate::request::RequestMetadata {
+                    request_id: format!("request-{n}"),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(cache.continuation_context("resp_0", "official").is_none());
+        assert_eq!(
+            cache
+                .continuation_context("resp_1024", "official")
+                .unwrap()
+                .request_id,
+            "request-1024"
+        );
+        assert!(cache
+            .continuation_context("resp_1024", "foreign-route")
+            .is_none());
+        assert!(cache
+            .get("resp_1024", "official", Some("other-account"))
+            .is_none());
+        assert_eq!(cache.1.lock().unwrap().len(), 1024);
+        cache.remember_context(
+            "resp_1024",
+            "foreign-route",
+            crate::request::RequestMetadata::default(),
+        );
+        assert_eq!(
+            cache
+                .continuation_context("resp_1024", "official")
+                .unwrap()
+                .request_id,
+            "request-1024",
+            "a colliding response id on another route cannot erase the binding"
+        );
+        let metadata = crate::request::RequestMetadata {
+            codex_identity: Some(crate::codex_metadata::CodexTurnIdentity {
+                session_id: Some(
+                    crate::codex_metadata::CodexOpaqueId::new("session_id", "session-one").unwrap(),
+                ),
+                thread_id: Some(
+                    crate::codex_metadata::CodexOpaqueId::new("thread_id", "thread-one").unwrap(),
+                ),
+                trust: crate::codex_metadata::CodexIdentityTrust::Structured,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let key = metadata.codex_thread_key().unwrap();
+        cache.remember_context("resp_thread", "official", metadata.clone());
+        assert_eq!(cache.thread_context(&key, "official"), Some(metadata));
+        assert!(cache.thread_context(&key, "foreign-route").is_none());
+        cache.1.lock().unwrap().back_mut().unwrap().created =
+            Instant::now() - Duration::from_secs(7201);
+        assert!(cache.thread_context(&key, "official").is_none());
+        assert!(cache
+            .continuation_context("resp_thread", "official")
+            .is_none());
+    }
 
     #[test]
     fn serialized_payload_budget_evicts_old_snapshots() {

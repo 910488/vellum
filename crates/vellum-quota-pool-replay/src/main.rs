@@ -318,6 +318,7 @@ fn simulate_events(
             row.session.clone()
         };
         let context = OfficialRoutingContext {
+            socket_affinity: None,
             session_key: Some(key),
             request_id: format!("replay-{n}"),
             context_window_key: Some(window.to_string()),
