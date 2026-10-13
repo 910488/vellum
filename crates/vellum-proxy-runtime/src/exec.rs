@@ -8750,12 +8750,10 @@ fn official_refresh_matches_snapshot(
 }
 
 fn hashed_account_identity(account_id: &str) -> String {
-    let digest = Sha256::digest(account_id.as_bytes());
-    let encoded = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("sha256:{encoded}")
+    format!(
+        "sha256:{}",
+        crate::request::OfficialSocketAffinity::hash_account(account_id)
+    )
 }
 
 /// Stable realm fingerprint compatible with Desktop's durable
@@ -9583,6 +9581,28 @@ mod tests {
         let hydrated = stages.stages[0].1;
         let prepared = stages.stages[1].1;
         assert!(prepared >= hydrated);
+    }
+
+    #[test]
+    fn socket_affinity_reads_back_the_execution_hash_it_was_built_from() {
+        // Producers strip the `sha256:` prefix from the execution hash; the
+        // quota pool must match that exact form, not the truncated
+        // diagnostic `account_hash`, or every mid-turn retry is refused.
+        let execution = hashed_account_identity("credential-a");
+        let affinity = crate::request::OfficialSocketAffinity {
+            account_hash: execution.strip_prefix("sha256:").unwrap().into(),
+            turn_in_progress: true,
+            input_tokens: 0,
+            quota_exhausted: false,
+        };
+        assert!(affinity.is_account("credential-a"));
+        assert!(!affinity.is_account("credential-b"));
+        assert_ne!(
+            affinity.account_hash,
+            crate::account_hash("credential-a")
+                .trim_start_matches("sha256:")
+                .to_string()
+        );
     }
 
     #[test]

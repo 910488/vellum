@@ -781,7 +781,7 @@ impl CodexOAuthManager {
                     .read()
                     .await
                     .keys()
-                    .find(|id| pool_account_hash(id) == affinity.account_hash)
+                    .find(|id| affinity.is_account(id))
                     .cloned();
                 if let Some(account) = account {
                     // Register the invocation even when no quota lookup is
@@ -909,9 +909,7 @@ impl CodexOAuthManager {
         let mut routing_members = settings.members.iter().collect::<Vec<_>>();
         if settings.strategy == QuotaPoolStrategy::Rank {
             if let Some(affinity) = context.socket_affinity.as_ref() {
-                routing_members.sort_by_key(|member| {
-                    pool_account_hash(&member.account_id) != affinity.account_hash
-                });
+                routing_members.sort_by_key(|member| !affinity.is_account(&member.account_id));
             }
         }
         for member in routing_members {
@@ -922,7 +920,7 @@ impl CodexOAuthManager {
             if context.socket_affinity.as_ref().is_some_and(|affinity| {
                 !affinity.turn_in_progress
                     && affinity.quota_exhausted
-                    && pool_account_hash(&member.account_id) == affinity.account_hash
+                    && affinity.is_account(&member.account_id)
             }) {
                 // A usage-limit frame is authoritative even while the cached
                 // quota snapshot is still below its gate. Capacity 429s do not
@@ -2642,7 +2640,7 @@ mod tests {
         manager.set_quota_pool(settings.clone()).await.unwrap();
         let mut context = OfficialRoutingContext {
             socket_affinity: Some(OfficialSocketAffinity {
-                account_hash: pool_account_hash("midturn-a"),
+                account_hash: OfficialSocketAffinity::hash_account("midturn-a"),
                 turn_in_progress: true,
                 input_tokens: 300_000,
                 quota_exhausted: false,
