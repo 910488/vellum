@@ -60,6 +60,9 @@ impl RemoteClientManager {
             Ok(hosts) => drop_stale_legacy_broker_hosts(&cache, &hosts),
             Err(_) => Vec::new(),
         };
+        if let Ok(hosts) = cache.list_hosts() {
+            drop_managed_alias_echoes(&cache, &hosts);
+        }
         Ok(Self {
             cache,
             dropped_legacy_broker_hosts,
@@ -177,9 +180,14 @@ impl RemoteClientManager {
     /// Manager.  Broker pairing remains a separate legacy action.
     pub fn import_discovered_host(&self, candidate: &RemoteHostCandidate) -> AppResult<CachedHost> {
         validate_ssh_alias(&candidate.ssh_alias)?;
-        if let Some(existing) = self
-            .cache
-            .list_hosts()?
+        let hosts = self.cache.list_hosts()?;
+        if let Some(echoed) = hosts
+            .iter()
+            .find(|host| is_managed_alias_of(&candidate.ssh_alias, host))
+        {
+            return Ok(echoed.clone());
+        }
+        if let Some(existing) = hosts
             .into_iter()
             .find(|host| host.id == candidate.vellum_host_id)
         {
@@ -232,6 +240,34 @@ fn drop_stale_legacy_broker_hosts(cache: &RemoteLocalCache, hosts: &[CachedHost]
         }
     }
     dropped
+}
+
+/// The isolated SSH alias Vellum writes for a host (`vellum-remote-<id>`)
+/// is the same machine under another name. Discovery used to read it back
+/// out of `~/.ssh/config` and import it as a second host; drop those rows so
+/// the Remote Manager stops listing the machine twice.
+fn is_managed_alias_of(alias: &str, host: &CachedHost) -> bool {
+    alias
+        .trim()
+        .eq_ignore_ascii_case(&crate::remote::ssh_isolation::managed_alias(&host.id))
+}
+
+fn drop_managed_alias_echoes(cache: &RemoteLocalCache, hosts: &[CachedHost]) {
+    for echo in hosts {
+        let Some(original) = hosts
+            .iter()
+            .find(|host| host.id != echo.id && is_managed_alias_of(&echo.ssh_alias, host))
+        else {
+            continue;
+        };
+        log::info!(
+            "remote host {} ({}) is the managed SSH alias of {}; dropping the duplicate row",
+            echo.id,
+            echo.name,
+            original.id
+        );
+        let _ = cache.remove_host(&echo.id);
+    }
 }
 
 fn validate_ssh_alias(alias: &str) -> AppResult<()> {
@@ -321,6 +357,54 @@ mod tests {
         cache.set_active_host(Some("jetson")).unwrap();
         cache.remove_host("jetson").unwrap();
         assert_eq!(cache.active_host().unwrap(), None);
+    }
+
+    /// Discovery once imported `vellum-remote-<id>` from the managed block
+    /// of `~/.ssh/config` as a second host. Reopening drops that echo, and a
+    /// stale candidate for it resolves to the original instead of a new row.
+    #[test]
+    fn managed_ssh_alias_echoes_are_dropped_and_not_reimported() {
+        let temp = tempfile::tempdir().unwrap();
+        let echo_alias = crate::remote::ssh_isolation::managed_alias("remote-jetson");
+        {
+            let cache = RemoteLocalCache::open(temp.path().join("remote-cache.sqlite3")).unwrap();
+            let mut jetson = host("remote-jetson", "jetson-orin", "ws://127.0.0.1:45100/ws");
+            jetson.ssh_alias = "jetson-orin".into();
+            cache.upsert_host(&jetson).unwrap();
+            let mut echo = host("remote-echo", &echo_alias, "ws://127.0.0.1:45100/ws");
+            echo.ssh_alias = echo_alias.clone();
+            cache.upsert_host(&echo).unwrap();
+            let mut other = host("remote-806", "806", "ws://127.0.0.1:45100/ws");
+            other.ssh_alias = "vellum-remote-unrelated".into();
+            cache.upsert_host(&other).unwrap();
+        }
+
+        let manager = RemoteClientManager::open(temp.path().to_path_buf()).unwrap();
+        let mut ids = manager
+            .list_hosts()
+            .unwrap()
+            .into_iter()
+            .map(|host| host.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["remote-806", "remote-jetson"]);
+
+        let imported = manager
+            .import_discovered_host(&RemoteHostCandidate {
+                codex_host_id: None,
+                vellum_host_id: "remote-echo".into(),
+                display_name: echo_alias.clone(),
+                ssh_alias: echo_alias.to_uppercase(),
+                hostname: None,
+                user: None,
+                port: None,
+                source: "openSsh".into(),
+                validated: false,
+                validation_error: None,
+            })
+            .unwrap();
+        assert_eq!(imported.id, "remote-jetson");
+        assert_eq!(manager.list_hosts().unwrap().len(), 2);
     }
 
     #[test]
