@@ -146,7 +146,7 @@ mod tests {
             launch_id: "01LAUNCH".into(),
             created_at: 1,
             official: identity(official),
-            enhanced: identity(enhanced),
+            enhanced: Some(identity(enhanced)),
             model_provider_map_path: root.join("map.json"),
             model_provider_map_sha256: "sha256:map".into(),
             binding_db: root.join("bindings.sqlite3"),

@@ -491,6 +491,7 @@ fn enhanced_commit_guard(
 
 fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     if !state.is_generation_current(generation) {
+        log::warn!("[Enhanced] arming cancelled kind=StaleProxyGeneration generation={generation}");
         return;
     }
     let armed = crate::enhanced_runtime::desktop_manager::sync_proxy_desktop_launch(
@@ -502,12 +503,22 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     // Notices and failure cleanup belong to the same generation too. In
     // particular, an old failure must not release a newer start's lease.
     let Ok(_guard) = enhanced_commit_guard(state, generation) else {
+        log::warn!(
+            "[Enhanced] arming not committed kind=StaleProxyGeneration generation={generation}"
+        );
         return;
     };
     match armed {
         Ok(launch) => {
             let status = crate::enhanced_runtime::desktop_runtime_status(&state.data_root());
-            let adopted = status.ready && !status.restart_required;
+            if status.enhanced_core == "missing" {
+                log::warn!(
+                    "[Enhanced] Official-only bridge prepared; core=missing protection_active={}",
+                    status.bridge_protection_active
+                );
+            }
+            let adopted =
+                (status.ready || status.bridge_protection_active) && !status.restart_required;
             state.reconcile_enhanced_adoption(adopted);
             if let Some(process_identity) = (launch.is_some() && !adopted)
                 .then(crate::commands::runtime::codex_process_identity)
@@ -520,7 +531,10 @@ fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
             }
         }
         Err(error) => {
-            let _ = crate::enhanced_runtime::release_desktop_launch(&state.data_root());
+            log::warn!("[Enhanced] bridge not armed kind={error:?}");
+            if let Err(cleanup) = crate::enhanced_runtime::release_desktop_launch(&state.data_root()) {
+                log::warn!("[Enhanced] failed arming cleanup kind={cleanup:?}");
+            }
             state.record_live_applied(
                 crate::model::RuntimeNotice::new("enhancedDesktopRuntimeNotArmed")
                     .with("detail", error.to_string()),

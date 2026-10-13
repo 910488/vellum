@@ -161,10 +161,14 @@ impl BridgeConfig {
     }
 
     fn validate(&self) -> Result<(), BridgeError> {
-        for (plane, identity) in [
-            (ExecutionPlane::OfficialCodex, &self.manifest.official),
-            (ExecutionPlane::EnhancedCodex, &self.manifest.enhanced),
-        ] {
+        for (plane, identity) in
+            std::iter::once((ExecutionPlane::OfficialCodex, &self.manifest.official)).chain(
+                self.manifest
+                    .enhanced
+                    .as_ref()
+                    .map(|identity| (ExecutionPlane::EnhancedCodex, identity)),
+            )
+        {
             if !identity.executable.is_absolute() || !identity.executable.is_file() {
                 return Err(BridgeError::ExecutableUnavailable {
                     plane,
@@ -201,10 +205,7 @@ pub fn run_from_env() -> Result<(), BridgeError> {
         // exiting here is what left it with no app-server at all.
         let (official, drifted) = super::official_drift::resolve_official(&manifest)?;
         if drifted || enhanced_lease_released() {
-            return wait_for_delegated_command(released_app_server_command(
-                &official,
-                &child_args,
-            ));
+            return wait_for_delegated_command(released_app_server_command(&official, &child_args));
         }
     }
     run(BridgeConfig::load(&manifest_path, child_args)?)
@@ -327,11 +328,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
             runtime_digest: manifest.official.runtime_digest.clone(),
             ..ChildAttestation::default()
         },
-        ChildAttestation {
-            binary_sha256: manifest.enhanced.artifact_sha256.clone(),
-            runtime_digest: manifest.enhanced.runtime_digest.clone(),
-            ..ChildAttestation::default()
-        },
+        enhanced_child_attestation(&manifest),
     );
     let _ = attestation.flush();
 
@@ -343,10 +340,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         Ok(bindings) => bindings,
         Err(error) => return Err(fail_attestation(&mut attestation, error.into())),
     };
-    let providers = TrustedProviderSet::new(
-        manifest.official_provider_ids.clone(),
-        manifest.third_party_provider_ids.clone(),
-    );
+    let providers = manifest.providers();
     let (events_tx, events_rx) = mpsc::channel();
     let mut official = match ChildProcess::spawn(
         ExecutionPlane::OfficialCodex,
@@ -359,20 +353,28 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         Err(error) => return Err(fail_attestation(&mut attestation, error)),
     };
     attestation.set_child_pid(ExecutionPlane::OfficialCodex, official.pid());
-    let mut enhanced = match ChildProcess::spawn(
-        ExecutionPlane::EnhancedCodex,
-        &manifest,
-        &config.child_args,
-        events_tx.clone(),
-        adopted_by_desktop,
-    ) {
-        Ok(child) => child,
-        Err(error) => {
-            official.terminate();
-            return Err(fail_attestation(&mut attestation, error));
-        }
+    let mut enhanced = if manifest.enhanced.is_some() {
+        Some(
+            match ChildProcess::spawn(
+                ExecutionPlane::EnhancedCodex,
+                &manifest,
+                &config.child_args,
+                events_tx.clone(),
+                adopted_by_desktop,
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    official.terminate();
+                    return Err(fail_attestation(&mut attestation, error));
+                }
+            },
+        )
+    } else {
+        None
     };
-    attestation.set_child_pid(ExecutionPlane::EnhancedCodex, enhanced.pid());
+    if let Some(enhanced) = enhanced.as_ref() {
+        attestation.set_child_pid(ExecutionPlane::EnhancedCodex, enhanced.pid());
+    }
     let _ = attestation.flush();
     spawn_client_reader(events_tx);
 
@@ -386,7 +388,7 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         store,
         providers,
         manifest.official.runtime_digest.clone(),
-        manifest.enhanced.runtime_digest.clone(),
+        manifest.enhanced_digest(),
         config.model_provider_map,
         attestation,
         journal,
@@ -454,7 +456,12 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
                             observations.observe(plane.as_str(), &value);
                             match plane {
                                 ExecutionPlane::OfficialCodex => official.send(&value)?,
-                                ExecutionPlane::EnhancedCodex => enhanced.send(&value)?,
+                                ExecutionPlane::EnhancedCodex => enhanced
+                                    .as_mut()
+                                    .ok_or_else(|| {
+                                        BridgeError::Protocol("Enhanced core is unavailable".into())
+                                    })?
+                                    .send(&value)?,
                             }
                         }
                         BridgeAction::ToClient(value) => write_json(&mut client_out, &value)?,
@@ -466,7 +473,12 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
                         // in-memory writer or subscriptions.
                         BridgeAction::ToRelay(value) => match FALLBACK_REMOTE_CONTROL_PLANE {
                             ExecutionPlane::OfficialCodex => official.send(&value)?,
-                            ExecutionPlane::EnhancedCodex => enhanced.send(&value)?,
+                            ExecutionPlane::EnhancedCodex => enhanced
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    BridgeError::Protocol("Enhanced core is unavailable".into())
+                                })?
+                                .send(&value)?,
                         },
                     }
                 }
@@ -484,7 +496,9 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         let _ = observations.write(&observation_path);
     }
     official.terminate();
-    enhanced.terminate();
+    if let Some(enhanced) = enhanced.as_mut() {
+        enhanced.terminate();
+    }
     state.attestation.mark_stopped();
     let _ = state.attestation.flush();
     let _ = observations.write(&observation_path);
@@ -495,6 +509,21 @@ fn fail_attestation(attestation: &mut AttestationWriter, error: BridgeError) -> 
     attestation.mark_failed(error.to_string());
     let _ = attestation.flush();
     error
+}
+
+fn enhanced_child_attestation(manifest: &LaunchManifestV1) -> ChildAttestation {
+    manifest
+        .enhanced
+        .as_ref()
+        .map(|identity| ChildAttestation {
+            binary_sha256: identity.artifact_sha256.clone(),
+            runtime_digest: identity.runtime_digest.clone(),
+            ..ChildAttestation::default()
+        })
+        .unwrap_or_else(|| ChildAttestation {
+            exited: true,
+            ..ChildAttestation::default()
+        })
 }
 
 fn write_json(writer: &mut impl Write, value: &Value) -> Result<(), BridgeError> {
@@ -520,7 +549,10 @@ impl ChildProcess {
     ) -> Result<Self, BridgeError> {
         let identity = match plane {
             ExecutionPlane::OfficialCodex => &manifest.official,
-            ExecutionPlane::EnhancedCodex => &manifest.enhanced,
+            ExecutionPlane::EnhancedCodex => manifest
+                .enhanced
+                .as_ref()
+                .ok_or_else(|| BridgeError::Protocol("Enhanced core is unavailable".into()))?,
         };
         let mut command = Command::new(&identity.executable);
         command
@@ -840,6 +872,12 @@ impl BridgeState {
             return Ok(vec![BridgeAction::ToRelay(value)]);
         }
         if method == "initialized" {
+            if self.enhanced_digest.is_empty() {
+                return Ok(vec![BridgeAction::ToChild(
+                    ExecutionPlane::OfficialCodex,
+                    value,
+                )]);
+            }
             return Ok(vec![
                 BridgeAction::ToChild(ExecutionPlane::OfficialCodex, value.clone()),
                 BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, value),
@@ -864,6 +902,12 @@ impl BridgeState {
                 return Err(BridgeError::Protocol("initialize request has no id".into()));
             };
             self.initialize_requests.insert(id_key(&id));
+            if self.enhanced_digest.is_empty() {
+                return Ok(vec![BridgeAction::ToChild(
+                    ExecutionPlane::OfficialCodex,
+                    value,
+                )]);
+            }
             let translated = format!("vellum:shadow:initialize:{}", self.next_server_request);
             self.next_server_request += 1;
             self.shadow_requests
@@ -929,6 +973,7 @@ impl BridgeState {
             "thread/resume" => {
                 let thread_id = required_string(params, "threadId")?;
                 if let Some(binding) = self.store.get(thread_id)? {
+                    let binding = self.effective_binding(binding);
                     let child_provider_id =
                         self.ensure_provider_does_not_switch(params, &binding)?;
                     return Ok((binding.plane, None, child_provider_id));
@@ -1027,7 +1072,18 @@ impl BridgeState {
     fn require_binding(&self, thread_id: &str) -> Result<ThreadRuntimeBinding, BridgeError> {
         self.store
             .get(thread_id)?
+            .map(|binding| self.effective_binding(binding))
             .ok_or_else(|| BridgeError::UnboundThread(thread_id.into()))
+    }
+
+    fn effective_binding(&self, mut binding: ThreadRuntimeBinding) -> ThreadRuntimeBinding {
+        // A bridge-only launch uses the shared task home through Official.
+        // Preserve the durable historical binding instead of rewriting it.
+        if self.enhanced_digest.is_empty() {
+            binding.plane = ExecutionPlane::OfficialCodex;
+            binding.runtime_digest = self.official_digest.clone();
+        }
+        binding
     }
 
     fn ensure_provider_does_not_switch(

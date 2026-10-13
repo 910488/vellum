@@ -43,6 +43,13 @@ native; a failure after adoption must be surfaced as the real failure.
 ### Proxy and Enhanced Runtime lifecycle
 
 - Starting Proxy automatically attempts to arm Enhanced Runtime.
+- A missing or unverified Enhanced core does not disarm the verified App Server
+  bridge. A bridge-only launch omits the Enhanced binary identity, starts only
+  Official Codex and retains Desktop account/backend relay handling. It reports
+  degraded protection separately from Enhanced readiness. This fallback applies
+  to a new managed launch, never by moving a running turn between children.
+  Existing durable Enhanced bindings retain their history; a bridge-only launch
+  resolves their shared task home through Official until a verified core returns.
 - Stopping Proxy releases Vellum's Enhanced Runtime injection and restores the
   native launch state.
 - There is no independent user-facing enable/disable switch for Enhanced
