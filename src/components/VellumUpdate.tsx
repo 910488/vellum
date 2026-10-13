@@ -37,6 +37,7 @@ export interface VellumUpdateView {
   autoUpdate: boolean;
   earlyAccess: boolean;
   hosts: VellumUpdateHosts;
+  core?: { activeVersion: string | null; pendingVersion: string | null; missing: boolean };
   /** 目標版本的版本說明；沒有就不出連結。 */
   notes: string | null;
   /** 有動作在跑：主要按鈕與開關先停用。 */
@@ -56,6 +57,7 @@ export interface VellumUpdateActions {
   onAutoUpdate: (next: boolean) => void;
   onEarlyAccess: (next: boolean) => void;
   onOpenHosts: () => void;
+  onRepairCore?: () => void;
 }
 
 const K = "settings.page.updates.simple";
@@ -235,6 +237,14 @@ export function VellumUpdate({
       ) : null}
 
       <Rows>
+        {view.core ? <Row label={t("tabPolish.core.label")}>
+          <span className="vupdate__core">
+            <span>{view.core.missing ? t("tabPolish.core.missing") : view.core.pendingVersion
+              ? t("tabPolish.core.pending", { version: view.core.activeVersion ?? "—", pending: view.core.pendingVersion })
+              : t("tabPolish.core.active", { version: view.core.activeVersion ?? t("tabPolish.core.bundled") })}</span>
+            {view.core.missing && actions.onRepairCore ? <Btn soft mini onClick={actions.onRepairCore} disabled={busy}>{t("tabPolish.core.repair")}</Btn> : null}
+          </span>
+        </Row> : null}
         <Row
           label={
             <span className="runtime-control__copy">

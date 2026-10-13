@@ -213,6 +213,7 @@ pub struct UpdateStatusSnapshot {
     pub desktop: LayerStatus,
     pub remote: LayerStatus,
     pub core: LayerStatus,
+    pub core_runtime: CoreRuntimeStatus,
     pub preferences: UpdatePreferences,
     pub live_auto_update: bool,
     pub attention: UpdateAttention,
@@ -222,6 +223,14 @@ pub struct UpdateStatusSnapshot {
     /// A Desktop restart that waits for running work to finish.
     #[serde(default)]
     pub restart_schedule: Option<RestartSchedule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreRuntimeStatus {
+    pub active_version: Option<String>,
+    pub pending_version: Option<String>,
+    pub missing: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

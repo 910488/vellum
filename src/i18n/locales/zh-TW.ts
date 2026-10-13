@@ -1,6 +1,59 @@
 import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
+  "tabPolish": {
+    "details": "詳細資料",
+    "loginExpired": "這台主機的登入已失效，請重新登入。",
+    "rateLimited": "Grok 暫時限流（429），稍後會自動重試。",
+    "genericError": "操作未完成，請查看詳細資料後重試。",
+    "settingsTitle": "設定",
+    "settingsIndex": "設定分類",
+    "groups": {
+      "general": "一般與顯示",
+      "integration": "Codex 整合",
+      "network": "連線與網路",
+      "diagnostics": "診斷與復原"
+    },
+    "restoreHost": "恢復主機原本的運作方式",
+    "remoteControl": "遠端控制",
+    "logLead": "查看用量趨勢、請求結果與執行紀錄。",
+    "time": {
+      "hoursMinutes": "{{hours}} 小時 {{minutes}} 分",
+      "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
+      "seconds": "{{seconds}} 秒"
+    },
+    "headers": {
+      "time": "時間",
+      "model": "供應商／模型",
+      "tokens": "輸入 → 輸出",
+      "cache": "快取",
+      "duration": "耗時",
+      "status": "結果"
+    },
+    "moreActions": "更多帳號操作",
+    "fiveHourOn": "5 小時窗自動重置：開",
+    "fiveHourOff": "5 小時窗自動重置：關",
+    "domainRules": "{{count}} 條網域存取規則",
+    "allowed": "允許：{{domains}}",
+    "blocked": "封鎖：{{domains}}",
+    "anyDomain": "所有網域",
+    "noBlocked": "無",
+    "dashboardHint": "這些選項只影響「現況」頁的供應商卡片。",
+    "core": {
+      "label": "Enhanced core",
+      "active": "使用中 · {{version}}",
+      "pending": "使用中：{{version}} · 等待套用：{{pending}}",
+      "missing": "Enhanced core 缺失",
+      "bundled": "隨安裝提供",
+      "repair": "修復 core"
+    },
+    "qualified": "已驗證",
+    "launchReady": "啟動設定已備妥",
+    "conversation": "對話 {{index}}",
+    "parentConversation": "子對話",
+    "technical": "技術資料",
+    "account": "ChatGPT 帳號 {{index}}"
+  },
   "enhanced": {"heading":"Enhanced 執行狀態","lead":"顯示每條路由的執行者、相容性檢查結果，以及手機連線狀態。","title":"Enhanced Core","subtitle":"執行者、相容性證據與手機連線","serving":"Enhanced Core 運作中","notServing":"Enhanced Core 未運作","sessions":"已觀察到的工作階段","running":"執行中的回合","freshness":"資料時間","restartRequired":"已備妥新的啟動設定。請在進行中的回合結束後再安全重新啟動。","launchCoreDrift":"Codex Desktop 已更新核心。Vellum 會在回合閒置時自動重新啟動 Proxy；完成後請重新啟動 Codex。","now": "現在", "runningTurns_one": "{{count}} 個回合執行中", "runningTurns_other": "{{count}} 個回合執行中", "sessionCount_one": "{{count}} 個工作階段", "sessionCount_other": "{{count}} 個工作階段", "verdict": {"serving": "Codex Desktop 目前經由 Enhanced Core 執行。", "servingOtherLaunch": "Enhanced 仍在運作，但沿用上一次啟動的設定。重新啟動 Codex 才會切換到這次的設定。", "stoppedAt": "啟動流程停在「{{link}}」階段。", "disabled": "Enhanced Core 已停用，Codex Desktop 正使用原生核心。"}, "chain": {"title": "啟動流程", "artifact": "元件驗證", "armed": "路徑接管", "adopted": "Bridge 接手", "inPlace": "執行確認"}, "mark": {"blocked": "未通過", "waiting": "等待中", "inPlace": "已生效"}, "whyStopped": "在「{{link}}」階段停下的原因", "whyNoted": "執行中，但有幾點需要注意", "protocol": {"verified": "已驗證", "unverified": "未驗證", "incompatible": "不相容"}, "protocolUnrun": "比對尚未執行", "unverifiedNote": "這個 Codex Desktop 版本沒有經過驗證。路由會用到的方法都還在，所以路由沒有問題；下方列出的差異確實存在，但未經測試 —— 可以用，但不保證正確。", "missingHelpers": "Enhanced 核心少了官方安裝中有的輔助程式：{{list}}。對話與路由不受影響，只有沙箱命令執行會失敗。", "routed": "路由所需", "delta": {"methodUnservable": "此方法無法提供", "methodUnknownToDesktop": "Desktop 未宣告此方法", "fieldNewlyRequired": "欄位變成必填", "fieldRemoved": "欄位已移除"}, "environment": {"leaseValueMissing": "已被清除，正在還原", "leased": "持有中", "released": "已交還", "orphanedBridge": "殘留的舊 Bridge", "foreignValue": "由其他工具設定", "unreadable": "無法讀取"}, "bridgeProcess": "Bridge 程序", "bridgeState": "Bridge 狀態", "children": "子程序", "launch": "啟動", "relayNote": "手機要連上，必須通過握手、任務清單、訊息載入、即時事件與任務控制五個階段；哪一關沒過，就是連不上的原因。", "staleWarning":"顯示的是最後一次觀察結果，可能已經過期。","compatibility":"版本與相容性","activeRuntime":"目前實際使用的 runtime","candidateRuntime":"下次啟動使用的 runtime","structure":"Schema 比較","qualification":"最近驗證","notObserved":"尚未觀察","observed":"已觀察","evidenceNote":"Schema 一致只能算是結構上的證據，不能證明 Desktop 或手機的行為已經驗證過。","differences":"差異與阻礙","relay":"Relay 狀態","clients":"已連線的用戶端版本","handshake":"握手","list":"任務清單","history":"訊息載入","stream":"即時事件","control":"任務控制","failureStage":"最後失敗階段","plane":"執行者","all":"全部","empty":"這次啟動還沒有觀察到任何工作階段。過去的綁定不等於目前的連線。","session":"工作階段","state":"狀態","lastActivity":"最後活動時間","parent":"父任務","diagnostics":"診斷","recheck":"重新檢查相容性","export":"匯出診斷","exported":"已儲存","states":{"starting":"啟動中", "ready":"就緒", "degraded":"降級", "stopped":"已停止", "transportReady":"傳輸就緒", "unknown":"未知","current":"最新","stale":"已過期","offline":"離線","unavailable":"沒有資料","running":"執行中","idle":"閒置","approval":"等待核准","unloaded":"已卸載","observed":"已觀察","attached":"已連接","failed":"失敗"}},
   "common": { "expiresAt": "到期時間：{{month}}月{{day}}日 {{time}}（{{zone}}）", "expiredAlready": "已過期", "expiresInMinutes": "剩 {{value}} 分鐘", "expiresInHours": "剩 {{value}} 小時", "expiresInDays": "剩 {{value}} 天","emDash": "—", "none": "—", "listSeparator": "；", "itemSeparator": "、", "loading": "讀取中…", "processing": "處理中…", "refreshing": "更新中…", "refresh": "重新整理", "reorganize": "重新整理", "save": "儲存", "cancel": "取消", "confirm": "確認", "close": "關閉", "remove": "移除", "enabled": "啟用", "disabled": "停用", "yes": "是", "no": "否", "on": "開", "off": "關", "unknown": "未知", "provider": "Provider", "model": "模型", "proxy": "Proxy", "codexCatalog": "Codex 模型選單", "justNow": "剛剛", "minutesAgo": "{{count}} 分鐘前", "hoursAgo": "{{count}} 小時前", "daysAgo": "{{count}} 天前", "resetAt": "{{month}}月{{day}}日 {{time}} 重設", "previousPage": "上一頁", "nextPage": "下一頁", "pageOf": "第 {{page}} / {{total}} 頁", "shortcutTitle": "{{label}}（Ctrl+{{n}}）", "statusUpdateFailed": "狀態更新失敗：{{detail}}", "errorWithDetail": "{{message}}：{{detail}}", "connectionFailed": "連線失敗", "operationFailed": "操作失敗", "loadFailed": "載入失敗", "saveFailed": "儲存失敗", "visible": "顯示", "hidden": "隱藏", "totalItems_one": "共 {{count}} 筆", "totalItems_other": "共 {{count}} 筆", "itemsNeedAttention_one": "個項目需要處理", "itemsNeedAttention_other": "個項目需要處理", "notice": {"info": "提示", "warn": "注意", "error": "失敗"}, "dismiss": "知道了"},
   "navigation": {
@@ -26,7 +79,7 @@ const zhTW: ResourceTree = {
       "blurb": "執行者與相容性狀態"
     },
     "remote": {
-      "label": "遠端",
+      "label": "遠端總管",
       "title": "遠端總管",
       "blurb": "Codex App SSH 主機與原生 daemon"
     },
@@ -756,7 +809,7 @@ const zhTW: ResourceTree = {
       "grokStarting": "正在等待 Grok CLI…"
     },
     "control": {
-      "title": "Remote 控制",
+      "title": "遠端控制",
       "identity": "使用帳號",
       "status": "憑證狀態",
       "choose": "選擇 Remote Control 帳號",
@@ -776,7 +829,7 @@ const zhTW: ResourceTree = {
       "select": "選用",
       "remove": "移除",
       "removeSelected": "移除目前的獨立執行帳號",
-      "namePlaceholder": "這個 Official 帳號的顯示名稱",
+      "namePlaceholder": "帳號顯示名稱",
       "loginHint": "完成 Official 裝置登入："
     },
     "maintenance": {

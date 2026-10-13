@@ -20,7 +20,8 @@ import { api } from "@/lib/api";
 import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
-import { Btn, Cap, Card, Confirm, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
+import { operationalErrorKey } from "@/lib/operationalError";
+import { Btn, Cap, Card, Confirm, Empty, Notice, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
 import {
   REVIEW_POLICIES,
   fallbackShare,
@@ -82,6 +83,7 @@ export function Settings({
   const { sinceLabel } = useLocaleFormat();
   const [localePreference, setLocalePreferenceState] = useState<LocalePreference>(getLocalePreference());
   const [themePreference, setThemePreferenceState] = useState<ThemePreference>(readThemePreference);
+  const [settingsGroup, setSettingsGroup] = useState("general");
   const [settings, setSettings] = useState<ReviewSettings | null>(null);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [models, setModels] = useState<ModelRoute[]>([]);
@@ -126,6 +128,17 @@ export function Settings({
   const subagentRef = useRef<SubagentSettings | null>(null);
   const subagentLastSavedRef = useRef<SubagentSettings | null>(null);
   const subagentSaveQueue = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    if (typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+      const group = (visible[0]?.target as HTMLElement | undefined)?.dataset.settingsGroup;
+      if (group) setSettingsGroup(group);
+    }, { rootMargin: "-15% 0px -65% 0px" });
+    document.querySelectorAll("[data-settings-group]").forEach((section) => observer.observe(section));
+    return () => observer.disconnect();
+  }, [settings]);
 
   useEffect(() => {
     let alive = true;
@@ -656,7 +669,7 @@ export function Settings({
           <h2 className="canvas__title">{t("settings.title")}</h2>
         </div>
         <Card>
-          <Empty>{error ?? t("settings.page.loading")}</Empty>
+          {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : <Empty>{t("settings.page.loading")}</Empty>}
         </Card>
       </>
     );
@@ -729,11 +742,14 @@ export function Settings({
       <div className="canvas__head">
         <div>
           <p className="eyebrow">{t("settings.title")}</p>
-          <h2 className="canvas__title">{t("settings.page.heading")}</h2>
+          <h2 className="canvas__title">{t("tabPolish.settingsTitle")}</h2>
         </div>
       </div>
 
-      {error ? <p className="note">{error}</p> : null}
+      {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : null}
+      <nav className="settings-index" aria-label={t("tabPolish.settingsIndex")}>{["general","integration","network","diagnostics"].map((group) => <a key={group} href={`#settings-${group}`} aria-current={settingsGroup === group ? "location" : undefined} onClick={() => setSettingsGroup(group)}>{t(`tabPolish.groups.${group}`)}</a>)}</nav>
+      <section id="settings-general" className="settings-group" data-settings-group="general">
+        <h3>{t("tabPolish.groups.general")}</h3>
 
       {/* 語言與外觀是頁面級偏好，各只有一個控制項。放進 grid2 會讓它們吃掉 1.35fr
           的主欄，把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成同一張
@@ -783,6 +799,15 @@ export function Settings({
         </div>
       </Card>
 
+      <Card>
+        <Cap>{t("settings.page.dashboard.title")}</Cap>
+        <p className="note">{t("tabPolish.dashboardHint")}</p>
+        <p className="note">{t("settings.page.dashboard.note", { count: dashboardRouteIds.length })}</p>
+        <Rows>{routes.map((route) => <Row key={route.id} label={route.name}><label className="rowline"><input type="checkbox" checked={dashboardRouteIds.includes(route.id)} onChange={() => toggleDashboardProvider(route.id)} /><span>{route.enabled ? t("common.visible") : t("settings.page.dashboard.disabledVisible")}</span></label></Row>)}</Rows>
+      </Card>
+      </section>
+      <section id="settings-integration" className="settings-group" data-settings-group="integration">
+        <h3>{t("tabPolish.groups.integration")}</h3>
       <div className="grid2">
         <Card>
           <div className="rowline">
@@ -851,9 +876,9 @@ export function Settings({
                     {showsFallback ? <State tone="warn" label={t("settings.page.review.fallbackActive")} /> : null}
                   </span>
                   {showsFallback ? (
-                    <span className="rows__hint" style={{ display: "block" }}>
-                      {stats?.activeReason ?? t("settings.page.review.selectedUnavailable")}
-                    </span>
+                    <div className="rows__hint">
+                      {stats?.activeReason ? <Notice raw={stats.activeReason}>{t(operationalErrorKey(stats.activeReason))}</Notice> : t("settings.page.review.selectedUnavailable")}
+                    </div>
                   ) : null}
                 </Row>
 
@@ -1179,6 +1204,9 @@ export function Settings({
           引擎在設定變了之後自己重建，所以這裡不需要任何「重啟才生效」的提示。
 
           排在壓縮策略之後、顯示偏好之前：這三張講的都是「送出去的請求長什麼樣」。 */}
+      </section>
+      <section id="settings-network" className="settings-group" data-settings-group="network">
+        <h3>{t("tabPolish.groups.network")}</h3>
       {searchSettings ? (
         <Card>
           <div className="rowline">
@@ -1278,7 +1306,7 @@ export function Settings({
                       {searchProbing
                         ? t("settings.page.webSearch.probing")
                         : searchProbeError
-                          ? t("settings.page.webSearch.probeFailed", { detail: searchProbeError })
+                          ? <Notice tone="warn" raw={searchProbeError}>{t(operationalErrorKey(searchProbeError))}</Notice>
                           : searchProbe
                             ? t(
                                 searchProbe.resultCount > 0
@@ -1306,9 +1334,9 @@ export function Settings({
 
               {/* 網域限制是裝一次的東西，數量不固定 —— 收進托盤，收起來時顯示條數。 */}
               <div style={{ marginTop: 16 }}>
+                <p className="note">{t("tabPolish.allowed", { domains: searchSettings.domainPolicy.allow.join(", ") || t("tabPolish.anyDomain") })}<br />{t("tabPolish.blocked", { domains: searchSettings.domainPolicy.block.join(", ") || t("tabPolish.noBlocked") })}</p>
                 <Tray
-                  label={t("settings.page.webSearch.domainTray")}
-                  count={domainRuleCount(searchSettings)}
+                  label={t("tabPolish.domainRules", { count: domainRuleCount(searchSettings) })}
                 >
                   <div className="field" style={{ marginTop: 12 }}>
                     <label className="field__label" htmlFor="websearch-allow">
@@ -1365,27 +1393,9 @@ export function Settings({
         </Card>
       ) : null}
 
-      <Card>
-        <Cap>{t("settings.page.dashboard.title")}</Cap>
-        <p className="note" style={{ marginTop: 10 }}>
-          {t("settings.page.dashboard.note", { count: dashboardRouteIds.length })}
-        </p>
-        <Rows>
-          {routes.map((route) => (
-            <Row key={route.id} label={route.name}>
-              <label className="rowline">
-                <input
-                  type="checkbox"
-                  checked={dashboardRouteIds.includes(route.id)}
-                  onChange={() => toggleDashboardProvider(route.id)}
-                />
-                <span>{route.enabled ? t("common.visible") : t("settings.page.dashboard.disabledVisible")}</span>
-              </label>
-            </Row>
-          ))}
-        </Rows>
-      </Card>
-
+      </section>
+      <section id="settings-diagnostics" className="settings-group" data-settings-group="diagnostics">
+        <h3>{t("tabPolish.groups.diagnostics")}</h3>
       <Card>
         <Cap>{t("settings.page.restore.title")}</Cap>
         <p className="prose" style={{ marginTop: 10 }}>
@@ -1545,7 +1555,7 @@ export function Settings({
       </Card>
 
       <Card quiet>
-        <Cap>{t("settings.page.app.title")}</Cap>
+          <Cap>{t("settings.page.app.title")}</Cap>
         <div className="rowline" style={{ marginTop: 6 }}>
           <Btn soft onClick={() => void api.exitVellum()}>{t("settings.page.app.exit")}</Btn>
           <span className="rows__hint">
@@ -1553,6 +1563,7 @@ export function Settings({
           </span>
         </div>
       </Card>
+      </section>
     </>
   );
 }
