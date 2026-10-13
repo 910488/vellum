@@ -1004,6 +1004,9 @@ impl BridgeState {
             "initialize" | "model/list" | "account/read" | "config/read" => {
                 Ok((ExecutionPlane::OfficialCodex, None, None))
             }
+            method if super::contracts::is_official_thread_metadata(method) => {
+                Ok((ExecutionPlane::OfficialCodex, None, None))
+            }
             _ => {
                 if let Some(thread_id) = find_thread_id(params) {
                     return Ok((self.require_binding(thread_id)?.plane, None, None));
