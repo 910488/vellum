@@ -4,9 +4,14 @@ import type { VellumUpdateState } from "@/components/VellumUpdate";
 /** One fixed slot; progress uses the same combined byte count as the panel. */
 export function UpdateIndicator({ state, onClick }: { state: VellumUpdateState; onClick: () => void }) {
   const { t } = useTranslation();
-  const visible = !["current", "checking", "unsigned"].includes(state.kind);
+  /* 「已更新」不是一件待辦：打勾會一直掛在那裡，直到下一個版本出來，
+     版本號與更新時間在更新面板就看得到。只有 core 還等著套用時才值得佔這一格，
+     而那時該畫的是重新啟動，不是打勾。 */
+  const corePending = state.kind === "updated" && state.corePending;
+  const visible = !["current", "checking", "unsigned"].includes(state.kind)
+    && (state.kind !== "updated" || corePending);
   const percent = state.kind === "downloading" ? Math.max(0, Math.min(100, state.percent)) : 0;
-  const restart = state.kind === "ready" || state.kind === "scheduled";
+  const restart = state.kind === "ready" || state.kind === "scheduled" || corePending;
   const label = state.kind === "available" ? t("status.updateAvailable")
     : restart ? t("status.updateWaitingRestart")
     : state.kind === "failed" ? t("status.updateFailed")
@@ -25,7 +30,6 @@ export function UpdateIndicator({ state, onClick }: { state: VellumUpdateState; 
         </> : null}
         {restart || state.kind === "installing" ? <><path d="M23 13a8 8 0 1 0 0 7" /><path d="M23 7v6h-6" /></>
           : state.kind === "failed" ? <><path d="M16 8v10" /><circle cx="16" cy="23" r=".5" /></>
-          : state.kind === "updated" ? <path d="m9 16 5 5 10-11" />
           : state.kind === "downloading"
             /* Inside the ring the full-size glyph's tray touches the circle;
                a smaller arrow over a plain baseline keeps clear space. */
