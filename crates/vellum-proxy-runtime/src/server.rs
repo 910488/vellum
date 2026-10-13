@@ -423,6 +423,7 @@ pub(crate) fn build_request_metadata(
         guardian_dispatch: false,
         primary_failure_reason: None,
         connection_id,
+        official_socket_affinity: None,
         codex_identity,
         codex_capabilities,
         force_portable_official_handoff: false,

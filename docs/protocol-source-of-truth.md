@@ -403,6 +403,22 @@ force-refresh invalidates the previous reading. Gates control automatic
 rotation, not whether a request can be sent. Usage by other clients and
 in-flight turns can cross a floor before the next reading. No in-flight request
 is replayed automatically after a quota error.
+Enabling a pool does not reassign an existing WebSocket root turn. Incremental
+frames retain the socket's trusted thread identity and last observed full input
+size, so a tool result is not treated as a new tiny session. A usable incumbent
+also keeps its cache at the next root boundary; quota gates, disabling/removing
+the member, or unavailable authentication can permit a boundary migration.
+A native `usage_limit_reached` frame excludes that incumbent only at the next
+root boundary, even if its quota snapshot is stale. A capacity rate limit does
+not set that exclusion, and a subsequent successful response clears it.
+When root metadata is absent, an incremental continuation conservatively stays
+on its current account rather than inventing a safe turn boundary.
+Known native response ids retain bounded routing-only metadata for up to two
+hours (1,024 entries), allowing a reconnect to recover that same thread binding.
+The mapping is route scoped and carries no request body or authorization data.
+Portable dispatch retains the planned request metadata and the caller's current
+Official tool contract; only input/history and account-scoped continuation
+fields are rewritten. Namespace tools are not flattened on Official resumes.
 Each managed credential is a distinct pool member. Multiple user seats in the
 same workspace may be pooled because upstream quota windows can be scoped to
 the authenticated user; their access tokens, quota caches, gates, and rotation
