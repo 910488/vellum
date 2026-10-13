@@ -120,6 +120,20 @@ struct Inner {
     subagent: SubagentSettings,
     #[serde(default)]
     remote_sidebar_forced: bool,
+    /// Hide the Remote Manager even when managed hosts exist. Kept separate
+    /// from `remote_sidebar_forced` so older settings files read as "auto".
+    #[serde(default)]
+    remote_sidebar_hidden: bool,
+}
+
+/// Whether the Remote Manager sits in the sidebar. `Auto` shows it once a
+/// managed host exists; `Show` and `Hide` override that either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteSidebarMode {
+    Auto,
+    Show,
+    Hide,
 }
 
 pub struct ActiveRequestGuard {
@@ -212,6 +226,7 @@ impl AppState {
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
             remote_sidebar_forced: false,
+            remote_sidebar_hidden: false,
         });
         let migrated = migrate_seeded_route_names(&mut inner.routes)
             | migrate_opencode_access_modes(&mut inner.routes)
@@ -943,16 +958,24 @@ impl AppState {
         self.inner.lock().expect("state poisoned").subagent.clone()
     }
 
-    pub(crate) fn remote_sidebar_forced(&self) -> bool {
-        self.inner.lock().expect("app state poisoned").remote_sidebar_forced
+    pub(crate) fn remote_sidebar_mode(&self) -> RemoteSidebarMode {
+        let inner = self.inner.lock().expect("app state poisoned");
+        if inner.remote_sidebar_hidden {
+            RemoteSidebarMode::Hide
+        } else if inner.remote_sidebar_forced {
+            RemoteSidebarMode::Show
+        } else {
+            RemoteSidebarMode::Auto
+        }
     }
 
-    pub(crate) fn set_remote_sidebar_forced(&self, forced: bool) -> AppResult<()> {
+    pub(crate) fn set_remote_sidebar_mode(&self, mode: RemoteSidebarMode) -> AppResult<()> {
         let mut inner = self.inner.lock().expect("app state poisoned");
-        let previous = inner.remote_sidebar_forced;
-        inner.remote_sidebar_forced = forced;
+        let previous = (inner.remote_sidebar_forced, inner.remote_sidebar_hidden);
+        inner.remote_sidebar_forced = mode == RemoteSidebarMode::Show;
+        inner.remote_sidebar_hidden = mode == RemoteSidebarMode::Hide;
         if let Err(error) = try_persist_inner(&self.data_root, &inner) {
-            inner.remote_sidebar_forced = previous;
+            (inner.remote_sidebar_forced, inner.remote_sidebar_hidden) = previous;
             return Err(AppError::Message(error));
         }
         Ok(())
@@ -2560,6 +2583,7 @@ mod tests {
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
             remote_sidebar_forced: false,
+            remote_sidebar_hidden: false,
         };
         inner
             .routes

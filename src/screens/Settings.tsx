@@ -16,7 +16,7 @@ import { RemoteSidebarPreference } from "@/components/RemoteSidebarPreference";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { I18N_LANGUAGE_SELECTOR_ENABLED, type LocalePreference } from "@/i18n/locale";
 import { readThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
-import { api } from "@/lib/api";
+import { api, type RemoteSidebarMode } from "@/lib/api";
 import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
@@ -68,16 +68,16 @@ export function Settings({
   refreshVersion,
   onRefreshComplete,
   active = true,
-  remoteSidebarForced = false,
-  onRemoteSidebarForced,
+  remoteSidebarMode = "auto",
+  onRemoteSidebarMode,
 }: {
   onChanged: () => void;
   onOpenOnboarding: () => void;
   refreshVersion: number;
   onRefreshComplete: (version: number) => void;
   active?: boolean;
-  remoteSidebarForced?: boolean;
-  onRemoteSidebarForced?: (forced: boolean) => void;
+  remoteSidebarMode?: RemoteSidebarMode;
+  onRemoteSidebarMode?: (mode: RemoteSidebarMode) => void;
 }) {
   const { t } = useTranslation();
   const { sinceLabel } = useLocaleFormat();
@@ -766,7 +766,7 @@ export function Settings({
           的主欄，把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成同一張
           卡裡的兩條橫幅。 */}
       <Card quiet className="prefstrips">
-        {onRemoteSidebarForced ? <RemoteSidebarPreference forced={remoteSidebarForced} onChange={onRemoteSidebarForced} /> : null}
+        {onRemoteSidebarMode ? <RemoteSidebarPreference mode={remoteSidebarMode} onChange={onRemoteSidebarMode} /> : null}
       {I18N_LANGUAGE_SELECTOR_ENABLED ? (
         <div className="prefstrip">
           <div className="prefstrip__copy">

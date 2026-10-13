@@ -1,7 +1,7 @@
 //! Tauri commands for remote broker control-plane wiring.
 
 use crate::error::AppResult;
-use crate::state::AppState;
+use crate::state::{AppState, RemoteSidebarMode};
 use sha2::{Digest, Sha256};
 
 #[tauri::command]
@@ -9,8 +9,13 @@ pub fn get_remote_manager_feature_flags(state: tauri::State<'_, AppState>) -> se
     sidebar_flags(&state)
 }
 
-fn sidebar_visible(enabled: bool, has_hosts: bool, forced: bool) -> bool {
-    enabled && (has_hosts || forced)
+fn sidebar_visible(enabled: bool, has_hosts: bool, mode: RemoteSidebarMode) -> bool {
+    enabled
+        && match mode {
+            RemoteSidebarMode::Auto => has_hosts,
+            RemoteSidebarMode::Show => true,
+            RemoteSidebarMode::Hide => false,
+        }
 }
 
 fn sidebar_flags(state: &AppState) -> serde_json::Value {
@@ -19,15 +24,15 @@ fn sidebar_flags(state: &AppState) -> serde_json::Value {
         .unwrap_or(true);
     serde_json::json!({
         "nativeCodexRemoteManager": enabled,
-        "showInSidebar": sidebar_visible(enabled, state.remote().has_hosts().unwrap_or(false), state.remote_sidebar_forced()),
-        "sidebarForced": state.remote_sidebar_forced(),
+        "showInSidebar": sidebar_visible(enabled, state.remote().has_hosts().unwrap_or(false), state.remote_sidebar_mode()),
+        "sidebarMode": state.remote_sidebar_mode(),
         "legacyBrokerHostsDropped": state.remote().dropped_legacy_broker_hosts(),
     })
 }
 
 #[tauri::command]
-pub fn set_remote_sidebar_forced(state: tauri::State<'_, AppState>, forced: bool) -> AppResult<serde_json::Value> {
-    state.set_remote_sidebar_forced(forced)?;
+pub fn set_remote_sidebar_mode(state: tauri::State<'_, AppState>, mode: RemoteSidebarMode) -> AppResult<serde_json::Value> {
+    state.set_remote_sidebar_mode(mode)?;
     Ok(sidebar_flags(&state))
 }
 
@@ -786,22 +791,24 @@ pub async fn remote_session_summary(
 mod tests {
     #[test]
     fn sidebar_appears_only_for_managed_hosts_or_explicit_preference() {
-        assert!(!super::sidebar_visible(true, false, false));
-        assert!(super::sidebar_visible(true, true, false));
-        assert!(super::sidebar_visible(true, false, true));
-        assert!(!super::sidebar_visible(false, true, true));
+        use crate::state::RemoteSidebarMode::{Auto, Hide, Show};
+        assert!(!super::sidebar_visible(true, false, Auto));
+        assert!(super::sidebar_visible(true, true, Auto));
+        assert!(super::sidebar_visible(true, false, Show));
+        assert!(!super::sidebar_visible(true, true, Hide));
+        assert!(!super::sidebar_visible(false, true, Show));
     }
 
     #[test]
     fn sidebar_preference_is_saved_in_existing_settings() {
+        use crate::state::RemoteSidebarMode::{Auto, Hide, Show};
         let dir = tempfile::tempdir().unwrap();
-        let state = crate::state::AppState::with_data_dir(dir.path().to_path_buf());
-        assert!(!state.remote_sidebar_forced());
-        state.set_remote_sidebar_forced(true).unwrap();
-        let reopened = crate::state::AppState::with_data_dir(dir.path().to_path_buf());
-        assert!(reopened.remote_sidebar_forced());
-        reopened.set_remote_sidebar_forced(false).unwrap();
-        assert!(!crate::state::AppState::with_data_dir(dir.path().to_path_buf()).remote_sidebar_forced());
+        let open = || crate::state::AppState::with_data_dir(dir.path().to_path_buf());
+        assert_eq!(open().remote_sidebar_mode(), Auto);
+        for mode in [Show, Hide, Auto] {
+            open().set_remote_sidebar_mode(mode).unwrap();
+            assert_eq!(open().remote_sidebar_mode(), mode);
+        }
     }
     #[test]
     fn boundary_key_provisioning_precedes_the_manual_restart_rpc_in_source_order() {

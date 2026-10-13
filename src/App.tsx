@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api, recordInvokeResult } from "@/lib/api";
+import { api, recordInvokeResult, type RemoteSidebarMode } from "@/lib/api";
 import {
   buildOnboardingConnections,
   codexCompatibleProbeModels,
@@ -50,7 +50,7 @@ export function App() {
   const { t } = useTranslation();
   const [screen, setScreen] = useState<ScreenId>("today");
   const [remoteVisible, setRemoteVisible] = useState(false);
-  const [remoteSidebarForced, setRemoteSidebarForced] = useState(false);
+  const [remoteSidebarMode, setRemoteSidebarMode] = useState<RemoteSidebarMode>("auto");
   const [mountedScreens, setMountedScreens] = useState<Set<ScreenId>>(
     () => new Set<ScreenId>(["today"]),
   );
@@ -121,7 +121,7 @@ export function App() {
       void api.getRemoteManagerFeatureFlags().then((flags) => {
         if (!active) return;
         setRemoteVisible(Boolean(flags.showInSidebar));
-        setRemoteSidebarForced(Boolean(flags.sidebarForced));
+        setRemoteSidebarMode(flags.sidebarMode ?? "auto");
       }).catch(() => {});
     };
     refreshFlags();
@@ -608,11 +608,11 @@ export function App() {
               refreshVersion={refreshVersions.settings ?? 0}
               onRefreshComplete={pageRefreshComplete}
               active={screen === "settings"}
-              remoteSidebarForced={remoteSidebarForced}
-              onRemoteSidebarForced={(forced) => {
-                void api.setRemoteSidebarForced(forced).then((flags) => {
+              remoteSidebarMode={remoteSidebarMode}
+              onRemoteSidebarMode={(mode) => {
+                void api.setRemoteSidebarMode(mode).then((flags) => {
                   setRemoteVisible(flags.showInSidebar);
-                  setRemoteSidebarForced(flags.sidebarForced);
+                  setRemoteSidebarMode(flags.sidebarMode);
                 }).catch(() => setRefreshError(t("common.saveFailed")));
               }}
             />

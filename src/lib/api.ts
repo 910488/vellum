@@ -221,21 +221,22 @@ function previewEnhancedRuntimeStatus(): EnhancedDesktopRuntimeStatus {
   };
 }
 
-let previewRemoteSidebarForced = false;
+export type RemoteSidebarMode = "auto" | "show" | "hide";
+let previewRemoteSidebarMode: RemoteSidebarMode = "auto";
 export const api = {
   getRemoteManagerFeatureFlags(): Promise<{
     nativeCodexRemoteManager: boolean;
     showInSidebar?: boolean;
-    sidebarForced?: boolean;
+    sidebarMode?: RemoteSidebarMode;
     legacyBrokerHostsDropped?: string[];
   }> {
-    if (!hasTauri()) return delay({ nativeCodexRemoteManager: true, showInSidebar: previewRemoteSidebarForced, sidebarForced: previewRemoteSidebarForced, legacyBrokerHostsDropped: [] });
+    if (!hasTauri()) return delay({ nativeCodexRemoteManager: true, showInSidebar: previewRemoteSidebarMode === "show", sidebarMode: previewRemoteSidebarMode, legacyBrokerHostsDropped: [] });
     return call("get_remote_manager_feature_flags");
   },
 
-  setRemoteSidebarForced(forced: boolean): Promise<{ showInSidebar: boolean; sidebarForced: boolean }> {
-    if (!hasTauri()) { previewRemoteSidebarForced = forced; return delay({ showInSidebar: forced, sidebarForced: forced }); }
-    return afterSettingsChange(call<{ showInSidebar: boolean; sidebarForced: boolean }>("set_remote_sidebar_forced", { forced })).then((flags) => { window.dispatchEvent(new Event("vellum:remote-sidebar-changed")); return flags; });
+  setRemoteSidebarMode(mode: RemoteSidebarMode): Promise<{ showInSidebar: boolean; sidebarMode: RemoteSidebarMode }> {
+    if (!hasTauri()) { previewRemoteSidebarMode = mode; return delay({ showInSidebar: mode === "show", sidebarMode: mode }); }
+    return afterSettingsChange(call<{ showInSidebar: boolean; sidebarMode: RemoteSidebarMode }>("set_remote_sidebar_mode", { mode })).then((flags) => { window.dispatchEvent(new Event("vellum:remote-sidebar-changed")); return flags; });
   },
 
   discoverRemoteConnections(): Promise<RemoteHostCandidate[]> {
