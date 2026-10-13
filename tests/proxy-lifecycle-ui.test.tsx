@@ -94,6 +94,31 @@ describe("proxy lifecycle button state", () => {
     vi.clearAllMocks();
   });
 
+  it("says loading, not 'no providers', until the first overview arrives", async () => {
+    let resolveOverviews: ((value: unknown[]) => void) | null = null;
+    apiMocks.getProviderOverviews.mockImplementation(
+      () => new Promise((resolve) => { resolveOverviews = resolve; }),
+    );
+    render(
+      <Today
+        proxy={stopped}
+        overview={overview}
+        onNavigate={() => {}}
+        onChanged={() => {}}
+        onProxyChanged={() => {}}
+        refreshVersion={0}
+        onRefreshComplete={() => {}}
+        active
+      />,
+    );
+    await waitFor(() => expect(resolveOverviews).not.toBeNull());
+    expect(screen.queryByText(i18n.t("today.providers.empty"))).toBeNull();
+    expect(screen.queryByText(i18n.t("today.quota.noData"))).toBeNull();
+    expect(screen.getAllByText(i18n.t("common.loading")).length).toBeGreaterThanOrEqual(2);
+    resolveOverviews!([]);
+    expect(await screen.findByText(i18n.t("today.providers.empty"))).not.toBeNull();
+  });
+
   it("applies a lifecycle event on Today without polling getProxyStatus", async () => {
     let emitLifecycle: ((status: ProxyStatus) => void) | null = null;
     apiMocks.subscribeProxyLifecycle.mockImplementation(async (onStatus: (status: ProxyStatus) => void) => {
