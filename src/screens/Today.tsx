@@ -62,6 +62,9 @@ export function Today({
   const { exact, resetLabel, sinceLabel } = useLocaleFormat();
   const [proxyBusy, setProxyBusy] = useState(false);
   const [providers, setProviders] = useState<ProviderOverview[]>([]);
+  /* 額度要逐家問上游，第一次可能好幾秒。沒問完之前說「沒有 Provider」
+     是錯的——那句話叫人去設定勾選，而他早就勾了。 */
+  const [providersLoaded, setProvidersLoaded] = useState(false);
   const [dashboardRouteIds, setDashboardRouteIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [budget, setBudget] = useState<ContextBudget | null>(null);
@@ -94,6 +97,7 @@ export function Today({
       ]);
       if (generation !== loadGeneration.current) return;
       if (nextProviders.status === "fulfilled") setProviders(nextProviders.value);
+      setProvidersLoaded(true);
       if (nextSessions.status === "fulfilled") setSessions(nextSessions.value);
       if (nextRoutes.status === "fulfilled") {
         const saved = window.localStorage.getItem("vellum.dashboard.providers");
@@ -342,7 +346,7 @@ export function Today({
               </p>
             </>
           ) : (
-            <Empty>{t("today.quota.noData")}</Empty>
+            <Empty>{t(providersLoaded ? "today.quota.noData" : "common.loading")}</Empty>
           )}
         </Card>
         {/* 「用了幾 %」本身不可怕，可怕的是「什麼時候會被壓縮」。
@@ -557,7 +561,7 @@ export function Today({
             })}
           </div>
         ) : (
-          <Empty>{t("today.providers.empty")}</Empty>
+          <Empty>{t(providersLoaded ? "today.providers.empty" : "common.loading")}</Empty>
         )}
       </Card>
 
