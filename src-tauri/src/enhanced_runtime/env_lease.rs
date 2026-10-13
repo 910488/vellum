@@ -233,7 +233,7 @@ fn release_file(lease_path: &Path) -> Result<ReleaseOutcome, EnvironmentLeaseErr
 pub fn read_user_environment(variable: &str) -> Result<Option<String>, EnvironmentLeaseError> {
     #[cfg(test)]
     {
-        return Ok(test_environment::read(variable));
+        Ok(test_environment::read(variable))
     }
     #[cfg(all(not(test), target_os = "windows"))]
     {
@@ -270,7 +270,7 @@ fn write_user_environment(
     #[cfg(test)]
     {
         test_environment::write(variable, value);
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(not(test), target_os = "windows"))]
     {
