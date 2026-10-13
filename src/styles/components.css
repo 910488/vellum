@@ -5520,3 +5520,42 @@ html[data-performance="low"] .card {
   .remote-maintenance-list > div > small { grid-column: 1; }
   .remote-maintenance-list > div > .btn { grid-column: 2; grid-row: 1 / span 2; }
 }
+
+.update-indicator-slot {
+  display: inline-flex;
+  flex: 0 0 2.25rem;
+  min-height: 2.25rem;
+  align-items: center;
+}
+.update-indicator {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: .25rem;
+  border: 0;
+  border-radius: var(--radius-sm, .4rem);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  animation: update-indicator-in 140ms ease-out;
+  transition: background-color 140ms ease-out;
+}
+.update-indicator:hover { background: var(--lavender-wash); }
+.update-indicator svg { width: 100%; height: 100%; }
+.update-indicator__track { opacity: .18; }
+.update-indicator__progress {
+  transform: rotate(-90deg);
+  transform-origin: center;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 600ms linear;
+}
+.update-indicator--failed { color: var(--coral); }
+.vupdate .meter__fill { transition: width 600ms linear; }
+@keyframes update-indicator-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .update-indicator, .update-indicator__progress, .vupdate .meter__fill {
+    animation: none;
+    transition: none;
+  }
+}

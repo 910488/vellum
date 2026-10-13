@@ -99,10 +99,11 @@ function actionableRemoteFailure(stage: string | null | undefined): string | nul
   return stage && REMOTE_FAILURE_STAGES.has(stage) ? stage : null;
 }
 
-export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
+export function EnhancedCore({ status, refreshVersion, onRefreshComplete, onOpenUpdates }: {
   status: EnhancedDesktopRuntimeStatus | null;
   refreshVersion: number;
   onRefreshComplete: (version: number) => void;
+  onOpenUpdates?: () => void;
 }) {
   const { t } = useTranslation();
   const [report, setReport] = useState<RuntimeObservations | null>(null);
@@ -205,6 +206,10 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete }: {
       {exportPath ? <Notice>{t("enhanced.exported")}: <code>{exportPath}</code></Notice> : null}
       {error ? <Notice tone="warn" raw={error}>{t("enhanced.staleWarning")}</Notice> : null}
       {runtime?.unverified ? <Notice tone="warn">{t("enhanced.unverifiedNote")}</Notice> : null}
+      {runtime && !runtime.coreAvailable ? <Notice tone="warn">
+        {t("settings.page.enhancedRuntime.inject.blocked.noCore")}
+        {onOpenUpdates ? <Btn soft mini onClick={onOpenUpdates}>{t("settings.page.updates.title")}</Btn> : null}
+      </Notice> : null}
       {runtime?.missingHelpers.length ? (
         <Notice tone="warn">
           {t("enhanced.missingHelpers", { list: runtime.missingHelpers.join(t("common.itemSeparator")) })}

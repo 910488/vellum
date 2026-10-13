@@ -90,6 +90,7 @@ struct ProxyControl {
     draining: bool,
     restart_reasons: Vec<RuntimeNotice>,
     restart_process_identity: Option<String>,
+    codex_process_baseline: Option<crate::codex_restart::ProcessBaseline>,
     /// The launch id of a superseded live launch this session already spent
     /// its one automatic repair on. See [`AppState::claim_launch_repair`].
     repaired_launch_id: Option<String>,
@@ -117,6 +118,8 @@ struct Inner {
     /// Proxy apply and hot-updates them while the Proxy is running.
     #[serde(default)]
     subagent: SubagentSettings,
+    #[serde(default)]
+    remote_sidebar_forced: bool,
 }
 
 pub struct ActiveRequestGuard {
@@ -208,6 +211,7 @@ impl AppState {
             findings: Vec::new(),
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
+            remote_sidebar_forced: false,
         });
         let migrated = migrate_seeded_route_names(&mut inner.routes)
             | migrate_opencode_access_modes(&mut inner.routes)
@@ -290,6 +294,7 @@ impl AppState {
                 draining: false,
                 restart_reasons: Vec::new(),
                 restart_process_identity: None,
+                codex_process_baseline: None,
                 repaired_launch_id: None,
                 live_applied: Vec::new(),
                 active_catalog_version: None,
@@ -936,6 +941,21 @@ impl AppState {
 
     pub fn subagent_settings(&self) -> SubagentSettings {
         self.inner.lock().expect("state poisoned").subagent.clone()
+    }
+
+    pub(crate) fn remote_sidebar_forced(&self) -> bool {
+        self.inner.lock().expect("app state poisoned").remote_sidebar_forced
+    }
+
+    pub(crate) fn set_remote_sidebar_forced(&self, forced: bool) -> AppResult<()> {
+        let mut inner = self.inner.lock().expect("app state poisoned");
+        let previous = inner.remote_sidebar_forced;
+        inner.remote_sidebar_forced = forced;
+        if let Err(error) = try_persist_inner(&self.data_root, &inner) {
+            inner.remote_sidebar_forced = previous;
+            return Err(AppError::Message(error));
+        }
+        Ok(())
     }
 
     /// Validate and persist sub-agent defaults.
@@ -1851,6 +1871,44 @@ impl AppState {
         }
     }
 
+    pub(crate) fn set_codex_process_baseline(
+        &self,
+        baseline: Option<crate::codex_restart::ProcessBaseline>,
+    ) {
+        self.proxy.lock().expect("proxy state poisoned").codex_process_baseline = baseline;
+    }
+
+    pub(crate) fn reconcile_codex_proxy_contract(
+        &self,
+        identity: &str,
+        current: Option<&crate::codex_restart::ProxyContract>,
+        successful_request: bool,
+    ) -> bool {
+        let mut proxy = self.proxy.lock().expect("proxy state poisoned");
+        if !proxy.codex_process_baseline.as_ref().is_some_and(|baseline| baseline.matches(identity, current, successful_request)) {
+            return false;
+        }
+        let baseline = proxy.codex_process_baseline.as_mut().expect("matched baseline");
+        let persist = successful_request && !baseline.contract_loaded;
+        baseline.contract_loaded = true;
+        let confirmed = persist.then(|| baseline.clone());
+        // A successful unchanged transport does not acknowledge a real catalog
+        // change or Enhanced adoption; clear only the transport restart reasons.
+        proxy.restart_reasons.retain(|reason| !matches!(reason.code.as_str(), "codexRunning" | "proxyStoppedCodexRestartRequired"));
+        if proxy.restart_reasons.is_empty() {
+            proxy.restart_process_identity = None;
+        }
+        drop(proxy);
+        if let Some(confirmed) = confirmed {
+            confirmed.persist(&self.data_root);
+        }
+        true
+    }
+
+    pub(crate) fn has_codex_proxy_restart_reason(&self) -> bool {
+        self.proxy.lock().expect("proxy state poisoned").restart_reasons.iter().any(|reason| reason.code == "codexRunning")
+    }
+
     /// Records a restart reason together with the Codex instance that still
     /// has the previous configuration loaded. Keeping both writes under one
     /// lock prevents a status poll from observing an unreconcilable reason
@@ -2501,6 +2559,7 @@ mod tests {
             findings: Vec::new(),
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
+            remote_sidebar_forced: false,
         };
         inner
             .routes

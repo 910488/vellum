@@ -7,6 +7,7 @@ pub mod boot;
 pub mod budget;
 pub mod catalog;
 pub mod codex;
+mod codex_restart;
 pub mod codex_oauth;
 pub mod codex_profile;
 pub mod codex_quota;
@@ -224,6 +225,9 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                updates::check_on_focus(window.app_handle());
+            }
             // The close button is a data-plane stop, not a cosmetic hide.
             // Leaving the Proxy alive behind a hidden tray window made users
             // reasonably believe Vellum was closed while Codex config and an
@@ -344,6 +348,7 @@ pub fn run() {
             commands::probe_web_search,
             commands::get_subagent_capability,
             remote::commands::get_remote_manager_feature_flags,
+            remote::commands::set_remote_sidebar_forced,
             remote::commands::get_remote_release_status,
             remote::commands::get_desktop_codex_compatibility,
             remote::commands::update_remote_codex_for_desktop,

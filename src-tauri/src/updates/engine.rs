@@ -45,6 +45,14 @@ struct PersistedState {
     /// Unix seconds of the last check that reached GitHub.
     #[serde(default)]
     last_checked_at: Option<i64>,
+    #[serde(default)]
+    release_indexes: HashMap<String, ReleaseIndex>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReleaseIndex {
+    etag: Option<String>,
+    releases: Vec<super::github::GithubRelease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +405,32 @@ impl UpdateEngine {
                 UpdateComponent::Core,
             ],
         };
+        let mut listings = HashMap::new();
+        for item in &components {
+            let repo = item.github_repo();
+            if listings.contains_key(repo) {
+                continue;
+            }
+            let previous = state.release_indexes.get(repo);
+            let mut listed = self
+                .source
+                .list_releases(repo, previous.and_then(|index| index.etag.as_deref()))
+                .map_err(AppError::Message)?;
+            if listed.not_modified {
+                if let Some(previous) = previous {
+                    listed.releases = previous.releases.clone();
+                }
+            } else if !listed.rate_limited {
+                state.release_indexes.insert(
+                    repo.into(),
+                    ReleaseIndex {
+                        etag: listed.etag.clone(),
+                        releases: listed.releases.clone(),
+                    },
+                );
+            }
+            listings.insert(repo, listed);
+        }
         for item in components {
             let current = currents.of(item);
             let record = Self::layer_mut(&mut state, item, current);
@@ -409,10 +443,7 @@ impl UpdateEngine {
             record.phase =
                 transition(record.phase, &UpdateEvent::StartCheck).unwrap_or(UpdatePhase::Checking);
             record.operation_id = Some(op.operation_id.clone());
-            let listed = self
-                .source
-                .list_releases(item.github_repo(), None)
-                .map_err(AppError::Message)?;
+            let listed = &listings[item.github_repo()];
             if listed.rate_limited {
                 if let Some(incomplete) = incomplete {
                     *record = incomplete;
@@ -444,16 +475,33 @@ impl UpdateEngine {
                 else {
                     continue;
                 };
-                let raw = self
-                    .source
-                    .fetch_bytes(&manifest_asset.browser_download_url)
-                    .map_err(AppError::Message)?;
-                let sig = self
-                    .source
-                    .fetch_bytes(&sig_asset.browser_download_url)
-                    .map_err(AppError::Message)?;
+                let cached = listed
+                    .not_modified
+                    .then(|| {
+                        release
+                            .tag_name
+                            .strip_prefix(item.tag_prefix())
+                            .filter(|version| super::manifest::parse_version(version).is_some())
+                            .and_then(|version| {
+                                load_checked_manifest(&self.root, item, version).ok()
+                            })
+                    })
+                    .flatten();
+                let (raw, sig) = match cached {
+                    Some(cached) => cached,
+                    None => (
+                        self.source
+                            .fetch_bytes(&manifest_asset.browser_download_url)
+                            .map_err(AppError::Message)?,
+                        self.source
+                            .fetch_bytes(&sig_asset.browser_download_url)
+                            .map_err(AppError::Message)?,
+                    ),
+                };
                 match verify_signed_manifest(&raw, &sig, &self.trust) {
                     Ok(manifest) => {
+                        persist_checked_manifest(&self.root, item, &manifest.version, &raw, &sig)
+                            .map_err(|error| AppError::Message(error.to_string()))?;
                         if item == UpdateComponent::Core {
                             signed_core_candidates.insert(manifest.release_tag.clone(), (raw, sig));
                         }
@@ -898,20 +946,29 @@ impl UpdateEngine {
     }
 
     fn reconcile_identical_bundled_core(&self) -> AppResult<()> {
-        let Some(bundled) =
-            crate::enhanced_runtime::desktop_manager::packaged_enhanced_executable(&self.root)
-        else {
-            return Ok(());
-        };
-        self.reconcile_core_with_bundled(&bundled)
+        let bundled =
+            crate::enhanced_runtime::desktop_manager::packaged_enhanced_executable(&self.root);
+        self.reconcile_core_with_bundled(bundled.as_deref())
     }
 
-    fn reconcile_core_with_bundled(&self, bundled: &Path) -> AppResult<()> {
+    fn reconcile_core_with_bundled(&self, bundled: Option<&Path>) -> AppResult<()> {
+        // A verified active slot is still a runnable core; do not bypass its
+        // managed next-start handoff merely because no bundled image exists.
+        if bundled.is_none()
+            && CoreSlots::load(&self.root)
+                .active
+                .as_ref()
+                .is_some_and(|active| {
+                    super::core_slots::verified_slot(&self.root, active, &self.trust)
+                })
+        {
+            return Ok(());
+        }
         let Some(slot) = CoreSlots::load(&self.root).pending else {
             return Ok(());
         };
         if !super::core_slots::verified_slot(&self.root, &slot, &self.trust)
-            || !super::core_slots::bundled_tree_matches(&slot, bundled)
+            || bundled.is_some_and(|path| !super::core_slots::bundled_tree_matches(&slot, path))
         {
             return Ok(());
         }
@@ -938,7 +995,14 @@ impl UpdateEngine {
         self.record_journal(
             &op,
             UpdatePhase::Applied,
-            Some("pending core already matches the verified bundled tree".into()),
+            Some(
+                if bundled.is_some() {
+                    "pending core already matches the verified bundled tree"
+                } else {
+                    "verified pending core recovered a missing bundled core"
+                }
+                .into(),
+            ),
         )
     }
 
@@ -1753,6 +1817,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conditional_check_reuses_signed_manifests_and_lists_each_repo_once() {
+        struct ConditionalSource {
+            inner: SharedSource,
+            lists: std::sync::atomic::AtomicUsize,
+            fetches: std::sync::atomic::AtomicUsize,
+        }
+        impl super::super::github::ReleaseSource for ConditionalSource {
+            fn list_releases(
+                &self,
+                repo: &str,
+                etag: Option<&str>,
+            ) -> Result<ListedReleases, String> {
+                use std::sync::atomic::Ordering;
+                self.lists.fetch_add(1, Ordering::SeqCst);
+                if etag == Some("release-index-v1") {
+                    return Ok(ListedReleases {
+                        etag: etag.map(str::to_string),
+                        not_modified: true,
+                        rate_limited: false,
+                        retry_after_secs: 0,
+                        releases: Vec::new(),
+                    });
+                }
+                let mut listed = self.inner.list_releases(repo, etag)?;
+                listed.etag = Some("release-index-v1".into());
+                Ok(listed)
+            }
+            fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+                self.fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.fetch_bytes(url)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.0",
+            b"core",
+            Arc::new(RecordingExecutor::default()),
+        );
+        let source = Arc::new(ConditionalSource {
+            inner: engine.source.clone(),
+            lists: Default::default(),
+            fetches: Default::default(),
+        });
+        engine.source = source.clone();
+        engine.check(None, currents).await.unwrap();
+        assert_eq!(source.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(source.fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Re-open like the production command path: ETag/index survive engine creation.
+        let reopened = UpdateEngine::open(dir.path(), engine.trust.clone(), source.clone());
+        reopened.check(None, currents).await.unwrap();
+        assert_eq!(source.lists.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(source.fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            reopened
+                .snapshot("0.2.9", "0.2.9", "bundled")
+                .core
+                .available_version
+                .as_deref(),
+            Some("0.3.0")
+        );
+    }
+
+    #[tokio::test]
     async fn duplicate_download_shares_one_flight() {
         let dir = tempfile::tempdir().unwrap();
         let signing = SigningKey::from_bytes(&[4u8; 32]);
@@ -2180,6 +2310,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_bundled_core_recovers_verified_pending_with_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        let pending = CoreSlots::load(dir.path()).pending.unwrap();
+        engine.reconcile_core_with_bundled(None).unwrap();
+        let resolved =
+            super::super::core_slots::resolve_enhanced_runtime_with(dir.path(), &engine.trust)
+                .unwrap();
+        assert_eq!(resolved.path, pending.path);
+        assert_eq!(resolved.helpers, pending.helpers);
+        assert!(!resolved.helpers.is_empty());
+        assert!(CoreSlots::load(dir.path()).pending.is_none());
+        let record = &engine.load().layers["core"];
+        assert_eq!(record.phase, UpdatePhase::Applied);
+        assert_eq!(record.current_version, "0.3.1");
+        assert_eq!(record.target_version.as_deref(), Some("0.3.1"));
+    }
+
+    #[tokio::test]
+    async fn missing_bundled_core_does_not_promote_a_tampered_pending_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        let pending = CoreSlots::load(dir.path()).pending.unwrap();
+        std::fs::write(&pending.helpers[0], b"tampered").unwrap();
+        engine.reconcile_core_with_bundled(None).unwrap();
+        assert!(CoreSlots::load(dir.path()).pending.is_some());
+        assert!(CoreSlots::load(dir.path()).active.is_none());
+    }
+
+    #[tokio::test]
     async fn identical_bundled_core_settles_pending_only_after_all_signed_files_match() {
         let dir = tempfile::tempdir().unwrap();
         let payload = core_archive();
@@ -2211,13 +2399,13 @@ mod tests {
         std::fs::create_dir(&bundled_dir).unwrap();
         let bundled = bundled_dir.join("vellum-enhanced-codex.exe");
         std::fs::write(&bundled, b"core").unwrap();
-        engine.reconcile_core_with_bundled(&bundled).unwrap();
+        engine.reconcile_core_with_bundled(Some(&bundled)).unwrap();
         assert!(
             CoreSlots::load(dir.path()).pending.is_some(),
             "matching executable alone cannot skip helper verification"
         );
         std::fs::write(bundled_dir.join("codex-command-runner.exe"), b"helper").unwrap();
-        engine.reconcile_core_with_bundled(&bundled).unwrap();
+        engine.reconcile_core_with_bundled(Some(&bundled)).unwrap();
         let slots = CoreSlots::load(dir.path());
         assert!(slots.pending.is_none());
         assert_eq!(slots.active.unwrap().version, "0.3.1");

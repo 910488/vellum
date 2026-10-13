@@ -4,6 +4,29 @@
 ; overwrites or removes the files.
 !include "LogicLib.nsh"
 Var VellumRetiredMask
+Var VellumRetiredSuffix
+
+!ifndef VELLUM_INSTALL_CORE
+  !if /FileExists "${__FILEDIR__}\..\binaries\vellum-enhanced-codex.exe"
+    !define VELLUM_INSTALL_CORE 1
+  !else
+    !define VELLUM_INSTALL_CORE 0
+  !endif
+!endif
+!ifndef VELLUM_INSTALL_BRIDGE
+  !if /FileExists "${__FILEDIR__}\..\binaries\vellum-codex-app-server.exe"
+    !define VELLUM_INSTALL_BRIDGE 1
+  !else
+    !define VELLUM_INSTALL_BRIDGE 0
+  !endif
+!endif
+!ifndef VELLUM_INSTALL_RELAY
+  !if /FileExists "${__FILEDIR__}\..\binaries\vellum-codex-relay.exe"
+    !define VELLUM_INSTALL_RELAY 1
+  !else
+    !define VELLUM_INSTALL_RELAY 0
+  !endif
+!endif
 
 !macro VELLUM_RESTORE_IMAGE FILE FLAG
   IntOp $R2 $VellumRetiredMask & ${FLAG}
@@ -57,12 +80,42 @@ FunctionEnd
 
 !macro VELLUM_RETIRE_SIDECARS
   StrCpy $VellumRetiredMask 0
+  StrCpy $VellumRetiredSuffix "$R0-$R1"
+!if ${VELLUM_INSTALL_BRIDGE} == 1
   !insertmacro VELLUM_RETIRE_IMAGE "binaries\vellum-codex-app-server.exe" 1
+!endif
+!if ${VELLUM_INSTALL_CORE} == 1
   !insertmacro VELLUM_RETIRE_IMAGE "binaries\vellum-enhanced-codex.exe" 2
+!endif
+!if ${VELLUM_INSTALL_RELAY} == 1
   !insertmacro VELLUM_RETIRE_IMAGE "binaries\vellum-codex-relay.exe" 4
-  !insertmacro VELLUM_RETIRE_IMAGE "vellum-codex-app-server.exe" 8
-  !insertmacro VELLUM_RETIRE_IMAGE "vellum-enhanced-codex.exe" 16
-  !insertmacro VELLUM_RETIRE_IMAGE "vellum-codex-relay.exe" 32
+!endif
+  ; Resources are installed beneath binaries; legacy root images are not
+  ; destinations in this payload and must not be retired.
+!macroend
+
+; Never leave an original absent when this payload did not replace it.
+!macro VELLUM_RESTORE_UNREPLACED_IMAGE FILE FLAG
+  IntOp $R2 $VellumRetiredMask & ${FLAG}
+  ${If} $R2 != 0
+  ${AndIfNot} ${FileExists} "$INSTDIR\${FILE}"
+    ClearErrors
+    Rename "$INSTDIR\${FILE}.old-$VellumRetiredSuffix" "$INSTDIR\${FILE}"
+    ${If} ${Errors}
+      DetailPrint "Unable to restore unreplaced ${FILE}; retaining its old image."
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  Push $R2
+  !insertmacro VELLUM_RESTORE_UNREPLACED_IMAGE "vellum-codex-relay.exe" 32
+  !insertmacro VELLUM_RESTORE_UNREPLACED_IMAGE "vellum-enhanced-codex.exe" 16
+  !insertmacro VELLUM_RESTORE_UNREPLACED_IMAGE "vellum-codex-app-server.exe" 8
+  !insertmacro VELLUM_RESTORE_UNREPLACED_IMAGE "binaries\vellum-codex-relay.exe" 4
+  !insertmacro VELLUM_RESTORE_UNREPLACED_IMAGE "binaries\vellum-enhanced-codex.exe" 2
+  !insertmacro VELLUM_RESTORE_UNREPLACED_IMAGE "binaries\vellum-codex-app-server.exe" 1
+  Pop $R2
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL

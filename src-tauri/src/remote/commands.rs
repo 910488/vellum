@@ -6,13 +6,29 @@ use sha2::{Digest, Sha256};
 
 #[tauri::command]
 pub fn get_remote_manager_feature_flags(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    sidebar_flags(&state)
+}
+
+fn sidebar_visible(enabled: bool, has_hosts: bool, forced: bool) -> bool {
+    enabled && (has_hosts || forced)
+}
+
+fn sidebar_flags(state: &AppState) -> serde_json::Value {
     let enabled = std::env::var("VELLUM_NATIVE_CODEX_REMOTE_MANAGER")
         .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
         .unwrap_or(true);
     serde_json::json!({
         "nativeCodexRemoteManager": enabled,
+        "showInSidebar": sidebar_visible(enabled, state.remote().has_hosts().unwrap_or(false), state.remote_sidebar_forced()),
+        "sidebarForced": state.remote_sidebar_forced(),
         "legacyBrokerHostsDropped": state.remote().dropped_legacy_broker_hosts(),
     })
+}
+
+#[tauri::command]
+pub fn set_remote_sidebar_forced(state: tauri::State<'_, AppState>, forced: bool) -> AppResult<serde_json::Value> {
+    state.set_remote_sidebar_forced(forced)?;
+    Ok(sidebar_flags(&state))
 }
 
 #[tauri::command]
@@ -768,6 +784,25 @@ pub async fn remote_session_summary(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sidebar_appears_only_for_managed_hosts_or_explicit_preference() {
+        assert!(!super::sidebar_visible(true, false, false));
+        assert!(super::sidebar_visible(true, true, false));
+        assert!(super::sidebar_visible(true, false, true));
+        assert!(!super::sidebar_visible(false, true, true));
+    }
+
+    #[test]
+    fn sidebar_preference_is_saved_in_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::with_data_dir(dir.path().to_path_buf());
+        assert!(!state.remote_sidebar_forced());
+        state.set_remote_sidebar_forced(true).unwrap();
+        let reopened = crate::state::AppState::with_data_dir(dir.path().to_path_buf());
+        assert!(reopened.remote_sidebar_forced());
+        reopened.set_remote_sidebar_forced(false).unwrap();
+        assert!(!crate::state::AppState::with_data_dir(dir.path().to_path_buf()).remote_sidebar_forced());
+    }
     #[test]
     fn boundary_key_provisioning_precedes_the_manual_restart_rpc_in_source_order() {
         let source = include_str!("commands.rs");

@@ -6,17 +6,21 @@ import { useTranslation } from "react-i18next";
 import { noticeText } from "@/lib/notice";
 import { headline, type SystemStatus } from "@/lib/status";
 import { Btn, Pill } from "@/components/ui";
+import { UpdateIndicator } from "@/components/UpdateIndicator";
+import { vellumUpdateState } from "@/lib/vellumUpdate";
 
 export function StatusBar({
   status,
   refreshing,
   refreshError,
   onRefresh,
+  onOpenUpdates,
 }: {
   status: SystemStatus;
   refreshing: boolean;
   refreshError: string | null;
   onRefresh: () => void;
+  onOpenUpdates?: () => void;
 }) {
   const { t } = useTranslation();
   const h = headline(status);
@@ -188,10 +192,7 @@ export function StatusBar({
           {t("status.restartCodexRequired")}
         </Pill>
       ) : null}
-      {h.updateAttention === "available" ? <Pill tone="warn" dot>{t("status.updateAvailable")}</Pill> : null}
-      {h.updateAttention === "waitingIdle" ? <Pill tone="warn" dot>{t("status.updateWaitingIdle")}</Pill> : null}
-      {h.updateAttention === "waitingRestart" ? <Pill tone="warn" dot>{t("status.updateWaitingRestart")}</Pill> : null}
-      {h.updateAttention === "failed" ? <Pill tone="warn" dot>{t("status.updateFailed")}</Pill> : null}
+      <UpdateIndicator state={status.updates ? vellumUpdateState(status.updates, { checking: false }) : { kind: "current", checkedAt: null }} onClick={onOpenUpdates ?? (() => {})} />
 
       {/* 一般通報也維持警告色；只有真正的 provider/proxy 故障才使用紅色，
           讓錯誤與「需要稍後處理」保有清楚的嚴重度差異。 */}

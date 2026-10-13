@@ -34,10 +34,10 @@ pub fn cleanup_retired_images(directory: &Path) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if SIDECARS
-                .iter()
-                .any(|base| name.starts_with(&format!("{base}.old-")))
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            if SIDECARS.iter().any(|base| {
+                name.starts_with(&format!("{base}.old-"))
+                    && entry.path().with_file_name(base).is_file()
+            }) && entry.file_type().is_ok_and(|kind| kind.is_file())
             {
                 let _ = std::fs::remove_file(entry.path()); // Running images remain until a later startup.
             }
@@ -77,6 +77,10 @@ mod tests {
         let keep = dir.path().join("unrelated.exe.old-1-2");
         std::fs::write(&old, b"old").unwrap();
         std::fs::write(&keep, b"keep").unwrap();
+        // An unreplaced image may be the user's only remaining core.
+        cleanup_retired_images(dir.path());
+        assert!(old.exists());
+        std::fs::write(dir.path().join("vellum-codex-app-server.exe"), b"new").unwrap();
         cleanup_retired_images(dir.path());
         assert!(!old.exists());
         assert!(keep.exists());

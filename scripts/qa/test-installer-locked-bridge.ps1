@@ -50,6 +50,10 @@ Unicode true
 Name "Vellum isolated race regression"
 OutFile "$installer"
 RequestExecutionLevel user
+; Compile-time stand-ins for the isolated staged payload.
+!define VELLUM_INSTALL_BRIDGE 1
+!define VELLUM_INSTALL_CORE 1
+!define VELLUM_INSTALL_RELAY 0
 !include "$hook"
 Function CompileProductionHookOnly
   !insertmacro NSIS_HOOK_PREINSTALL
@@ -126,7 +130,45 @@ SectionEnd
     }
     $relaunched = Get-Process -Id ([int][IO.File]::ReadAllText($pidFile))
     if ($relaunched.HasExited) { throw 'partial rollback left desktop stopped' }
-    Write-Output "PASS: locked overwrite rejected; successful retirement installs new bytes; failed first/second Rename restores originals and relaunches desktop. Artifacts: $testRoot"
+    $locked.Dispose()
+    $locked = $null
+    Stop-Process -Id $relaunched.Id
+    $relaunched.WaitForExit()
+    # The actual Desktop-only compile-time selection must leave both core
+    # locations intact, even when a core denies FILE_SHARE_DELETE.
+    $hotHook = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../src-tauri/windows/installer-hot-update-hooks.nsh'))
+    $hotInstaller = Join-Path $testRoot 'hot-setup.exe'
+    $hotScript = Join-Path $testRoot 'hot.nsi'
+    $hotNsis = $nsis.Replace($hook, $hotHook).Replace($installer, $hotInstaller).Replace('SectionEnd', '  !insertmacro NSIS_HOOK_POSTINSTALL' + "`nSectionEnd")
+    [IO.File]::WriteAllText($hotScript, $hotNsis, [Text.UTF8Encoding]::new($false))
+    & $Makensis /V2 $hotScript
+    if ($LASTEXITCODE -ne 0) { throw 'hot-update regression installer did not compile' }
+    $rootCore = Join-Path $partialRoot 'vellum-enhanced-codex.exe'
+    Copy-Item -LiteralPath $partialCore -Destination $rootCore
+    $locked = [IO.File]::Open($partialCore, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $setup = Start-Process -FilePath $hotInstaller -ArgumentList @('/S', ('/D=' + $partialRoot)) -WindowStyle Hidden -Wait -PassThru
+    if ($setup.ExitCode -ne 0) { throw 'hot install incorrectly tried to retire locked core' }
+    foreach ($core in @($partialCore, $rootCore)) {
+        if (!(Test-Path -LiteralPath $core) -or (Get-FileHash -LiteralPath $core).Hash -ne $coreHash) { throw 'hot update lost existing core' }
+    }
+    if ((Get-FileHash -LiteralPath $partialBridge).Hash -ne $newHash) { throw 'hot update did not replace bridge' }
+    # Full payload safety net: if a retired image was not actually replaced,
+    # POSTINSTALL restores it rather than relying on later cleanup.
+    $restoreInstaller = Join-Path $testRoot 'restore-setup.exe'
+    $restoreScript = Join-Path $testRoot 'restore.nsi'
+    $restoreNsis = $nsis.Replace($installer, $restoreInstaller).Replace('SectionEnd', '  !insertmacro NSIS_HOOK_POSTINSTALL' + "`nSectionEnd")
+    [IO.File]::WriteAllText($restoreScript, $restoreNsis, [Text.UTF8Encoding]::new($false))
+    & $Makensis /V2 $restoreScript
+    if ($LASTEXITCODE -ne 0) { throw 'postinstall regression installer did not compile' }
+    $locked.Dispose()
+    $locked = $null
+    $setup = Start-Process -FilePath $restoreInstaller -ArgumentList @('/S', ('/D=' + $partialRoot)) -WindowStyle Hidden -Wait -PassThru
+    if ($setup.ExitCode -ne 0) { throw 'postinstall safety installer failed' }
+    foreach ($core in @($partialCore, $rootCore)) {
+        if (!(Test-Path -LiteralPath $core) -or (Get-FileHash -LiteralPath $core).Hash -ne $coreHash) { throw 'postinstall did not restore unreplaced core' }
+        if (Get-ChildItem -LiteralPath (Split-Path $core) -Filter ((Split-Path $core -Leaf) + '.old-*')) { throw 'unreplaced core remains retired' }
+    }
+    Write-Output "PASS: locked overwrite; rollback/relaunch; hot payload preserves core; postinstall restores unreplaced core. Artifacts: $testRoot"
 } finally {
     if ($locked) { $locked.Dispose() }
     if ($relaunched -and !$relaunched.HasExited) { Stop-Process -Id $relaunched.Id; $relaunched.WaitForExit() }

@@ -626,12 +626,19 @@ impl RuntimeHistoryStore for DesktopHistory {
 }
 
 struct DesktopUsage {
+    state: AppState,
     accounts: Arc<crate::codex_oauth::CodexOAuthManager>,
     inner: Arc<crate::usage::UsageStore>,
     records: Mutex<Vec<RuntimeUsageRecord>>,
 }
 impl RuntimeUsageStore for DesktopUsage {
     fn record(&self, value: &RuntimeUsageRecord) -> Result<(), String> {
+        if value.status == 200
+            && value.upstream_attempted == Some(true)
+            && value.conversation_identity.as_deref().is_some_and(|identity| identity.starts_with("codex:"))
+        {
+            crate::commands::proxy::observe_successful_codex_request(&self.state);
+        }
         if let Some(request_id) = value.request_id.as_deref() {
             self.accounts.observe_routing_usage(
                 request_id,
@@ -879,6 +886,7 @@ impl DesktopProxyRuntimeState {
             inner: state.history_store(),
         }))
         .with_usage_store(Arc::new(DesktopUsage {
+            state: state.clone(),
             accounts: state.codex_oauth(),
             inner: state.usage_store(),
             records: Mutex::new(Vec::new()),

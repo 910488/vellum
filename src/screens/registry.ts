@@ -61,3 +61,11 @@ export function screenById(id: ScreenId): ScreenDef {
   if (!found) throw new Error(`unknown screen: ${id}`);
   return found;
 }
+
+export function visibleScreens(remoteVisible: boolean): ScreenDef[] {
+  return SCREENS.filter((screen) => screen.id !== "remote" || remoteVisible);
+}
+
+export function accessibleScreen(id: ScreenId, remoteVisible: boolean): ScreenId {
+  return id === "remote" && !remoteVisible ? "today" : id;
+}
