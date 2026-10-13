@@ -224,6 +224,9 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                updates::check_on_focus(window.app_handle());
+            }
             // The close button is a data-plane stop, not a cosmetic hide.
             // Leaving the Proxy alive behind a hidden tray window made users
             // reasonably believe Vellum was closed while Codex config and an

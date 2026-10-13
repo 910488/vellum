@@ -45,6 +45,25 @@ Settings reports the bridge as missing rather than pretending it is there.
 
 ## The Enhanced Codex core, and the helpers next to it
 
+Windows Desktop-only hot updates use `tauri.hot-update.conf.json` and
+`installer-hot-update-hooks.nsh`: their payload replaces the bridge and relay,
+but never retires the existing core or helpers. The full installer derives its
+retirement flags from the staged executable files. POSTINSTALL restores any
+retired executable that the payload did not replace; startup cleanup deletes an
+old image only when its original path already contains a replacement.
+
+A downloaded core normally stays pending until Vellum performs a managed Codex
+restart and observes the new launch. Restarting Vellum alone does not arm that
+handoff. Startup can settle a pending core without a managed restart when its
+entire signed tree matches the bundled tree, or when both the bundled core and
+a verified active slot are missing. The latter recovery verifies the pending
+core and every helper, promotes the slot, and settles update state and journal.
+
+Run `scripts/qa/test-installer-locked-bridge.ps1` for an isolated Windows
+regression using disposable fake executables. It exercises locked replacement,
+retirement rollback, Desktop-only core preservation, and POSTINSTALL recovery;
+it never invokes the production global taskkill hook.
+
 The Enhanced core is built from the public, commit-pinned
 [`910488/enhanced-codex-core`](https://github.com/910488/enhanced-codex-core)
 repository, not from this repository. Its artifact workflow builds:

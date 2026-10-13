@@ -1,5 +1,10 @@
 {
   "bundle": {
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/installer-hot-update-hooks.nsh"
+      }
+    },
     "resources": [
       "binaries/vellum-codex-app-server*",
       "binaries/vellum-codex-relay*"

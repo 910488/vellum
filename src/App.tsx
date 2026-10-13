@@ -394,6 +394,27 @@ export function App() {
     };
   }, [refresh]);
 
+  const updateInProgress = [status.updates?.desktop.phase, status.updates?.core.phase]
+    .some((phase) => phase && ["downloading", "verifying", "applying", "validating"].includes(phase));
+  useEffect(() => {
+    if (updatesOpen || !updateInProgress) return;
+    let active = true;
+    let polling = false;
+    const poll = async () => {
+      if (polling || document.visibilityState !== "visible") return;
+      polling = true;
+      try {
+        const updates = await api.getUpdateStatus();
+        if (active) setStatus((current) => ({ ...current, updates }));
+      } finally { polling = false; }
+    };
+    // Keep an in-flight progress ring current when the panel is closed.
+    // Idle status uses the normal refresh; avoid continuously verifying the
+    // installed core tree just to poll an idle update indicator.
+    const timer = window.setInterval(() => { void poll().catch(() => {}); }, 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [updatesOpen, updateInProgress]);
+
   useEffect(() => {
     const updatePerformanceMode = () => {
       document.documentElement.dataset.performance =
@@ -483,6 +504,7 @@ export function App() {
           refreshing={refreshing}
           refreshError={refreshError}
           onRefresh={() => void manualRefresh()}
+          onOpenUpdates={() => setUpdatesOpen(true)}
         />
 
         <Rail
@@ -494,7 +516,7 @@ export function App() {
         />
 
         <main className="canvas">
-          {mountedScreens.has("enhanced") ? <div className="screen-slot" hidden={screen !== "enhanced"}><EnhancedCore status={status.enhancedRuntime ?? null} refreshVersion={refreshVersions.enhanced ?? 0} onRefreshComplete={pageRefreshComplete} /></div> : null}
+          {mountedScreens.has("enhanced") ? <div className="screen-slot" hidden={screen !== "enhanced"}><EnhancedCore status={status.enhancedRuntime ?? null} refreshVersion={refreshVersions.enhanced ?? 0} onRefreshComplete={pageRefreshComplete} onOpenUpdates={() => setUpdatesOpen(true)} /></div> : null}
           {mountedScreens.has("today") ? (
             <div className="screen-slot" hidden={screen !== "today"}>
             <Today

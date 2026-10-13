@@ -4,13 +4,13 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::UpdateComponent;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GithubRelease {
     pub tag_name: String,
     #[serde(default)]
@@ -23,7 +23,7 @@ pub struct GithubRelease {
     pub assets: Vec<GithubAsset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GithubAsset {
     pub name: String,
     #[serde(default)]
@@ -56,13 +56,11 @@ pub trait ReleaseSource: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct GithubSource {
-    etags: Mutex<HashMap<String, String>>,
-}
+pub struct GithubSource;
 
 impl GithubSource {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 
@@ -121,12 +119,6 @@ impl ReleaseSource for GithubSource {
             .get("etag")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        if let Some(etag) = etag.clone() {
-            self.etags
-                .lock()
-                .expect("etag map")
-                .insert(repo.to_string(), etag);
-        }
         let body = response.text().map_err(|error| error.to_string())?;
         let releases = parse_github_releases(&body)?;
         Ok(ListedReleases {

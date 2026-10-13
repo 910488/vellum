@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import i18n from "i18next";
 import "@/i18n";
 import { UpdateCards } from "@/components/UpdateCards";
+import { UpdateIndicator } from "@/components/UpdateIndicator";
 import { Rail } from "@/components/Rail";
 import { api } from "@/lib/api";
 import { attention, headline, type SystemStatus } from "@/lib/status";
@@ -32,6 +33,31 @@ vi.mock("@/lib/api", () => ({
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("update icon", () => {
+  it("opens the panel and shares the combined byte progress", async () => {
+    await i18n.changeLanguage("en");
+    const open = vi.fn();
+    const { container, rerender } = render(<UpdateIndicator state={{ kind: "downloading", version: "0.3.1", percent: 62, bytes: 110_360_000, total: 178_000_000 }} onClick={open} />);
+    const button = screen.getByRole("button", { name: /62/ });
+    expect(button.title).toContain("62");
+    expect(container.querySelector(".update-indicator__progress")?.getAttribute("stroke-dashoffset")).toBe("38");
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledOnce();
+    for (const state of [
+      { kind: "ready", version: "0.3.1" },
+      { kind: "installing", version: "0.3.1" },
+      { kind: "updated", version: "0.3.1", corePending: false },
+      { kind: "failed", version: "0.3.1", reason: "desktopInstallIncomplete" },
+    ] as const) {
+      rerender(<UpdateIndicator state={state} onClick={open} />);
+      expect(screen.getByRole("button").getAttribute("aria-label")).not.toContain("settings.page");
+    }
+    rerender(<UpdateIndicator state={{ kind: "current", checkedAt: null }} onClick={open} />);
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(container.querySelector(".update-indicator-slot")).not.toBeNull();
+  });
 });
 
 const layer = (component: LayerStatus["component"], patch: Partial<LayerStatus> = {}): LayerStatus => ({
@@ -358,10 +384,8 @@ describe("update attention vs models badge", () => {
     expect(headline(status({ updates: snapshot({ attention: "waitingIdle" }) })).updateAttention).toBe("waitingIdle");
     expect(headline(status({ updates: snapshot({ attention: "waitingRestart" }) })).updateAttention).toBe("waitingRestart");
     expect(headline(status({ updates: snapshot({ attention: "failed" }) })).updateAttention).toBe("failed");
-    expect(statusBarSource).toMatch(/status\.updateAvailable/);
-    expect(statusBarSource).toMatch(/status\.updateWaitingIdle/);
-    expect(statusBarSource).toMatch(/status\.updateWaitingRestart/);
-    expect(statusBarSource).toMatch(/status\.updateFailed/);
+    expect(statusBarSource).toMatch(/UpdateIndicator/);
+    expect(statusBarSource).toMatch(/onOpenUpdates/);
   });
 
   it("does not increment models for desktop or remote update-ready reasons", () => {

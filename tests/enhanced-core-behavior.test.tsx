@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import i18n from "i18next";
 import "@/i18n";
 import { EnhancedCore } from "@/screens/EnhancedCore";
@@ -9,6 +9,16 @@ import { EMPTY_OBSERVATIONS } from "@/lib/enhanced";
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("Enhanced Core observed state", () => {
+  it("explains a missing core and opens the update repair panel", async () => {
+    await i18n.changeLanguage("en");
+    const status = await api.getEnhancedDesktopRuntimeStatus();
+    vi.spyOn(api, "getEnhancedRuntimeObservations").mockResolvedValue(EMPTY_OBSERVATIONS);
+    const open = vi.fn();
+    render(<EnhancedCore status={{ ...status, coreAvailable: false }} refreshVersion={0} onRefreshComplete={() => undefined} onOpenUpdates={open} />);
+    expect(screen.getByText(i18n.t("settings.page.enhancedRuntime.inject.blocked.noCore"))).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("settings.page.updates.title") }));
+    expect(open).toHaveBeenCalledOnce();
+  });
   it("does not call a verified, armed artifact serving before adoption", async () => {
     const status = await api.getEnhancedDesktopRuntimeStatus();
     vi.spyOn(api, "getEnhancedRuntimeObservations").mockResolvedValue(EMPTY_OBSERVATIONS);
