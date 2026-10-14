@@ -167,11 +167,27 @@ impl ApplyExecutor for FsApplyExecutor {
     }
 }
 
+type Flights = Mutex<HashMap<String, watch::Receiver<Flight>>>;
+
+/// Every command opens its own `UpdateEngine`, so in-flight work is shared
+/// per data root rather than per engine. Per engine, the startup check and a
+/// focus check ran side by side and raced each other writing `state.json`.
+fn shared_flights(root: &Path) -> std::sync::Arc<Flights> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<Flights>>>,
+    > = std::sync::OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.entry(root.to_path_buf()).or_default().clone()
+}
+
 pub struct UpdateEngine {
     root: PathBuf,
     trust: TrustStore,
     source: SharedSource,
-    flights: Mutex<HashMap<String, watch::Receiver<Flight>>>,
+    flights: std::sync::Arc<Flights>,
     executor: std::sync::Arc<dyn ApplyExecutor>,
 }
 
@@ -196,7 +212,7 @@ impl UpdateEngine {
             root: root.to_path_buf(),
             trust,
             source,
-            flights: Mutex::new(HashMap::new()),
+            flights: shared_flights(root),
             executor,
         }
     }
@@ -2286,6 +2302,49 @@ mod tests {
             assert!(!at("0.1.0"), "old desktop installer stays in {base:?}");
             assert!(at("0.2.0") && at("0.3.0"));
         }
+    }
+
+    #[test]
+    fn engines_on_one_data_root_share_in_flight_work() {
+        // Commands open a fresh engine per call; the startup check and a focus
+        // check must still see each other's flight.
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let open = |root: &Path| {
+            UpdateEngine::open(
+                root,
+                TrustStore::bundled(),
+                Arc::new(MemorySource {
+                    releases: HashMap::new(),
+                    listed: ListedReleases {
+                        etag: None,
+                        not_modified: false,
+                        rate_limited: false,
+                        retry_after_secs: 0,
+                        releases: Vec::new(),
+                    },
+                }),
+            )
+        };
+        let (a, b, c) = (open(dir.path()), open(dir.path()), open(other.path()));
+        assert!(Arc::ptr_eq(&a.flights, &b.flights));
+        assert!(!Arc::ptr_eq(&a.flights, &c.flights));
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_one_file_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    (0..25).all(|_| write_atomic(&path, format!("{n}").as_bytes()).is_ok())
+                })
+            })
+            .collect();
+        assert!(writers.into_iter().all(|writer| writer.join().unwrap()));
+        assert!(std::fs::read_to_string(&path).unwrap().parse::<u8>().is_ok());
     }
 
     struct RecordingExecutor {

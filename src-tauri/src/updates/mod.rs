@@ -70,12 +70,16 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
     std::fs::create_dir_all(parent)?;
+    // Unique per write, not just per process: two writers of the same file in
+    // one process must not share (and rename away) each other's temporary.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("update"),
-        std::process::id()
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
         let mut file = std::fs::File::create(&temporary)?;
