@@ -208,13 +208,20 @@ pub async fn run_review(
 
 /// doc/07：壓縮前的預覽。
 #[tauri::command(rename_all = "camelCase")]
-pub fn get_compaction_preview(
+pub async fn get_compaction_preview(
     session_id: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<CompactionPreview> {
-    crate::history::catch_history_panic(std::panic::AssertUnwindSafe(|| {
-        preview_for_session(&state, session_id.as_deref())
-    }))
+    // Reads history and scans Codex rollouts, like the snapshot below; on the
+    // main thread that stalled the window while the Context screen loaded.
+    let owned = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::history::catch_history_panic(std::panic::AssertUnwindSafe(|| {
+            preview_for_session(&owned, session_id.as_deref())
+        }))
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("compaction preview task failed: {error}")))?
 }
 
 /// Return both redesigned Context cards from one selected compaction event.
