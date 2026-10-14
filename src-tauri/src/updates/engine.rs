@@ -262,6 +262,12 @@ impl UpdateEngine {
         if !self.state_path().is_file() {
             return;
         }
+        // The startup check and a focus check both prune after their shared
+        // check. Side by side, each failed with "access denied" on the files
+        // the other was deleting; the second one has nothing left to do.
+        let Some(_claim) = PruneClaim::take(&self.root) else {
+            return;
+        };
         let state = self.load();
         let slots = CoreSlots::load(&self.root);
         let updates = self.root.join("updates");
@@ -316,6 +322,7 @@ impl UpdateEngine {
                     }
                     match std::fs::remove_dir_all(&path) {
                         Ok(()) => log::info!("[Updates] removed retired {name} {version}"),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => {
                             log::warn!("[Updates] cannot remove retired {name} {version}: {error}")
                         }
@@ -1313,6 +1320,34 @@ impl<'a> Currents<'a> {
     }
 }
 
+/// Marks one data root as being pruned, for as long as it lives.
+struct PruneClaim(PathBuf);
+
+static PRUNING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+impl PruneClaim {
+    /// `None` while another prune of `root` is running.
+    fn take(root: &Path) -> Option<Self> {
+        let mut pruning = PRUNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pruning.iter().any(|claimed| claimed == root) {
+            return None;
+        }
+        pruning.push(root.to_path_buf());
+        Some(Self(root.to_path_buf()))
+    }
+}
+
+impl Drop for PruneClaim {
+    fn drop(&mut self) {
+        let mut pruning = PRUNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pruning.retain(|claimed| claimed != &self.0);
+    }
+}
+
 /// `commit_candidate` keeps the replaced tree as `previous` only so a crash
 /// mid-switch can recover; once the switch finished it is dead weight.
 fn drop_finished_switch_backup(slot: &Path) {
@@ -2199,6 +2234,49 @@ mod tests {
     }
 
     #[test]
+    fn a_prune_already_running_on_the_root_is_not_run_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let engine = UpdateEngine::open(
+            root,
+            TrustStore::bundled(),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        );
+        let mut state = PersistedState::default();
+        state
+            .layers
+            .insert("desktop".into(), LayerRecord::new("0.2.0"));
+        engine.save(&state).unwrap();
+        let retired = root.join("updates").join("desktop").join("0.1.0");
+        std::fs::create_dir_all(&retired).unwrap();
+
+        let running = PruneClaim::take(root).expect("no prune is running yet");
+        assert!(PruneClaim::take(root).is_none());
+        engine.prune_retired_versions();
+        assert!(
+            retired.is_dir(),
+            "the second prune must leave the work to the first"
+        );
+
+        drop(running);
+        engine.prune_retired_versions();
+        assert!(!retired.exists());
+        assert!(
+            PruneClaim::take(root).is_some(),
+            "a finished prune releases the root"
+        );
+    }
+
+    #[test]
     fn retired_update_versions_are_pruned_but_referenced_and_newer_ones_stay() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2344,7 +2422,10 @@ mod tests {
             })
             .collect();
         assert!(writers.into_iter().all(|writer| writer.join().unwrap()));
-        assert!(std::fs::read_to_string(&path).unwrap().parse::<u8>().is_ok());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<u8>()
+            .is_ok());
     }
 
     struct RecordingExecutor {
