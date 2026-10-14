@@ -535,16 +535,15 @@ fn has_existing_credentials(root: &Path) -> AppResult<bool> {
         .any(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("bin")))
 }
 
+/// Load the DPAPI-sealed master key, creating it only when none exists.
+///
+/// The key is the only way to open every stored credential and journal, so
+/// an existing key file is never replaced: a file that cannot be opened, read
+/// or unsealed fails closed instead of being overwritten by a fresh key.
 #[cfg(windows)]
 fn load_or_create_dpapi_key(path: &Path) -> AppResult<Vec<u8>> {
-    if let Ok(mut file) = std::fs::File::open(path) {
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)
-            .map_err(|e| AppError::Message(format!("read dpapi key: {e}")))?;
-        let plain = dpapi_unprotect(&buf)?;
-        if plain.len() == KEY_BYTES {
-            return Ok(plain);
-        }
+    if let Some(key) = read_dpapi_key(path)? {
+        return Ok(key);
     }
     let mut key = vec![0u8; KEY_BYTES];
     getrandom::fill(&mut key)
@@ -553,9 +552,49 @@ fn load_or_create_dpapi_key(path: &Path) -> AppResult<Vec<u8>> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, &sealed)
+    // Publish without clobbering: two first-run callers may both find no key.
+    // The loser adopts the winner's key, so nothing is ever sealed with a key
+    // that is not on disk.
+    let temporary = crate::enhanced_runtime::atomic::unique_temporary(path);
+    std::fs::write(&temporary, &sealed)
         .map_err(|e| AppError::Message(format!("write dpapi key: {e}")))?;
-    Ok(key)
+    let published = std::fs::hard_link(&temporary, path);
+    let _ = std::fs::remove_file(&temporary);
+    match published {
+        Ok(()) => Ok(key),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_dpapi_key(path)?
+            .ok_or_else(|| {
+                AppError::Message("dpapi key vanished after another writer created it".into())
+            }),
+        Err(error) => Err(AppError::Message(format!("write dpapi key: {error}"))),
+    }
+}
+
+/// `Ok(None)` only when no key file exists.
+#[cfg(windows)]
+fn read_dpapi_key(path: &Path) -> AppResult<Option<Vec<u8>>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Message(format!(
+                "open dpapi key {}: {error}; existing data was not modified",
+                path.display()
+            )))
+        }
+    };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| AppError::Message(format!("read dpapi key: {e}")))?;
+    let plain = dpapi_unprotect(&buf)?;
+    if plain.len() != KEY_BYTES {
+        return Err(AppError::Message(format!(
+            "dpapi key {} unsealed to {} bytes, expected {KEY_BYTES}; existing data was not modified",
+            path.display(),
+            plain.len()
+        )));
+    }
+    Ok(Some(plain))
 }
 
 #[cfg(windows)]
@@ -716,6 +755,54 @@ pub(crate) mod tests {
         assert!(!disk.windows(first.len()).any(|window| window == first));
         let second = load_or_create_dpapi_key(&path).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_dpapi_key_that_cannot_be_used_is_never_replaced() {
+        let root = tempfile::TempDir::new().unwrap();
+
+        // Opening fails (a directory stands where the key file should be).
+        let unopenable = root.path().join("unopenable.dpapi");
+        std::fs::create_dir(&unopenable).unwrap();
+        assert!(load_or_create_dpapi_key(&unopenable).is_err());
+        assert!(
+            unopenable.is_dir(),
+            "the unreadable key path must be left alone"
+        );
+
+        // Unseals, but to a key of the wrong length.
+        let short = root.path().join("short.dpapi");
+        let sealed = dpapi_protect(&[7u8; 16]).unwrap();
+        std::fs::write(&short, &sealed).unwrap();
+        let error = load_or_create_dpapi_key(&short).unwrap_err().to_string();
+        assert!(error.contains("expected 32"), "{error}");
+        assert_eq!(std::fs::read(&short).unwrap(), sealed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_first_runs_all_get_the_key_that_is_on_disk() {
+        let root = tempfile::TempDir::new().unwrap();
+        let path = root.path().join("vellum-key.dpapi");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let keys: Vec<Vec<u8>> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_dpapi_key(&path).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let on_disk = load_or_create_dpapi_key(&path).unwrap();
+        assert!(keys.iter().all(|key| *key == on_disk));
+        let leftovers = std::fs::read_dir(root.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the key file may remain");
     }
 
     #[test]
