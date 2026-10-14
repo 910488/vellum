@@ -434,6 +434,8 @@ export interface EnhancedDesktopRuntimeStatus {
    *  it with a managed restart on its own; this flag is what the screen says
    *  while that is happening. */
   launchCoreDrift: boolean;
+  /** A downloaded Enhanced core waits for the managed Codex restart. */
+  pendingCore?: boolean;
   blockers: string[];
 }
 
