@@ -635,9 +635,11 @@ fn save_record(root: &Path, record: &QualificationRecord) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("qualification record has no parent".into()))?;
     fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("create qualification directory: {error}")))?;
-    fs::write(
+    // A record cut short would fail to parse on every later load and block
+    // this host until someone deleted it by hand.
+    crate::enhanced_runtime::atomic::write_atomic(
         &path,
-        serde_json::to_vec_pretty(record).map_err(|error| AppError::Message(error.to_string()))?,
+        &serde_json::to_vec_pretty(record).map_err(|error| AppError::Message(error.to_string()))?,
     )
     .map_err(|error| AppError::Message(format!("write qualification record: {error}")))
 }
