@@ -4,6 +4,20 @@ use crate::error::AppResult;
 use crate::state::{AppState, RemoteSidebarMode};
 use sha2::{Digest, Sha256};
 
+/// Remote commands talk to the host over `ssh` and wait for it. A synchronous
+/// Tauri command runs on the main thread, so each call froze the window for a
+/// round trip, and the Remote screen polls some of them every one or two
+/// seconds. They run on the blocking pool instead.
+async fn off_main_thread<T: Send + 'static>(
+    state: &tauri::State<'_, AppState>,
+    work: impl FnOnce(AppState) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || work(state))
+        .await
+        .map_err(|error| crate::error::AppError::Message(format!("remote task failed: {error}")))?
+}
+
 #[tauri::command]
 pub fn get_remote_manager_feature_flags(state: tauri::State<'_, AppState>) -> serde_json::Value {
     sidebar_flags(&state)
@@ -31,7 +45,10 @@ fn sidebar_flags(state: &AppState) -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn set_remote_sidebar_mode(state: tauri::State<'_, AppState>, mode: RemoteSidebarMode) -> AppResult<serde_json::Value> {
+pub fn set_remote_sidebar_mode(
+    state: tauri::State<'_, AppState>,
+    mode: RemoteSidebarMode,
+) -> AppResult<serde_json::Value> {
     state.set_remote_sidebar_mode(mode)?;
     Ok(sidebar_flags(&state))
 }
@@ -59,50 +76,53 @@ pub async fn get_desktop_codex_compatibility(
 }
 
 #[tauri::command]
-pub fn update_remote_codex_for_desktop(
+pub async fn update_remote_codex_for_desktop(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
-    let operation_id = format!("desktop-codex-sync-{}", ulid::Ulid::new());
-    let progress = crate::remote::RemoteOperationProgress::queued(
-        operation_id.clone(),
-        host_id.clone(),
-        "desktopCodexSync",
-    );
-    crate::remote::operation::save(&state.data_root(), &progress)?;
-    let owned = state.inner().clone();
-    let task_operation_id = operation_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut running = progress;
-        running.phase = "resolvingDesktopCodex".into();
-        running.percent = 10;
-        running.message = Some("Resolving the Desktop Codex protocol identity".into());
-        running.updated_at = chrono::Utc::now();
-        let _ = crate::remote::operation::save(&owned.data_root(), &running);
-        match crate::remote::desktop_codex::update_remote_for_desktop(
-            &owned,
-            &host_id,
-            &task_operation_id,
-        )
-        .await
-        {
-            Ok(result) => {
-                running.phase = "verified".into();
-                running.percent = 100;
-                running.state = "completed".into();
-                running.message = Some("Remote Codex now matches the Desktop protocol".into());
-                running.result = Some(result);
+    off_main_thread(&state, move |state| {
+        let operation_id = format!("desktop-codex-sync-{}", ulid::Ulid::new());
+        let progress = crate::remote::RemoteOperationProgress::queued(
+            operation_id.clone(),
+            host_id.clone(),
+            "desktopCodexSync",
+        );
+        crate::remote::operation::save(&state.data_root(), &progress)?;
+        let owned = state.clone();
+        let task_operation_id = operation_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut running = progress;
+            running.phase = "resolvingDesktopCodex".into();
+            running.percent = 10;
+            running.message = Some("Resolving the Desktop Codex protocol identity".into());
+            running.updated_at = chrono::Utc::now();
+            let _ = crate::remote::operation::save(&owned.data_root(), &running);
+            match crate::remote::desktop_codex::update_remote_for_desktop(
+                &owned,
+                &host_id,
+                &task_operation_id,
+            )
+            .await
+            {
+                Ok(result) => {
+                    running.phase = "verified".into();
+                    running.percent = 100;
+                    running.state = "completed".into();
+                    running.message = Some("Remote Codex now matches the Desktop protocol".into());
+                    running.result = Some(result);
+                }
+                Err(error) => {
+                    running.phase = "failed".into();
+                    running.state = "failed".into();
+                    running.message = Some(error.to_string());
+                }
             }
-            Err(error) => {
-                running.phase = "failed".into();
-                running.state = "failed".into();
-                running.message = Some(error.to_string());
-            }
-        }
-        running.updated_at = chrono::Utc::now();
-        let _ = crate::remote::operation::save(&owned.data_root(), &running);
-    });
-    crate::remote::operation::load(&state.data_root(), &operation_id)
+            running.updated_at = chrono::Utc::now();
+            let _ = crate::remote::operation::save(&owned.data_root(), &running);
+        });
+        crate::remote::operation::load(&state.data_root(), &operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -188,12 +208,15 @@ pub async fn bootstrap_remote_host(
 }
 
 #[tauri::command]
-pub fn plan_remote_deployment(
+pub async fn plan_remote_deployment(
     state: tauri::State<'_, AppState>,
     host_id: String,
     selection: crate::remote::RemoteModelSelection,
 ) -> AppResult<crate::remote::RemoteDeploymentPlan> {
-    crate::remote::deployment::plan(&state, &host_id, selection)
+    off_main_thread(&state, move |state| {
+        crate::remote::deployment::plan(&state, &host_id, selection)
+    })
+    .await
 }
 
 /// Rebuild a plan from this host's own last-applied model selection and
@@ -204,50 +227,56 @@ pub fn plan_remote_deployment(
 /// defaults the way calling `plan_remote_deployment` with a fresh, empty
 /// `RemotePolicyOverrides` would.
 #[tauri::command]
-pub fn reapply_remote_deployment(
+pub async fn reapply_remote_deployment(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<crate::remote::RemoteDeploymentPlan> {
-    crate::remote::deployment::reapply_desired_state(&state, &host_id)
+    off_main_thread(&state, move |state| {
+        crate::remote::deployment::reapply_desired_state(&state, &host_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn apply_remote_deployment(
+pub async fn apply_remote_deployment(
     state: tauri::State<'_, AppState>,
     host_id: String,
     plan_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
-    let operation_id = ulid::Ulid::new().to_string();
-    let progress = crate::remote::RemoteOperationProgress::queued(
-        operation_id.clone(),
-        host_id.clone(),
-        "applyDeployment",
-    );
-    crate::remote::operation::save(&state.data_root(), &progress)?;
-    let owned = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let mut running = progress;
-        running.phase = "applying".into();
-        running.percent = 10;
-        running.updated_at = chrono::Utc::now();
-        let _ = crate::remote::operation::save(&owned.data_root(), &running);
-        match crate::remote::deployment::apply(&owned, &host_id, &plan_id).await {
-            Ok(result) => {
-                running.phase = "verified".into();
-                running.percent = 100;
-                running.state = "completed".into();
-                running.result = serde_json::to_value(result).ok();
+    off_main_thread(&state, move |state| {
+        let operation_id = ulid::Ulid::new().to_string();
+        let progress = crate::remote::RemoteOperationProgress::queued(
+            operation_id.clone(),
+            host_id.clone(),
+            "applyDeployment",
+        );
+        crate::remote::operation::save(&state.data_root(), &progress)?;
+        let owned = state.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut running = progress;
+            running.phase = "applying".into();
+            running.percent = 10;
+            running.updated_at = chrono::Utc::now();
+            let _ = crate::remote::operation::save(&owned.data_root(), &running);
+            match crate::remote::deployment::apply(&owned, &host_id, &plan_id).await {
+                Ok(result) => {
+                    running.phase = "verified".into();
+                    running.percent = 100;
+                    running.state = "completed".into();
+                    running.result = serde_json::to_value(result).ok();
+                }
+                Err(error) => {
+                    running.phase = "failed".into();
+                    running.state = "failed".into();
+                    running.message = Some(error.to_string());
+                }
             }
-            Err(error) => {
-                running.phase = "failed".into();
-                running.state = "failed".into();
-                running.message = Some(error.to_string());
-            }
-        }
-        running.updated_at = chrono::Utc::now();
-        let _ = crate::remote::operation::save(&owned.data_root(), &running);
-    });
-    crate::remote::operation::load(&state.data_root(), &operation_id)
+            running.updated_at = chrono::Utc::now();
+            let _ = crate::remote::operation::save(&owned.data_root(), &running);
+        });
+        crate::remote::operation::load(&state.data_root(), &operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -271,9 +300,7 @@ fn restart_remote_native_codex_inner(
         session.as_ref(),
         status.as_ref().and_then(|value| value.get("nativeCodex")),
     )
-    .map_err(|code| {
-        crate::error::AppError::Message(format!("NativeRestartBlocked: {code}"))
-    })?;
+    .map_err(|code| crate::error::AppError::Message(format!("NativeRestartBlocked: {code}")))?;
     let provisioned = crate::remote::provision_remote_boundary_key(
         &client,
         &state.data_root(),
@@ -300,22 +327,28 @@ fn restart_remote_native_codex_inner(
 }
 
 #[tauri::command]
-pub fn restart_remote_native_codex(
+pub async fn restart_remote_native_codex(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
 ) -> AppResult<serde_json::Value> {
-    restart_remote_native_codex_inner(&state, &host_id, &operation_id)
+    off_main_thread(&state, move |state| {
+        restart_remote_native_codex_inner(&state, &host_id, &operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn stop_remote_app_owned_codex(
+pub async fn stop_remote_app_owned_codex(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).codex_stop_app_owned(&operation_id)
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).codex_stop_app_owned(&operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -368,42 +401,54 @@ pub async fn restore_remote_host(
 }
 
 #[tauri::command]
-pub fn start_remote_grok_login(
+pub async fn start_remote_grok_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target)
-        .grok_start_login(&format!("grok-login-{}", ulid::Ulid::new()))
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target)
+            .grok_start_login(&format!("grok-login-{}", ulid::Ulid::new()))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn poll_remote_grok_login(
+pub async fn poll_remote_grok_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).grok_poll_login()
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).grok_poll_login()
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn refresh_remote_grok_login(
+pub async fn refresh_remote_grok_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target)
-        .grok_refresh(&format!("grok-refresh-{}", ulid::Ulid::new()))
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target)
+            .grok_refresh(&format!("grok-refresh-{}", ulid::Ulid::new()))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn cancel_remote_grok_login(
+pub async fn cancel_remote_grok_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target)
-        .grok_cancel_login(&format!("grok-cancel-{}", ulid::Ulid::new()))
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target)
+            .grok_cancel_login(&format!("grok-cancel-{}", ulid::Ulid::new()))
+    })
+    .await
 }
 
 /// Which Desktop account a remote account command acts on. Omitting it keeps
@@ -411,7 +456,7 @@ pub fn cancel_remote_grok_login(
 /// one-account-at-a-time repair path stays exactly as it was; passing one is
 /// what lets first-run setup walk the whole account list.
 fn requested_account_id(
-    state: &tauri::State<'_, AppState>,
+    state: &AppState,
     account_id: Option<String>,
 ) -> AppResult<String> {
     let requested = account_id
@@ -426,7 +471,7 @@ fn requested_account_id(
             .peek_accounts()
             .iter()
             .any(|(id, _, _)| *id == requested)
-            && super::desktop_control_account_id(state.inner()).as_deref()
+            && super::desktop_control_account_id(state).as_deref()
                 != Some(requested.as_str())
         {
             return Err(crate::error::AppError::Message(
@@ -435,7 +480,7 @@ fn requested_account_id(
         }
         return Ok(requested);
     }
-    super::desktop_control_account_id(state.inner())
+    super::desktop_control_account_id(state)
         .ok_or_else(|| crate::error::AppError::Message("desktopOfficialAccountMissing".into()))
 }
 
@@ -457,123 +502,140 @@ pub fn set_active_remote_host(
 /// so this works against every agent already deployed, and the cost is only
 /// paid when the account panel is open.
 #[tauri::command(rename_all = "camelCase")]
-pub fn list_remote_codex_account_pairings(
+pub async fn list_remote_codex_account_pairings(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let mut accounts = state.codex_oauth().peek_accounts();
-    let default_account_id = super::desktop_control_account_id(state.inner());
-    if let Some(native) = default_account_id.as_ref() {
-        if !accounts.iter().any(|(account, _, _)| account == native) {
-            accounts.push((native.clone(), None, None));
+    off_main_thread(&state, move |state| {
+        let mut accounts = state.codex_oauth().peek_accounts();
+        let default_account_id = super::desktop_control_account_id(&state);
+        if let Some(native) = default_account_id.as_ref() {
+            if !accounts.iter().any(|(account, _, _)| account == native) {
+                accounts.push((native.clone(), None, None));
+            }
         }
-    }
-    accounts.sort_by(|left, right| left.0.cmp(&right.0));
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    let client = crate::remote::RemoteAgentClient::new(target);
-    let mut rows = Vec::with_capacity(accounts.len());
-    for (account_id, email, workspace_name) in accounts {
-        // One unreachable or unpairable account must not blank the whole
-        // panel: report it on its own row and keep going.
-        let status = client.codex_account_status(Some(&account_id));
-        let (paired, active, credential_state, expires_at, detail) = match &status {
-            Ok(value) => (
-                value.get("paired").and_then(serde_json::Value::as_bool) == Some(true),
-                value.get("active").and_then(serde_json::Value::as_bool) == Some(true),
-                value
-                    .get("credentialState")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                value.get("expiresAt").and_then(serde_json::Value::as_i64),
-                None,
-            ),
-            Err(error) => (
-                false,
-                false,
-                "unknown".into(),
-                None,
-                Some(error.to_string()),
-            ),
-        };
-        rows.push(serde_json::json!({
-            "accountId": account_id,
-            "email": email,
-            "workspaceName": workspace_name,
-            "isDesktopDefault": default_account_id.as_deref() == Some(account_id.as_str()),
-            "paired": paired,
-            "active": active,
-            "credentialState": credential_state,
-            "expiresAt": expires_at,
-            "detail": detail,
-        }));
-    }
-    Ok(serde_json::Value::Array(rows))
+        accounts.sort_by(|left, right| left.0.cmp(&right.0));
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        let client = crate::remote::RemoteAgentClient::new(target);
+        let mut rows = Vec::with_capacity(accounts.len());
+        for (account_id, email, workspace_name) in accounts {
+            // One unreachable or unpairable account must not blank the whole
+            // panel: report it on its own row and keep going.
+            let status = client.codex_account_status(Some(&account_id));
+            let (paired, active, credential_state, expires_at, detail) = match &status {
+                Ok(value) => (
+                    value.get("paired").and_then(serde_json::Value::as_bool) == Some(true),
+                    value.get("active").and_then(serde_json::Value::as_bool) == Some(true),
+                    value
+                        .get("credentialState")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    value.get("expiresAt").and_then(serde_json::Value::as_i64),
+                    None,
+                ),
+                Err(error) => (
+                    false,
+                    false,
+                    "unknown".into(),
+                    None,
+                    Some(error.to_string()),
+                ),
+            };
+            rows.push(serde_json::json!({
+                "accountId": account_id,
+                "email": email,
+                "workspaceName": workspace_name,
+                "isDesktopDefault": default_account_id.as_deref() == Some(account_id.as_str()),
+                "paired": paired,
+                "active": active,
+                "credentialState": credential_state,
+                "expiresAt": expires_at,
+                "detail": detail,
+            }));
+        }
+        Ok(serde_json::Value::Array(rows))
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn start_remote_codex_account_login(
+pub async fn start_remote_codex_account_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
     account_id: Option<String>,
 ) -> AppResult<serde_json::Value> {
-    let account_id = requested_account_id(&state, account_id)?;
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).codex_account_login_start(
-        &format!("codex-account-login-{}", ulid::Ulid::new()),
-        &account_id,
-    )
+    off_main_thread(&state, move |state| {
+        let account_id = requested_account_id(&state, account_id)?;
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).codex_account_login_start(
+            &format!("codex-account-login-{}", ulid::Ulid::new()),
+            &account_id,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn poll_remote_codex_account_login(
+pub async fn poll_remote_codex_account_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).codex_account_login_poll()
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).codex_account_login_poll()
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn activate_remote_codex_account(
+pub async fn activate_remote_codex_account(
     state: tauri::State<'_, AppState>,
     host_id: String,
     account_id: Option<String>,
 ) -> AppResult<serde_json::Value> {
-    let account_id = requested_account_id(&state, account_id)?;
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    let result = crate::remote::RemoteAgentClient::new(target).codex_account_activate(
-        &format!("codex-account-activate-{}", ulid::Ulid::new()),
-        &account_id,
-    );
-    if result.is_ok() {
-        state.remote().invalidate_snapshot(&host_id);
-    }
-    result
+    off_main_thread(&state, move |state| {
+        let account_id = requested_account_id(&state, account_id)?;
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        let result = crate::remote::RemoteAgentClient::new(target).codex_account_activate(
+            &format!("codex-account-activate-{}", ulid::Ulid::new()),
+            &account_id,
+        );
+        if result.is_ok() {
+            state.remote().invalidate_snapshot(&host_id);
+        }
+        result
+    })
+    .await
 }
 
 /// Pair a phone with the remote daemon's control identity. Official Remote
 /// requires Desktop and phone to use the same ChatGPT account/workspace.
 #[tauri::command]
-pub fn start_remote_control_pairing(
+pub async fn start_remote_control_pairing(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    let client = crate::remote::RemoteAgentClient::new(target);
-    let status = client.codex_account_status(None)?;
-    let account_id = status
-        .get("accountId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|_| {
-            matches!(
-                status.get("state").and_then(serde_json::Value::as_str),
-                Some("ready" | "synchronized")
-            )
-        })
-        .ok_or_else(|| crate::error::AppError::Message("remoteControlAccountUnavailable".into()))?;
-    let expected_hash = format!("{:x}", Sha256::digest(account_id.as_bytes()));
-    client.codex_remote_control_pair_start(&expected_hash)
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        let client = crate::remote::RemoteAgentClient::new(target);
+        let status = client.codex_account_status(None)?;
+        let account_id = status
+            .get("accountId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| {
+                matches!(
+                    status.get("state").and_then(serde_json::Value::as_str),
+                    Some("ready" | "synchronized")
+                )
+            })
+            .ok_or_else(|| {
+                crate::error::AppError::Message("remoteControlAccountUnavailable".into())
+            })?;
+        let expected_hash = format!("{:x}", Sha256::digest(account_id.as_bytes()));
+        client.codex_remote_control_pair_start(&expected_hash)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -593,72 +655,89 @@ pub async fn list_remote_official_execution_accounts(
 }
 
 #[tauri::command]
-pub fn start_remote_official_execution_account_login(
+pub async fn start_remote_official_execution_account_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
     display_name: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).proxy_official_account_login_start(
-        &format!("official-execution-login-{}", ulid::Ulid::new()),
-        &display_name,
-    )
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).proxy_official_account_login_start(
+            &format!("official-execution-login-{}", ulid::Ulid::new()),
+            &display_name,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn poll_remote_official_execution_account_login(
+pub async fn poll_remote_official_execution_account_login(
     state: tauri::State<'_, AppState>,
     host_id: String,
     login_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).proxy_official_account_login_poll(&login_id)
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).proxy_official_account_login_poll(&login_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn select_remote_official_execution_account(
+pub async fn select_remote_official_execution_account(
     state: tauri::State<'_, AppState>,
     host_id: String,
     account_id_hash: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).proxy_official_account_select(
-        &format!("official-execution-select-{}", ulid::Ulid::new()),
-        &account_id_hash,
-    )
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).proxy_official_account_select(
+            &format!("official-execution-select-{}", ulid::Ulid::new()),
+            &account_id_hash,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn clear_remote_official_execution_account_selection(
+pub async fn clear_remote_official_execution_account_selection(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).proxy_official_account_clear_selection(&format!(
-        "official-execution-clear-{}",
-        ulid::Ulid::new()
-    ))
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).proxy_official_account_clear_selection(
+            &format!("official-execution-clear-{}", ulid::Ulid::new()),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remove_remote_official_execution_account(
+pub async fn remove_remote_official_execution_account(
     state: tauri::State<'_, AppState>,
     host_id: String,
     account_id_hash: String,
 ) -> AppResult<serde_json::Value> {
-    let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
-    crate::remote::RemoteAgentClient::new(target).proxy_official_account_remove(
-        &format!("official-execution-remove-{}", ulid::Ulid::new()),
-        &account_id_hash,
-    )
+    off_main_thread(&state, move |state| {
+        let target = crate::remote::RemoteHostManager::resolve_target(&state, &host_id)?;
+        crate::remote::RemoteAgentClient::new(target).proxy_official_account_remove(
+            &format!("official-execution-remove-{}", ulid::Ulid::new()),
+            &account_id_hash,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remote_agent_host_status(
+pub async fn remote_agent_host_status(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::probe_agent(&state, &host_id)
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::probe_agent(&state, &host_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -677,91 +756,120 @@ pub async fn remote_host_aggregate_status(
 }
 
 #[tauri::command]
-pub fn remote_proxy_start(
+pub async fn remote_proxy_start(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
     host_port: Option<u16>,
     image: Option<String>,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::start_proxy(
-        &state,
-        &host_id,
-        &operation_id,
-        host_port,
-        image.as_deref(),
-    )
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::start_proxy(
+            &state,
+            &host_id,
+            &operation_id,
+            host_port,
+            image.as_deref(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remote_proxy_install(
+pub async fn remote_proxy_install(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
     image: String,
     image_digest: Option<String>,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::install_proxy(
-        &state,
-        &host_id,
-        &operation_id,
-        &image,
-        image_digest.as_deref(),
-    )
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::install_proxy(
+            &state,
+            &host_id,
+            &operation_id,
+            &image,
+            image_digest.as_deref(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remote_proxy_configure(
+pub async fn remote_proxy_configure(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
     config_toml: String,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::configure_proxy(&state, &host_id, &operation_id, &config_toml)
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::configure_proxy(
+            &state,
+            &host_id,
+            &operation_id,
+            &config_toml,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remote_proxy_stop(
+pub async fn remote_proxy_stop(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::stop_proxy(&state, &host_id, &operation_id)
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::stop_proxy(&state, &host_id, &operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remote_manager_repair(
+pub async fn remote_manager_repair(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::repair(&state, &host_id, &operation_id)
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::repair(&state, &host_id, &operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remote_manager_support_bundle(
+pub async fn remote_manager_support_bundle(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::RemoteHostManager::support_bundle(&state, &host_id)
+    off_main_thread(&state, move |state| {
+        crate::remote::RemoteHostManager::support_bundle(&state, &host_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn install_remote_pinned_codex(
-    state: tauri::State<'_, AppState>,
-    host_id: String,
-    operation_id: String,
-) -> AppResult<serde_json::Value> {
-    crate::remote::pinned_install::install_pinned_codex(&state, &host_id, &operation_id)
-}
-
-#[tauri::command]
-pub fn update_remote_components(
+pub async fn install_remote_pinned_codex(
     state: tauri::State<'_, AppState>,
     host_id: String,
     operation_id: String,
 ) -> AppResult<serde_json::Value> {
-    crate::remote::pinned_install::update_remote_components(&state, &host_id, &operation_id)
+    off_main_thread(&state, move |state| {
+        crate::remote::pinned_install::install_pinned_codex(&state, &host_id, &operation_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_remote_components(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    operation_id: String,
+) -> AppResult<serde_json::Value> {
+    off_main_thread(&state, move |state| {
+        crate::remote::pinned_install::update_remote_components(&state, &host_id, &operation_id)
+    })
+    .await
 }
 
 #[tauri::command]
