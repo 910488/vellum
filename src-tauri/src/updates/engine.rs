@@ -1538,7 +1538,52 @@ fn current_versions(core: &str) -> Currents<'_> {
 }
 
 fn current_core_version(state: &AppState) -> String {
-    match super::resolve_enhanced_runtime(&state.data_root()) {
+    current_core_version_at(&state.data_root())
+}
+
+/// What the cached core version was verified against: the slot index and
+/// the active executable's size and mtime. Any install, rollback or edit of
+/// the executable changes one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreVersionKey {
+    root: PathBuf,
+    slots: Option<Vec<u8>>,
+    executable: Option<(u64, Option<SystemTime>)>,
+}
+
+impl CoreVersionKey {
+    fn read(root: &Path) -> Self {
+        let slots = std::fs::read(CoreSlots::path(root)).ok();
+        let executable = CoreSlots::load(root).active.and_then(|slot| {
+            let metadata = std::fs::metadata(&slot.path).ok()?;
+            Some((metadata.len(), metadata.modified().ok()))
+        });
+        Self {
+            root: root.to_path_buf(),
+            slots,
+            executable,
+        }
+    }
+}
+
+static CORE_VERSION_CACHE: std::sync::Mutex<Option<(CoreVersionKey, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Status, check and apply only need the running core's version. Verifying
+/// it hashes the whole signed tree (about 400 MB on macOS), and the update
+/// panel asks for status every second, so reuse the last verification until
+/// the slot index or the executable changes. Launch still verifies the
+/// tree itself through `resolve_enhanced_runtime`.
+fn current_core_version_at(root: &Path) -> String {
+    let key = CoreVersionKey::read(root);
+    if let Ok(cache) = CORE_VERSION_CACHE.lock() {
+        if let Some((cached_key, version)) = cache.as_ref() {
+            if *cached_key == key {
+                return version.clone();
+            }
+        }
+    }
+    let version = match super::resolve_enhanced_runtime(root) {
         Some(runtime) if super::manifest::parse_version(&runtime.version).is_some() => {
             runtime.version
         }
@@ -1546,7 +1591,11 @@ fn current_core_version(state: &AppState) -> String {
         // Missing is not the installed Desktop version. Offer the compatible
         // core release even when it matches the current Desktop version.
         None => "0.0.0".into(),
+    };
+    if let Ok(mut cache) = CORE_VERSION_CACHE.lock() {
+        *cache = Some((key, version.clone()));
     }
+    version
 }
 
 pub fn progress_from(op: &UpdateOperation) -> UpdateProgress {
@@ -1564,6 +1613,39 @@ pub fn progress_from(op: &UpdateOperation) -> UpdateProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_core_version_is_keyed_on_the_slot_index_and_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let empty = CoreVersionKey::read(root);
+        assert_eq!(empty, CoreVersionKey::read(root));
+
+        let exe = root.join("codex");
+        std::fs::write(&exe, b"core-a").unwrap();
+        let slots = CoreSlots::path(root);
+        std::fs::create_dir_all(slots.parent().unwrap()).unwrap();
+        let index = serde_json::json!({
+            "active": {
+                "version": "0.2.10",
+                "digest": "sha256:00",
+                "protocol": "",
+                "path": exe,
+                "helpers": []
+            }
+        });
+        std::fs::write(&slots, serde_json::to_vec(&index).unwrap()).unwrap();
+        let installed = CoreVersionKey::read(root);
+        assert_ne!(empty, installed, "an install changes the slot index");
+        assert!(installed.executable.is_some());
+
+        std::fs::write(&exe, b"core-a-but-longer").unwrap();
+        assert_ne!(
+            installed,
+            CoreVersionKey::read(root),
+            "replacing the executable invalidates the cached verification"
+        );
+    }
     use crate::updates::core_slots::CoreSlot;
     use crate::updates::github::{GithubAsset, GithubRelease, ListedReleases, MemorySource};
     use crate::updates::manifest::{

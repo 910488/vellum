@@ -10,9 +10,23 @@ fn emit_progress(app: &tauri::AppHandle, op: &UpdateOperation) {
     let _ = app.emit(UPDATES_PROGRESS_EVENT, crate::updates::progress_from(op));
 }
 
+/// Update commands read the signed core tree. Synchronous Tauri commands
+/// run on the main thread, where that work starves the event loop: on macOS
+/// the window froze and the exit for a Desktop update never ran, so the swap
+/// script gave up. Run them on the blocking pool instead.
+async fn off_main_thread<T: Send + 'static>(
+    state: &AppState,
+    work: impl FnOnce(AppState) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    let state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || work(state))
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?
+}
+
 #[tauri::command]
-pub fn get_update_status(state: State<'_, AppState>) -> AppResult<UpdateStatusSnapshot> {
-    Ok(crate::updates::get_status(&state))
+pub async fn get_update_status(state: State<'_, AppState>) -> AppResult<UpdateStatusSnapshot> {
+    off_main_thread(&state, |state| Ok(crate::updates::get_status(&state))).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -28,27 +42,30 @@ pub async fn check_updates(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn set_update_preferences(
+pub async fn set_update_preferences(
     channel: Option<String>,
     auto_check: Option<bool>,
     auto_download: Option<bool>,
     core_idle_handoff: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<UpdatePreferences> {
-    let mut preferences = crate::updates::get_status(&state).preferences;
-    if let Some(channel) = channel.as_deref().and_then(crate::updates::Channel::parse) {
-        preferences.channel = channel;
-    }
-    if let Some(auto_check) = auto_check {
-        preferences.auto_check = auto_check;
-    }
-    if let Some(auto_download) = auto_download {
-        preferences.auto_download = auto_download;
-    }
-    if let Some(core_idle_handoff) = core_idle_handoff {
-        preferences.core_idle_handoff = core_idle_handoff;
-    }
-    crate::updates::set_preferences(&state, preferences)
+    off_main_thread(&state, move |state| {
+        let mut preferences = crate::updates::get_status(&state).preferences;
+        if let Some(channel) = channel.as_deref().and_then(crate::updates::Channel::parse) {
+            preferences.channel = channel;
+        }
+        if let Some(auto_check) = auto_check {
+            preferences.auto_check = auto_check;
+        }
+        if let Some(auto_download) = auto_download {
+            preferences.auto_download = auto_download;
+        }
+        if let Some(core_idle_handoff) = core_idle_handoff {
+            preferences.core_idle_handoff = core_idle_handoff;
+        }
+        crate::updates::set_preferences(&state, preferences)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -66,7 +83,7 @@ pub async fn download_update(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn apply_update(
+pub async fn apply_update(
     app: tauri::AppHandle,
     component: String,
     host_id: Option<String>,
@@ -74,7 +91,10 @@ pub fn apply_update(
 ) -> AppResult<UpdateOperation> {
     let component = UpdateComponent::parse(&component)
         .ok_or_else(|| crate::error::AppError::Message("unknown component".into()))?;
-    let op = crate::updates::apply_update(&state, component, host_id)?;
+    let op = off_main_thread(&state, move |state| {
+        crate::updates::apply_update(&state, component, host_id)
+    })
+    .await?;
     emit_progress(&app, &op);
     Ok(op)
 }
@@ -209,27 +229,33 @@ pub fn cancel_scheduled_restart() -> bool {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn cancel_update_download(
+pub async fn cancel_update_download(
     app: tauri::AppHandle,
     component: String,
     state: State<'_, AppState>,
 ) -> AppResult<UpdateOperation> {
     let component = UpdateComponent::parse(&component)
         .ok_or_else(|| crate::error::AppError::Message("unknown component".into()))?;
-    let op = crate::updates::cancel_download(&state, component)?;
+    let op = off_main_thread(&state, move |state| {
+        crate::updates::cancel_download(&state, component)
+    })
+    .await?;
     emit_progress(&app, &op);
     Ok(op)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn rollback_update(
+pub async fn rollback_update(
     app: tauri::AppHandle,
     component: String,
     state: State<'_, AppState>,
 ) -> AppResult<UpdateOperation> {
     let component = UpdateComponent::parse(&component)
         .ok_or_else(|| crate::error::AppError::Message("unknown component".into()))?;
-    let op = crate::updates::rollback_update(&state, component)?;
+    let op = off_main_thread(&state, move |state| {
+        crate::updates::rollback_update(&state, component)
+    })
+    .await?;
     emit_progress(&app, &op);
     Ok(op)
 }
