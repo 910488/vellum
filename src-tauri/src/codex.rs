@@ -2138,36 +2138,98 @@ fn restrict_to_current_user(path: &Path) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        // `icacls /inheritance:r` drops inherited entries, then the owner is
-        // granted full control explicitly. Failure is reported rather than
-        // ignored: silently leaving a broad ACL on a file holding the boundary
-        // key would defeat the point of writing it there.
-        let output = crate::process::background_command("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("{}:F", current_windows_user()?))
-            .output()
+        // Failure is reported rather than ignored: silently leaving a broad
+        // ACL on a file holding the boundary key would defeat the point of
+        // writing it there.
+        owner_only_acl(path)
             .map_err(|error| AppError::Message(format!("無法設定設定檔 ACL：{error}")))?;
-        if !output.status.success() {
-            return Err(AppError::Message(format!(
-                "無法設定設定檔 ACL：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
     }
     let _ = path;
     Ok(())
 }
 
+/// What `icacls <path> /inheritance:r /grant:r <user>:F` did, without the
+/// child process: a protected DACL holding one full-control entry for the
+/// process user. While Windows ends the session new console processes fail
+/// to start, and icacls failing there left config.toml pointing at a Proxy
+/// that the shutdown was about to take away.
 #[cfg(windows)]
-fn current_windows_user() -> AppResult<String> {
-    let domain = std::env::var("USERDOMAIN").ok();
-    let user = std::env::var("USERNAME")
-        .map_err(|_| AppError::Message("無法取得目前 Windows 使用者".into()))?;
-    Ok(match domain {
-        Some(domain) if !domain.trim().is_empty() => format!("{domain}\\{user}"),
-        _ => user,
-    })
+fn owner_only_acl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
+        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut needed = 0u32;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    // u64 keeps the SID pointer inside TOKEN_USER aligned.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    let read_error = std::io::Error::last_os_error();
+    unsafe { CloseHandle(token) };
+    if read == 0 {
+        return Err(read_error);
+    }
+    let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: user.User.Sid.cast(),
+        },
+    };
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    unsafe { LocalFree(acl.cast()) };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
@@ -2193,6 +2255,67 @@ mod tests {
         "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_acl_leaves_one_protected_entry() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl, ACL,
+            ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SE_DACL_PROTECTED,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        std::fs::write(&file, "model = \"x\"\n").unwrap();
+        owner_only_acl(&file).unwrap();
+
+        let wide: Vec<u16> = file
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut size = ACL_SIZE_INFORMATION::default();
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        unsafe {
+            assert_ne!(
+                GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ),
+                0
+            );
+            assert_ne!(
+                GetSecurityDescriptorControl(descriptor, &mut control, &mut revision),
+                0
+            );
+            LocalFree(descriptor);
+        }
+        assert_eq!(size.AceCount, 1, "only the owner's entry survives");
+        assert_ne!(control & SE_DACL_PROTECTED, 0, "inheritance is cut off");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "model = \"x\"\n");
+    }
 
     #[test]
     fn parses_codex_cli_versions_for_native_subagent_gate() {
