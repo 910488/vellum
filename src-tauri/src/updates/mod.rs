@@ -311,6 +311,8 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
 /// does not stop the others.
 pub async fn update_vellum(state: &AppState) -> crate::error::AppResult<UpdateStatusSnapshot> {
     let snapshot = check_updates(state, None).await?;
+    let root = state.data_root();
+    let _ = tokio::task::spawn_blocking(move || engine(&root).prune_retired_versions()).await;
     if !snapshot.live_auto_update {
         return Ok(snapshot);
     }
