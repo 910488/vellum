@@ -18,6 +18,7 @@ mod manifest;
 mod observe;
 mod remote_helper;
 mod remote_host;
+mod resume;
 mod schedule;
 mod select;
 mod trust;
@@ -55,6 +56,7 @@ pub use manifest::{
     sign_raw, verify_asset_sha256, verify_signed_manifest, AssetRef, CompatRange, CoreFile,
     CoreManifest, CoreTarget, UpdateManifest, MANIFEST_SCHEMA_VERSION,
 };
+pub use resume::{remember_running_proxy, take_proxy_resume};
 pub use select::{select_compatible, Channel, ReleaseCandidate, SelectContext, Selection};
 pub use trust::{live_auto_update_enabled, TrustStore};
 
