@@ -237,11 +237,8 @@ pub fn read_user_environment(variable: &str) -> Result<Option<String>, Environme
     }
     #[cfg(all(not(test), target_os = "windows"))]
     {
-        let script = format!(
-            "$value = [Environment]::GetEnvironmentVariable('{variable}','User'); if ($null -eq $value) {{ Write-Output '<unset>' }} else {{ Write-Output $value }}"
-        );
-        let output = powershell(&script)?;
-        Ok((output != "<unset>").then_some(output))
+        user_registry::read(user_registry::ENVIRONMENT, variable)
+            .map_err(|error| EnvironmentLeaseError::Command(error.to_string()))
     }
     #[cfg(all(not(test), target_os = "macos"))]
     {
@@ -274,15 +271,8 @@ fn write_user_environment(
     }
     #[cfg(all(not(test), target_os = "windows"))]
     {
-        let script = match value {
-            Some(value) => format!(
-                "[Environment]::SetEnvironmentVariable('{variable}',{},'User')",
-                powershell_literal(value)
-            ),
-            None => format!("[Environment]::SetEnvironmentVariable('{variable}',$null,'User')"),
-        };
-        powershell(&script)?;
-        Ok(())
+        user_registry::write(user_registry::ENVIRONMENT, variable, value)
+            .map_err(|error| EnvironmentLeaseError::Command(error.to_string()))
     }
     #[cfg(all(not(test), target_os = "macos"))]
     {
@@ -365,54 +355,157 @@ pub(crate) mod test_environment {
 }
 
 #[cfg(target_os = "windows")]
-/// Runs a PowerShell snippet and returns its stdout as text.
+/// The per-user environment is `HKCU\Environment`, read and written in
+/// process.
 ///
-/// The encoding prelude is not decoration. With stdout redirected to a pipe,
-/// PowerShell encodes it with the console output code page — cp950 on a
-/// Traditional Chinese install, cp932 on a Japanese one — and decoding those
-/// bytes as UTF-8 turns every non-ASCII character into U+FFFD.
-///
-/// That is not cosmetic here. `CODEX_CLI_PATH` holds a path, this function is
-/// how Vellum reads back the path it just wrote, and the lease compares the
-/// two. Installed anywhere with a non-ASCII path — under `OneDrive/文档`, say
-/// — Vellum read its own value back as `????`, concluded another tool had
-/// taken the variable, and reported `environmentDrift`. The handover could
-/// never reach `active`, and nothing in the message said why.
-fn powershell(script: &str) -> Result<String, EnvironmentLeaseError> {
-    let mut command = crate::process::background_command("powershell");
-    command.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &format!(
-            "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; {script}"
-        ),
-    ]);
-    let output = command
-        .output()
-        .map_err(|error| EnvironmentLeaseError::Command(error.to_string()))?;
-    if !output.status.success() {
-        return Err(EnvironmentLeaseError::Command(
-            decode_utf8(&output.stderr).trim().to_string(),
-        ));
+/// This used to go through PowerShell's `[Environment]` API, and a child
+/// process failed in two ways. Its stdout used the console code page, so a
+/// non-ASCII path such as `OneDrive/文档` came back as `????` without an
+/// encoding prelude. And while Windows ends the session (shutdown, restart,
+/// sign-out) new console processes fail to start, so the exit teardown could
+/// not hand `CODEX_CLI_PATH` back: Codex opened after the next boot still
+/// launched the bridge of a Vellum that was not running.
+mod user_registry {
+    use std::io;
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, WIN32_ERROR,
+    };
+    use windows_sys::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_NOEXPAND,
+        RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+
+    pub(super) const ENVIRONMENT: &str = "Environment";
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
     }
-    Ok(decode_utf8(&output.stdout).trim().to_string())
-}
 
-/// UTF-8 with any byte order mark removed; some PowerShell hosts emit one once
-/// the output encoding is set, and a leading U+FEFF would break every
-/// comparison the lease makes.
-#[cfg(target_os = "windows")]
-fn decode_utf8(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .trim_start_matches('\u{feff}')
-        .to_string()
-}
+    fn failed(status: WIN32_ERROR) -> io::Error {
+        io::Error::from_raw_os_error(status as i32)
+    }
 
-/// PowerShell single-quoted string literal; the only escape is a doubled `'`.
-#[cfg(target_os = "windows")]
-fn powershell_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    /// The stored text, unexpanded, so writing it back restores it exactly.
+    pub(super) fn read(subkey: &str, name: &str) -> io::Result<Option<String>> {
+        let (subkey, name) = (wide(subkey), wide(name));
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        loop {
+            let mut bytes = 0u32;
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    name.as_ptr(),
+                    flags,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut bytes,
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            if status != ERROR_SUCCESS {
+                return Err(failed(status));
+            }
+            let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    name.as_ptr(),
+                    flags,
+                    std::ptr::null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut bytes,
+                )
+            };
+            match status {
+                ERROR_SUCCESS => {
+                    buffer.truncate(bytes as usize / 2);
+                    while buffer.last() == Some(&0) {
+                        buffer.pop();
+                    }
+                    let value = String::from_utf16(&buffer)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    return Ok((!value.is_empty()).then_some(value));
+                }
+                ERROR_FILE_NOT_FOUND => return Ok(None),
+                // Another writer grew the value between the two calls.
+                ERROR_MORE_DATA => continue,
+                status => return Err(failed(status)),
+            }
+        }
+    }
+
+    pub(super) fn write(subkey: &str, name: &str, value: Option<&str>) -> io::Result<()> {
+        let (subkey, name) = (wide(subkey), wide(name));
+        let status = match value {
+            Some(value) => {
+                let data = wide(value);
+                unsafe {
+                    RegSetKeyValueW(
+                        HKEY_CURRENT_USER,
+                        subkey.as_ptr(),
+                        name.as_ptr(),
+                        REG_SZ,
+                        data.as_ptr().cast(),
+                        (data.len() * 2) as u32,
+                    )
+                }
+            }
+            None => {
+                match unsafe {
+                    RegDeleteKeyValueW(HKEY_CURRENT_USER, subkey.as_ptr(), name.as_ptr())
+                } {
+                    ERROR_FILE_NOT_FOUND => ERROR_SUCCESS,
+                    status => status,
+                }
+            }
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(failed(status))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::Registry::RegDeleteKeyW;
+
+        /// A throwaway key, never `Environment`: the real per-user
+        /// environment is shared with the developer's own Codex Desktop.
+        struct ScratchKey(String);
+
+        impl Drop for ScratchKey {
+            fn drop(&mut self) {
+                let key = wide(&self.0);
+                unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, key.as_ptr()) };
+            }
+        }
+
+        #[test]
+        fn values_round_trip_byte_for_byte() {
+            let key = ScratchKey(format!(
+                r"Software\vellum-env-lease-test-{}",
+                std::process::id()
+            ));
+            let path = r"C:\Users\developer\OneDrive\文档\code\GLM Harness測試\%HOME%\bridge.exe";
+
+            assert_eq!(read(&key.0, "CODEX_CLI_PATH").unwrap(), None);
+            write(&key.0, "CODEX_CLI_PATH", Some(path)).unwrap();
+            assert_eq!(
+                read(&key.0, "CODEX_CLI_PATH").unwrap().as_deref(),
+                Some(path)
+            );
+            write(&key.0, "CODEX_CLI_PATH", None).unwrap();
+            assert_eq!(read(&key.0, "CODEX_CLI_PATH").unwrap(), None);
+            // Removing what is already gone is the steady state of a release.
+            write(&key.0, "CODEX_CLI_PATH", None).unwrap();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -495,23 +588,6 @@ fn plan_previous_value_for_acquire(
 
 #[cfg(test)]
 mod tests {
-    /// The lease compares the path it wrote against the path it reads back, so
-    /// the reader has to be byte-faithful. On a console code page that cannot
-    /// represent the path — cp950 here — the old reader returned `????` and the
-    /// runtime called its own value foreign.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn powershell_output_survives_a_non_ascii_path() {
-        let path = r"C:\Users\developer\OneDrive\文档\code\GLM Harness測試\vellum";
-        let echoed =
-            super::powershell(&format!("Write-Output '{path}'")).expect("powershell should run");
-        assert_eq!(echoed, path);
-        assert!(
-            !echoed.contains('\u{fffd}'),
-            "the reader must not lose characters it cannot encode"
-        );
-    }
-
     use super::*;
 
     // The bridge lease's ownership rule, which most of these tests exercise.
@@ -692,11 +768,9 @@ mod tests {
     fn real_user_environment(variable: &str) -> Option<String> {
         #[cfg(target_os = "windows")]
         {
-            powershell(&format!(
-                "[Environment]::GetEnvironmentVariable('{variable}','User')"
-            ))
-            .ok()
-            .filter(|value| !value.is_empty())
+            user_registry::read(user_registry::ENVIRONMENT, variable)
+                .ok()
+                .flatten()
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -715,12 +789,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(EnvironmentLease::read(temp.path()), Some(value));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn powershell_literals_escape_quotes() {
-        assert_eq!(powershell_literal("C:/a b/c.exe"), "'C:/a b/c.exe'");
-        assert_eq!(powershell_literal("it's"), "'it''s'");
     }
 }
