@@ -146,6 +146,10 @@ pub struct DesktopRuntimeStatus {
     /// its own field rather than left as prose in `blockers` because Vellum
     /// repairs this one itself, and a repair needs a condition it can test.
     pub launch_core_drift: bool,
+    /// A downloaded core waits in the pending slot. Only a managed restart
+    /// arms it (`arm_core_pending_apply`); Desktop restarting on its own keeps
+    /// the active core, and on macOS no bundled core settles it at startup.
+    pub pending_core: bool,
     pub blockers: Vec<String>,
 }
 
@@ -1113,6 +1117,7 @@ fn status_for_settings(
         && status.environment_state == "leased";
     status.bridge_protection_active &=
         status.bridge_prepared && status.enabled && status.environment_state == "leased";
+    status.pending_core = crate::updates::pending_core(data_root).is_some();
     status.restart_required = restart_would_fix(&status);
     status.activation_state = activation_state(&status).into();
     status
@@ -1163,7 +1168,10 @@ fn restart_would_fix(status: &DesktopRuntimeStatus) -> bool {
     // A launch left on a superseded core is exactly what a managed restart
     // fixes, and the only thing that fixes it: the path is adopted already,
     // so nothing changes until the children are respawned from it.
-    adopt || release || status.launch_core_drift
+    // A pending core is applied by the managed restart and nothing else, and
+    // only while the lease is ours to hand the new launch.
+    let pending = status.pending_core && status.enabled && status.environment_state == "leased";
+    adopt || release || status.launch_core_drift || pending
 }
 
 fn activation_state(status: &DesktopRuntimeStatus) -> &'static str {
@@ -1506,6 +1514,7 @@ fn empty_status(data_root: &Path, configured: bool, blockers: Vec<String>) -> De
         last_qualification: QualificationResult::read(data_root),
         missing_helpers: Vec::new(),
         launch_core_drift: false,
+        pending_core: false,
         blockers,
     }
 }
@@ -2092,8 +2101,19 @@ mod tests {
 
         status.launch_core_drift = true;
         assert!(restart_would_fix(&status));
-
         status.launch_core_drift = false;
+
+        // A downloaded core waits for the managed restart, which needs the lease.
+        status.active = true;
+        status.environment_state = "leased".into();
+        status.pending_core = true;
+        assert!(restart_would_fix(&status), "a pending core is applied by a restart");
+        status.environment_state = "released".into();
+        assert!(!restart_would_fix(&status), "without the lease a restart cannot apply it");
+        status.environment_state = "leased".into();
+        status.pending_core = false;
+        status.active = false;
+
         status.enabled = false;
         status.bridge_observed = true;
         assert!(
