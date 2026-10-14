@@ -305,7 +305,15 @@ pub fn apply_managed_ssh_isolation(
         port: request.port,
         identity_file: request.identity_file.to_string_lossy().into_owned(),
     };
-    let existing = fs::read_to_string(request.ssh_config_path).unwrap_or_default();
+    // This is the user's own ~/.ssh/config. Only a missing file starts empty:
+    // treating a read failure (bytes that are not UTF-8, a lock) the same way
+    // would replace every host the user configured with this one block. It is
+    // written in place, not renamed over, so a symlinked config stays a link.
+    let existing = match fs::read_to_string(request.ssh_config_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("SshConfigReadFailed: {error}")),
+    };
     let next = upsert_ssh_config(&existing, &config);
     if let Some(parent) = request.ssh_config_path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("SshConfigDirCreateFailed: {error}"))?;
@@ -486,6 +494,31 @@ mod tests {
                 "remote path export was not POSIX: {line}"
             );
         }
+    }
+
+    #[test]
+    fn an_unreadable_user_ssh_config_is_never_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        // The user's own hosts, with a comment that is not UTF-8.
+        let existing = b"# caf\xe9\nHost work\n  HostName work.example\n".to_vec();
+        std::fs::write(&config, &existing).unwrap();
+        let error = apply_managed_ssh_isolation(IsolationApplyRequest {
+            ssh_config_path: &config,
+            identity_file: &temp.path().join("id_ed25519"),
+            host_id: "linux-host",
+            hostname: "example.test",
+            user: "josh",
+            port: 22,
+            public_key: "ssh-ed25519 AAAAMANAGED vellum",
+            managed_codex_home: "/home/josh/.codex",
+            install_dir: "/home/josh/.codex/packages/standalone/current",
+            extra_path: "/home/josh/.local/bin",
+            existing_authorized_keys: "",
+        })
+        .unwrap_err();
+        assert!(error.starts_with("SshConfigReadFailed:"), "{error}");
+        assert_eq!(std::fs::read(&config).unwrap(), existing);
     }
 
     #[test]
