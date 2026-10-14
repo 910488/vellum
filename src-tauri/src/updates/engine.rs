@@ -1,6 +1,6 @@
 //! Named operations, persisted state, and single-flight.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -237,12 +237,91 @@ impl UpdateEngine {
 
     /// Whether what a waiting layer staged is still in place: the pending core
     /// slot for Core, the downloaded asset for the others.
-    fn still_staged(&self, component: UpdateComponent, record: &LayerRecord, version: &str) -> bool {
+    fn still_staged(
+        &self,
+        component: UpdateComponent,
+        record: &LayerRecord,
+        version: &str,
+    ) -> bool {
         match component {
             UpdateComponent::Core => {
                 super::pending_core(&self.root).is_some_and(|slot| slot.version == version)
             }
             _ => record.staged_asset.as_deref().is_some_and(Path::is_file),
+        }
+    }
+
+    /// Removes core trees, archives, and installers that nothing refers to.
+    ///
+    /// Nothing else ever deleted them: each preview left a 416 MB core tree
+    /// (twice over when it was re-staged) plus its archives, ~6 GB within a
+    /// few days, until a Mac ran out of disk mid-download. Only versions
+    /// older than the newest one still referenced go, so a download that
+    /// started after the state was read is never touched.
+    pub fn prune_retired_versions(&self) {
+        if !self.state_path().is_file() {
+            return;
+        }
+        let state = self.load();
+        let slots = CoreSlots::load(&self.root);
+        let updates = self.root.join("updates");
+        for component in [UpdateComponent::Desktop, UpdateComponent::Core] {
+            let Some(record) = state.layers.get(component.as_str()) else {
+                continue;
+            };
+            let mut keep: HashSet<String> = [
+                Some(&record.current_version),
+                record.available_version.as_ref(),
+                record.staged_version.as_ref(),
+                record.target_version.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+            if component == UpdateComponent::Core {
+                keep.extend(
+                    [&slots.active, &slots.pending, &slots.previous]
+                        .into_iter()
+                        .flatten()
+                        .map(|slot| slot.version.clone()),
+                );
+            }
+            let Some(newest_kept) = keep
+                .iter()
+                .filter_map(|version| super::manifest::parse_version(version))
+                .max()
+            else {
+                continue;
+            };
+            let name = component.as_str();
+            for dir in [updates.join(name), updates.join("cache").join(name)] {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let version = entry.file_name().to_string_lossy().into_owned();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    if keep.contains(&version) {
+                        drop_finished_switch_backup(&path);
+                        continue;
+                    }
+                    if super::manifest::parse_version(&version)
+                        .is_none_or(|parsed| parsed >= newest_kept)
+                    {
+                        continue;
+                    }
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => log::info!("[Updates] removed retired {name} {version}"),
+                        Err(error) => {
+                            log::warn!("[Updates] cannot remove retired {name} {version}: {error}")
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1234,6 +1313,24 @@ impl<'a> Currents<'a> {
     }
 }
 
+/// `commit_candidate` keeps the replaced tree as `previous` only so a crash
+/// mid-switch can recover; once the switch finished it is dead weight.
+fn drop_finished_switch_backup(slot: &Path) {
+    let previous = slot.join("previous");
+    if !previous.is_dir() {
+        return;
+    }
+    let done = std::fs::read(slot.join("switch.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|marker| marker["phase"] == "done");
+    if done && slot.join("current").join(".complete").is_file() {
+        if let Err(error) = std::fs::remove_dir_all(&previous) {
+            log::warn!("[Updates] cannot remove {}: {error}", previous.display());
+        }
+    }
+}
+
 fn checked_manifest_dir(root: &Path, component: UpdateComponent, version: &str) -> PathBuf {
     root.join("updates")
         .join("manifests")
@@ -1933,7 +2030,10 @@ mod tests {
             .download(UpdateComponent::Core, currents, Vec::new())
             .await
             .unwrap();
-        assert_eq!(CoreSlots::load(dir.path()).pending.unwrap().version, "0.2.0");
+        assert_eq!(
+            CoreSlots::load(dir.path()).pending.unwrap().version,
+            "0.2.0"
+        );
 
         super::super::core_slots::promote_pending(dir.path()).unwrap();
         let promoted = engine.snapshot("0.2.9", "0.2.9", "0.2.0");
@@ -2096,6 +2196,112 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert_eq!(first.operation_id, second.operation_id);
+    }
+
+    #[test]
+    fn retired_update_versions_are_pruned_but_referenced_and_newer_ones_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let engine = UpdateEngine::open(
+            root,
+            TrustStore::bundled(),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        );
+        let updates = root.join("updates");
+        let tree = |parts: &[&str]| {
+            let path = parts
+                .iter()
+                .fold(updates.clone(), |path, part| path.join(part));
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        // Nothing is pruned until there is state to say what is in use.
+        tree(&["core", "0.1.0", "current"]);
+        engine.prune_retired_versions();
+        assert!(updates.join("core").join("0.1.0").is_dir());
+
+        let mut state = PersistedState::default();
+        state
+            .layers
+            .insert("desktop".into(), LayerRecord::new("0.2.0"));
+        let mut core = LayerRecord::new("0.4.0");
+        core.staged_version = Some("0.5.0".into());
+        state.layers.insert("core".into(), core);
+        engine.save(&state).unwrap();
+        let slot = |version: &str| {
+            serde_json::json!({"version": version, "digest": "d", "protocol": "p",
+                "path": "x", "helpers": [], "launchId": null})
+        };
+        let slots: CoreSlots = serde_json::from_value(serde_json::json!({
+            "active": slot("0.4.0"), "pending": slot("0.5.0"), "previous": slot("0.3.0")
+        }))
+        .unwrap();
+        slots.save(root).unwrap();
+
+        for version in ["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0", "0.6.0"] {
+            tree(&["core", version, "current"]);
+            tree(&["cache", "core", version]);
+        }
+        for version in ["0.1.0", "0.2.0", "0.3.0"] {
+            tree(&["desktop", version, "current"]);
+            tree(&["cache", "desktop", version]);
+        }
+        tree(&["core", "not-a-version"]);
+        // A finished switch leaves its backup behind; an unfinished one keeps it.
+        tree(&["core", "0.5.0", "previous"]);
+        std::fs::write(updates.join("core/0.5.0/current/.complete"), b"ok").unwrap();
+        std::fs::write(
+            updates.join("core/0.5.0/switch.json"),
+            br#"{"phase":"done"}"#,
+        )
+        .unwrap();
+        tree(&["core", "0.4.0", "previous"]);
+        std::fs::write(
+            updates.join("core/0.4.0/switch.json"),
+            br#"{"phase":"renamingCandidate"}"#,
+        )
+        .unwrap();
+
+        engine.prune_retired_versions();
+
+        let present = |parts: &[&str]| {
+            parts
+                .iter()
+                .fold(updates.clone(), |p, part| p.join(part))
+                .exists()
+        };
+        for base in [&["core"][..], &["cache", "core"][..]] {
+            let at = |version: &str| present(&[base, &[version]].concat());
+            assert!(
+                !at("0.1.0") && !at("0.2.0"),
+                "retired cores stay in {base:?}"
+            );
+            assert!(
+                at("0.3.0") && at("0.4.0") && at("0.5.0"),
+                "slot versions go"
+            );
+            assert!(
+                at("0.6.0"),
+                "a version newer than every reference is a download in flight"
+            );
+        }
+        assert!(present(&["core", "not-a-version"]));
+        assert!(!present(&["core", "0.5.0", "previous"]));
+        assert!(present(&["core", "0.4.0", "previous"]));
+        for base in [&["desktop"][..], &["cache", "desktop"][..]] {
+            let at = |version: &str| present(&[base, &[version]].concat());
+            assert!(!at("0.1.0"), "old desktop installer stays in {base:?}");
+            assert!(at("0.2.0") && at("0.3.0"));
+        }
     }
 
     #[test]
