@@ -219,6 +219,17 @@ impl UpdateEngine {
             .map_err(|error| AppError::Message(error.to_string()))
     }
 
+    /// Whether what a waiting layer staged is still in place: the pending core
+    /// slot for Core, the downloaded asset for the others.
+    fn still_staged(&self, component: UpdateComponent, record: &LayerRecord, version: &str) -> bool {
+        match component {
+            UpdateComponent::Core => {
+                super::pending_core(&self.root).is_some_and(|slot| slot.version == version)
+            }
+            _ => record.staged_asset.as_deref().is_some_and(Path::is_file),
+        }
+    }
+
     fn layer_mut<'a>(
         state: &'a mut PersistedState,
         component: UpdateComponent,
@@ -435,6 +446,14 @@ impl UpdateEngine {
             let current = currents.of(item);
             let record = Self::layer_mut(&mut state, item, current);
             let was_applied = record.phase == UpdatePhase::Applied;
+            // A release that is already staged and waiting stays waiting. Marking
+            // it Available again makes the next download re-stage it: for Core
+            // that re-extracts the whole tree on every check.
+            let waiting = matches!(
+                record.phase,
+                UpdatePhase::Staged | UpdatePhase::WaitingForRestart | UpdatePhase::WaitingForIdle
+            )
+            .then(|| (record.phase, record.staged_version.clone()));
             // Preserve repair state unless a strictly newer release supersedes
             // the failed target; failure must never disable future checks.
             let incomplete = (item == UpdateComponent::Desktop
@@ -574,8 +593,17 @@ impl UpdateEngine {
                     .map_or(0, |asset| asset.size);
                 record.download_bytes = 0;
                 record.manifest = Some(manifest);
-                record.phase = transition(record.phase, &UpdateEvent::FoundAvailable)
-                    .unwrap_or(UpdatePhase::Available);
+                record.phase = match waiting {
+                    Some((phase, Some(staged)))
+                        if record.target_version.as_deref() == Some(staged.as_str())
+                            && self.still_staged(item, record, &staged) =>
+                    {
+                        record.download_bytes = record.download_total;
+                        phase
+                    }
+                    _ => transition(record.phase, &UpdateEvent::FoundAvailable)
+                        .unwrap_or(UpdatePhase::Available),
+                };
                 record.failure_reason = None;
             } else {
                 let record = Self::layer_mut(&mut state, item, current);
@@ -1862,6 +1890,34 @@ mod tests {
         assert_eq!(snap.core.staged_version.as_deref(), Some("0.2.0"));
         assert_eq!(snap.core.available_version.as_deref(), Some("0.2.0"));
         assert_eq!(snap.core_runtime.pending_version.as_deref(), Some("0.2.0"));
+
+        // Checking again finds the same release. It is already pending, so it
+        // keeps waiting instead of being offered (and re-staged) again.
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        let rechecked = engine.snapshot("0.2.9", "0.2.9", "bundled");
+        assert_eq!(rechecked.core.phase, UpdatePhase::WaitingForRestart);
+        assert_eq!(rechecked.core.staged_version.as_deref(), Some("0.2.0"));
+
+        // Once the pending slot is gone the same release is offered again.
+        let mut without_pending = CoreSlots::load(dir.path());
+        without_pending.pending = None;
+        without_pending.save(dir.path()).unwrap();
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.snapshot("0.2.9", "0.2.9", "bundled").core.phase,
+            UpdatePhase::Available
+        );
+        engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(CoreSlots::load(dir.path()).pending.unwrap().version, "0.2.0");
 
         super::super::core_slots::promote_pending(dir.path()).unwrap();
         let promoted = engine.snapshot("0.2.9", "0.2.9", "0.2.0");
