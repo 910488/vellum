@@ -67,7 +67,7 @@ pub fn rollback_catalog(root: &Path, id: &str, target: &Path) -> AppResult<()> {
     }
     let bytes = std::fs::read(&source)
         .map_err(|error| AppError::Message(format!("無法讀取型錄版本：{error}")))?;
-    let tmp = target.with_extension("rollback.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(target);
     std::fs::write(&tmp, bytes)
         .map_err(|error| AppError::Message(format!("無法寫入回滾型錄：{error}")))?;
     std::fs::rename(&tmp, target)
