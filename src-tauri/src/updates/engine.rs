@@ -47,6 +47,9 @@ struct PersistedState {
     last_checked_at: Option<i64>,
     #[serde(default)]
     release_indexes: HashMap<String, ReleaseIndex>,
+    /// state.json exists but could not be read. Shown as defaults; never saved.
+    #[serde(skip)]
+    unreadable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,13 +225,22 @@ impl UpdateEngine {
     }
 
     fn load(&self) -> PersistedState {
-        let Ok(bytes) = std::fs::read(self.state_path()) else {
-            return PersistedState::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        match super::read_stored_json(&self.state_path()) {
+            super::StoredJson::Parsed(state) => state,
+            super::StoredJson::Missing | super::StoredJson::SetAside => PersistedState::default(),
+            super::StoredJson::Unreadable => PersistedState {
+                unreadable: true,
+                ..PersistedState::default()
+            },
+        }
     }
 
     fn save(&self, state: &PersistedState) -> AppResult<()> {
+        if state.unreadable {
+            return Err(AppError::Message(
+                "updates/state.json could not be read; not overwriting it".into(),
+            ));
+        }
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|error| AppError::Message(error.to_string()))?;
         write_atomic(&self.state_path(), &bytes)
@@ -269,7 +281,14 @@ impl UpdateEngine {
             return;
         };
         let state = self.load();
-        let slots = CoreSlots::load(&self.root);
+        // Every slot names a version to keep; without them the rollback core
+        // would look retired.
+        let Ok(slots) = CoreSlots::load_for_update(&self.root) else {
+            return;
+        };
+        if state.unreadable {
+            return;
+        }
         let updates = self.root.join("updates");
         for component in [UpdateComponent::Desktop, UpdateComponent::Core] {
             let Some(record) = state.layers.get(component.as_str()) else {
@@ -2274,6 +2293,84 @@ mod tests {
             PruneClaim::take(root).is_some(),
             "a finished prune releases the root"
         );
+    }
+
+    fn engine_without_releases(root: &Path) -> UpdateEngine {
+        UpdateEngine::open(
+            root,
+            TrustStore::bundled(),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        )
+    }
+
+    #[test]
+    fn an_unreadable_slot_index_keeps_the_rollback_core_and_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let engine = engine_without_releases(root);
+        let mut state = PersistedState::default();
+        state
+            .layers
+            .insert("core".into(), LayerRecord::new("0.3.0"));
+        engine.save(&state).unwrap();
+        let rollback = root.join("updates").join("core").join("0.2.0");
+        std::fs::create_dir_all(&rollback).unwrap();
+        // A directory in its place: it exists, but reading it fails.
+        let index = CoreSlots::path(root);
+        std::fs::create_dir_all(&index).unwrap();
+
+        engine.prune_retired_versions();
+        assert!(rollback.is_dir(), "the slots it cannot read may name it");
+
+        assert!(super::super::core_slots::promote_pending(root).is_err());
+        assert!(index.is_dir(), "the index must not be replaced");
+    }
+
+    #[test]
+    fn an_unparseable_slot_index_is_kept_aside_before_starting_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = CoreSlots::path(root);
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(&index, b"{\"active\": tru").unwrap();
+
+        super::super::core_slots::promote_pending(root).unwrap();
+
+        let kept: Vec<_> = std::fs::read_dir(index.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("core-slots.json.unreadable-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"{\"active\": tru");
+        assert_eq!(CoreSlots::load(root), CoreSlots::default());
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_without_releases(dir.path());
+        std::fs::create_dir_all(engine.state_path()).unwrap();
+
+        let state = engine.load();
+
+        assert!(state.unreadable);
+        assert!(engine.save(&state).is_err());
+        assert!(engine.state_path().is_dir());
     }
 
     #[test]

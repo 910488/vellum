@@ -74,11 +74,21 @@ impl CoreSlots {
         root.join("updates").join("core-slots.json")
     }
 
+    /// For readers: an index that cannot be read shows no slots.
     pub fn load(root: &Path) -> Self {
-        let Ok(bytes) = std::fs::read(Self::path(root)) else {
-            return Self::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        Self::load_for_update(root).unwrap_or_default()
+    }
+
+    /// For read-modify-write and pruning: an index that exists but cannot be
+    /// read is an error, so it is never replaced by an empty one.
+    pub fn load_for_update(root: &Path) -> std::io::Result<Self> {
+        match super::read_stored_json(&Self::path(root)) {
+            super::StoredJson::Parsed(slots) => Ok(slots),
+            super::StoredJson::Missing | super::StoredJson::SetAside => Ok(Self::default()),
+            super::StoredJson::Unreadable => Err(std::io::Error::other(
+                "core-slots.json could not be read; not overwriting it",
+            )),
+        }
     }
 
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
@@ -128,7 +138,7 @@ pub fn load_signed_core_trust(root: &Path, version: &str) -> Option<(Vec<u8>, Ve
 /// Staging a candidate only writes `pending`. Active launch identity is
 /// untouched, including any recorded launch id / lease.
 pub fn set_pending(root: &Path, pending: CoreSlot) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     let previous_active = slots.active.clone();
     slots.pending = Some(pending);
     slots.save(root)?;
@@ -173,7 +183,7 @@ pub fn conclude_pending_core(
 }
 
 pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(pending) = slots.pending.take() {
         if let Some(active) = slots.active.take() {
             slots.previous = Some(active);
@@ -185,7 +195,7 @@ pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
 }
 
 pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(previous) = slots.previous.take() {
         let rolled_back = slots.active.take();
         slots.active = Some(previous);
@@ -200,7 +210,7 @@ pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
 /// Next-start apply never promoted, so "rollback before the user turn" means
 /// drop `pending` and keep the running `active` identity.
 fn abort_unpromoted_pending(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if slots.previous.is_some() && slots.pending.is_none() {
         return rollback_to_previous(root);
     }

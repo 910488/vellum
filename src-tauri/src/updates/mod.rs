@@ -103,6 +103,72 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// An update control file as read from disk. Only a missing file means
+/// "nothing recorded"; a file that exists but cannot be read must never be
+/// replaced by defaults.
+pub(crate) enum StoredJson<T> {
+    Missing,
+    Parsed(T),
+    /// Did not parse. The bytes were copied aside first, so starting over
+    /// from defaults loses nothing.
+    SetAside,
+    /// Could not be read (or not copied aside). Writers must leave it alone.
+    Unreadable,
+}
+
+pub(crate) fn read_stored_json<T: serde::de::DeserializeOwned>(path: &Path) -> StoredJson<T> {
+    let mut attempt = 0;
+    let bytes = loop {
+        match std::fs::read(path) {
+            Ok(bytes) => break bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return StoredJson::Missing
+            }
+            Err(error) if attempt < 3 => {
+                attempt += 1;
+                log::warn!(
+                    "[Updates] {} is not readable yet (attempt {attempt}): {error}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                log::warn!(
+                    "[Updates] cannot read {}; leaving it untouched: {error}",
+                    path.display()
+                );
+                return StoredJson::Unreadable;
+            }
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => StoredJson::Parsed(value),
+        Err(parse_error) => {
+            let aside = path.with_extension(format!(
+                "json.unreadable-{}",
+                chrono::Utc::now().timestamp_millis()
+            ));
+            match write_atomic(&aside, &bytes) {
+                Ok(()) => {
+                    log::warn!(
+                        "[Updates] {} did not parse ({parse_error}); kept it as {} and started over",
+                        path.display(),
+                        aside.display()
+                    );
+                    StoredJson::SetAside
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[Updates] {} did not parse and cannot be kept aside ({error}); leaving it untouched",
+                        path.display()
+                    );
+                    StoredJson::Unreadable
+                }
+            }
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
