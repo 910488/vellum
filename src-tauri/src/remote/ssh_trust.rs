@@ -177,7 +177,8 @@ fn save_store(data_root: &Path, store: &ConfirmationStore) -> AppResult<()> {
     }
     let bytes =
         serde_json::to_vec_pretty(store).map_err(|error| AppError::Message(error.to_string()))?;
-    fs::write(&path, bytes).map_err(|error| AppError::Message(error.to_string()))
+    crate::enhanced_runtime::atomic::write_atomic(&path, &bytes)
+        .map_err(|error| AppError::Message(error.to_string()))
 }
 
 /// Has this exact resolved `(host, port)` already been explicitly confirmed?
@@ -472,13 +473,26 @@ fn append_known_hosts_line(data_root: &Path, line: &str) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| AppError::Message(error.to_string()))?;
     }
-    let mut contents = fs::read_to_string(&path).unwrap_or_default();
+    // Only a missing file starts empty. Treating a read failure the same way
+    // would rewrite known_hosts with this one line and drop every host key
+    // trusted before it.
+    let mut contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(AppError::Message(format!(
+                "read {}: {error}; known hosts were not modified",
+                path.display()
+            )))
+        }
+    };
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
     }
     contents.push_str(line);
     contents.push('\n');
-    fs::write(&path, contents).map_err(|error| AppError::Message(error.to_string()))
+    crate::enhanced_runtime::atomic::write_atomic(&path, contents.as_bytes())
+        .map_err(|error| AppError::Message(error.to_string()))
 }
 
 fn resolved_target_for_host(state: &AppState, host_id: &str) -> AppResult<SshTarget> {
@@ -721,6 +735,21 @@ mod tests {
         // record must mean "not confirmed", not "trust by default".
         assert!(!is_confirmed(temp.path(), &target).unwrap());
         assert!(require_trust_or_error(temp.path(), &target).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_known_hosts_file_is_never_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = known_hosts_path(temp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Readable bytes, but not UTF-8: read_to_string fails with InvalidData.
+        let existing = b"[10.0.0.9]:22 ssh-ed25519 AAAA\xff\n".to_vec();
+        fs::write(&path, &existing).unwrap();
+        let error = append_known_hosts_line(temp.path(), "[10.0.0.5]:2222 ssh-ed25519 BBBB")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("known hosts were not modified"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), existing);
     }
 
     #[test]
