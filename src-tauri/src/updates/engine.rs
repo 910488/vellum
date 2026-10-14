@@ -1124,6 +1124,11 @@ impl UpdateEngine {
     /// asking for an update after every Vellum restart.
     fn settle_pending_identical_to_active(&self) -> AppResult<bool> {
         let slots = CoreSlots::load(&self.root);
+        // The running launch is on `previous` when an earlier identical core
+        // settled since Codex last started; that tree has to stay a slot.
+        let launched_previous = slots.previous.as_ref().is_some_and(|previous| {
+            launched_core_version(&self.root) == Some(previous.version.clone())
+        });
         let (Some(active), Some(pending)) = (slots.active, slots.pending) else {
             return Ok(false);
         };
@@ -1136,6 +1141,7 @@ impl UpdateEngine {
         self.settle_pending_core(
             pending,
             "pending core has the same signed files as the active core",
+            launched_previous,
         )?;
         Ok(true)
     }
@@ -1168,12 +1174,22 @@ impl UpdateEngine {
             } else {
                 "verified pending core recovered a missing bundled core"
             },
+            false,
         )
     }
 
-    fn settle_pending_core(&self, slot: super::core_slots::CoreSlot, note: &str) -> AppResult<()> {
-        super::core_slots::promote_pending(&self.root)
-            .map_err(|error| AppError::Message(error.to_string()))?;
+    fn settle_pending_core(
+        &self,
+        slot: super::core_slots::CoreSlot,
+        note: &str,
+        keep_previous: bool,
+    ) -> AppResult<()> {
+        if keep_previous {
+            super::core_slots::promote_pending_keeping_previous(&self.root)
+        } else {
+            super::core_slots::promote_pending(&self.root)
+        }
+        .map_err(|error| AppError::Message(error.to_string()))?;
         let mut state = self.load();
         let record = Self::layer_mut(&mut state, UpdateComponent::Core, &slot.version);
         record.current_version = slot.version.clone();

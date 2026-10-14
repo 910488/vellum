@@ -194,6 +194,18 @@ pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
     Ok(slots)
 }
 
+/// Promotes `pending` but leaves `previous` alone. A core settled without a
+/// restart keeps the running launch on its old tree, and that tree has to
+/// stay a signed slot for the launch to keep verifying.
+pub fn promote_pending_keeping_previous(root: &Path) -> std::io::Result<CoreSlots> {
+    let mut slots = CoreSlots::load_for_update(root)?;
+    if let Some(pending) = slots.pending.take() {
+        slots.active = Some(pending);
+    }
+    slots.save(root)?;
+    Ok(slots)
+}
+
 pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
     let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(previous) = slots.previous.take() {
@@ -606,6 +618,22 @@ mod tests {
             feature_profile: "profile".into(),
             launch_id: Some("launch-live".into()),
         }
+    }
+
+    #[test]
+    fn promoting_while_the_launch_runs_from_previous_keeps_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        CoreSlots {
+            active: Some(slot("relabelled")),
+            pending: Some(slot("relabelled-again")),
+            previous: Some(slot("launched")),
+        }
+        .save(dir.path())
+        .unwrap();
+        let after = promote_pending_keeping_previous(dir.path()).unwrap();
+        assert_eq!(after.active.unwrap().version, "relabelled-again");
+        assert_eq!(after.previous.unwrap().version, "launched");
+        assert!(after.pending.is_none());
     }
 
     #[test]
