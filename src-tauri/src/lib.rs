@@ -164,6 +164,19 @@ pub fn run() {
                 Ok(None) => {}
                 Err(error) => log::warn!("[Updates] cannot settle desktop update: {error}"),
             }
+            if crate::updates::take_proxy_resume(&data_root) {
+                let state = (*app.state::<AppState>()).clone();
+                tauri::async_runtime::spawn(async move {
+                    match crate::commands::proxy::start_proxy_inner(&state).await {
+                        Ok(_) => log::info!("[Updates] proxy resumed after the update restart"),
+                        Err(error) => {
+                            log::warn!(
+                                "[Updates] proxy did not resume after the update restart: {error}"
+                            )
+                        }
+                    }
+                });
+            }
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
             let boot = crate::boot::record_boot(&data_root);

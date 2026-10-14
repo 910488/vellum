@@ -135,6 +135,9 @@ async fn restart_now(app: &tauri::AppHandle, state: &AppState) -> AppResult<Upda
     let applied = crate::shutdown_for_exit(state, true).await;
     if let Some(Ok(op)) = &applied {
         if op.phase == UpdatePhase::Applying {
+            if proxy_was_running {
+                crate::updates::remember_running_proxy(&state.data_root());
+            }
             emit_progress(app, op);
             // Let the reply reach the window before the process goes away.
             let handle = app.clone();
