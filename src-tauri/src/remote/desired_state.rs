@@ -69,7 +69,7 @@ pub fn save(root: &Path, state: &RemoteHostDesiredState) -> AppResult<()> {
     let path = dir.join(format!("{}.json", state.host_id));
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| AppError::Message(format!("encode desired state: {error}")))?;
-    std::fs::write(&path, bytes)
+    crate::enhanced_runtime::atomic::write_atomic(&path, &bytes)
         .map_err(|error| AppError::Message(format!("write desired state: {error}")))
 }
 
