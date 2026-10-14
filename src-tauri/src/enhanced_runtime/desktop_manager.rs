@@ -350,7 +350,7 @@ pub fn configure_desktop_runtime(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)?;
+    super::atomic::write_atomic(&path, &serde_json::to_vec_pretty(&settings)?)?;
     Ok(())
 }
 
@@ -367,9 +367,9 @@ pub fn disable_desktop_runtime(
     .map_err(|error| DesktopRuntimeManagerError::EnvironmentLease(error.to_string()))?;
     if let Some(mut settings) = settings {
         settings.enabled = false;
-        std::fs::write(
-            data_root.join(SETTINGS_FILE),
-            serde_json::to_vec_pretty(&settings)?,
+        super::atomic::write_atomic(
+            &data_root.join(SETTINGS_FILE),
+            &serde_json::to_vec_pretty(&settings)?,
         )?;
     }
     Ok(outcome)
@@ -518,9 +518,9 @@ fn adopt_packaged_bridge(data_root: &Path) -> Result<(), DesktopRuntimeManagerEr
     env_lease::release_configured_bridge(data_root, &settings.bridge_executable)
         .map_err(|error| DesktopRuntimeManagerError::EnvironmentLease(error.to_string()))?;
     settings.bridge_executable = packaged;
-    std::fs::write(
-        data_root.join(SETTINGS_FILE),
-        serde_json::to_vec_pretty(&settings)?,
+    super::atomic::write_atomic(
+        &data_root.join(SETTINGS_FILE),
+        &serde_json::to_vec_pretty(&settings)?,
     )?;
     Ok(())
 }
@@ -1032,9 +1032,9 @@ fn adopt_discovered_official(data_root: &Path) -> Result<(), DesktopRuntimeManag
         settings.enhanced_codex_executable = recovered.path;
         settings.bridge_only = false;
     }
-    std::fs::write(
-        data_root.join(SETTINGS_FILE),
-        serde_json::to_vec_pretty(&settings)?,
+    super::atomic::write_atomic(
+        &data_root.join(SETTINGS_FILE),
+        &serde_json::to_vec_pretty(&settings)?,
     )?;
     Ok(())
 }

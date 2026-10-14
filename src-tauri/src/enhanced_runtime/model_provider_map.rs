@@ -92,7 +92,7 @@ impl TrustedModelProviderMap {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        super::atomic::write_atomic(path, &serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
 

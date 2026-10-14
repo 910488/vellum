@@ -124,9 +124,9 @@ pub fn write_enhanced_runtime_config(
         "compiledFeatureDefaults": compiled_feature_defaults,
         "debugLog": debug_log,
     });
-    std::fs::write(
-        codex_home.join("enhanced-runtime.json"),
-        serde_json::to_vec_pretty(&payload).map_err(|error| {
+    super::atomic::write_atomic(
+        &codex_home.join("enhanced-runtime.json"),
+        &serde_json::to_vec_pretty(&payload).map_err(|error| {
             EnhancedProcessError::Io(format!("encode enhanced-runtime.json: {error}"))
         })?,
     )
