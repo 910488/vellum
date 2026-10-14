@@ -471,7 +471,7 @@ fn requested_account_id(
             .peek_accounts()
             .iter()
             .any(|(id, _, _)| *id == requested)
-            && super::desktop_control_account_id(&state).as_deref()
+            && super::desktop_control_account_id(state).as_deref()
                 != Some(requested.as_str())
         {
             return Err(crate::error::AppError::Message(
@@ -480,7 +480,7 @@ fn requested_account_id(
         }
         return Ok(requested);
     }
-    super::desktop_control_account_id(&state)
+    super::desktop_control_account_id(state)
         .ok_or_else(|| crate::error::AppError::Message("desktopOfficialAccountMissing".into()))
 }
 
