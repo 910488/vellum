@@ -311,6 +311,9 @@ impl UpdateEngine {
                         .flatten()
                         .map(|slot| slot.version.clone()),
                 );
+                // An identical core settles without a restart, so the tree
+                // Codex launched can fall out of every slot while it runs.
+                keep.extend(launched_core_version(&self.root));
             }
             let Some(newest_kept) = keep
                 .iter()
@@ -953,6 +956,18 @@ impl UpdateEngine {
         let reason = record.failure_reason.clone();
         self.save(&state)?;
         self.record_journal(&op, phase, reason)?;
+        if component == UpdateComponent::Core && phase == UpdatePhase::WaitingForRestart {
+            match self.settle_pending_identical_to_active() {
+                Ok(true) => {
+                    return Ok(UpdateOperation {
+                        phase: UpdatePhase::Applied,
+                        ..op
+                    })
+                }
+                Ok(false) => {}
+                Err(error) => log::warn!("[Updates] identical core stays pending: {error}"),
+            }
+        }
         Ok(op)
     }
 
@@ -1095,9 +1110,34 @@ impl UpdateEngine {
     }
 
     fn reconcile_identical_bundled_core(&self) -> AppResult<()> {
+        if self.settle_pending_identical_to_active()? {
+            return Ok(());
+        }
         let bundled =
             crate::enhanced_runtime::desktop_manager::packaged_enhanced_executable(&self.root);
         self.reconcile_core_with_bundled(bundled.as_deref())
+    }
+
+    /// Settles a pending core whose signed files are the active core's. A Mac
+    /// ships no bundled core, so such a pending used to wait for a managed
+    /// Codex restart that the update panel never offers, and the panel kept
+    /// asking for an update after every Vellum restart.
+    fn settle_pending_identical_to_active(&self) -> AppResult<bool> {
+        let slots = CoreSlots::load(&self.root);
+        let (Some(active), Some(pending)) = (slots.active, slots.pending) else {
+            return Ok(false);
+        };
+        if !super::core_slots::same_core_tree(&active, &pending)
+            || !super::core_slots::verified_slot(&self.root, &pending, &self.trust)
+            || !super::core_slots::verified_slot(&self.root, &active, &self.trust)
+        {
+            return Ok(false);
+        }
+        self.settle_pending_core(
+            pending,
+            "pending core has the same signed files as the active core",
+        )?;
+        Ok(true)
     }
 
     fn reconcile_core_with_bundled(&self, bundled: Option<&Path>) -> AppResult<()> {
@@ -1121,6 +1161,17 @@ impl UpdateEngine {
         {
             return Ok(());
         }
+        self.settle_pending_core(
+            slot,
+            if bundled.is_some() {
+                "pending core already matches the verified bundled tree"
+            } else {
+                "verified pending core recovered a missing bundled core"
+            },
+        )
+    }
+
+    fn settle_pending_core(&self, slot: super::core_slots::CoreSlot, note: &str) -> AppResult<()> {
         super::core_slots::promote_pending(&self.root)
             .map_err(|error| AppError::Message(error.to_string()))?;
         let mut state = self.load();
@@ -1141,18 +1192,7 @@ impl UpdateEngine {
             target_version: Some(slot.version),
         };
         self.save(&state)?;
-        self.record_journal(
-            &op,
-            UpdatePhase::Applied,
-            Some(
-                if bundled.is_some() {
-                    "pending core already matches the verified bundled tree"
-                } else {
-                    "verified pending core recovered a missing bundled core"
-                }
-                .into(),
-            ),
-        )
+        self.record_journal(&op, UpdatePhase::Applied, Some(note.into()))
     }
 
     pub fn apply(
@@ -1365,6 +1405,24 @@ impl Drop for PruneClaim {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pruning.retain(|claimed| claimed != &self.0);
     }
+}
+
+/// The `updates/core/<version>` tree the running bridge was launched from.
+fn launched_core_version(root: &Path) -> Option<String> {
+    use crate::enhanced_runtime::launch_manifest::LaunchManifestV1;
+    let manifest = LaunchManifestV1::read(&LaunchManifestV1::path_in(root)).ok()?;
+    core_version_in(&manifest.enhanced?.executable)
+}
+
+fn core_version_in(executable: &Path) -> Option<String> {
+    let parts = executable
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    parts
+        .windows(3)
+        .find(|window| window[0] == "updates" && window[1] == "core")
+        .map(|window| window[2].clone())
 }
 
 /// `commit_candidate` keeps the replaced tree as `previous` only so a crash
@@ -2888,6 +2946,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_core_with_the_active_cores_files_settles_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        first
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        first
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        // Nothing is active yet, so the first core still waits for its launch.
+        assert_eq!(
+            first.load().layers["core"].phase,
+            UpdatePhase::WaitingForRestart
+        );
+        super::super::core_slots::promote_pending(dir.path()).unwrap();
+
+        // The next nightly re-labels the same build.
+        let (second, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.2",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        let currents = Currents {
+            core: "0.3.1",
+            ..currents
+        };
+        second
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        let settled = second
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(settled.phase, UpdatePhase::Applied);
+        let slots = CoreSlots::load(dir.path());
+        assert!(slots.pending.is_none());
+        assert_eq!(slots.active.unwrap().version, "0.3.2");
+        assert_eq!(slots.previous.unwrap().version, "0.3.1");
+        let record = &second.load().layers["core"];
+        assert_eq!(record.phase, UpdatePhase::Applied);
+        assert_eq!(record.current_version, "0.3.2");
+        assert!(record.staged_version.is_none());
+    }
+
+    #[test]
+    fn a_core_with_one_different_file_is_not_the_same_core() {
+        let file = |name: &str, sha: &str| super::super::core_slots::CoreSlotFile {
+            path: PathBuf::from(format!("/data/updates/core/0.3.1/current/{name}")),
+            size: 4,
+            sha256: sha.into(),
+        };
+        let active = CoreSlot {
+            version: "0.3.1".into(),
+            digest: "sha256:aa".into(),
+            path: PathBuf::from("/data/updates/core/0.3.1/current/codex"),
+            helpers: vec![PathBuf::from("/data/updates/core/0.3.1/current/helper")],
+            files: vec![file("codex", "aa"), file("helper", "bb")],
+            ..CoreSlot::default()
+        };
+        let relabeled = CoreSlot {
+            version: "0.3.2".into(),
+            digest: "AA".into(),
+            path: PathBuf::from("/data/updates/core/0.3.2/current/codex"),
+            helpers: vec![PathBuf::from("/data/updates/core/0.3.2/current/helper")],
+            files: vec![file("helper", "sha256:BB"), file("codex", "aa")],
+            ..active.clone()
+        };
+        assert!(super::super::core_slots::same_core_tree(
+            &active, &relabeled
+        ));
+        let rebuilt = CoreSlot {
+            files: vec![file("codex", "aa"), file("helper", "cc")],
+            ..relabeled.clone()
+        };
+        assert!(!super::super::core_slots::same_core_tree(&active, &rebuilt));
+        let other_protocol = CoreSlot {
+            protocol: "next".into(),
+            ..relabeled
+        };
+        assert!(!super::super::core_slots::same_core_tree(
+            &active,
+            &other_protocol
+        ));
+    }
+
+    #[test]
+    fn the_launched_core_version_is_read_from_its_tree() {
+        assert_eq!(
+            core_version_in(Path::new(
+                "/Users/me/Library/Application Support/vellum/updates/core/0.2.10-nightly.1/current/codex"
+            ))
+            .as_deref(),
+            Some("0.2.10-nightly.1")
+        );
+        assert_eq!(
+            core_version_in(Path::new("/Applications/Vellum.app/codex")),
+            None
+        );
     }
 
     #[tokio::test]

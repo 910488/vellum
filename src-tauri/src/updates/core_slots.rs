@@ -403,6 +403,46 @@ pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
         })
 }
 
+/// Nightly releases re-label one core build, so a "new" core is often the
+/// running one under another version: same signed files, same protocol.
+/// Switching to it changes no byte that runs, so it needs no restart.
+pub(super) fn same_core_tree(a: &CoreSlot, b: &CoreSlot) -> bool {
+    fn bare(digest: &str) -> String {
+        digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase()
+    }
+    fn files(slot: &CoreSlot) -> Option<HashSet<(std::ffi::OsString, u64, String)>> {
+        slot.files
+            .iter()
+            .map(|file| {
+                Some((
+                    file.path.file_name()?.to_os_string(),
+                    file.size,
+                    bare(&file.sha256),
+                ))
+            })
+            .collect()
+    }
+    let names = |slot: &CoreSlot| {
+        slot.helpers
+            .iter()
+            .map(|helper| helper.file_name().map(|name| name.to_os_string()))
+            .collect::<Vec<_>>()
+    };
+    !a.files.is_empty()
+        && a.files.len() == b.files.len()
+        && bare(&a.digest) == bare(&b.digest)
+        && a.path.file_name() == b.path.file_name()
+        && a.protocol == b.protocol
+        && a.protocol_compat == b.protocol_compat
+        && a.enhanced_commit == b.enhanced_commit
+        && a.feature_profile == b.feature_profile
+        && names(a) == names(b)
+        && files(a).is_some_and(|left| files(b).is_some_and(|right| left == right))
+}
+
 /// Every status read verifies the active slot, and the macOS tree is about
 /// 400 MB. Read whole on each poll it held a core busy for seconds at a time.
 /// The launch digest cache streams the file and reuses a digest while path,
