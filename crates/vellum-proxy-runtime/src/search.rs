@@ -405,10 +405,14 @@ pub struct BraveBackend {
 
 impl BraveBackend {
     pub fn new(api_key: String) -> Result<Self, String> {
-        Ok(Self {
-            api_key,
-            client: reqwest::Client::new(),
-        })
+        // A model's web_search call waits on this request; without a bound a
+        // stalled Brave endpoint holds the whole turn open.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| format!("Brave search client: {error}"))?;
+        Ok(Self { api_key, client })
     }
 }
 
