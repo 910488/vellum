@@ -214,7 +214,7 @@ impl AppState {
     ) -> AppResult<Self> {
         let lease_active = root == app_data_dir()
             && crate::codex::has_active_lease(&crate::codex::CodexPaths::discover(&root));
-        let mut inner = load_inner(&root).unwrap_or_else(|| Inner {
+        let mut inner = load_inner(&root)?.unwrap_or_else(|| Inner {
             routes: seed_routes(),
             review: ReviewSettings {
                 route_id: "grok-cli".to_string(),
@@ -2447,9 +2447,54 @@ fn settings_path(root: &std::path::Path) -> PathBuf {
     root.join("settings.json")
 }
 
-fn load_inner(root: &std::path::Path) -> Option<Inner> {
-    let bytes = std::fs::read(settings_path(root)).ok()?;
-    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+/// `Ok(None)` means "start from the seed": no settings file exists, or the
+/// one that does could not be parsed and was first kept aside. The seed is
+/// persisted over `settings.json` by the next change, so it must never stand
+/// in for a file that is merely unreadable right now (a sync client or an
+/// antivirus scan holding it) or that this build cannot parse (written by a
+/// newer version before a rollback).
+fn load_inner(root: &std::path::Path) -> AppResult<Option<Inner>> {
+    let path = settings_path(root);
+    let mut attempt = 0;
+    let bytes = loop {
+        match std::fs::read(&path) {
+            Ok(bytes) => break bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if attempt < 4 => {
+                attempt += 1;
+                log::warn!("[State] 設定檔暫時無法讀取，重試 {attempt}：{error}");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(AppError::Message(format!(
+                    "無法讀取設定檔 {}：{error}；為避免用預設值覆蓋，未啟動",
+                    path.display()
+                )))
+            }
+        }
+    };
+    let Some(inner) = parse_inner(&bytes) else {
+        let aside = root.join(format!(
+            "settings.json.unreadable-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        crate::enhanced_runtime::atomic::write_atomic(&aside, &bytes).map_err(|error| {
+            AppError::Message(format!(
+                "設定檔無法解析，且無法另存 {}：{error}；未覆蓋原檔",
+                aside.display()
+            ))
+        })?;
+        log::warn!(
+            "[State] 設定檔無法解析，已另存為 {} 後改用預設值",
+            aside.display()
+        );
+        return Ok(None);
+    };
+    Ok(Some(inner))
+}
+
+fn parse_inner(bytes: &[u8]) -> Option<Inner> {
+    let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(error) => {
             log::warn!("[State] 忽略損壞的設定檔：{error}");
@@ -2592,7 +2637,7 @@ mod tests {
             .unwrap()
             .wire = WireFormat::Chat;
         persist_inner(dir.path(), &inner);
-        let reopened = load_inner(dir.path()).unwrap();
+        let reopened = load_inner(dir.path()).unwrap().unwrap();
         let grok = reopened
             .routes
             .iter()
@@ -2606,6 +2651,36 @@ mod tests {
             .find(|route| route.provider_kind == ProviderKind::GrokCli)
             .unwrap();
         assert_eq!(grok.wire, WireFormat::Responses);
+    }
+
+    #[test]
+    fn unparseable_settings_are_kept_aside_before_the_seed_replaces_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = br#"{"routes":"written by a newer Vellum"}"#;
+        std::fs::write(settings_path(dir.path()), original).unwrap();
+        assert!(load_inner(dir.path()).unwrap().is_none());
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.unreadable-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_stop_startup_instead_of_being_reseeded() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file belongs: reading fails, but not NotFound.
+        std::fs::create_dir(settings_path(dir.path())).unwrap();
+        assert!(load_inner(dir.path()).is_err());
+        assert!(AppState::try_with_data_dir(dir.path().to_path_buf()).is_err());
+        assert!(settings_path(dir.path()).is_dir());
     }
 
     #[test]
