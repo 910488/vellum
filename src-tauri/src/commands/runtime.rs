@@ -139,30 +139,27 @@ async fn read_desktop_runtime_status(
     .await
 }
 
-/// Rebuilds Proxy launch state after Codex Desktop replaces its core.
+/// Rebuilds the launch after Codex Desktop replaces its core.
 ///
 /// Reported as a blocker this was a set of instructions — quit Codex Desktop,
 /// stop the Proxy, start the Proxy, launch Codex Desktop — to be carried out
 /// in that order, about an update the user never asked for and a stored path
-/// Vellum had already corrected on its own. Every step of it is
-/// A Proxy restart re-runs the launch transaction against Desktop's newly
-/// discovered core. Codex still holds the old child processes, so the runtime
-/// status remains restart-required until Codex itself restarts.
+/// Vellum had already corrected on its own.
 ///
-/// It is bounded on three sides:
+/// None of the Proxy restart was ever needed for the launch itself: arming
+/// prepares a launch against Desktop's current core while the Proxy keeps
+/// serving. Stopping the Proxy first is what did the harm. It handed the
+/// lease back, and the bridge Desktop started in that gap could only serve
+/// plain Official until someone restarted Codex. Re-arming in place keeps the
+/// lease, writes the new launch, and leaves the bridge swap to the launch
+/// steward, which waits for Desktop to be idle.
+///
 /// [`superseded_launch_repair`] says whether this launch may be rebuilt at
-/// all, [`AppState::claim_launch_repair`] gives each launch exactly one
-/// attempt, and the repair refuses outright while Codex or Proxy is mid-turn —
-/// the refusal hands the claim back, because a repair
-/// deferred until the turn ends is the behaviour we want, not a spent attempt.
+/// all, and [`AppState::claim_launch_repair`] gives each launch exactly one
+/// attempt. Nothing here can interrupt a turn, so there is no turn check.
 ///
-/// Detached rather than awaited, because the caller is a poll. `refresh` in
-/// the shell awaits this status alongside three others before it renders any
-/// of them, and a managed restart waits up to `BRIDGE_READY_TIMEOUT` for the
-/// new bridge — so awaiting it here would freeze the whole window for a minute
-/// and a half to report a repair the next poll can report by itself. The
-/// screen already says a repair is under way, off `launch_core_drift`.
-fn repair_superseded_launch(
+/// Detached rather than awaited, because the callers are polls.
+pub(crate) fn repair_superseded_launch(
     state: &AppState,
     status: &crate::enhanced_runtime::DesktopRuntimeStatus,
 ) {
@@ -175,36 +172,20 @@ fn repair_superseded_launch(
     if !state.claim_launch_repair(&launch_id) {
         return;
     }
-    if let Some(process_identity) = codex_process_identity() {
-        state.mark_restart_required_for_process(
-            RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
-            process_identity,
-        );
-    }
     let state = state.clone();
-    tauri::async_runtime::spawn(async move {
-        // Close admission before checking for idle, otherwise a request can
-        // enter between the check and the Proxy lifecycle lock and be cancelled by
-        // what is meant to be a non-disruptive repair.
-        state.set_draining(true);
-        let bridge = crate::enhanced_runtime::live_bridge_attestation(&state.data_root());
-        if state.active_requests() != 0 || codex_turn_refusal(bridge.as_ref(), false).is_some() {
-            state.set_draining(false);
-            state.release_launch_repair();
-            return;
-        }
-        let repair = async {
-            crate::commands::proxy::stop_proxy_gracefully(&state).await?;
-            crate::commands::proxy::start_proxy_inner(&state).await?;
-            Ok::<_, AppError>(())
-        }
-        .await;
-        let notice = match repair {
-            Ok(()) => RuntimeNotice::new("enhancedLaunchCoreRepaired").with("launchId", launch_id),
-            Err(error) => RuntimeNotice::new("enhancedLaunchCoreRepairFailed")
-                .with("reason", error.to_string()),
-        };
-        state.record_live_applied(notice);
+    let generation = state.proxy_status().generation;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::commands::proxy::arm_enhanced_runtime_for_proxy(&state, generation);
+        let rebuilt = crate::enhanced_runtime::LaunchManifestV1::read(
+            &crate::enhanced_runtime::LaunchManifestV1::path_in(&state.data_root()),
+        )
+        .is_ok_and(|manifest| manifest.launch_id != launch_id);
+        state.record_live_applied(if rebuilt {
+            RuntimeNotice::new("enhancedLaunchCoreRepaired").with("launchId", launch_id)
+        } else {
+            RuntimeNotice::new("enhancedLaunchCoreRepairFailed")
+                .with("reason", "the launch was not rebuilt")
+        });
     });
 }
 
@@ -1422,6 +1403,7 @@ mod restart_guard_tests {
             enhanced_identity: None,
             session_features_applied: 0,
             open_turns,
+            fallback: None,
             failure_reason: None,
         }
     }

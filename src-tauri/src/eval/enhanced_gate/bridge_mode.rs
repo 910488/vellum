@@ -685,6 +685,7 @@ fn build_manifest(
         attestation_path: run_root.join("bridge-attestation.json"),
         qualification_journal_path: run_root.join("qualification-journal.jsonl"),
         relay: None,
+        official_successors: Vec::new(),
     })
 }
 

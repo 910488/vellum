@@ -679,6 +679,7 @@ mod tests {
             enhanced_identity: None,
             session_features_applied: 0,
             open_turns: 0,
+            fallback: None,
             failure_reason: None,
         };
         attestation.official.initialized = true;
@@ -764,6 +765,7 @@ mod tests {
             enhanced_identity: None,
             session_features_applied: 0,
             open_turns: 0,
+            fallback: None,
             failure_reason: None,
         };
         attestation.official.initialized = true;

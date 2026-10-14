@@ -107,6 +107,12 @@ pub struct BridgeAttestationV1 {
     /// stop, and thread ids have no business in a file Settings displays.
     #[serde(default)]
     pub open_turns: u32,
+    /// Set when this bridge is standing in for a launch it could not run: the
+    /// lease was released, or Desktop replaced the Official core with one this
+    /// launch never checked. It then serves plain Official only, but keeps
+    /// counting turns so Vellum can tell when replacing it loses nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
     pub failure_reason: Option<String>,
 }
 
@@ -160,7 +166,8 @@ impl BridgeAttestationV1 {
     /// and answering. What the launch id decides is whether it is serving
     /// *this* configuration, which is [`Self::is_active_for`].
     pub fn is_serving(&self) -> bool {
-        self.is_live()
+        self.fallback.is_none()
+            && self.is_live()
             && self.state == BridgeLifecycle::Ready
             && self.official.initialized
             && !self.official.exited
@@ -172,6 +179,7 @@ impl BridgeAttestationV1 {
     /// both children answered `initialize` on the expected identities.
     pub fn is_active_for(&self, launch_id: &str) -> bool {
         self.matches_launch(launch_id)
+            && self.fallback.is_none()
             && self.is_live()
             && self.state == BridgeLifecycle::Ready
             && self.official.initialized
@@ -209,6 +217,11 @@ impl BridgeAttestationV1 {
         }
         if self.enhanced_identity.is_none() {
             blockers.push("Enhanced Codex child did not report its runtime identity".into());
+        }
+        if let Some(reason) = &self.fallback {
+            blockers.push(format!(
+                "the bridge is serving plain Official Codex ({reason})"
+            ));
         }
         if let Some(reason) = &self.failure_reason {
             blockers.push(reason.clone());
@@ -254,6 +267,7 @@ impl AttestationWriter {
                 enhanced_identity: None,
                 session_features_applied: 0,
                 open_turns: 0,
+                fallback: None,
                 failure_reason: None,
             },
         }
@@ -302,6 +316,10 @@ impl AttestationWriter {
         }
         self.attestation.open_turns = open;
         let _ = self.flush();
+    }
+
+    pub fn set_fallback(&mut self, reason: impl Into<String>) {
+        self.attestation.fallback = Some(reason.into());
     }
 
     pub fn set_failure_reason(&mut self, reason: impl Into<String>) {
@@ -473,6 +491,30 @@ mod tests {
         assert_eq!(loaded.state, BridgeLifecycle::Ready);
         assert!(!loaded.is_live());
         assert!(!loaded.is_active_for("launch-1"));
+    }
+
+    #[test]
+    fn a_fallback_bridge_is_never_serving_or_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer = writer(&temp);
+        writer.mark_initialized(ExecutionPlane::OfficialCodex);
+        writer.mark_initialized(ExecutionPlane::EnhancedCodex);
+        report_identity(&mut writer);
+        writer.flush().unwrap();
+        assert!(BridgeAttestationV1::read(writer.path())
+            .unwrap()
+            .is_active_for("launch-1"));
+
+        writer.set_fallback("officialDrift");
+        writer.flush().unwrap();
+        let loaded = BridgeAttestationV1::read(writer.path()).unwrap();
+        assert_eq!(loaded.fallback.as_deref(), Some("officialDrift"));
+        assert!(!loaded.is_serving());
+        assert!(!loaded.is_active_for("launch-1"));
+        assert!(loaded
+            .blockers_for("launch-1")
+            .iter()
+            .any(|blocker| blocker.contains("plain Official")));
     }
 
     #[test]

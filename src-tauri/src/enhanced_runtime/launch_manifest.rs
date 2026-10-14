@@ -73,6 +73,34 @@ pub struct LaunchManifestV1 {
     pub qualification_journal_path: PathBuf,
     #[serde(default)]
     pub relay: Option<RelayBinaryIdentity>,
+    /// Official cores this launch may run in place of `official`.
+    ///
+    /// Codex Desktop stages its next version long before it restarts into it,
+    /// and the restarted Desktop starts the bridge from a core in a directory
+    /// this manifest never named. Without this list the bridge could only
+    /// serve that core as plain Official and wait for Vellum to rebuild the
+    /// launch. Each entry is a core Vellum already checked against this
+    /// launch's Enhanced core, so the bridge can take it on its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub official_successors: Vec<OfficialSuccessor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialSuccessor {
+    /// `sha256:<hex>`. Desktop copies its core byte for byte into
+    /// `bin\<hash>\`, so the staged file and the one it runs share this.
+    pub artifact_sha256: String,
+    /// Where Vellum found it. Informational: the bridge matches by hash.
+    pub source: PathBuf,
+}
+
+impl LaunchManifestV1 {
+    pub fn accepts_official_successor(&self, sha256: &str) -> bool {
+        self.official_successors
+            .iter()
+            .any(|successor| successor.artifact_sha256 == sha256)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +197,13 @@ impl LaunchManifestV1 {
             {
                 return Err(LaunchManifestError::Incomplete("runtime identity"));
             }
+        }
+        if self
+            .official_successors
+            .iter()
+            .any(|successor| !successor.artifact_sha256.starts_with("sha256:"))
+        {
+            return Err(LaunchManifestError::Incomplete("official successor identity"));
         }
         self.assert_credential_free()?;
         Ok(())
@@ -403,6 +438,7 @@ mod tests {
             attestation_path: root.join("attestation.json"),
             qualification_journal_path: root.join("journal.jsonl"),
             relay: None,
+            official_successors: Vec::new(),
         }
     }
 
@@ -518,5 +554,35 @@ mod tests {
             manifest.validate(),
             Err(LaunchManifestError::RelativePath(_))
         ));
+    }
+
+    #[test]
+    fn a_successor_is_only_accepted_by_its_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manifest = fixture(temp.path());
+        assert!(!manifest.accepts_official_successor("sha256:next"));
+        manifest.official_successors.push(OfficialSuccessor {
+            artifact_sha256: "sha256:next".into(),
+            source: temp.path().join("staged").join("codex.exe"),
+        });
+        manifest.validate().unwrap();
+        assert!(manifest.accepts_official_successor("sha256:next"));
+        assert!(!manifest.accepts_official_successor("sha256:other"));
+
+        manifest.official_successors[0].artifact_sha256 = "next".into();
+        assert!(matches!(
+            manifest.validate(),
+            Err(LaunchManifestError::Incomplete("official successor identity"))
+        ));
+    }
+
+    #[test]
+    fn a_manifest_without_successors_reads_as_before() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = fixture(temp.path());
+        let encoded = serde_json::to_value(&manifest).unwrap();
+        assert!(encoded.get("officialSuccessors").is_none());
+        let decoded: LaunchManifestV1 = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.official_successors.is_empty());
     }
 }

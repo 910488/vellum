@@ -73,6 +73,7 @@ mod tests {
             enhanced_identity: None,
             session_features_applied: 0,
             open_turns: open,
+            fallback: None,
             failure_reason: None,
         }
     }
