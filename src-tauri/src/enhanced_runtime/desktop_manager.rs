@@ -575,13 +575,41 @@ pub(crate) fn sync_proxy_desktop_launch<G>(
 ) -> Result<Option<DesktopRuntimeLaunch>, DesktopRuntimeManagerError> {
     let official = crate::remote::desktop_codex::desktop_identity()
         .map_err(|error| DesktopRuntimeManagerError::DesktopProbe(error.to_string()))?;
-    let enhanced = crate::updates::resolve_enhanced_runtime(data_root);
+    let enhanced = crate::updates::resolve_enhanced_runtime(data_root)
+        .map(|runtime| running_identical_core(data_root, &runtime).unwrap_or(runtime.path));
     let settings = proxy_launch_settings(
         PathBuf::from(official.binary),
-        enhanced.map(|runtime| runtime.path),
+        enhanced,
         packaged_bridge_executable(),
     )?;
     prepare_desktop_launch_guarded(data_root, routes, models, settings, commit_guard, true)
+}
+
+/// A core settled without a restart is the running core's bytes in a new
+/// version directory. Preparing a launch on the new path would mint a new
+/// launch id, and the live bridge would read as needing a Codex restart for
+/// a change of nothing but a directory name. Keep the launched path while it
+/// is still a signed slot with the same digest.
+fn running_identical_core(
+    data_root: &Path,
+    runtime: &crate::updates::ResolvedCore,
+) -> Option<PathBuf> {
+    let launched = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root))
+        .ok()?
+        .enhanced?;
+    let bare = |digest: &str| {
+        digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase()
+    };
+    if canonical(&launched.executable) == canonical(&runtime.path)
+        || bare(&launched.artifact_sha256) != bare(&runtime.digest)
+    {
+        return None;
+    }
+    crate::updates::signed_core_identity(data_root, &launched.executable, &runtime.digest)?;
+    Some(launched.executable)
 }
 
 fn proxy_launch_settings(
