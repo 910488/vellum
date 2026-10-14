@@ -373,7 +373,7 @@ pub(super) fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) ->
         && slot.feature_profile == core.feature_profile
         && helpers_match
         && files_match
-        && super::manifest::verify_asset_file(&executable, expected).is_ok()
+        && file_matches_digest(&executable, expected)
         && expected_helpers.iter().all(|helper| helper.is_file())
 }
 
@@ -389,8 +389,22 @@ pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
                 bundled.parent().unwrap_or(bundled).join(name)
             };
             std::fs::metadata(&candidate).is_ok_and(|meta| meta.len() == file.size)
-                && super::manifest::verify_asset_file(&candidate, &file.sha256).is_ok()
+                && file_matches_digest(&candidate, &file.sha256)
         })
+}
+
+/// Every status read verifies the active slot, and the macOS tree is about
+/// 400 MB. Read whole on each poll it held a core busy for seconds at a time.
+/// The launch digest cache streams the file and reuses a digest while path,
+/// size and mtime are unchanged, for at most five minutes: the same reuse the
+/// executable hash in the launch manifest already relied on.
+fn file_matches_digest(path: &Path, expected: &str) -> bool {
+    let Ok(actual) = crate::enhanced_runtime::launch_manifest::sha256_file(path) else {
+        return false;
+    };
+    let actual = actual.strip_prefix("sha256:").unwrap_or(&actual);
+    let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
+    actual.eq_ignore_ascii_case(expected)
 }
 
 fn verify_tree_against_signed_target(root: &Path, target: &CoreTarget) -> Result<(), String> {
@@ -420,8 +434,11 @@ fn verify_tree_against_signed_target(root: &Path, target: &CoreTarget) -> Result
                 file.size
             ));
         }
-        super::manifest::verify_asset_file(path, &file.sha256)
-            .map_err(|error| error.to_string())?;
+        if !file_matches_digest(path, &file.sha256) {
+            return Err(format!(
+                "core file {relative} does not match its signed digest"
+            ));
+        }
         observed.insert(key);
         Ok(())
     })?;
@@ -493,6 +510,38 @@ pub fn consume_core_pending_apply() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_digest_does_not_survive_a_same_size_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("codex");
+        let age = |path: &Path, seconds: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
+                )
+                .unwrap();
+        };
+        std::fs::write(&file, b"signed-core-a").unwrap();
+        age(&file, 3600);
+        let signed = format!("sha256:{}", hex::encode(Sha256::digest(b"signed-core-a")));
+        assert!(file_matches_digest(&file, &signed));
+        assert!(
+            file_matches_digest(&file, &signed),
+            "second read reuses the digest"
+        );
+
+        // Same length as the signed bytes, so only the mtime can tell.
+        std::fs::write(&file, b"altered-core-").unwrap();
+        age(&file, 1800);
+        assert!(
+            !file_matches_digest(&file, &signed),
+            "a new mtime must send the check back to the bytes"
+        );
+    }
 
     fn slot(name: &str) -> CoreSlot {
         CoreSlot {
