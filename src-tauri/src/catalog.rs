@@ -809,7 +809,7 @@ fn write_catalog_with_search(
         .ok_or_else(|| AppError::Message("模型型錄路徑沒有父目錄".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("無法建立模型型錄目錄：{error}")))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(path);
     let official = official_cache_path.and_then(read_official_catalog);
     let mut catalog = catalog_json_with_official(routes, official.as_ref());
     ensure_catalog_ready_for_codex(&mut catalog)?;
@@ -817,8 +817,10 @@ fn write_catalog_with_search(
         .map_err(|error| AppError::Message(format!("模型型錄序列化失敗：{error}")))?;
     std::fs::write(&tmp, bytes)
         .map_err(|error| AppError::Message(format!("模型型錄寫入失敗：{error}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| AppError::Message(format!("模型型錄替換失敗：{error}")))?;
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::Message(format!("模型型錄替換失敗：{error}"))
+    })?;
     Ok(())
 }
 
@@ -919,13 +921,15 @@ pub fn write_catalog_with_model_routes_and_search_and_compaction(
         .ok_or_else(|| AppError::Message("模型型錄路徑沒有父目錄".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("無法建立模型型錄目錄：{error}")))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(path);
     let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|error| AppError::Message(format!("模型型錄序列化失敗：{error}")))?;
     std::fs::write(&tmp, bytes)
         .map_err(|error| AppError::Message(format!("模型型錄寫入失敗：{error}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| AppError::Message(format!("模型型錄替換失敗：{error}")))
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::Message(format!("模型型錄替換失敗：{error}"))
+    })
 }
 
 #[cfg(test)]

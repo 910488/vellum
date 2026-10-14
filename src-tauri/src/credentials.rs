@@ -9,7 +9,7 @@ pub fn save(root: &Path, route_id: &str, secret: &str) -> AppResult<()> {
     std::fs::create_dir_all(&directory)
         .map_err(|error| AppError::Message(format!("無法建立憑證目錄：{error}")))?;
     let path = directory.join(file_name(route_id));
-    let tmp = path.with_extension("bin.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(&path);
     std::fs::write(&tmp, encrypted)
         .map_err(|error| AppError::Message(format!("無法寫入憑證：{error}")))?;
     std::fs::rename(&tmp, path).map_err(|error| AppError::Message(format!("無法替換憑證：{error}")))
@@ -101,7 +101,7 @@ pub fn prepare_migration(
 /// truncated.
 pub fn commit_migration(staged: StagedCredentialMigration) -> AppResult<()> {
     for (path, data) in staged.entries {
-        let tmp = path.with_extension("bin.tmp");
+        let tmp = crate::enhanced_runtime::atomic::unique_temporary(&path);
         std::fs::write(&tmp, &data)
             .map_err(|error| AppError::Message(format!("write migrated credential: {error}")))?;
         std::fs::rename(&tmp, &path)

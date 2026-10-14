@@ -2113,14 +2113,19 @@ fn write_text_atomic(path: &Path, content: &str) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("設定路徑沒有父目錄".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("無法建立設定目錄：{error}")))?;
-    let tmp = path.with_extension("toml.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(path);
     std::fs::write(&tmp, content)
         .map_err(|error| AppError::Message(format!("無法寫入暫存設定：{error}")))?;
     // The config now carries the proxy boundary key, so it is a secret file.
     // Tightened on the temp file, before the rename publishes it.
-    restrict_to_current_user(&tmp)?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| AppError::Message(format!("無法原子替換設定：{error}")))
+    if let Err(error) = restrict_to_current_user(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::Message(format!("無法原子替換設定：{error}"))
+    })
 }
 
 /// Restrict a file to the current user.
@@ -2240,11 +2245,13 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("lease 路徑沒有父目錄".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("無法建立 lease 目錄：{error}")))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(path);
     std::fs::write(&tmp, bytes)
         .map_err(|error| AppError::Message(format!("無法寫入 lease：{error}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| AppError::Message(format!("無法替換 lease：{error}")))
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::Message(format!("無法替換 lease：{error}"))
+    })
 }
 
 #[cfg(test)]
