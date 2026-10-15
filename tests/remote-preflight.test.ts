@@ -1,27 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { describeBlocker, onDemandPsFailure, visibleBlockers } from "@/lib/remoteVocabulary";
+import { describeBlocker, psStartTimeFailure, visibleBlockers } from "@/lib/remoteVocabulary";
 
-describe("onDemand prerequisites", () => {
+describe("Linux process start-time prerequisites", () => {
   it("keeps a missing ps prerequisite visible on a fresh host", () => {
-    const reason = "onDemandPsUnavailable";
+    const reason = "psStartTimeUnavailable";
     const blocker = describeBlocker(reason);
-    expect(blocker.messageKey).toBe("remote.blocker.onDemandPsUnavailable");
+    expect(blocker.messageKey).toBe("remote.blocker.psStartTimeUnavailable");
     expect(blocker.remedy).toBeNull();
     expect(visibleBlockers([reason, reason], true)).toEqual([blocker]);
   });
 
   it("recognizes the prerequisite code when the backend includes repair details", () => {
-    expect(describeBlocker("onDemandPsUnavailable:apk add procps-ng").messageKey)
-      .toBe("remote.blocker.onDemandPsUnavailable");
+    expect(describeBlocker("psStartTimeUnavailable:apk add procps-ng").messageKey)
+      .toBe("remote.blocker.psStartTimeUnavailable");
   });
 
   it("shows one line of repair advice only for the ps prerequisite", () => {
-    expect(onDemandPsFailure("OneClickBootstrapBlocked: onDemandPsUnavailable; repair: apk add procps-ng\nextra details"))
+    expect(psStartTimeFailure("OneClickBootstrapBlocked: psStartTimeUnavailable; repair: apk add procps-ng\nextra details"))
       .toEqual({ repair: "apk add procps-ng" });
-    expect(onDemandPsFailure("DeploymentPreflightBlocked: onDemandPsUnavailable; repair: apt-get install procps"))
+    expect(psStartTimeFailure("DeploymentPreflightBlocked: psStartTimeUnavailable; repair: apt-get install procps"))
       .toEqual({ repair: "apt-get install procps" });
-    expect(onDemandPsFailure("onDemandPsUnavailable")).toEqual({ repair: null });
-    expect(onDemandPsFailure("SSH failed; repair: reconnect")).toBeNull();
-    expect(onDemandPsFailure(null)).toBeNull();
+    expect(psStartTimeFailure("psStartTimeUnavailable")).toEqual({ repair: null });
+    expect(psStartTimeFailure("SSH failed; repair: reconnect")).toBeNull();
+    expect(psStartTimeFailure(null)).toBeNull();
   });
 });

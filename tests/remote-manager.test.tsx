@@ -631,7 +631,7 @@ describe("Remote Manager operations UI", () => {
   });
 
   it.each(["immediate", "background"])("shows the ps prerequisite and repair command on %s failure", async (mode) => {
-    const message = "OneClickBootstrapBlocked: onDemandPsUnavailable; repair: apk add procps-ng";
+    const message = "OneClickBootstrapBlocked: psStartTimeUnavailable; repair: apk add procps-ng";
     if (mode === "immediate") {
       apiMocks.bootstrapRemoteHost.mockRejectedValueOnce(new Error(message));
     } else {
@@ -645,7 +645,7 @@ describe("Remote Manager operations UI", () => {
     fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
     fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
     expect(await screen.findByText(
-      "主機的 ps 無法查詢程序啟動時間，無法使用 onDemand 模式。請依修復指令安裝相容的 ps，再重新部署。",
+      "主機的 ps 無法查詢程序啟動時間，無法啟動 Codex daemon。請依修復指令安裝相容的 ps，再重新部署。",
       {}, { timeout: 2500 },
     )).toBeTruthy();
     expect(screen.getByText("apk add procps-ng")).toBeTruthy();

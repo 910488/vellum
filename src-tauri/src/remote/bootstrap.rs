@@ -291,7 +291,7 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
             }
         };
     let normalized_arch = platform.bundle_dir();
-    if let Some(blocker) = check_on_demand_prerequisites(
+    if let Some(blocker) = check_linux_prerequisites(
         &probe,
         &SshPsProcessClient {
             data_root: &data_root,
@@ -494,7 +494,7 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
     Ok(result)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct BootstrapProbe {
     os: String,
     arch: String,
@@ -531,13 +531,12 @@ impl super::preflight::PsProcessClient for SshPsProcessClient<'_> {
     }
 }
 
-fn check_on_demand_prerequisites(
+fn check_linux_prerequisites(
     probe: &BootstrapProbe,
     client: &dyn super::preflight::PsProcessClient,
 ) -> AppResult<Option<super::preflight::PrerequisiteBlocker>> {
-    super::preflight::on_demand_ps_preflight(
+    super::preflight::ps_start_time_preflight(
         &probe.os,
-        probe.systemd_user_available,
         &probe.distribution,
         &probe.distribution_like,
         client,
@@ -546,14 +545,14 @@ fn check_on_demand_prerequisites(
 
 /// Direct apply must enforce the same read-only gate as bootstrap, before any
 /// agent mutation. Local development targets have no SSH host to provision.
-pub(crate) fn preflight_on_demand_host(state: &AppState, host_id: &str) -> AppResult<()> {
+pub(crate) fn preflight_linux_host(state: &AppState, host_id: &str) -> AppResult<()> {
     let target = RemoteHostManager::resolve_target(state, host_id)?;
     let Some(alias) = target.ssh_destination else {
         return Ok(());
     };
     let data_root = state.data_root();
     let probe = probe(&data_root, &alias)?;
-    if let Some(blocker) = check_on_demand_prerequisites(
+    if let Some(blocker) = check_linux_prerequisites(
         &probe,
         &SshPsProcessClient {
             data_root: &data_root,
@@ -999,9 +998,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_ps_preflight_is_independent_of_systemd() {
+        struct FakePs {
+            success: bool,
+            stdout: &'static str,
+        }
+        impl super::super::preflight::PsProcessClient for FakePs {
+            fn probe_start_time(&self) -> AppResult<super::super::preflight::PsProbeOutput> {
+                Ok(super::super::preflight::PsProbeOutput {
+                    success: self.success,
+                    stdout: self.stdout.into(),
+                })
+            }
+        }
+        for systemd in [false, true] {
+            let probe = BootstrapProbe {
+                os: "Linux".into(),
+                systemd_user_available: systemd,
+                distribution: "debian".into(),
+                ..Default::default()
+            };
+            for stdout in ["sh: 2: ps: not found", "ps: unrecognized option: p"] {
+                let blocker = check_linux_prerequisites(
+                    &probe,
+                    &FakePs {
+                        success: false,
+                        stdout,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(blocker.code, "psStartTimeUnavailable");
+                assert_eq!(blocker.repair, "apt-get install procps");
+            }
+            assert!(check_linux_prerequisites(
+                &probe,
+                &FakePs {
+                    success: true,
+                    stdout: "Fri Oct 16 10:00:00 2026",
+                }
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    #[test]
     fn ps_preflight_runs_before_remote_installation() {
         let source = include_str!("bootstrap.rs");
-        let preflight = source.find("check_on_demand_prerequisites(").unwrap();
+        let preflight = source.find("check_linux_prerequisites(").unwrap();
         let isolation = source
             .find("install_managed_ssh_isolation(&data_root")
             .unwrap();

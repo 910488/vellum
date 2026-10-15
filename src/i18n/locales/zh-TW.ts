@@ -686,7 +686,7 @@ const zhTW: ResourceTree = {
       "proxyConfigurationSchemaTooNew": "主機上的 Proxy 設定格式比此 Vellum 版本能理解的更新，為避免覆寫已封鎖部署——請先更新 Vellum。",
       "proxyConfigurationUnreadable": "無法讀取主機上的 Proxy 設定（權限或 I/O 問題），為避免誤判為可安全覆寫已封鎖部署。",
       "systemdUserUnavailable": "主機上沒有可用的 user systemd，daemon 無法常駐。",
-      "onDemandPsUnavailable": "主機的 ps 無法查詢程序啟動時間，無法使用 onDemand 模式。請依修復指令安裝相容的 ps，再重新部署。",
+      "psStartTimeUnavailable": "主機的 ps 無法查詢程序啟動時間，無法啟動 Codex daemon。請依修復指令安裝相容的 ps，再重新部署。",
       "versionMismatch": "主機上的 Agent 版本與此 Vellum 不相符。"
     },
     "configuration": {

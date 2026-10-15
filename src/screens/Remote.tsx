@@ -20,7 +20,7 @@ import {
   configurationStateKey,
   elapsedLabel,
   hostVerdict,
-  onDemandPsFailure,
+  psStartTimeFailure,
   operationKindKey,
   phaseKey,
   visibleBlockers,
@@ -766,8 +766,8 @@ export function Remote({
   // background branch already offers rather than leaving the dialog with two
   // buttons that both lead nowhere.
   const immediateAppOwnedFailure = Boolean(failure?.raw.includes("nativeDaemonAppOwned"));
-  const immediatePsFailure = onDemandPsFailure(failure?.raw);
-  const operationPsFailure = ownOperation?.state === "failed" ? onDemandPsFailure(ownOperation.message) : null;
+  const immediatePsFailure = psStartTimeFailure(failure?.raw);
+  const operationPsFailure = ownOperation?.state === "failed" ? psStartTimeFailure(ownOperation.message) : null;
   const immediateDesktopProtocolFailure = Boolean(failure?.raw.includes("CodexDesktopProtocolMismatch"));
   const operationDesktopProtocolFailure = Boolean(
     ownOperation?.state === "failed" && ownOperation.message?.includes("CodexDesktopProtocolMismatch"),
@@ -1006,7 +1006,7 @@ export function Remote({
                     : immediateAppOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
                     : immediatePsFailure
-                      ? t("remote.blocker.onDemandPsUnavailable")
+                      ? t("remote.blocker.psStartTimeUnavailable")
                     : immediateBoundaryKeyFailure
                       ? t("remote.error.boundaryKeyProvisionFailed")
                       : t("remote.error.actionFailed", { action: t(failure.actionKey) })}
@@ -1033,7 +1033,7 @@ export function Remote({
                     : appOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
                     : operationPsFailure
-                      ? t("remote.blocker.onDemandPsUnavailable")
+                      ? t("remote.blocker.psStartTimeUnavailable")
                     : operationBoundaryKeyFailure
                       ? t("remote.error.boundaryKeyProvisionFailed")
                       : t("remote.error.operationFailed", {

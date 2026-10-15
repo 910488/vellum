@@ -27,7 +27,7 @@ const BLOCKER_CODES = [
   "managedRuntimeRecoveryRequired", "nativeCodexVersionMismatch",
   "nativeDaemonAppOwned", "noModelsSelected", "officialAccountActivationRequired",
   "officialAccountPairingRequired", "officialAccountReauthenticationRequired", "proxyConfigurationMissing",
-  "systemdUserUnavailable", "onDemandPsUnavailable", "versionMismatch",
+  "systemdUserUnavailable", "psStartTimeUnavailable", "versionMismatch",
 ];
 
 /** 三個 operation kind 走得到的 phase。 */

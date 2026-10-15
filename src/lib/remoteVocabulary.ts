@@ -16,8 +16,8 @@
 export type RemotePrimaryAction = "bootstrap" | "reconverge" | null;
 
 /** A preflight refusal carries a fixed, distro-specific repair hint from the backend. */
-export function onDemandPsFailure(message: string | null | undefined): { repair: string | null } | null {
-  if (!message?.includes("onDemandPsUnavailable")) return null;
+export function psStartTimeFailure(message: string | null | undefined): { repair: string | null } | null {
+  if (!message?.includes("psStartTimeUnavailable")) return null;
   const repair = message.split("; repair:")[1]?.split(/[\r\n]/, 1)[0].trim();
   return { repair: repair || null };
 }
@@ -127,7 +127,7 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   nativeCodexVersionMismatch: { remedy: "installCodex", expectedBeforeBootstrap: false },
   nativeDaemonAppOwned: { remedy: "stopAppOwned", expectedBeforeBootstrap: false },
   noModelsSelected: { remedy: "plan", expectedBeforeBootstrap: false },
-  onDemandPsUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  psStartTimeUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   officialAccountActivationRequired: { remedy: "activateChatGpt", expectedBeforeBootstrap: false },
   officialAccountPairingRequired: { remedy: "pairChatGpt", expectedBeforeBootstrap: false },
   proxyConfigurationMissing: { remedy: "bootstrap", expectedBeforeBootstrap: true },

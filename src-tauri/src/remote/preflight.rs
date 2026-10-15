@@ -2,7 +2,7 @@
 
 use crate::error::{AppError, AppResult};
 
-pub(crate) const ON_DEMAND_PS_BLOCKER: &str = "onDemandPsUnavailable";
+pub(crate) const PS_START_TIME_BLOCKER: &str = "psStartTimeUnavailable";
 
 // Probe our remote shell, rather than PID 1 (which may be hidden by procfs
 // permissions). No files, daemons, or package installations are involved.
@@ -35,13 +35,13 @@ pub(crate) struct PrerequisiteBlocker {
 pub(crate) fn parse_ps_probe_output(stdout: &str) -> AppResult<PsProbeOutput> {
     let (value, status) = stdout
         .rsplit_once("\nVELLUM_PS_PROBE_STATUS=")
-        .ok_or_else(|| AppError::Message("OnDemandPsProbeInvalid: missing probe status".into()))?;
+        .ok_or_else(|| AppError::Message("PsStartTimeProbeInvalid: missing probe status".into()))?;
     let success = match status.trim() {
         "ok" => true,
         "failed" => false,
         _ => {
             return Err(AppError::Message(
-                "OnDemandPsProbeInvalid: invalid probe status".into(),
+                "PsStartTimeProbeInvalid: invalid probe status".into(),
             ))
         }
     };
@@ -69,14 +69,13 @@ pub(crate) fn ps_install_remedy(distribution: &str, distribution_like: &str) -> 
     "Install a ps implementation supporting ps -p <pid> -o lstart=, then retry deployment."
 }
 
-pub(crate) fn on_demand_ps_preflight(
+pub(crate) fn ps_start_time_preflight(
     os: &str,
-    systemd_user_available: bool,
     distribution: &str,
     distribution_like: &str,
     client: &dyn PsProcessClient,
 ) -> AppResult<Option<PrerequisiteBlocker>> {
-    if super::platform::normalize_os(os) != Some("linux") || systemd_user_available {
+    if super::platform::normalize_os(os) != Some("linux") {
         return Ok(None);
     }
     let output = client.probe_start_time()?;
@@ -87,7 +86,7 @@ pub(crate) fn on_demand_ps_preflight(
         return Ok(None);
     }
     Ok(Some(PrerequisiteBlocker {
-        code: ON_DEMAND_PS_BLOCKER,
+        code: PS_START_TIME_BLOCKER,
         repair: ps_install_remedy(distribution, distribution_like),
     }))
 }
@@ -125,35 +124,30 @@ mod tests {
             false,
             "ps: unrecognized option: p\nBusyBox v1.36.1\nUsage: ps [-o COL1,COL2=HEADER] [-T]\n",
         );
-        let blocker = on_demand_ps_preflight("Linux", false, "alpine", "", &client)
+        let blocker = ps_start_time_preflight("Linux", "alpine", "", &client)
             .unwrap()
             .unwrap();
-        assert_eq!(blocker.code, "onDemandPsUnavailable");
+        assert_eq!(blocker.code, "psStartTimeUnavailable");
         assert_eq!(blocker.repair, "apk add procps-ng");
         assert_eq!(client.calls.get(), 1);
     }
 
     #[test]
-    fn procps_without_systemd_is_allowed_and_empty_output_fails_closed() {
+    fn procps_is_allowed_and_empty_output_fails_closed() {
         let procps = fake(true, "Thu Oct 15 23:46:01 2026\n");
-        assert!(
-            on_demand_ps_preflight("linux", false, "alpine", "", &procps)
-                .unwrap()
-                .is_none()
-        );
+        assert!(ps_start_time_preflight("linux", "alpine", "", &procps)
+            .unwrap()
+            .is_none());
         let empty = fake(true, " \n");
-        assert!(on_demand_ps_preflight("linux", false, "alpine", "", &empty)
+        assert!(ps_start_time_preflight("linux", "alpine", "", &empty)
             .unwrap()
             .is_some());
     }
 
     #[test]
-    fn systemd_and_macos_skip_the_on_demand_probe() {
+    fn macos_skips_the_linux_probe() {
         let client = fake(false, "ps: unrecognized option: p");
-        assert!(on_demand_ps_preflight("linux", true, "alpine", "", &client)
-            .unwrap()
-            .is_none());
-        assert!(on_demand_ps_preflight("darwin", false, "", "", &client)
+        assert!(ps_start_time_preflight("darwin", "", "", &client)
             .unwrap()
             .is_none());
         assert_eq!(client.calls.get(), 0);
@@ -198,11 +192,9 @@ mod tests {
                 Err(AppError::Message("SSH unavailable".into()))
             }
         }
-        assert!(
-            on_demand_ps_preflight("linux", false, "alpine", "", &Unreachable)
-                .unwrap_err()
-                .to_string()
-                .contains("SSH unavailable")
-        );
+        assert!(ps_start_time_preflight("linux", "alpine", "", &Unreachable)
+            .unwrap_err()
+            .to_string()
+            .contains("SSH unavailable"));
     }
 }
