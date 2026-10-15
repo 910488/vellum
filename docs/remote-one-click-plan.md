@@ -1,0 +1,191 @@
+# 遠端總管簡化與部署成功率計畫（工單）
+
+> 協調者：Claude。執行者：Codex。分支：`codex/remote-one-click`（worktree
+> `E:\code_E\vellum-worktrees\remote-one-click`，從 `origin/codex/dev` c2b8158 切出）。
+> Rust target 共用 `E:\code_E\vellum-target`，不要放 C 槽。
+
+## 0. 問題
+
+遠端總管現在是給維運人員用的控制台，不是給一般使用者的功能。
+
+**配置繁瑣。** 一台新主機要成功，使用者得自己理解並依序處理：SSH 指紋確認、
+部署、規劃（勾模型）、套用、ChatGPT 帳號逐一配對、遙控身分綁定、Official
+執行帳號、Grok 登入、Install Codex、Update Agent、Sync Desktop Codex、
+Restart native、Repair。`Remote.tsx` 上有十幾顆動作按鈕、七張卡片。
+
+**部署會卡死。** `one_click_bootstrap` 是遇到 blocker 就整個 `Err` 結束，而下列
+blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一段英文修復指令：
+
+| Blocker | 現況 | 根因 |
+|---|---|---|
+| `dockerUnavailable` | Linux 必須有 Docker 且使用者在 docker 群組 | Linux 走 Docker proxy；macOS 早已改用原生 `vellum-proxy-daemon` |
+| `systemdUserUnavailable` / `lingerEnableFailed` | 擋死 | 只支援 systemd user＋linger 一種常駐方式 |
+| `proxyPortConflict` | 擋死 | 固定 15721／15722 |
+| `nativeDaemonAppOwned` | 要使用者自己去 Codex App 斷線再重按 | 沒有「等它閒置後接手」的流程 |
+| `activeTurnInProgress` | 直接失敗 | 沒有等待重試 |
+| `insufficientDiskSpace` | 擋死 | Docker image archive 很大 |
+| `noModelsSelected` | 要先去規劃勾模型 | 沒有預設選擇 |
+| `officialAccountPairingRequired` | 部署前必須配對 | ChatGPT 配對被放在部署的關鍵路徑上 |
+| `versionMismatch` / `nativeCodexVersionMismatch` / `CodexDesktopProtocolMismatch` | 跳出另一顆按鈕要使用者按 | 修復動作沒有收進一鍵流程 |
+| glibc 版本 | 舊發行版上 Agent 直接起不來 | Linux artifact 是 `*-linux-gnu` |
+
+另外 `one_click_clean_host_bootstrap` 遇到既有 Vellum 足跡就拒絕（`CleanHostRequired`），
+那是驗收閘門，不該是使用者路徑。
+
+## 1. 目標與「100%」的定義
+
+部署成功率 100% 的可驗證定義：
+
+1. **支援矩陣內的主機，一鍵部署必成功。** 矩陣見 §5，每一列都要在 CI／本機
+   自動化中真的跑過。
+2. **矩陣外的主機，在動到主機之前就被前置檢查擋下**，且給出一句人話＋一個
+   可行動的下一步。不允許「裝到一半才失敗」。
+3. **任何中斷都可重入。** 部署中途斷線、Desktop 關閉、主機重開，再按一次同一顆
+   按鈕必定收斂到成功或回到 §1.2 的明確拒絕；不需要手動清理、不需要 Restore。
+4. **每次部署留下一筆本機紀錄**（host、平台、每個 phase 結果、失敗碼），用來
+   計算真實成功率。只存本機，不上傳。
+
+使用者面的目標：**新主機從「選主機」到「可在 Codex App 用」只需按一顆按鈕，
+外加最多一次 SSH 指紋確認。** 其他東西全部變成部署後的選配。
+
+## 2. 設計原則
+
+- **部署只有一個動詞。** 「部署／重新部署」= 冪等收斂（converge）。Plan／Apply／
+  Repair／Install Codex／Update Agent／Sync Desktop Codex／Restart native 都是
+  converge 內部的步驟，不再是使用者要排順序的按鈕。
+- **先檢查、後動手。** 新增純讀取的 `preflight`，一次回報所有問題；能自動修的
+  列入計畫自動修，不能修的才擋。
+- **能降級就不擋。** 沒 Docker → 原生 proxy；沒 linger → 不常駐模式；port 被占
+  → 換 port；沒配對 ChatGPT → 先用其他已有憑證的 provider 部署。
+- **安全邊界不放寬。** loopback-only、secret 只進遠端 0600、host key 必須被信任、
+  不殺 App 擁有的進行中 turn、manifest／digest fail-closed —— 全部維持。
+
+## 3. 工作項目
+
+依序做，每個里程碑一個（或數個）commit，各自能編過、測過。
+
+### M1 Linux 改用原生 proxy，移除 Docker 依賴（成功率最大的一塊）
+
+- `vellum-proxy-daemon` 加 Linux 建置：`x86_64-unknown-linux-musl`、
+  `aarch64-unknown-linux-musl`（靜態連結，消除 glibc 版本問題）。Agent 一起改 musl。
+  `vellum-remote-broker` 是 diagnostic-only，Linux bundle 可直接不再打包。
+- Agent `native_proxy.rs` 目前只有 `LaunchdClient`。抽出 service trait，新增
+  `SystemdUserClient`（產生 `~/.config/systemd/user/vellum-proxy.service`，
+  `systemctl --user daemon-reload/enable --now/status`）。
+- `RemotePlatform::proxy_backend()` 的 Linux 改回 `Native`；`docker_is_blocker()`
+  恆 false。Docker backend 保留為讀取／遷移用：已用 Docker 部署的主機，converge
+  時停掉受管 container（只停有 Vellum label 的）、改起原生 proxy，設定與憑證沿用。
+- `build-local-release.ps1/.sh`、manifest（升 schema 5）、`finalize-remote-*-manifest`
+  同步更新；Linux 不再需要 Proxy image archive。
+- `requires_agent_protocol` 照 macOS 的做法升版，舊 Agent 由 converge 自動更新（M3）。
+
+### M2 常駐方式與 port 的降級
+
+- 常駐方式依序嘗試：systemd user＋linger → systemd user（無 linger，登入期間常駐）
+  → 無 systemd：Agent 內建的 supervisor（pidfile＋`setsid`，SSH 連入時由
+  `ssh_launcher` 確認存活並拉起）。結果以 `persistenceScope` 回報
+  （`linger`／`login`／`onDemand`），UI 用一句話說明「主機重開機後需要重新連線
+  一次」之類的實際影響，不擋部署。
+- 先查清楚：Codex 自己的 `app-server daemon` 在沒有 systemd user 時怎麼常駐。
+  若它本身做不到，`onDemand` 模式下的 durable 判定要跟著調整，不能謊報 detachedReady。
+- Proxy port：預設 port 被非受管程序占用時，自動在 15721–15799 內挑一個空的，
+  寫入 desired state，catalog／config 的 base_url 跟著走。`proxyPortConflict`
+  只在整段範圍都被占時才出現。
+
+### M3 一鍵 converge 吸收所有修復動作
+
+改寫 `one_click_bootstrap` 成一個狀態機（保留函式名以免破壞呼叫端）：
+
+1. `preflight`（純讀）：SSH 可達、host key 已信任、OS/arch、磁碟、glibc 不再相關、
+   常駐能力、port、Codex daemon 擁有者、進行中 turn、Desktop 有沒有至少一個可用
+   provider 憑證、bundled release ready。產出 `{autoFix[], blockers[]}`。
+2. 自動修：Agent 版本不符 → 更新 Agent；Codex 版本／Desktop 協議不符 → 安裝／同步
+   pinned Codex；proxy image／binary 過期 → 換；boundary key 缺 → provision；
+   config `upgradeRequired`／`repairRequired` → 照現有邏輯收斂。
+3. `activeTurnInProgress` / `nativeDaemonAppOwned`：不直接失敗。進入
+   `waitingForIdle` phase，輪詢到 App 擁有的 app-server 沒有 active turn 後，
+   **在使用者一次確認後**才接手（沿用現有 `stopAppOwned` 的安全檢查）。等待可取消；
+   UI 顯示「等 Codex 目前這輪結束」而不是錯誤。
+4. 模型選擇：desired state 沒有選擇時，預設 = Desktop 目前啟用且通過 qualification
+   的模型。不再因 `noModelsSelected` 擋。
+5. 憑證：只部署「Desktop 已有憑證」的 provider。ChatGPT 配對移出關鍵路徑 ——
+   沒配對就不注入 Official 模型，部署照樣成功，結果頁提示「要在這台用 ChatGPT
+   帳號？配對」。只有當 Desktop 上**唯一**可用的就是 ChatGPT 時，才在流程中
+   插入一次配對（只配 Desktop 目前的帳號，不是全部）。
+6. plan → apply → verify，verify 失敗自動重試一次（只重試 verify 與 proxy start，
+   不重跑安裝）。
+7. 每個 phase 的冪等性：中途失敗後重按，不能因為「上次做了一半」而走不同的錯誤。
+   `CleanHostRequired` 只留在 qualification 入口，UI 永遠走一般入口。
+
+錯誤輸出：每個失敗都要對到 `remoteVocabulary` 的已知碼＋人話＋remedy；
+找不到 remedy 的 blocker 要在 §5 的測試裡被列為「矩陣外，preflight 拒絕」。
+
+### M4 SSH 信任與加主機
+
+- 指紋確認：若使用者自己的 `~/.ssh/known_hosts` 已有**相同** Ed25519 key，
+  視為使用者先前已信任，直接寫入 Vellum 私有 known_hosts，不再跳確認；
+  不一致或不存在時維持現行確認流程。（只讀 known_hosts，不寫回、不匯入其他 host。）
+- 主機清單空的時候，提供「新增主機」：輸入 `user@host[:port]`，Vellum 寫一筆受管
+  SSH alias（沿用 `ssh_isolation` 的 key）。需要密碼登入的情況，用一次互動式
+  `ssh-copy-id` 等價流程把 isolation key 放上去 —— 密碼由系統 ssh 的提示處理，
+  Vellum 不經手。這項若超出範圍可先做成提示文字，回報給協調者。
+
+### M5 介面簡化（Remote.tsx）
+
+- 工作面只剩：狀態一句話、主要按鈕（部署／重新部署）、進度、失敗時的單一
+  remedy。Plan 按鈕拿掉；模型選擇改成部署後「這台可用的模型」清單，可增減並自動
+  重新 converge。
+- 預設只顯示：主機清單、工作面、「這台可用的模型」、ChatGPT 帳號（只在有
+  ChatGPT 模型時）。
+- 收進「進階」摺疊（預設關）：遙控身分綁定、Official 執行帳號、Grok、手機配對、
+  執行緒明細、主機明細、Revision／Rollback、Export support bundle。
+- 維護 Tray 的 Install Codex／Update Agent／Sync Desktop Codex／Restart native／
+  Repair 從預設介面移除（converge 會處理）；進階裡保留「重新部署」與 support
+  bundle 即可。Restore 留在危險區。
+- 四語 i18n（zh-TW／zh-CN／ja／en）同步；遵守 repo 既有排版規則（CJK 不用 `ch`
+  做寬度、避免固定寬欄位）。不要加模板式的英雄區／三卡並排。
+- 預覽台：`src/dev/remote-preview.tsx` 要能看到 待部署／等待閒置／進行中／失敗／
+  就緒（含 onDemand 常駐）五個狀態。
+
+### M6 部署紀錄與成功率
+
+- Desktop 每次 converge 寫一行 JSONL 到 data root 下 `remote-deploy-log/<hostId>.jsonl`：
+  時間、build 版本、平台、persistenceScope、每個 phase 的結果與耗時、最終結果、
+  失敗碼。不含 secret、不含 hostname 以外的識別資訊。
+- support bundle 帶上最近 20 筆。
+
+## 4. 不做／不改
+
+- 不放寬任何 fail-closed：manifest／digest、boundary key、loopback-only、secret 落地方式。
+- 不殺有 active turn 的 App 擁有 app-server。
+- 不支援 Intel Mac（維持 `intelMacUnsupported`，但要在 preflight 擋）。
+- 不改 `-32070` 行為、不碰 Enhanced Runtime。
+- Docker backend 程式碼不刪，只降為遷移用途。
+
+## 5. 驗證（「100%」的證據）
+
+1. 單元測試：preflight 每個分支、降級選擇（常駐方式、port）、converge 的冪等性
+   （每個 phase 注入一次失敗後重入都會收斂）、模型預設選擇、ChatGPT 不在關鍵路徑。
+2. 主機矩陣（自動化，Docker 容器跑 sshd＋systemd，或 `vellum-remote-testkit` 的
+   fault injector；寫成可重複執行的腳本，放 `scripts/qa/remote/`）：
+   - Ubuntu 22.04 / 24.04、Debian 11 / 12、Fedora 最新、Rocky 8、Alpine（無
+     systemd → onDemand）、Arch；x64 與 arm64 至少各一。
+   - 有／無 Docker、有／無 linger 權限、無 systemd、port 15721 被占、磁碟剩 500 MB、
+     既有舊版 Vellum（Docker proxy）升級、部署中途殺掉 SSH 後重按。
+   - 每一列：一鍵部署 → `detachedReady`（或 onDemand 的對應狀態）→ proxy `/readyz`
+     → 一次 provider 請求 → 重按部署為 no-op。
+   - 矩陣外：Intel Mac、32-bit、非 Linux/macOS → preflight 拒絕且主機上沒有任何新檔案。
+3. 實機：Jetson（既有 `live_jetson`）與 Mac mini 各跑一次完整一鍵部署＋從舊版升級。
+   需要動實機時先停下來問協調者，不要自行對實機做破壞性操作。
+4. 既有測試全綠：`cargo test`（workspace）、`pnpm test`、clippy、`pnpm typecheck`。
+   main 上原本就紅的測試請列出來，不要順手改。注意：#50 之前的分支跑 Rust 測試
+   會清掉真實的 HKCU `CODEX_CLI_PATH`；本分支已在其後，但若 log 出現
+   `cleared under lease` 請回報。
+
+## 6. 交付
+
+- 每個里程碑一個 PR 到 `codex/dev`（或一個 PR 多個乾淨 commit，二擇一，先問）。
+- commit 訊息英文，**不要**加 `Co-Authored-By: Claude` 之類的 trailer。
+- PR 描述附上 §5 矩陣的實跑結果表（每列 PASS/FAIL＋紀錄路徑）。
+- 卡住、需要實機、需要改安全邊界、或發現本計畫的假設不成立（例如 Codex daemon
+  沒有 systemd 時根本無法常駐）時，停下來用中文回報，不要自行繞過。
