@@ -406,7 +406,6 @@ fn configure_one_deployable_route(state: &AppState) {
                 probe_version: Some(vellum_lib::probe::HARNESS_PROBE_VERSION),
                 ..Default::default()
             }],
-            catalog_scope: None,
         },
         vellum_lib::model::ProviderKind::OpenAiCompatible,
         vellum_lib::model::AuthKind::Bearer,

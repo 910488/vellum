@@ -159,8 +159,7 @@ pub struct RuntimeRouteConfig {
     pub insecure_http_policy: crate::outbound::InsecureHttpPolicy,
     /// The OpenCode access mode the probe persisted for this exact model.
     /// `None` means "infer from the profile", which is what older configs do
-    /// and what `to_route` used to do unconditionally -- overriding a probed
-    /// `anonymousFree` back to `credentialed` on every remote deployment.
+    /// and what `to_route` used to do unconditionally.
     #[serde(default)]
     pub access_mode: Option<crate::route::RuntimeAccessMode>,
 }
@@ -252,9 +251,7 @@ impl RuntimeRouteConfig {
             // carries what the probe found must not have it re-guessed from
             // the model name here.
             access_mode: self.access_mode.or_else(|| {
-                provider_profile.map(|profile| {
-                    crate::opencode::default_access_mode(profile, &self.upstream_model)
-                })
+                provider_profile.map(crate::opencode::default_access_mode)
             }),
             chat_capabilities: self.chat_capabilities.clone(),
         }

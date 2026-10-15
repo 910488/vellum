@@ -644,7 +644,6 @@ export const api = {
     selectedModels?: string[],
     contextWindow?: number | null,
     modelCapabilities?: import("../types").ModelCapability[],
-    catalogScope?: import("../types").CatalogScope,
   ): Promise<Route[]> {
     if (!hasTauri()) return delay(mock.routes());
     return afterSettingsChange(call<Route[]>("create_route", {
@@ -662,7 +661,6 @@ export const api = {
         selectedModels,
         contextWindow,
         modelCapabilities,
-        catalogScope,
       },
     }));
   },

@@ -87,7 +87,7 @@ pub struct UsageRecord {
     /// Revision of the immutable Official account selection snapshot.
     #[serde(default)]
     pub selection_revision: Option<u64>,
-    /// OpenCode `anonymousFree` / `credentialed`. Never a secret.
+    /// OpenCode access mode (`credentialed`). Never a secret.
     #[serde(default)]
     pub auth_mode: Option<String>,
     /// OpenCode `openCodeZen` / `openCodeGo`. Other providers leave this unset.

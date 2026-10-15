@@ -1039,7 +1039,6 @@ mod tests {
                 probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
                 ..Default::default()
             }],
-            catalog_scope: None,
         }
     }
 

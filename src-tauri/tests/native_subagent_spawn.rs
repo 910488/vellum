@@ -426,7 +426,6 @@ async fn ui_selected_third_party_model_is_used_by_a_real_native_codex_spawn() {
             models: Some(vec!["parent-model".into(), "third-party-child".into()]),
             selected_models: Some(vec!["parent-model".into(), "third-party-child".into()]),
             context_window: Some(128_000),
-            catalog_scope: None,
             model_capabilities: Vec::new(),
         },
         ProviderKind::OpenAiCompatible,
