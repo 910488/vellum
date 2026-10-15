@@ -81,6 +81,22 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
 
 ### M2 常駐方式與 port 的降級
 
+- **調查閘門（待協調者決定支援條件）**：精確 pinned tag
+  `rust-v0.147.0-alpha.6.6` 指向 commit
+  `15a7ef83c47fc1d92532d1ed44ad267e71703617`。該版本的 daemon 已是 PID
+  backend：`bootstrap_locked` 直接啟動 `pid_backend`，程序以 `setsid()` 脫離
+  terminal，stdin/stdout 接 null、stderr 寫 log，不依賴 systemd user。
+  但它的 `read_process_start_time` 必須呼叫 `ps -p <pid> -o lstart=`；開始時間
+  讀取失敗會終止剛啟動的 daemon，不能用 PID-only 略過。
+  Alpine 預設 BusyBox `ps` 不支援此介面，所以 §5 的 Alpine 列目前缺少必要條件；
+  僅新增 onDemand supervisor 無法解決。建議將相容的 `ps`（例如 procps）列為
+  主機前置條件，純 BusyBox 主機由唯讀 preflight 拒絕；這項矩陣調整尚未核准。
+  這是原始碼調查結論，尚未在 Alpine 或實機上執行驗證。
+  來源：[pinned daemon lifecycle](https://github.com/openai/codex/blob/15a7ef83c47fc1d92532d1ed44ad267e71703617/codex-rs/app-server-daemon/src/lib.rs#L587)、
+  [pinned PID backend](https://github.com/openai/codex/blob/15a7ef83c47fc1d92532d1ed44ad267e71703617/codex-rs/app-server-daemon/src/backend/pid.rs#L126)、
+  [開始時間探測](https://github.com/openai/codex/blob/15a7ef83c47fc1d92532d1ed44ad267e71703617/codex-rs/app-server-daemon/src/backend/pid.rs#L701)、
+  [BusyBox ps](https://busybox.net/downloads/BusyBox.html#ps)、
+  [Alpine BusyBox 設定](https://github.com/alpinelinux/aports/blob/master/main/busybox/busyboxconfig)。
 - 常駐方式依序嘗試：systemd user＋linger → systemd user（無 linger，登入期間常駐）
   → 無 systemd：Agent 內建的 supervisor（pidfile＋`setsid`，SSH 連入時由
   `ssh_launcher` 確認存活並拉起）。結果以 `persistenceScope` 回報
@@ -93,6 +109,11 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
   只在整段範圍都被占時才出現。
 
 ### M3 一鍵 converge 吸收所有修復動作
+
+待辦（M1 審查延後處理）：Docker → native 遷移若已停止舊容器，而後續原生 proxy
+啟動失敗，converge 需補上恢復舊容器的補償流程與失敗說明。只允許恢復本次遷移
+實際停掉、且 Vellum label、host ID、install ID 仍一致的容器；維持現有安全邊界。
+目前 M1 沒有這個補償，失敗後舊容器仍保持停止。
 
 改寫 `one_click_bootstrap` 成一個狀態機（保留函式名以免破壞呼叫端）：
 
