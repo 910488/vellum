@@ -631,6 +631,7 @@ const ja: ResourceTree = {
       "proxyConfigurationSchemaTooNew": "ホスト上の Proxy 設定は、この Vellum が理解できるより新しい形式です。上書きを避けるためデプロイをブロックしています — 先に Vellum を更新してください。",
       "proxyConfigurationUnreadable": "ホスト上の Proxy 設定を読み取れません（権限または I/O の問題）。安全に置き換え可能とみなさず、デプロイをブロックしています。",
       "systemdUserUnavailable": "ホストに使える user systemd がないため、daemon を常駐させられません。",
+      "onDemandPsUnavailable": "ホストの ps ではプロセスの開始時刻を取得できないため、onDemand モードを使えません。修復コマンドで互換性のある ps をインストールしてから、再度デプロイしてください。",
       "versionMismatch": "ホスト上の Agent のバージョンが、この Vellum と一致しません。"
     },
     "configuration": {

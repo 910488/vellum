@@ -291,6 +291,15 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
             }
         };
     let normalized_arch = platform.bundle_dir();
+    if let Some(blocker) = check_on_demand_prerequisites(
+        &probe,
+        &SshPsProcessClient {
+            data_root: &data_root,
+            alias: &alias,
+        },
+    )? {
+        return Ok(blocked(operation_id, probe, blocker.code, blocker.repair));
+    }
     let remote_agent_sha256 = probe.agent_sha256.clone();
     let remote_broker_sha256 = probe.broker_sha256.clone();
     let mut result = BootstrapResult {
@@ -501,6 +510,62 @@ struct BootstrapProbe {
     user_home: Option<String>,
     managed_codex_home: Option<String>,
     disk_free_bytes: Option<u64>,
+    distribution: String,
+    distribution_like: String,
+}
+
+struct SshPsProcessClient<'a> {
+    data_root: &'a Path,
+    alias: &'a str,
+}
+
+impl super::preflight::PsProcessClient for SshPsProcessClient<'_> {
+    fn probe_start_time(&self) -> AppResult<super::preflight::PsProbeOutput> {
+        let output = ssh_script(
+            self.data_root,
+            self.alias,
+            super::preflight::PS_PROBE_SCRIPT.as_bytes(),
+            "sh -s --",
+        )?;
+        super::preflight::parse_ps_probe_output(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+fn check_on_demand_prerequisites(
+    probe: &BootstrapProbe,
+    client: &dyn super::preflight::PsProcessClient,
+) -> AppResult<Option<super::preflight::PrerequisiteBlocker>> {
+    super::preflight::on_demand_ps_preflight(
+        &probe.os,
+        probe.systemd_user_available,
+        &probe.distribution,
+        &probe.distribution_like,
+        client,
+    )
+}
+
+/// Direct apply must enforce the same read-only gate as bootstrap, before any
+/// agent mutation. Local development targets have no SSH host to provision.
+pub(crate) fn preflight_on_demand_host(state: &AppState, host_id: &str) -> AppResult<()> {
+    let target = RemoteHostManager::resolve_target(state, host_id)?;
+    let Some(alias) = target.ssh_destination else {
+        return Ok(());
+    };
+    let data_root = state.data_root();
+    let probe = probe(&data_root, &alias)?;
+    if let Some(blocker) = check_on_demand_prerequisites(
+        &probe,
+        &SshPsProcessClient {
+            data_root: &data_root,
+            alias: &alias,
+        },
+    )? {
+        return Err(AppError::Message(format!(
+            "DeploymentPreflightBlocked: {}; repair: {}",
+            blocker.code, blocker.repair
+        )));
+    }
+    Ok(())
 }
 
 fn probe(data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
@@ -508,6 +573,9 @@ fn probe(data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
 printf 'os=%s\n' "$(uname -s)"
 printf 'arch=%s\n' "$(uname -m)"
 printf 'home=%s\n' "$HOME"
+if [ -r /etc/os-release ]; then
+  awk -F= '$1 == "ID" { gsub(/[\042\047]/, "", $2); print "distribution=" $2 } $1 == "ID_LIKE" { gsub(/[\042\047]/, "", $2); print "distributionLike=" $2 }' /etc/os-release
+fi
 digest_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -567,6 +635,8 @@ fi
             }
         },
         disk_free_bytes: value("diskFree").parse().ok(),
+        distribution: value("distribution"),
+        distribution_like: value("distributionLike"),
     })
 }
 
@@ -927,6 +997,19 @@ fn blocked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_preflight_runs_before_remote_installation() {
+        let source = include_str!("bootstrap.rs");
+        let preflight = source.find("check_on_demand_prerequisites(").unwrap();
+        let isolation = source
+            .find("install_managed_ssh_isolation(&data_root")
+            .unwrap();
+        assert!(
+            preflight < isolation,
+            "preflight must precede the first remote mutation"
+        );
+    }
 
     #[test]
     fn bootstrap_installs_managed_ssh_isolation_before_agent_copy() {

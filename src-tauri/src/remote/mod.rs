@@ -20,6 +20,7 @@ pub mod observation;
 pub mod operation;
 pub mod pinned_install;
 pub mod platform;
+pub(crate) mod preflight;
 mod process;
 pub mod reducer;
 pub mod restore;

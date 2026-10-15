@@ -631,6 +631,7 @@ const zhCN: ResourceTree = {
       "proxyConfigurationSchemaTooNew": "主机上的 Proxy 配置格式比此 Vellum 版本能理解的更新，为避免覆盖已阻止部署——请先更新 Vellum。",
       "proxyConfigurationUnreadable": "无法读取主机上的 Proxy 配置（权限或 I/O 问题），为避免误判为可安全覆盖已阻止部署。",
       "systemdUserUnavailable": "主机上没有可用的 user systemd，daemon 无法常驻。",
+      "onDemandPsUnavailable": "主机的 ps 无法查询进程启动时间，无法使用 onDemand 模式。请按照修复命令安装兼容的 ps，再重新部署。",
       "versionMismatch": "主机上的 Agent 版本与此 Vellum 不相符。"
     },
     "configuration": {

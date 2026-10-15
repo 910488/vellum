@@ -81,17 +81,23 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
 
 ### M2 常駐方式與 port 的降級
 
-- **調查閘門（待協調者決定支援條件）**：精確 pinned tag
+- **調查結論與已核准的支援條件**：精確 pinned tag
   `rust-v0.147.0-alpha.6.6` 指向 commit
   `15a7ef83c47fc1d92532d1ed44ad267e71703617`。該版本的 daemon 已是 PID
   backend：`bootstrap_locked` 直接啟動 `pid_backend`，程序以 `setsid()` 脫離
   terminal，stdin/stdout 接 null、stderr 寫 log，不依賴 systemd user。
   但它的 `read_process_start_time` 必須呼叫 `ps -p <pid> -o lstart=`；開始時間
   讀取失敗會終止剛啟動的 daemon，不能用 PID-only 略過。
-  Alpine 預設 BusyBox `ps` 不支援此介面，所以 §5 的 Alpine 列目前缺少必要條件；
-  僅新增 onDemand supervisor 無法解決。建議將相容的 `ps`（例如 procps）列為
-  主機前置條件，純 BusyBox 主機由唯讀 preflight 拒絕；這項矩陣調整尚未核准。
-  這是原始碼調查結論，尚未在 Alpine 或實機上執行驗證。
+  Alpine 預設 BusyBox `ps` 不支援此介面，僅新增 onDemand supervisor 無法解決。
+  Joe 已核准：需要 onDemand 時，相容的 `ps`（例如 procps）是主機前置條件；
+  純 BusyBox 主機由唯讀 preflight 在 SSH isolation、Agent 安裝等部署寫入前拒絕，
+  附發行版安裝指令（Alpine：`apk add procps-ng`），不自動安裝系統套件。
+  有 systemd user 的主機不因這項新 preflight 被阻擋。
+  **已知限制**：linger／login 也使用相同的 pinned Codex PID backend，因此缺少
+  相容 `ps` 仍可能導致後續 Codex 啟動失敗；新 blocker 僅限 onDemand 是產品決定，
+  並不表示這兩種模式不需要 `ps`。
+  協調者已在 `alpine:3.20` 確認 BusyBox 的探測失敗，安裝 `procps-ng` 後成功；
+  Codex 本輪不執行建置、測試或實機驗證。
   來源：[pinned daemon lifecycle](https://github.com/openai/codex/blob/15a7ef83c47fc1d92532d1ed44ad267e71703617/codex-rs/app-server-daemon/src/lib.rs#L587)、
   [pinned PID backend](https://github.com/openai/codex/blob/15a7ef83c47fc1d92532d1ed44ad267e71703617/codex-rs/app-server-daemon/src/backend/pid.rs#L126)、
   [開始時間探測](https://github.com/openai/codex/blob/15a7ef83c47fc1d92532d1ed44ad267e71703617/codex-rs/app-server-daemon/src/backend/pid.rs#L701)、
@@ -190,7 +196,7 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
 2. 主機矩陣（自動化，Docker 容器跑 sshd＋systemd，或 `vellum-remote-testkit` 的
    fault injector；寫成可重複執行的腳本，放 `scripts/qa/remote/`）：
    - Ubuntu 22.04 / 24.04、Debian 11 / 12、Fedora 最新、Rocky 8、Alpine（無
-     systemd → onDemand）、Arch；x64 與 arm64 至少各一。
+     systemd → onDemand，須預裝相容的 procps `ps`）、Arch；x64 與 arm64 至少各一。
    - 有／無 Docker、有／無 linger 權限、無 systemd、port 15721 被占、磁碟剩 500 MB、
      既有舊版 Vellum（Docker proxy）升級、部署中途殺掉 SSH 後重按。
    - 每一列：一鍵部署 → `detachedReady`（或 onDemand 的對應狀態）→ proxy `/readyz`

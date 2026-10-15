@@ -630,6 +630,28 @@ describe("Remote Manager operations UI", () => {
     expect(screen.queryByRole("button", { name: "重新同步" })).toBeNull();
   });
 
+  it.each(["immediate", "background"])("shows the ps prerequisite and repair command on %s failure", async (mode) => {
+    const message = "OneClickBootstrapBlocked: onDemandPsUnavailable; repair: apk add procps-ng";
+    if (mode === "immediate") {
+      apiMocks.bootstrapRemoteHost.mockRejectedValueOnce(new Error(message));
+    } else {
+      apiMocks.getRemoteOperation.mockResolvedValue({
+        operationId: "one-click-bootstrap-1", hostId: "jetson", kind: "oneClickBootstrap",
+        phase: "hostPreflight", percent: 5, state: "failed", message, result: null,
+        updatedAt: "2026-10-16T00:00:00Z",
+      });
+    }
+    renderRemote();
+    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    expect(await screen.findByText(
+      "主機的 ps 無法查詢程序啟動時間，無法使用 onDemand 模式。請依修復指令安裝相容的 ps，再重新部署。",
+      {}, { timeout: 2500 },
+    )).toBeTruthy();
+    expect(screen.getByText("apk add procps-ng")).toBeTruthy();
+    expect(apiMocks.stopRemoteAppOwnedCodex).not.toHaveBeenCalled();
+  });
+
   it("offers a safe app-owned stop on the failure instead of popping a dialog unprompted", async () => {
     apiMocks.getRemoteOperation.mockResolvedValue({
       operationId: "one-click-bootstrap-1",

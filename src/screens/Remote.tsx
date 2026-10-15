@@ -20,6 +20,7 @@ import {
   configurationStateKey,
   elapsedLabel,
   hostVerdict,
+  onDemandPsFailure,
   operationKindKey,
   phaseKey,
   visibleBlockers,
@@ -765,6 +766,8 @@ export function Remote({
   // background branch already offers rather than leaving the dialog with two
   // buttons that both lead nowhere.
   const immediateAppOwnedFailure = Boolean(failure?.raw.includes("nativeDaemonAppOwned"));
+  const immediatePsFailure = onDemandPsFailure(failure?.raw);
+  const operationPsFailure = ownOperation?.state === "failed" ? onDemandPsFailure(ownOperation.message) : null;
   const immediateDesktopProtocolFailure = Boolean(failure?.raw.includes("CodexDesktopProtocolMismatch"));
   const operationDesktopProtocolFailure = Boolean(
     ownOperation?.state === "failed" && ownOperation.message?.includes("CodexDesktopProtocolMismatch"),
@@ -1002,9 +1005,12 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : immediateAppOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : immediatePsFailure
+                      ? t("remote.blocker.onDemandPsUnavailable")
                     : immediateBoundaryKeyFailure
                       ? t("remote.error.boundaryKeyProvisionFailed")
                       : t("remote.error.actionFailed", { action: t(failure.actionKey) })}
+                  {immediatePsFailure?.repair ? <p><code>{immediatePsFailure.repair}</code></p> : null}
                 </Notice>
               ) : ownOperation && ownOperation.state === "failed" ? (
                 <Notice
@@ -1026,12 +1032,15 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : appOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : operationPsFailure
+                      ? t("remote.blocker.onDemandPsUnavailable")
                     : operationBoundaryKeyFailure
                       ? t("remote.error.boundaryKeyProvisionFailed")
                       : t("remote.error.operationFailed", {
                           action: runningKindKey ? t(runningKindKey) : ownOperation.kind,
                           phase: runningPhaseKey ? t(runningPhaseKey) : ownOperation.phase,
                         })}
+                  {operationPsFailure?.repair ? <p><code>{operationPsFailure.repair}</code></p> : null}
                 </Notice>
               ) : (
                 <div className="worktop__acts">

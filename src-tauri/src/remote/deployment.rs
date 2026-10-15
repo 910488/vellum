@@ -1188,6 +1188,7 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
     }
     let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
     let operation_id = format!("native-{plan_id}");
+    super::bootstrap::preflight_on_demand_host(state, host_id)?;
     let mut steps = Vec::new();
     client.agent_version()?;
     client.codex_discover_native()?;
