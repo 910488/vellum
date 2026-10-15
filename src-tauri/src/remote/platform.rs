@@ -1,6 +1,6 @@
 //! OS + architecture identity for Remote Manager hosts.
 //!
-//! Artifact pick is always OS+arch. Linux x64/ARM64 stay first-class Docker
+//! Artifact pick is always OS+arch. Linux x64/ARM64 are native-proxy
 //! targets. Apple Silicon is a first-class native-proxy target. Intel Mac is
 //! recognised so the UI can say 尚未支援, but it is never deployable.
 
@@ -88,8 +88,8 @@ impl RemotePlatform {
 
     pub fn rust_target(self) -> &'static str {
         match self {
-            Self::LinuxAmd64 => "x86_64-unknown-linux-gnu",
-            Self::LinuxArm64 => "aarch64-unknown-linux-gnu",
+            Self::LinuxAmd64 => "x86_64-unknown-linux-musl",
+            Self::LinuxArm64 => "aarch64-unknown-linux-musl",
             Self::DarwinArm64 => RUST_TARGET_DARWIN_ARM64,
         }
     }
@@ -104,7 +104,7 @@ impl RemotePlatform {
 
     pub fn proxy_backend(self) -> ProxyBackend {
         match self {
-            Self::LinuxAmd64 | Self::LinuxArm64 => ProxyBackend::Docker,
+            Self::LinuxAmd64 | Self::LinuxArm64 => ProxyBackend::Native,
             Self::DarwinArm64 => ProxyBackend::Native,
         }
     }
@@ -144,8 +144,8 @@ impl RemotePlatform {
         }
     }
 
-    /// Linux remains deployable on agent protocols 1–3. macOS features require
-    /// agent protocol 4, and only after the isolation gate.
+    /// Native Linux deployment requires protocol 5. macOS still requires the
+    /// existing isolation gate and at least protocol 4.
     pub fn deployable(self) -> bool {
         match self {
             Self::LinuxAmd64 | Self::LinuxArm64 => true,
@@ -155,17 +155,17 @@ impl RemotePlatform {
 
     pub fn requires_agent_protocol(self) -> u32 {
         match self {
-            Self::LinuxAmd64 | Self::LinuxArm64 => 1,
+            Self::LinuxAmd64 | Self::LinuxArm64 => 5,
             Self::DarwinArm64 => 4,
         }
     }
 
     pub fn docker_is_blocker(self) -> bool {
-        matches!(self.proxy_backend(), ProxyBackend::Docker)
+        false
     }
 
     pub fn broker_required(self) -> bool {
-        matches!(self, Self::LinuxAmd64 | Self::LinuxArm64)
+        false
     }
 }
 
@@ -232,8 +232,9 @@ pub fn managed_state_root(data_local_dir: &Path) -> PathBuf {
 
 pub fn desktop_accepts_agent_protocol(protocol: u64, platform: Option<RemotePlatform>) -> bool {
     match platform {
-        Some(RemotePlatform::DarwinArm64) => protocol >= 4,
-        _ => matches!(protocol, 1..=4),
+        Some(RemotePlatform::LinuxAmd64 | RemotePlatform::LinuxArm64) => protocol == 5,
+        Some(RemotePlatform::DarwinArm64) => matches!(protocol, 4..=5),
+        None => matches!(protocol, 1..=5),
     }
 }
 
@@ -284,20 +285,21 @@ mod tests {
     }
 
     #[test]
-    fn linux_stays_docker_macos_is_native_and_not_blocked_by_docker() {
+    fn all_supported_platforms_use_native_proxy_without_docker_or_broker() {
         assert_eq!(
             RemotePlatform::LinuxAmd64.proxy_backend(),
-            ProxyBackend::Docker
+            ProxyBackend::Native
         );
         assert_eq!(
             RemotePlatform::LinuxArm64.proxy_backend(),
-            ProxyBackend::Docker
+            ProxyBackend::Native
         );
         assert_eq!(
             RemotePlatform::DarwinArm64.proxy_backend(),
             ProxyBackend::Native
         );
-        assert!(RemotePlatform::LinuxAmd64.docker_is_blocker());
+        assert!(!RemotePlatform::LinuxAmd64.docker_is_blocker());
+        assert!(!RemotePlatform::LinuxArm64.broker_required());
         assert!(!RemotePlatform::DarwinArm64.docker_is_blocker());
         assert!(!RemotePlatform::DarwinArm64.broker_required());
         assert_eq!(
@@ -334,21 +336,21 @@ mod tests {
         assert!(RemotePlatform::LinuxArm64.deployable());
         assert!(!RemotePlatform::DarwinArm64.deployable());
         assert_eq!(RemotePlatform::DarwinArm64.requires_agent_protocol(), 4);
-        assert_eq!(RemotePlatform::LinuxAmd64.requires_agent_protocol(), 1);
+        assert_eq!(RemotePlatform::LinuxAmd64.requires_agent_protocol(), 5);
     }
 
     #[test]
-    fn protocol_4_is_required_for_macos_while_linux_1_to_3_still_parse() {
-        assert!(desktop_accepts_agent_protocol(
+    fn protocol_5_is_required_for_linux_native_deployment() {
+        assert!(!desktop_accepts_agent_protocol(
             1,
             Some(RemotePlatform::LinuxAmd64)
         ));
-        assert!(desktop_accepts_agent_protocol(
+        assert!(!desktop_accepts_agent_protocol(
             2,
             Some(RemotePlatform::LinuxArm64)
         ));
         assert!(desktop_accepts_agent_protocol(3, None));
-        assert!(desktop_accepts_agent_protocol(
+        assert!(!desktop_accepts_agent_protocol(
             4,
             Some(RemotePlatform::LinuxAmd64)
         ));
@@ -365,7 +367,16 @@ mod tests {
             Some(RemotePlatform::DarwinArm64)
         ));
         assert!(!desktop_accepts_agent_protocol(0, None));
-        assert!(!desktop_accepts_agent_protocol(5, None));
+        assert!(desktop_accepts_agent_protocol(5, None));
+        assert!(desktop_accepts_agent_protocol(
+            5,
+            Some(RemotePlatform::LinuxAmd64)
+        ));
+        assert!(desktop_accepts_agent_protocol(
+            5,
+            Some(RemotePlatform::LinuxArm64)
+        ));
+        assert!(!desktop_accepts_agent_protocol(6, None));
     }
 
     #[test]

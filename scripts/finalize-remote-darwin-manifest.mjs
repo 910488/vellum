@@ -34,8 +34,12 @@ export function finalizeRemoteDarwinManifest(root) {
     resolvedRoot,
     "darwin-arm64/vellum-proxy-daemon",
   );
-  manifest.schemaVersion = 4;
-  manifest.protocolVersion = Math.max(Number(manifest.protocolVersion) || 0, 4);
+  // Adding Darwin must never turn native Linux artifacts back into OCI archives.
+  if (![3, 4, 5].includes(manifest.schemaVersion)) {
+    throw new Error(`unsupported remote schema: ${manifest.schemaVersion}`);
+  }
+  manifest.schemaVersion = manifest.schemaVersion === 5 ? 5 : 4;
+  manifest.protocolVersion = Math.max(Number(manifest.protocolVersion) || 0, manifest.schemaVersion);
 
   const temporaryPath = `${manifestPath}.tmp`;
   writeFileSync(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`);

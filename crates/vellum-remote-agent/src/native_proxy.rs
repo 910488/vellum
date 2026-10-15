@@ -1,8 +1,7 @@
-//! Native macOS proxy backend: `vellum-proxy-daemon serve` under LaunchAgent.
+//! Native proxy lifecycle under launchd (macOS) or systemd user (Linux).
 //!
-//! Production talks to `launchctl` through [`LaunchdClient`]. Unit tests inject
-//! a memory client so Windows can drive the same install/start/stop/status
-//! path without a live launchd.
+//! [`ProxyServiceClient`] keeps install/start/stop/status independent of the
+//! host service manager. Unit tests inject memory clients and command runners.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -189,7 +188,19 @@ pub fn port_conflict(listen: &str, in_use_by_managed: bool) -> Option<PortConfli
     }
 }
 
-pub trait LaunchdClient: Send + Sync {
+pub trait ProxyServiceClient: Send + Sync {
+    fn service_path(&self, directory: &Path) -> PathBuf {
+        LaunchAgentSpec::plist_path(directory)
+    }
+    fn write_service(&self, spec: &LaunchAgentSpec, directory: &Path) -> Result<PathBuf, String> {
+        write_launch_agent_plist(spec, directory)
+    }
+    fn default_port(&self) -> u16 {
+        crate::platform::DARWIN_PROXY_PORT
+    }
+    fn restart_after_update(&self, job: &LaunchdJobStatus) -> bool {
+        job.loaded || job.running
+    }
     fn load_agent(&self, domain: &str, plist: &Path) -> Result<(), String>;
     fn unload_agent(&self, domain: &str, label: &str) -> Result<(), String>;
     fn inspect_agent(&self, domain: &str, label: &str) -> Result<LaunchdJobStatus, String>;
@@ -203,7 +214,237 @@ pub trait LaunchdClient: Send + Sync {
     ) -> Result<ProxyLogsView, String>;
 }
 
+// Preserve the public name for existing launchd test clients.
+pub use ProxyServiceClient as LaunchdClient;
+
 pub struct ProcessLaunchdClient;
+
+pub const SYSTEMD_PROXY_UNIT: &str = "vellum-proxy.service";
+
+pub fn systemd_user_dir(home: &Path) -> PathBuf {
+    home.join(".config/systemd/user")
+}
+
+fn systemd_quote(value: &str, exec: bool) -> Result<String, String> {
+    if value.contains(['\n', '\r', '\0']) {
+        return Err("NativeProxyUnitInvalid: control character in service argument".into());
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    let escaped = if exec {
+        escaped.replace('$', "$$")
+    } else {
+        escaped
+    };
+    Ok(format!("\"{escaped}\""))
+}
+
+pub fn systemd_unit(spec: &LaunchAgentSpec) -> Result<String, String> {
+    if !spec.executable.is_absolute()
+        || !spec.config.is_absolute()
+        || !spec.state_root.is_absolute()
+    {
+        return Err("NativeProxyUnitInvalid: service paths must be absolute".into());
+    }
+    let executable = systemd_quote(&spec.executable.to_string_lossy(), true)?;
+    let config = systemd_quote(&spec.config.to_string_lossy(), true)?;
+    let listen = systemd_quote(&spec.listen, true)?;
+    let environment = systemd_quote(
+        &format!("VELLUM_REMOTE_STATE_ROOT={}", spec.state_root.display()),
+        false,
+    )?;
+    Ok(format!(
+        "[Unit]\nDescription=Vellum remote proxy\n\n[Service]\nType=simple\nExecStart={executable} serve --config {config} --listen {listen}\nEnvironment={environment}\nRestart=on-failure\nRestartSec=10\nUMask=0077\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n"
+    ))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ServiceCommandOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Injectable command boundary: tests never invoke the host service manager.
+pub trait ServiceCommandRunner: Send + Sync {
+    fn run(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, String>;
+}
+
+pub struct ProcessServiceCommandRunner;
+
+impl ServiceCommandRunner for ProcessServiceCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, String> {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| format!("NativeProxyServiceCommandFailed: {program}: {error}"))?;
+        Ok(ServiceCommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+pub struct SystemdUserClient {
+    runner: std::sync::Arc<dyn ServiceCommandRunner>,
+}
+
+impl Default for SystemdUserClient {
+    fn default() -> Self {
+        Self::with_runner(std::sync::Arc::new(ProcessServiceCommandRunner))
+    }
+}
+
+impl SystemdUserClient {
+    pub fn with_runner(runner: std::sync::Arc<dyn ServiceCommandRunner>) -> Self {
+        Self { runner }
+    }
+
+    fn checked(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, String> {
+        let output = self.runner.run(program, args)?;
+        if !output.success {
+            return Err(format!(
+                "NativeProxyServiceFailed: {program} {}: {}",
+                args.join(" "),
+                output.stderr.trim()
+            ));
+        }
+        Ok(output)
+    }
+}
+
+pub fn parse_systemd_show(output: &str) -> LaunchdJobStatus {
+    let property = |name: &str| output.lines().find_map(|line| line.strip_prefix(name));
+    let loaded = property("LoadState=") == Some("loaded");
+    let pid = property("MainPID=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 0);
+    LaunchdJobStatus {
+        loaded,
+        running: loaded && property("ActiveState=") == Some("active") && pid.is_some(),
+        pid,
+        program: None,
+    }
+}
+
+impl ProxyServiceClient for SystemdUserClient {
+    fn restart_after_update(&self, job: &LaunchdJobStatus) -> bool {
+        // LoadState=loaded only means the unit file exists. A stopped service
+        // must stay stopped until configure/credentials have converged.
+        job.running
+    }
+    fn service_path(&self, directory: &Path) -> PathBuf {
+        directory.join(SYSTEMD_PROXY_UNIT)
+    }
+
+    fn write_service(&self, spec: &LaunchAgentSpec, directory: &Path) -> Result<PathBuf, String> {
+        let contents = systemd_unit(spec)?;
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("NativeProxyUnitWriteFailed: {error}"))?;
+        let path = self.service_path(directory);
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("NativeProxyUnitWriteFailed: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("NativeProxyUnitWriteFailed: {error}"))?;
+        }
+        Ok(path)
+    }
+
+    fn default_port(&self) -> u16 {
+        crate::platform::LINUX_PROXY_PORT
+    }
+
+    fn load_agent(&self, _domain: &str, _unit: &Path) -> Result<(), String> {
+        self.checked("systemctl", &["--user", "daemon-reload"])?;
+        self.checked(
+            "systemctl",
+            &["--user", "enable", "--now", SYSTEMD_PROXY_UNIT],
+        )?;
+        Ok(())
+    }
+
+    fn unload_agent(&self, domain: &str, label: &str) -> Result<(), String> {
+        if !self.inspect_agent(domain, label)?.loaded {
+            return Ok(());
+        }
+        self.checked(
+            "systemctl",
+            &["--user", "disable", "--now", SYSTEMD_PROXY_UNIT],
+        )?;
+        Ok(())
+    }
+
+    fn inspect_agent(&self, _domain: &str, _label: &str) -> Result<LaunchdJobStatus, String> {
+        let output = self.runner.run(
+            "systemctl",
+            &[
+                "--user",
+                "show",
+                SYSTEMD_PROXY_UNIT,
+                "--property=LoadState,ActiveState,MainPID",
+                "--no-pager",
+            ],
+        )?;
+        // A missing unit is observable; an unavailable user bus is an error.
+        if !output.success
+            && !output
+                .stdout
+                .lines()
+                .any(|line| line == "LoadState=not-found")
+        {
+            return Err(format!(
+                "NativeProxyServiceProbeFailed: {}",
+                output.stderr.trim()
+            ));
+        }
+        Ok(parse_systemd_show(&output.stdout))
+    }
+
+    fn inspect_readyz(&self, port: u16, key: &str) -> Result<bool, String> {
+        ProcessLaunchdClient.inspect_readyz(port, key)
+    }
+
+    fn port_in_use(&self, port: u16) -> Result<bool, String> {
+        match std::net::TcpListener::bind((NATIVE_LISTEN_HOST, port)) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(true),
+            Err(error) => Err(format!("NativeProxyPortProbeFailed: {error}")),
+        }
+    }
+
+    fn read_logs(
+        &self,
+        _stdout: &Path,
+        _stderr: &Path,
+        max_bytes: usize,
+    ) -> Result<ProxyLogsView, String> {
+        let output = self.checked(
+            "journalctl",
+            &[
+                "--user",
+                "--unit",
+                SYSTEMD_PROXY_UNIT,
+                "--no-pager",
+                "--output=cat",
+                "--lines=200",
+            ],
+        )?;
+        let bytes = output.stdout.as_bytes();
+        let start = bytes.len().saturating_sub(max_bytes);
+        Ok(ProxyLogsView {
+            source: "systemdUser".into(),
+            stdout: String::from_utf8_lossy(&bytes[start..]).into_owned(),
+            stderr: String::new(),
+            truncated: start > 0,
+        })
+    }
+}
 
 impl ProcessLaunchdClient {
     pub fn domain() -> Result<String, String> {
@@ -297,11 +538,7 @@ impl LaunchdClient for ProcessLaunchdClient {
 
     fn port_in_use(&self, host_port: u16) -> Result<bool, String> {
         let output = Command::new("lsof")
-            .args([
-                "-nP",
-                &format!("-iTCP:{host_port}"),
-                "-sTCP:LISTEN",
-            ])
+            .args(["-nP", &format!("-iTCP:{host_port}"), "-sTCP:LISTEN"])
             .output()
             .map_err(|error| format!("lsof failed to start: {error}"))?;
         Ok(output.status.success() && !output.stdout.is_empty())
@@ -319,6 +556,7 @@ impl LaunchdClient for ProcessLaunchdClient {
 
 #[derive(Debug, Default)]
 pub struct MemoryLaunchd {
+    pub systemd: bool,
     pub loaded: Mutex<bool>,
     pub running: Mutex<bool>,
     pub pid: Mutex<Option<u32>>,
@@ -332,6 +570,34 @@ pub struct MemoryLaunchd {
 }
 
 impl LaunchdClient for MemoryLaunchd {
+    fn restart_after_update(&self, job: &LaunchdJobStatus) -> bool {
+        if self.systemd {
+            job.running
+        } else {
+            job.loaded || job.running
+        }
+    }
+    fn service_path(&self, directory: &Path) -> PathBuf {
+        if self.systemd {
+            directory.join(SYSTEMD_PROXY_UNIT)
+        } else {
+            LaunchAgentSpec::plist_path(directory)
+        }
+    }
+    fn write_service(&self, spec: &LaunchAgentSpec, directory: &Path) -> Result<PathBuf, String> {
+        if self.systemd {
+            SystemdUserClient::default().write_service(spec, directory)
+        } else {
+            write_launch_agent_plist(spec, directory)
+        }
+    }
+    fn default_port(&self) -> u16 {
+        if self.systemd {
+            crate::platform::LINUX_PROXY_PORT
+        } else {
+            crate::platform::DARWIN_PROXY_PORT
+        }
+    }
     fn load_agent(&self, _domain: &str, plist: &Path) -> Result<(), String> {
         self.loads.lock().unwrap().push(plist.to_path_buf());
         *self.loaded.lock().unwrap() = true;
@@ -376,7 +642,12 @@ impl LaunchdClient for MemoryLaunchd {
     ) -> Result<ProxyLogsView, String> {
         *self.log_reads.lock().unwrap() += 1;
         Ok(ProxyLogsView {
-            source: "launchd".into(),
+            source: if self.systemd {
+                "systemdUser"
+            } else {
+                "launchd"
+            }
+            .into(),
             stdout: self.stdout_log.lock().unwrap().clone(),
             stderr: self.stderr_log.lock().unwrap().clone(),
             truncated: false,
@@ -436,13 +707,13 @@ pub fn observe_native(
 ) -> Result<ProxyStatusView, String> {
     let state = store.load()?;
     let binary = native_proxy_bin(store.paths());
-    let plist = LaunchAgentSpec::plist_path(launch_agents_dir);
+    let plist = launchd.service_path(launch_agents_dir);
     let job = launchd.inspect_agent(domain, LAUNCH_AGENT_LABEL)?;
     let port = state
         .install
         .as_ref()
         .map(|item| item.host_port)
-        .unwrap_or(crate::platform::DARWIN_PROXY_PORT);
+        .unwrap_or_else(|| launchd.default_port());
     let listen = native_listen(port);
     if !job.running {
         if launchd.port_in_use(port)? {
@@ -495,10 +766,7 @@ pub fn start_native(
     let job = launchd.inspect_agent(domain, LAUNCH_AGENT_LABEL)?;
     if launchd.port_in_use(port)? && !job.running {
         if let Some(conflict) = port_conflict(&listen, false) {
-            return Err(format!(
-                "{}: {listen} is already in use",
-                conflict.code
-            ));
+            return Err(format!("{}: {listen} is already in use", conflict.code));
         }
     }
     let paths = store.paths();
@@ -519,7 +787,7 @@ pub fn start_native(
         &paths.logs_dir,
         paths.root.clone(),
     );
-    let plist = write_launch_agent_plist(&spec, launch_agents_dir)?;
+    let plist = launchd.write_service(&spec, launch_agents_dir)?;
     launchd.load_agent(domain, &plist)?;
     if let Some(install) = state.install.as_mut() {
         install.host_port = port;
@@ -575,10 +843,7 @@ fn tail_file(path: &Path, max_bytes: usize) -> Result<(String, bool), String> {
         return Ok((String::from_utf8_lossy(&data).into_owned(), false));
     }
     let start = data.len().saturating_sub(max_bytes);
-    Ok((
-        String::from_utf8_lossy(&data[start..]).into_owned(),
-        true,
-    ))
+    Ok((String::from_utf8_lossy(&data[start..]).into_owned(), true))
 }
 
 pub fn logs_native(
@@ -598,7 +863,7 @@ pub fn reload_native_if_loaded(
     boundary_key: &str,
 ) -> Result<ProxyStatusView, String> {
     let job = launchd.inspect_agent(domain, LAUNCH_AGENT_LABEL)?;
-    if job.loaded || job.running {
+    if launchd.restart_after_update(&job) {
         launchd.unload_agent(domain, LAUNCH_AGENT_LABEL)?;
         return start_native(
             store,
@@ -618,6 +883,136 @@ mod tests {
     use crate::state::AgentPaths;
     use chrono::Utc;
 
+    #[derive(Default)]
+    struct FakeServiceCommands {
+        calls: Mutex<Vec<String>>,
+        outputs: Mutex<std::collections::VecDeque<ServiceCommandOutput>>,
+    }
+
+    impl ServiceCommandRunner for FakeServiceCommands {
+        fn run(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            Ok(self
+                .outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected service command"))
+        }
+    }
+
+    fn command_output(success: bool, stdout: &str, stderr: &str) -> ServiceCommandOutput {
+        ServiceCommandOutput {
+            success,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn systemd_unit_quotes_paths_and_rejects_injected_directives() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut spec = LaunchAgentSpec::new(
+            temp.path().join("space $HOME %i/bin/proxy"),
+            temp.path().join("config/proxy.toml"),
+            "127.0.0.1:15721",
+            temp.path(),
+            temp.path().to_path_buf(),
+        );
+        let unit = systemd_unit(&spec).unwrap();
+        assert!(unit.contains("$$HOME %%i"));
+        assert!(unit.contains("serve --config \""));
+        assert!(unit.contains("--listen \"127.0.0.1:15721\""));
+        assert!(unit.contains("Restart=on-failure\nRestartSec=10\nUMask=0077"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(!unit.contains("docker"));
+        spec.listen = "127.0.0.1:15721\nExecStart=/bad".into();
+        assert!(systemd_unit(&spec)
+            .unwrap_err()
+            .contains("control character"));
+    }
+
+    #[test]
+    fn systemd_start_status_stop_and_logs_use_injected_commands() {
+        let runner = std::sync::Arc::new(FakeServiceCommands::default());
+        runner.outputs.lock().unwrap().extend([
+            command_output(true, "", ""), // daemon-reload
+            command_output(true, "", ""), // enable --now
+            command_output(
+                true,
+                "LoadState=loaded\nActiveState=active\nMainPID=123\n",
+                "",
+            ),
+            command_output(
+                true,
+                "LoadState=loaded\nActiveState=active\nMainPID=123\n",
+                "",
+            ),
+            command_output(true, "", ""), // disable --now
+            command_output(true, "log line", ""),
+        ]);
+        let client = SystemdUserClient::with_runner(runner.clone());
+        client.load_agent("user", Path::new("ignored")).unwrap();
+        let job = client.inspect_agent("user", LAUNCH_AGENT_LABEL).unwrap();
+        assert!(job.loaded && job.running);
+        assert_eq!(job.pid, Some(123));
+        client.unload_agent("user", LAUNCH_AGENT_LABEL).unwrap();
+        let logs = client
+            .read_logs(Path::new("ignored"), Path::new("ignored"), 4)
+            .unwrap();
+        assert_eq!(logs.source, "systemdUser");
+        assert_eq!(logs.stdout, "line");
+        assert!(logs.truncated);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls[0], "systemctl --user daemon-reload");
+        assert_eq!(
+            calls[1],
+            "systemctl --user enable --now vellum-proxy.service"
+        );
+        assert_eq!(
+            calls[4],
+            "systemctl --user disable --now vellum-proxy.service"
+        );
+        assert!(calls[5].starts_with("journalctl --user --unit vellum-proxy.service"));
+    }
+
+    #[test]
+    fn systemd_missing_unit_is_idle_but_unavailable_bus_and_enable_failure_are_errors() {
+        let runner = std::sync::Arc::new(FakeServiceCommands::default());
+        runner.outputs.lock().unwrap().extend([
+            command_output(
+                false,
+                "LoadState=not-found\nActiveState=inactive\nMainPID=0\n",
+                "",
+            ),
+            command_output(false, "", "Failed to connect to bus"),
+            command_output(true, "", ""),
+            command_output(false, "", "permission denied"),
+        ]);
+        let client = SystemdUserClient::with_runner(runner);
+        assert_eq!(
+            client.inspect_agent("user", "").unwrap(),
+            LaunchdJobStatus::default()
+        );
+        assert!(client
+            .inspect_agent("user", "")
+            .unwrap_err()
+            .contains("Failed to connect to bus"));
+        assert!(client
+            .load_agent("user", Path::new("unit"))
+            .unwrap_err()
+            .contains("permission denied"));
+        let stopped = parse_systemd_show("LoadState=loaded\nActiveState=inactive\nMainPID=0\n");
+        assert!(!stopped.running);
+        assert!(!client.restart_after_update(&stopped));
+        assert!(ProcessLaunchdClient.restart_after_update(&stopped));
+        let failed = parse_systemd_show("LoadState=loaded\nActiveState=failed\nMainPID=123\n");
+        assert!(!failed.running);
+    }
+
     #[test]
     fn launch_agent_plist_uses_absolute_exec_run_at_load_and_throttle() {
         let spec = LaunchAgentSpec::new(
@@ -631,9 +1026,7 @@ mod tests {
         );
         let plist = spec.to_plist();
         assert!(plist.contains("<string>com.vellum.remote.proxy</string>"));
-        assert!(plist.contains(
-            "<string>/Users/joshhuang/.local/bin/vellum-proxy-daemon</string>"
-        ));
+        assert!(plist.contains("<string>/Users/joshhuang/.local/bin/vellum-proxy-daemon</string>"));
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<string>127.0.0.1:15722</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
@@ -642,9 +1035,7 @@ mod tests {
         assert!(plist.contains("VELLUM_REMOTE_STATE_ROOT"));
         assert!(!plist.contains("/proc"));
         assert!(!plist.contains("docker"));
-        let path = LaunchAgentSpec::plist_path(Path::new(
-            "/Users/joshhuang/Library/LaunchAgents",
-        ));
+        let path = LaunchAgentSpec::plist_path(Path::new("/Users/joshhuang/Library/LaunchAgents"));
         assert_eq!(
             path,
             Path::new("/Users/joshhuang/Library/LaunchAgents/com.vellum.remote.proxy.plist")
@@ -654,9 +1045,7 @@ mod tests {
     #[test]
     fn busy_unmanaged_port_is_an_explicit_conflict() {
         assert_eq!(
-            port_conflict("127.0.0.1:15722", false)
-                .unwrap()
-                .code,
+            port_conflict("127.0.0.1:15722", false).unwrap().code,
             "proxyPortConflict"
         );
         assert!(port_conflict("127.0.0.1:15722", true).is_none());
@@ -726,18 +1115,17 @@ gui/501/com.vellum.remote.proxy = {
         assert_eq!(before.host_port, Some(15722));
         assert!(before.image.is_none() || before.image.as_deref() == Some(""));
 
-        let started =
-            start_native(&store, &launchd, &agents, "gui/501", None, "key").unwrap();
+        let started = start_native(&store, &launchd, &agents, "gui/501", None, "key").unwrap();
         assert!(started.running);
         assert!(started.ready);
         assert_eq!(started.host_port, Some(15722));
-        assert_eq!(started.native_executable_digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            started.native_executable_digest.as_deref(),
+            Some(digest.as_str())
+        );
         let loads = launchd.loads.lock().unwrap().clone();
         assert_eq!(loads.len(), 1);
-        assert_eq!(
-            loads[0],
-            LaunchAgentSpec::plist_path(&agents)
-        );
+        assert_eq!(loads[0], LaunchAgentSpec::plist_path(&agents));
         let plist = std::fs::read_to_string(&loads[0]).unwrap();
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<string>127.0.0.1:15722</string>"));
@@ -748,7 +1136,10 @@ gui/501/com.vellum.remote.proxy = {
         assert!(!stopped.running);
         assert!(!stopped.ready);
         assert!(LaunchAgentSpec::plist_path(&agents).is_file());
-        assert_eq!(launchd.unloads.lock().unwrap().as_slice(), [LAUNCH_AGENT_LABEL]);
+        assert_eq!(
+            launchd.unloads.lock().unwrap().as_slice(),
+            [LAUNCH_AGENT_LABEL]
+        );
         assert_eq!(store.load().unwrap().install.unwrap().host_port, 15722);
     }
 

@@ -42,5 +42,5 @@ pub use protocol::{
 pub use proxy::{ProxyManager, ProxyStartRequest};
 pub use state::{AgentPaths, AgentStateStore, InstallRecord};
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const AGENT_PROTOCOL_VERSION: u32 = 5;
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -185,6 +185,7 @@ function verifyRemotePayload(info, installerPath) {
       broker: "vellum-remote-broker",
       codex: "codex",
       proxyArchive: "proxy-image.tar",
+      proxyDaemon: "vellum-proxy-daemon",
     };
     for (const [key, fileName] of Object.entries(mapping)) {
       const expected = files?.[key];

@@ -8,7 +8,6 @@
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -16,7 +15,6 @@ use sha2::{Digest, Sha256};
 use vellum_remote_agent::configuration::{
     configure, credential_status, put_credential, remove_credential,
 };
-use vellum_remote_agent::docker::ProcessDockerClient;
 use vellum_remote_agent::host_probe::probe_host;
 use vellum_remote_agent::operations::BeginOutcome;
 use vellum_remote_agent::profile::ProfileManager;
@@ -82,7 +80,7 @@ fn run() -> Result<(), String> {
     };
     paths.ensure()?;
     let store = AgentStateStore::new(paths);
-    let manager = ProxyManager::with_docker(store.clone(), Arc::new(ProcessDockerClient::new()));
+    let manager = ProxyManager::new(store.clone());
     let profiles = ProfileManager::new(store.clone());
 
     match cli.command {
@@ -232,10 +230,9 @@ fn dispatch(
             image,
             image_digest,
         } => operation_to_value(manager.update(&operation_id, &image, image_digest)?),
-        AgentRequest::ProxyLogs { max_bytes } => {
-            Ok(serde_json::to_value(manager.logs(max_bytes)?)
-                .map_err(|error| error.to_string())?)
-        }
+        AgentRequest::ProxyLogs { max_bytes } => Ok(
+            serde_json::to_value(manager.logs(max_bytes)?).map_err(|error| error.to_string())?
+        ),
         AgentRequest::ProxyRollback { operation_id } => {
             operation_to_value(manager.rollback(&operation_id)?)
         }
@@ -880,11 +877,8 @@ fn host_inventory_with_native(
 ) -> Result<HostInventoryV2, String> {
     let state = store.load()?;
     let system = vellum_remote_agent::host_probe::probe_system_inventory();
-    let platform = vellum_remote_agent::platform::RemotePlatform::from_os_arch(
-        &system.os,
-        &system.arch,
-    )
-    .ok();
+    let platform =
+        vellum_remote_agent::platform::RemotePlatform::from_os_arch(&system.os, &system.arch).ok();
     let managed_home = dirs::home_dir().map(|home| {
         vellum_remote_agent::platform::managed_codex_home(&home, &system.os)
             .display()
@@ -1143,7 +1137,7 @@ mod tests {
         HostInventoryV2 {
             host_id: "h-1".into(),
             agent_version: "0.1.0".into(),
-            agent_protocol: 1,
+            agent_protocol: AGENT_PROTOCOL_VERSION,
             system: vellum_remote_agent::protocol::SystemInventory {
                 os: "linux".into(),
                 arch: "aarch64".into(),
@@ -1184,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_codex_and_docker_produce_blockers_and_actions() {
+    fn linux_missing_codex_is_actionable_without_a_docker_blocker() {
         let mut inventory = inventory_fixture();
         inventory.codex.source = "missing".into();
         inventory.docker.available = false;
@@ -1195,15 +1189,23 @@ mod tests {
             .iter()
             .map(|blocker| blocker.code.as_str())
             .collect();
-        assert!(codes.contains(&"dockerUnavailable"));
+        assert!(!codes.contains(&"dockerUnavailable"));
         assert!(codes.contains(&"codexBinaryMissing"));
         assert!(blockers.iter().all(|blocker| blocker.repairable));
 
         let actions = host_actions(&inventory);
         assert!(actions.contains(&"installCodex".to_string()));
-        assert!(actions.contains(&"repair".to_string()));
+        assert!(!actions.contains(&"repair".to_string()));
         assert!(actions.contains(&"exportSupportBundle".to_string()));
         assert!(actions.contains(&"updateComponents".to_string()));
+    }
+
+    #[test]
+    fn healthy_linux_without_docker_needs_no_repair() {
+        let mut inventory = inventory_fixture();
+        inventory.docker.available = false;
+        assert!(host_blockers(&inventory).is_empty());
+        assert!(!host_actions(&inventory).contains(&"repair".to_string()));
     }
 
     #[test]
@@ -1242,7 +1244,10 @@ mod tests {
             .map(|blocker| blocker.code.as_str())
             .collect();
         assert!(!codes.contains(&"dockerUnavailable"));
-        assert!(!host_actions(&inventory).contains(&"repair".to_string()) || inventory.codex.standalone_installed);
+        assert!(
+            !host_actions(&inventory).contains(&"repair".to_string())
+                || inventory.codex.standalone_installed
+        );
         let intel = {
             let mut item = inventory.clone();
             item.system.arch = "x86_64".into();

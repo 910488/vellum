@@ -1,10 +1,10 @@
 # Stage a development remote payload.
 #
-# The release path (build-local-release.ps1) rebuilds both architectures, both
-# proxy images, and re-downloads ~480 MB of pinned Codex on every run, because
+# The release path (build-local-release.ps1) rebuilds both architectures, native
+# proxy daemons, and re-downloads ~480 MB of pinned Codex on every run, because
 # a release must be buildable from nothing. A development iteration changes the
-# Agent, the Broker, or the Desktop -- never the pinned Codex, rarely the proxy
-# image, and usually only the architecture of the host being tested against.
+# Agent, proxy daemon, or Desktop -- never the pinned Codex, sometimes the proxy
+# daemon, and usually only the architecture of the host being tested against.
 # This script stages exactly what changed and reuses the rest from a
 # content-addressed cache under target/remote-dev-cache.
 #
@@ -15,8 +15,7 @@
 param(
     [ValidateSet("amd64", "arm64")]
     [string[]] $Arch = @("amd64"),
-    [string] $CodexVersion = "0.147.0-alpha.6.6",
-    [switch] $SkipProxyImage
+    [string] $CodexVersion = "0.147.0-alpha.6.6"
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,7 +30,6 @@ $cacheRoot = Join-Path $repo "target\remote-dev-cache"
 $packageJson = [IO.File]::ReadAllText((Join-Path $repo "package.json"), [Text.Encoding]::UTF8)
 $version = ($packageJson | ConvertFrom-Json).version
 $fingerprint = Get-VellumProxySourceFingerprint $repo
-$proxyImage = Get-VellumExpectedProxyImage $repo $version
 $allArch = @("amd64", "arm64")
 
 function Invoke-Checked([string] $Name, [scriptblock] $Work) {
@@ -87,38 +85,6 @@ function Get-CachedCodex([string] $Architecture) {
     return $cached
 }
 
-function Get-CachedProxyImage([string] $Architecture) {
-    # Keyed by the same source fingerprint the release image tag uses, so an
-    # untouched proxy is never rebuilt and a touched one can never be reused.
-    $cached = Join-Path $cacheRoot "proxy\$fingerprint\$Architecture\proxy-image.tar"
-    if (Test-Path -LiteralPath $cached -PathType Leaf) {
-        Write-Host "==> Reuse cached proxy image $proxyImage ($Architecture)"
-        return $cached
-    }
-    if ($SkipProxyImage) {
-        $existing = Join-Path $resourceRoot "linux-$Architecture\proxy-image.tar"
-        if (-not (Test-Path -LiteralPath $existing -PathType Leaf)) {
-            throw "-SkipProxyImage needs an already staged linux-$Architecture/proxy-image.tar"
-        }
-        Write-Host "==> Keep already staged proxy image ($Architecture); it may predate your proxy changes"
-        return $existing
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $cached) | Out-Null
-    Invoke-Checked "Build proxy image $proxyImage ($Architecture)" {
-        docker buildx build `
-            --platform "linux/$Architecture" `
-            --file (Join-Path $repo "deploy\proxy\Dockerfile") `
-            --tag $proxyImage `
-            --output "type=docker,dest=$cached" `
-            $repo
-    }
-    return $cached
-}
-
-function BundleArtifact([string] $Relative, [string] $Path) {
-    [ordered]@{ url = "bundle://$Relative"; sha256 = Sha256 $Path }
-}
-
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "Docker Desktop with buildx is required"
 }
@@ -130,19 +96,18 @@ foreach ($architecture in $Arch) {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
-    Invoke-Checked "Build Linux $architecture Agent and Broker" {
+    Invoke-Checked "Build Linux $architecture musl Agent and native Proxy" {
         docker buildx build `
-            --platform "linux/$architecture" `
+            --build-arg "REMOTE_ARCH=$architecture" `
             --file (Join-Path $repo "deploy\remote-bundle\Dockerfile") `
             --target export `
             --output "type=local,dest=$scratch" `
             $repo
     }
     Copy-Into (Join-Path $scratch "vellum-remote-agent") (Join-Path $destination "vellum-remote-agent")
-    Copy-Into (Join-Path $scratch "vellum-remote-broker") (Join-Path $destination "vellum-remote-broker")
+    Copy-Into (Join-Path $scratch "vellum-proxy-daemon") (Join-Path $destination "vellum-proxy-daemon")
     Copy-Into (Get-CachedCodex $architecture) (Join-Path $destination "codex")
-    Copy-Into (Get-CachedProxyImage $architecture) (Join-Path $destination "proxy-image.tar")
-    [IO.File]::WriteAllText((Join-Path $destination "proxy-image.ref"), "$proxyImage`n", $utf8)
+
 }
 
 # The manifest schema requires both architectures. One that was not rebuilt
@@ -151,7 +116,7 @@ foreach ($architecture in $Arch) {
 $carried = @()
 foreach ($architecture in $allArch) {
     if ($Arch -contains $architecture) { continue }
-    foreach ($name in @("vellum-remote-agent", "vellum-remote-broker", "codex", "proxy-image.tar")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex")) {
         $artifact = Join-Path $resourceRoot "linux-$architecture\$name"
         if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
             throw "linux-$architecture/$name is not staged. Stage it once with -Arch $architecture, or run scripts/build-local-release.ps1 -Mode stage-only."
@@ -160,54 +125,19 @@ foreach ($architecture in $allArch) {
     $carried += $architecture
 }
 
-$amd64 = Join-Path $resourceRoot "linux-amd64"
-$arm64 = Join-Path $resourceRoot "linux-arm64"
 $agentVersion = (Select-String -Path (Join-Path $repo "crates\vellum-remote-agent\Cargo.toml") -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-$brokerVersion = (Select-String -Path (Join-Path $repo "crates\vellum-remote-broker\Cargo.toml") -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-$manifest = [ordered]@{
-    schemaVersion = 3
-    releaseVersion = "$version+dev.$fingerprint"
-    codex = [ordered]@{
-        pinnedVersion = $CodexVersion
-        compatibleRange = $CodexVersion
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/codex" (Join-Path $amd64 "codex")
-            'linux-arm64' = BundleArtifact "linux-arm64/codex" (Join-Path $arm64 "codex")
-        }
-    }
-    agent = [ordered]@{
-        version = $agentVersion
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/vellum-remote-agent" (Join-Path $amd64 "vellum-remote-agent")
-            'linux-arm64' = BundleArtifact "linux-arm64/vellum-remote-agent" (Join-Path $arm64 "vellum-remote-agent")
-        }
-    }
-    broker = [ordered]@{
-        version = $brokerVersion
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/vellum-remote-broker" (Join-Path $amd64 "vellum-remote-broker")
-            'linux-arm64' = BundleArtifact "linux-arm64/vellum-remote-broker" (Join-Path $arm64 "vellum-remote-broker")
-        }
-    }
-    proxy = [ordered]@{
-        image = $proxyImage
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/proxy-image.tar" (Join-Path $amd64 "proxy-image.tar")
-            'linux-arm64' = BundleArtifact "linux-arm64/proxy-image.tar" (Join-Path $arm64 "proxy-image.tar")
-        }
-    }
-    protocolVersion = 3
-}
 $manifestPath = Join-Path $resourceRoot "manifest.json"
-[IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
+Invoke-Checked "Finalize schema 5 native development manifest" {
+    node (Join-Path $repo "scripts\finalize-remote-linux-manifest.mjs") $resourceRoot "$version+dev.$fingerprint" $CodexVersion $agentVersion $fingerprint
+}
 
 Write-Host ""
-Write-Host "Dev payload staged: $($manifest.releaseVersion)"
+Write-Host "Dev payload staged: $version+dev.$fingerprint"
 Write-Host "  rebuilt : $($Arch -join ', ')"
 if ($carried.Count -gt 0) {
     Write-Host "  carried : $($carried -join ', ') (kept from the previous staging, re-hashed)"
 }
-Write-Host "  proxy   : $proxyImage"
+Write-Host "  proxy   : native musl daemon"
 Write-Host "  manifest: $(Sha256 $manifestPath)"
 Write-Host ""
 Write-Host "Rebuild the Desktop so build.rs re-embeds this manifest hash:"

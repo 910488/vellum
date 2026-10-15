@@ -256,18 +256,42 @@ fn bundled_proxy_image() -> AppResult<String> {
         // the bundled manifest. Otherwise plan() stores `:local` and apply()
         // rejects its own plan as a manifest change before deployment.
         if std::env::var_os("VELLUM_LIVE_SSH_ALIAS").is_some() {
-            return Ok(crate::remote::pinned_install::load_verified_manifest()?
-                .proxy
-                .image);
+            return proxy_release_identity(
+                &crate::remote::pinned_install::load_verified_manifest()?
+            );
         }
         Ok("vellum-proxy:local".into())
     }
     #[cfg(not(test))]
     {
-        Ok(crate::remote::pinned_install::load_verified_manifest()?
-            .proxy
-            .image)
+        proxy_release_identity(&crate::remote::pinned_install::load_verified_manifest()?)
     }
+}
+
+// StoredPlan.image also carries a native release identity on schema 5. This
+// value is never sent to Docker or stored as a native InstallRecord.image.
+fn proxy_release_identity(
+    manifest: &crate::remote::pinned_install::ReleaseManifest,
+) -> AppResult<String> {
+    if manifest.schema_version >= 5 {
+        let artifacts = serde_json::to_string(&manifest.proxy.artifacts)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        Ok(format!("native-sha256:{}", hash(&artifacts)))
+    } else {
+        Ok(manifest.proxy.image.clone())
+    }
+}
+
+fn native_proxy_install_needed(status: &Value, digest: &str) -> bool {
+    status
+        .pointer("/install/proxyBackend")
+        .and_then(Value::as_str)
+        != Some("native")
+        || status
+            .pointer("/install/nativeExecutableDigest")
+            .and_then(Value::as_str)
+            != Some(digest)
+        || status.pointer("/proxy/present").and_then(Value::as_bool) != Some(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -885,7 +909,9 @@ pub fn plan(
         platform: identity.as_ref().map(|item| item.platform.clone()),
         proxy_backend: identity.as_ref().map(|item| item.proxy_backend.clone()),
         host_port: identity.as_ref().map(|item| item.host_port),
-        managed_codex_home: identity.as_ref().map(|item| item.managed_codex_home.clone()),
+        managed_codex_home: identity
+            .as_ref()
+            .map(|item| item.managed_codex_home.clone()),
         artifact_id: identity.as_ref().map(|item| item.artifact_id.clone()),
     };
     super::desired_state::save(
@@ -983,9 +1009,7 @@ fn deployment_identity_from_status(
     artifact_id: &str,
 ) -> Option<DeploymentIdentity> {
     let status = status?;
-    let os = status
-        .pointer("/capabilities/os")
-        .and_then(Value::as_str)?;
+    let os = status.pointer("/capabilities/os").and_then(Value::as_str)?;
     let arch = status
         .pointer("/capabilities/arch")
         .and_then(Value::as_str)?;
@@ -1188,11 +1212,39 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         .get("running")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let needs_install = proxy_install_needed(&agent_status, &stored.image);
-    // `proxy.install` lays down the image's bootstrap/mock configuration.
-    // Even when the previously running install already matched the desired
-    // hash, an image replacement must re-apply the desired configuration or
-    // the new container will start with only `vellum-mock` configured.
+    let manifest = crate::remote::pinned_install::load_verified_manifest()?;
+    if proxy_release_identity(&manifest)? != stored.image {
+        return Err(AppError::Message("DeploymentProxyManifestChanged".into()));
+    }
+    let os = agent_status
+        .pointer("/capabilities/os")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Message("host status missing capabilities.os".into()))?;
+    let arch = agent_status
+        .pointer("/capabilities/arch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Message("host status missing capabilities.arch".into()))?;
+    let platform = crate::remote::platform::RemotePlatform::from_os_arch(os, arch)
+        .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
+    let native_artifact =
+        if platform.proxy_backend() == crate::remote::platform::ProxyBackend::Native {
+            Some(
+                crate::remote::pinned_install::component_artifact_for_os_arch(
+                    &manifest,
+                    "vellum-proxy-daemon",
+                    os,
+                    arch,
+                )?,
+            )
+        } else {
+            None
+        };
+    let needs_install = match &native_artifact {
+        Some(artifact) => native_proxy_install_needed(&agent_status, &artifact.sha256),
+        None => proxy_install_needed(&agent_status, &stored.image),
+    };
+    // Reconfigure after component replacement so the Agent resolves the new
+    // install identity and upgrades legacy configuration in the normal phase.
     let needs_configure = stored.public.drift.config_changed || needs_install;
     let needs_proxy_mutation = needs_install || needs_configure;
     let needs_native_apply_preview = needs_proxy_mutation
@@ -1233,24 +1285,27 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         steps.push("proxy.stoppedForConfiguration".into());
     }
     if needs_install {
-        let manifest = crate::remote::pinned_install::load_verified_manifest()?;
-        if manifest.proxy.image != stored.image {
-            return Err(AppError::Message("DeploymentProxyManifestChanged".into()));
-        }
-        let inventory = client.host_inventory_v2()?;
-        let arch = inventory
-            .pointer("/system/arch")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Message("host inventory missing system.arch".into()))?;
-        let os = inventory
-            .pointer("/system/os")
-            .and_then(Value::as_str)
-            .unwrap_or("linux");
-        let native = crate::remote::platform::RemotePlatform::from_os_arch(os, arch)
-            .map(|platform| platform.proxy_backend() == crate::remote::platform::ProxyBackend::Native)
-            .unwrap_or(false);
-        if native {
-            client.proxy_install(&format!("{operation_id}-install"), "", None)?;
+        if let Some(artifact) = native_artifact.as_ref() {
+            let staged = crate::remote::pinned_install::download_artifact(artifact)?;
+            let install_result = (|| -> AppResult<()> {
+                let bytes = fs::read(&staged).map_err(|error| {
+                    AppError::Message(format!("read native proxy artifact: {error}"))
+                })?;
+                let remote_path = format!("/tmp/vellum-proxy-stage-{}.bin", ulid::Ulid::new());
+                let result = (|| -> AppResult<()> {
+                    client.stage_artifact(&remote_path, &bytes)?;
+                    client.proxy_update(
+                        &format!("{operation_id}-install"),
+                        &remote_path,
+                        Some(&artifact.sha256),
+                    )?;
+                    Ok(())
+                })();
+                client.remove_remote_file(&remote_path);
+                result
+            })();
+            let _ = fs::remove_file(&staged);
+            install_result?;
             steps.push("proxy.installedNative".into());
         } else {
             let artifact = crate::remote::pinned_install::proxy_artifact_for_arch(&manifest, arch)?;
@@ -1333,7 +1388,8 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
     }
     let proxy = if !running || needs_proxy_mutation {
         let listen_port = stored.public.host_port.unwrap_or(15721);
-        let value = client.proxy_start(&format!("{operation_id}-start"), Some(listen_port), None)?;
+        let value =
+            client.proxy_start(&format!("{operation_id}-start"), Some(listen_port), None)?;
         steps.push("proxy.ready".into());
         value
     } else {
@@ -1494,6 +1550,21 @@ mod desktop_parity;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_proxy_install_identity_uses_binary_digest_and_requires_migration() {
+        let mut status = serde_json::json!({
+            "proxy": {"present": true},
+            "install": {"image": "", "proxyBackend": "native", "nativeExecutableDigest": "current"}
+        });
+        assert!(!native_proxy_install_needed(&status, "current"));
+        assert!(native_proxy_install_needed(&status, "new"));
+        status["install"]["proxyBackend"] = "docker".into();
+        assert!(native_proxy_install_needed(&status, "current"));
+        status["install"]["proxyBackend"] = "native".into();
+        status["proxy"]["present"] = false.into();
+        assert!(native_proxy_install_needed(&status, "current"));
+    }
 
     #[test]
     fn desktop_bearer_secret_qualifies_the_detached_deployment() {
@@ -1697,33 +1768,18 @@ mod tests {
             managed_codex_home: "/Users/joshhuang/.vellum-remote/codex".into(),
             artifact_id: "sha256:abc".into(),
         };
-        let with_id = plan_fingerprint_with_identity(
-            &selected,
-            "cfg-a",
-            "cat-b",
-            "",
-            Some(&identity),
-        );
-        let again = plan_fingerprint_with_identity(
-            &selected,
-            "cfg-a",
-            "cat-b",
-            "",
-            Some(&identity),
-        );
+        let with_id =
+            plan_fingerprint_with_identity(&selected, "cfg-a", "cat-b", "", Some(&identity));
+        let again =
+            plan_fingerprint_with_identity(&selected, "cfg-a", "cat-b", "", Some(&identity));
         assert_eq!(with_id, again);
         assert!(apply_is_noop(&with_id, &again));
         let other_port = DeploymentIdentity {
             host_port: 15723,
             ..identity.clone()
         };
-        let changed = plan_fingerprint_with_identity(
-            &selected,
-            "cfg-a",
-            "cat-b",
-            "",
-            Some(&other_port),
-        );
+        let changed =
+            plan_fingerprint_with_identity(&selected, "cfg-a", "cat-b", "", Some(&other_port));
         assert!(!apply_is_noop(&with_id, &changed));
     }
 

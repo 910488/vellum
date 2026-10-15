@@ -19,7 +19,7 @@ use crate::remote::ssh_trust;
 
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
 const RPC_TIMEOUT_SECS: u64 = 60;
-const SUPPORTED_AGENT_PROTOCOLS: &[u64] = &[1, 2, 3, 4];
+const SUPPORTED_AGENT_PROTOCOLS: &[u64] = &[1, 2, 3, 4, 5];
 
 /// Trusted process target resolved from CachedHost metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,7 +724,7 @@ fn ensure_agent_compatible_for_platform(
     let platform = platform.or_else(|| platform_from_agent_value(value));
     if !crate::remote::platform::desktop_accepts_agent_protocol(protocol, platform) {
         return Err(AppError::Message(format!(
-            "IncompatibleAgentProtocol: macOS features require agent protocol 4, remote={protocol}"
+            "IncompatibleAgentProtocol: native deployment requires Linux agent protocol 5 or macOS agent protocol 4+, remote={protocol}"
         )));
     }
     Ok(())
@@ -929,7 +929,10 @@ mod tests {
             "agentProtocol": 3,
             "capabilities": {"os": "linux", "arch": "aarch64"}
         });
-        assert!(ensure_agent_compatible(&linux).is_ok());
+        assert!(ensure_agent_compatible(&linux).is_err());
+        let linux_new =
+            json!({"agentProtocol": 5, "capabilities": {"os": "linux", "arch": "aarch64"}});
+        assert!(ensure_agent_compatible(&linux_new).is_ok());
         let macos_old = json!({
             "agentProtocol": 3,
             "capabilities": {"os": "macos", "arch": "aarch64"}

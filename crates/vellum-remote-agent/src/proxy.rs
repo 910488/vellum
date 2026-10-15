@@ -34,27 +34,42 @@ pub struct ProxyManager {
     launch_agents_dir: PathBuf,
     launchd_domain: String,
     prefer_native: bool,
+    prefer_docker: bool,
 }
 
 impl ProxyManager {
     pub fn new(store: AgentStateStore) -> Self {
-        let launch_agents_dir =
-            crate::native_proxy::default_launch_agents_dir(store.paths());
-        let launchd_domain = crate::native_proxy::ProcessLaunchdClient::domain()
-            .unwrap_or_else(|_| "gui/0".into());
+        let linux = cfg!(target_os = "linux");
+        let launch_agents_dir = if linux {
+            dirs::home_dir()
+                .map(|home| crate::native_proxy::systemd_user_dir(&home))
+                .unwrap_or_else(|| store.paths().root.join("systemd/user"))
+        } else {
+            crate::native_proxy::default_launch_agents_dir(store.paths())
+        };
+        let launchd_domain = if linux {
+            "user".into()
+        } else {
+            crate::native_proxy::ProcessLaunchdClient::domain().unwrap_or_else(|_| "gui/0".into())
+        };
+        let service: Arc<dyn crate::native_proxy::ProxyServiceClient> = if linux {
+            Arc::new(crate::native_proxy::SystemdUserClient::default())
+        } else {
+            Arc::new(crate::native_proxy::ProcessLaunchdClient)
+        };
         Self {
             store,
             docker: Arc::new(ProcessDockerClient::new()),
-            launchd: Arc::new(crate::native_proxy::ProcessLaunchdClient),
+            launchd: service,
             launch_agents_dir,
             launchd_domain,
-            prefer_native: false,
+            prefer_native: cfg!(any(target_os = "linux", target_os = "macos")),
+            prefer_docker: false,
         }
     }
 
     pub fn with_docker(store: AgentStateStore, docker: Arc<dyn DockerClient>) -> Self {
-        let launch_agents_dir =
-            crate::native_proxy::default_launch_agents_dir(store.paths());
+        let launch_agents_dir = crate::native_proxy::default_launch_agents_dir(store.paths());
         Self {
             store,
             docker,
@@ -62,6 +77,7 @@ impl ProxyManager {
             launch_agents_dir,
             launchd_domain: "gui/0".into(),
             prefer_native: false,
+            prefer_docker: true,
         }
     }
 
@@ -78,6 +94,7 @@ impl ProxyManager {
             launch_agents_dir,
             launchd_domain: launchd_domain.into(),
             prefer_native: true,
+            prefer_docker: false,
         }
     }
 
@@ -140,6 +157,12 @@ impl ProxyManager {
         image: &str,
         image_digest: Option<String>,
     ) -> Result<OperationResult, String> {
+        if self.native_backend_active() && !image.trim().is_empty() {
+            return Err(
+                "NativeProxyImageUnsupported: install the native proxy binary with proxy.update"
+                    .into(),
+            );
+        }
         if self.native_backend_active() && image.trim().is_empty() {
             let request = json!({
                 "proxyBackend": crate::platform::PROXY_BACKEND_NATIVE,
@@ -169,6 +192,11 @@ impl ProxyManager {
         expected_sha256: &str,
         image: &str,
     ) -> Result<OperationResult, String> {
+        if self.native_backend_active() {
+            return Err(
+                "NativeProxyImageUnsupported: native proxy does not load Docker archives".into(),
+            );
+        }
         let request = json!({
             "stagedPath": staged_path,
             "expectedSha256": expected_sha256,
@@ -214,9 +242,12 @@ impl ProxyManager {
         });
         if self.native_backend_active() {
             return self.with_mutation_lock(|| {
-                self.run_operation_locked(&request.operation_id, "proxy.start", &payload, |record| {
-                    self.start_native_inner(record, &request)
-                })
+                self.run_operation_locked(
+                    &request.operation_id,
+                    "proxy.start",
+                    &payload,
+                    |record| self.start_native_inner(record, &request),
+                )
             });
         }
         self.with_mutation_lock(|| {
@@ -363,9 +394,7 @@ impl ProxyManager {
     }
 
     pub fn logs(&self, max_bytes: Option<u64>) -> Result<ProxyLogsView, String> {
-        let max = max_bytes
-            .unwrap_or(64 * 1024)
-            .min(usize::MAX as u64) as usize;
+        let max = max_bytes.unwrap_or(64 * 1024).min(usize::MAX as u64) as usize;
         if self.native_backend_active() {
             return crate::native_proxy::logs_native(&self.store, self.launchd.as_ref(), max);
         }
@@ -385,6 +414,9 @@ impl ProxyManager {
     }
 
     fn native_backend_active(&self) -> bool {
+        if self.prefer_docker {
+            return false;
+        }
         if self.prefer_native {
             return true;
         }
@@ -523,7 +555,7 @@ impl ProxyManager {
             );
         }
         let paths = self.store.paths();
-        paths.ensure()?;
+        prepare_proxy_mounts(paths)?;
         let mut state = self.store.load()?;
         let host_id = state.host_id.clone();
         let install_id = state
@@ -535,13 +567,10 @@ impl ProxyManager {
             .install
             .as_ref()
             .map(|item| item.host_port)
-            .unwrap_or(crate::platform::DARWIN_PROXY_PORT);
+            .unwrap_or_else(|| self.launchd.default_port());
         let binary = crate::native_proxy::native_proxy_bin(paths);
         if !binary.is_file() {
-            return Err(format!(
-                "NativeProxyBinaryMissing: {}",
-                binary.display()
-            ));
+            return Err(format!("NativeProxyBinaryMissing: {}", binary.display()));
         }
         let payload = std::fs::metadata(&binary)
             .map(|meta| meta.len())
@@ -556,15 +585,40 @@ impl ProxyManager {
             }
         }
         let digest = native_executable_digest.unwrap_or(actual_digest);
-        let config_hash = config_hash_for(&digest, host_port, &install_id);
-        write_default_proxy_config(
-            paths,
-            &host_id,
-            &install_id,
-            &config_hash,
-            "vellum-proxy-daemon",
-            &crate::native_proxy::native_listen(host_port),
-        )?;
+        // Keep the old Docker record until migration is fully persisted, so a
+        // retry after interruption still inventories and stops the owned container.
+        if let Some(old) = state
+            .install
+            .as_ref()
+            .filter(|item| item.backend() == crate::platform::ProxyBackend::Docker)
+        {
+            for container in self.require_docker_observable()? {
+                if same_install_ownership(old, &container) && container.running {
+                    self.docker.stop_container(&container.id)?;
+                }
+            }
+        }
+        let config_path = paths.proxy_config_dir.join("proxy.toml");
+        let config_hash = if config_path.is_file() {
+            // Preserve even an old config that the normal configure phase will
+            // upgrade. Never replace user/model/credential state with mock routes.
+            state
+                .install
+                .as_ref()
+                .map(|item| item.config_hash.clone())
+                .unwrap_or_else(|| config_hash_for(&digest, host_port, &install_id))
+        } else {
+            let hash = config_hash_for(&digest, host_port, &install_id);
+            write_default_proxy_config(
+                paths,
+                &host_id,
+                &install_id,
+                &hash,
+                "vellum-proxy-daemon",
+                &crate::native_proxy::native_listen(host_port),
+            )?;
+            hash
+        };
         let spec = crate::native_proxy::LaunchAgentSpec::new(
             binary,
             paths.proxy_config_dir.join("proxy.toml"),
@@ -572,7 +626,7 @@ impl ProxyManager {
             &paths.logs_dir,
             paths.root.clone(),
         );
-        crate::native_proxy::write_launch_agent_plist(&spec, &self.launch_agents_dir)?;
+        self.launchd.write_service(&spec, &self.launch_agents_dir)?;
         let install = InstallRecord {
             install_id,
             host_id,
@@ -594,7 +648,13 @@ impl ProxyManager {
         _record: &mut OperationRecord,
         request: &ProxyStartRequest,
     ) -> Result<Value, String> {
-        if self.store.load()?.install.is_none() {
+        if self
+            .store
+            .load()?
+            .install
+            .as_ref()
+            .is_none_or(|install| install.backend() != crate::platform::ProxyBackend::Native)
+        {
             self.install_native_inner(_record, None)?;
         }
         let view = crate::native_proxy::start_native(
@@ -837,16 +897,19 @@ impl ProxyManager {
                     .into(),
             );
         }
-        if self.store.load()?.install.is_none() {
-            return Err("NativeProxyInstallMissing: install the native proxy first".into());
-        }
         let target = crate::native_proxy::native_proxy_bin(self.store.paths());
+        std::fs::create_dir_all(target.parent().expect("native binary directory"))
+            .map_err(|error| format!("NativeProxyBinaryDirectoryFailed: {error}"))?;
         let staged = image.trim();
         if !staged.is_empty() {
-            let expected = match image_digest.as_deref() {
-                Some(digest) if !digest.is_empty() => digest.to_string(),
-                _ => crate::native_proxy::digest_native_binary(Path::new(staged))?,
-            };
+            let expected =
+                match image_digest.as_deref() {
+                    Some(digest) if !digest.is_empty() => digest.to_string(),
+                    _ => return Err(
+                        "NativeProxyDigestMissing: staged native proxy requires an expected digest"
+                            .into(),
+                    ),
+                };
             let payload = std::fs::metadata(staged)
                 .map(|meta| meta.len())
                 .unwrap_or(0);
@@ -900,7 +963,8 @@ fn looks_like_container_image(image: &str) -> bool {
 fn docker_file_logs(dir: &Path, max_bytes: usize) -> Result<ProxyLogsView, String> {
     let stdout_path = dir.join("proxy.out.log");
     let stderr_path = dir.join("proxy.err.log");
-    let mut view = crate::native_proxy::read_launchd_log_files(&stdout_path, &stderr_path, max_bytes)?;
+    let mut view =
+        crate::native_proxy::read_launchd_log_files(&stdout_path, &stderr_path, max_bytes)?;
     view.source = "docker-files".into();
     Ok(view)
 }
@@ -1231,6 +1295,168 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn linux_native_update_installs_without_docker_and_uses_systemd_unit() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        let service = Arc::new(crate::native_proxy::MemoryLaunchd {
+            systemd: true,
+            ready: Mutex::new(true),
+            ..crate::native_proxy::MemoryLaunchd::default()
+        });
+        let units = temp.path().join("home/.config/systemd/user");
+        let mut manager = ProxyManager::with_native(
+            AgentStateStore::new(paths.clone()),
+            service.clone(),
+            units.clone(),
+            "user",
+        );
+        manager.docker = Arc::new(FailingListDocker);
+        let staged = temp.path().join("proxy-stage");
+        std::fs::write(&staged, b"native-linux").unwrap();
+        let digest = crate::native_proxy::digest_native_binary(&staged).unwrap();
+        assert!(manager
+            .update("missing-digest", staged.to_str().unwrap(), None)
+            .unwrap_err()
+            .contains("NativeProxyDigestMissing"));
+        manager
+            .update("install", staged.to_str().unwrap(), Some(digest.clone()))
+            .unwrap();
+        assert!(units
+            .join(crate::native_proxy::SYSTEMD_PROXY_UNIT)
+            .is_file());
+        let installed = manager.store.load().unwrap().install.unwrap();
+        assert_eq!(installed.host_port, 15721);
+        assert_eq!(
+            installed.native_executable_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(installed.image.is_empty());
+        assert!(!manager.status().unwrap().running);
+        manager
+            .start(ProxyStartRequest {
+                operation_id: "start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap();
+        assert!(manager.status().unwrap().ready);
+        assert_eq!(
+            service.loads.lock().unwrap()[0],
+            units.join(crate::native_proxy::SYSTEMD_PROXY_UNIT)
+        );
+        manager.stop("stop").unwrap();
+        assert!(!manager.status().unwrap().running);
+    }
+
+    #[test]
+    fn docker_migration_preserves_config_credentials_and_foreign_containers() {
+        let temp = tempfile::tempdir().unwrap();
+        let (old, docker) = manager(&temp);
+        old.install("legacy-install", "vellum-proxy:old", None)
+            .unwrap();
+        old.start(ProxyStartRequest {
+            operation_id: "legacy-start".into(),
+            host_port: None,
+            image: None,
+        })
+        .unwrap();
+        let state = old.store.load().unwrap();
+        let paths = old.store.paths().clone();
+        let config = std::fs::read(paths.proxy_config_dir.join("proxy.toml")).unwrap();
+        std::fs::write(paths.secrets_dir.join("provider.json"), b"keep-secret").unwrap();
+        {
+            let mut containers = docker.containers.lock().unwrap();
+            let mut unlabeled = containers[0].clone();
+            unlabeled.id = "unlabeled".into();
+            unlabeled.labels.clear();
+            let mut foreign = containers[0].clone();
+            foreign.id = "foreign".into();
+            foreign
+                .labels
+                .insert("io.vellum.host-id".into(), "another-host".into());
+            let mut foreign_install = containers[0].clone();
+            foreign_install.id = "foreign-install".into();
+            foreign_install
+                .labels
+                .insert("io.vellum.install-id".into(), "another-install".into());
+            containers.extend([unlabeled, foreign, foreign_install]);
+        }
+        let service = Arc::new(crate::native_proxy::MemoryLaunchd {
+            systemd: true,
+            ready: Mutex::new(true),
+            ..Default::default()
+        });
+        let mut native = ProxyManager::with_native(
+            AgentStateStore::new(paths.clone()),
+            service.clone(),
+            temp.path().join("units"),
+            "user",
+        );
+        native.docker = docker.clone();
+        let staged = temp.path().join("proxy-stage");
+        std::fs::write(&staged, b"native-linux").unwrap();
+        let digest = crate::native_proxy::digest_native_binary(&staged).unwrap();
+        native
+            .update("migrate", staged.to_str().unwrap(), Some(digest.clone()))
+            .unwrap();
+        assert!(
+            native
+                .update("migrate", staged.to_str().unwrap(), Some(digest))
+                .unwrap()
+                .idempotent_replay
+        );
+        let migrated = native.store.load().unwrap().install.unwrap();
+        assert_eq!(migrated.install_id, state.install.unwrap().install_id);
+        assert_eq!(migrated.host_port, 15721);
+        assert_eq!(
+            std::fs::read(paths.proxy_config_dir.join("proxy.toml")).unwrap(),
+            config
+        );
+        assert_eq!(
+            std::fs::read(paths.secrets_dir.join("provider.json")).unwrap(),
+            b"keep-secret"
+        );
+        let containers = docker.containers.lock().unwrap();
+        assert!(!containers[0].running);
+        assert!(containers[1..].iter().all(|container| container.running));
+        drop(containers);
+        native
+            .start(ProxyStartRequest {
+                operation_id: "native-start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap();
+        assert!(native.status().unwrap().ready);
+        assert_eq!(service.loads.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn docker_migration_fails_closed_when_legacy_inventory_is_unobservable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (old, _) = manager(&temp);
+        old.install("legacy-install", "vellum-proxy:old", None)
+            .unwrap();
+        let paths = old.store.paths().clone();
+        let before = old.store.load().unwrap();
+        let bin = crate::native_proxy::native_proxy_bin(&paths);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"native").unwrap();
+        let mut native = ProxyManager::with_native(
+            AgentStateStore::new(paths),
+            Arc::new(crate::native_proxy::MemoryLaunchd::default()),
+            temp.path().join("units"),
+            "user",
+        );
+        native.docker = Arc::new(FailingListDocker);
+        assert!(native
+            .install("migrate", "", None)
+            .unwrap_err()
+            .contains("refusing mutation"));
+        assert_eq!(native.store.load().unwrap(), before);
+    }
 
     fn manager(temp: &tempfile::TempDir) -> (ProxyManager, Arc<FakeDockerClient>) {
         let store = AgentStateStore::new(AgentPaths::from_root(temp.path().to_path_buf()));
@@ -1854,7 +2080,7 @@ mod tests {
             .find("space::gate_replace")
             .expect("install_native_inner must call gate_replace");
         let plist = install_body
-            .find("write_launch_agent_plist")
+            .find("write_service")
             .expect("install writes plist");
         assert!(
             install_gate < plist,
@@ -1890,8 +2116,7 @@ mod tests {
             ready: Mutex::new(true),
             ..crate::native_proxy::MemoryLaunchd::default()
         });
-        let manager =
-            ProxyManager::with_native(store, launchd.clone(), agents.clone(), "gui/501");
+        let manager = ProxyManager::with_native(store, launchd.clone(), agents.clone(), "gui/501");
 
         let installed = manager
             .install("op-n-install", "", Some(digest.clone()))
@@ -1920,7 +2145,10 @@ mod tests {
             })
             .unwrap();
         let started = manager.status().unwrap();
-        assert!(started.running, "status must follow launchctl, not a constant");
+        assert!(
+            started.running,
+            "status must follow launchctl, not a constant"
+        );
         assert!(started.ready);
         assert_eq!(started.host_port, Some(15722));
         let plist = std::fs::read_to_string(&plist_path).unwrap();
@@ -1934,7 +2162,10 @@ mod tests {
         let stopped = manager.status().unwrap();
         assert!(!stopped.running);
         assert!(!stopped.ready);
-        assert!(plist_path.is_file(), "stop unloads launchd, it does not delete the plist");
+        assert!(
+            plist_path.is_file(),
+            "stop unloads launchd, it does not delete the plist"
+        );
         assert_eq!(
             launchd.unloads.lock().unwrap().as_slice(),
             [crate::native_proxy::LAUNCH_AGENT_LABEL]
@@ -1961,8 +2192,7 @@ mod tests {
             stderr_log: Mutex::new("native stderr".into()),
             ..crate::native_proxy::MemoryLaunchd::default()
         });
-        let manager =
-            ProxyManager::with_native(store, launchd.clone(), agents.clone(), "gui/501");
+        let manager = ProxyManager::with_native(store, launchd.clone(), agents.clone(), "gui/501");
 
         manager
             .install("op-n-install", "", Some(digest_v1.clone()))
@@ -2015,16 +2245,10 @@ mod tests {
         );
         assert_eq!(launchd.unloads.lock().unwrap().len(), 2);
         assert_eq!(launchd.loads.lock().unwrap().len(), 3);
-        assert!(
-            manager
-                .update(
-                    "op-n-update-image",
-                    "vellum-proxy:local",
-                    None,
-                )
-                .unwrap_err()
-                .contains("NativeProxyDigestInvalid")
-        );
+        assert!(manager
+            .update("op-n-update-image", "vellum-proxy:local", None,)
+            .unwrap_err()
+            .contains("NativeProxyDigestInvalid"));
 
         manager.rollback("op-n-rollback").unwrap();
         assert_eq!(std::fs::read(&bin).unwrap(), b"proxy-v1");
@@ -2042,7 +2266,10 @@ mod tests {
         assert_eq!(launchd.unloads.lock().unwrap().len(), 3);
         assert_eq!(launchd.loads.lock().unwrap().len(), 4);
         assert_eq!(manager.status().unwrap().host_port, Some(15722));
-        assert_eq!(manager.status().unwrap().proxy_backend.as_deref(), Some("native"));
+        assert_eq!(
+            manager.status().unwrap().proxy_backend.as_deref(),
+            Some("native")
+        );
     }
 
     #[derive(Debug, Default)]
