@@ -4,13 +4,13 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::UpdateComponent;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GithubRelease {
     pub tag_name: String,
     #[serde(default)]
@@ -23,7 +23,7 @@ pub struct GithubRelease {
     pub assets: Vec<GithubAsset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GithubAsset {
     pub name: String,
     #[serde(default)]
@@ -44,16 +44,23 @@ pub struct ListedReleases {
 pub trait ReleaseSource: Send + Sync {
     fn list_releases(&self, repo: &str, etag: Option<&str>) -> Result<ListedReleases, String>;
     fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String>;
+    fn fetch_bytes_with_progress(
+        &self,
+        url: &str,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, String> {
+        let bytes = self.fetch_bytes(url)?;
+        progress(bytes.len() as u64);
+        Ok(bytes)
+    }
 }
 
 #[derive(Default)]
-pub struct GithubSource {
-    etags: Mutex<HashMap<String, String>>,
-}
+pub struct GithubSource;
 
 impl GithubSource {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 
@@ -112,12 +119,6 @@ impl ReleaseSource for GithubSource {
             .get("etag")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        if let Some(etag) = etag.clone() {
-            self.etags
-                .lock()
-                .expect("etag map")
-                .insert(repo.to_string(), etag);
-        }
         let body = response.text().map_err(|error| error.to_string())?;
         let releases = parse_github_releases(&body)?;
         Ok(ListedReleases {
@@ -130,6 +131,14 @@ impl ReleaseSource for GithubSource {
     }
 
     fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.fetch_bytes_with_progress(url, &mut |_| {})
+    }
+
+    fn fetch_bytes_with_progress(
+        &self,
+        url: &str,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, String> {
         if !crate::updates::live_auto_update_enabled() {
             return Err("live auto-update is disabled".into());
         }
@@ -137,14 +146,44 @@ impl ReleaseSource for GithubSource {
             .user_agent("vellum-updater")
             .build()
             .map_err(|error| error.to_string())?;
-        let response = agent.get(url).send().map_err(|error| error.to_string())?;
+        let mut response = agent.get(url).send().map_err(|error| error.to_string())?;
         if !response.status().is_success() {
             return Err(format!("download HTTP {}", response.status()));
         }
-        response
-            .bytes()
-            .map(|b| b.to_vec())
-            .map_err(|error| error.to_string())
+        read_with_progress(&mut response, progress)
+    }
+}
+
+fn read_with_progress(
+    reader: &mut dyn std::io::Read,
+    progress: &mut dyn FnMut(u64),
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        progress(bytes.len() as u64);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn download_reports_monotonic_bytes_before_completion() {
+        let payload = vec![7; 150_000];
+        let mut samples = Vec::new();
+        let downloaded = read_with_progress(&mut std::io::Cursor::new(&payload), &mut |bytes| {
+            samples.push(bytes)
+        })
+        .unwrap();
+        assert_eq!(downloaded, payload);
+        assert_eq!(samples, [65_536, 131_072, 150_000]);
     }
 }
 

@@ -1,6 +1,6 @@
 //! Named operations, persisted state, and single-flight.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +42,20 @@ struct PersistedState {
     remote_policies: Vec<RemoteUpdatePolicy>,
     layers: HashMap<String, LayerRecord>,
     restart_reasons_at_stage: Vec<String>,
+    /// Unix seconds of the last check that reached GitHub.
+    #[serde(default)]
+    last_checked_at: Option<i64>,
+    #[serde(default)]
+    release_indexes: HashMap<String, ReleaseIndex>,
+    /// state.json exists but could not be read. Shown as defaults; never saved.
+    #[serde(skip)]
+    unreadable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReleaseIndex {
+    etag: Option<String>,
+    releases: Vec<super::github::GithubRelease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,11 +170,27 @@ impl ApplyExecutor for FsApplyExecutor {
     }
 }
 
+type Flights = Mutex<HashMap<String, watch::Receiver<Flight>>>;
+
+/// Every command opens its own `UpdateEngine`, so in-flight work is shared
+/// per data root rather than per engine. Per engine, the startup check and a
+/// focus check ran side by side and raced each other writing `state.json`.
+fn shared_flights(root: &Path) -> std::sync::Arc<Flights> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<Flights>>>,
+    > = std::sync::OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.entry(root.to_path_buf()).or_default().clone()
+}
+
 pub struct UpdateEngine {
     root: PathBuf,
     trust: TrustStore,
     source: SharedSource,
-    flights: Mutex<HashMap<String, watch::Receiver<Flight>>>,
+    flights: std::sync::Arc<Flights>,
     executor: std::sync::Arc<dyn ApplyExecutor>,
 }
 
@@ -185,7 +215,7 @@ impl UpdateEngine {
             root: root.to_path_buf(),
             trust,
             source,
-            flights: Mutex::new(HashMap::new()),
+            flights: shared_flights(root),
             executor,
         }
     }
@@ -195,17 +225,133 @@ impl UpdateEngine {
     }
 
     fn load(&self) -> PersistedState {
-        let Ok(bytes) = std::fs::read(self.state_path()) else {
-            return PersistedState::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        match super::read_stored_json(&self.state_path()) {
+            super::StoredJson::Parsed(state) => state,
+            super::StoredJson::Missing | super::StoredJson::SetAside => PersistedState::default(),
+            super::StoredJson::Unreadable => PersistedState {
+                unreadable: true,
+                ..PersistedState::default()
+            },
+        }
     }
 
     fn save(&self, state: &PersistedState) -> AppResult<()> {
+        if state.unreadable {
+            return Err(AppError::Message(
+                "updates/state.json could not be read; not overwriting it".into(),
+            ));
+        }
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|error| AppError::Message(error.to_string()))?;
         write_atomic(&self.state_path(), &bytes)
             .map_err(|error| AppError::Message(error.to_string()))
+    }
+
+    /// Whether what a waiting layer staged is still in place: the pending core
+    /// slot for Core, the downloaded asset for the others.
+    fn still_staged(
+        &self,
+        component: UpdateComponent,
+        record: &LayerRecord,
+        version: &str,
+    ) -> bool {
+        match component {
+            UpdateComponent::Core => {
+                super::pending_core(&self.root).is_some_and(|slot| slot.version == version)
+            }
+            _ => record.staged_asset.as_deref().is_some_and(Path::is_file),
+        }
+    }
+
+    /// Removes core trees, archives, and installers that nothing refers to.
+    ///
+    /// Nothing else ever deleted them: each preview left a 416 MB core tree
+    /// (twice over when it was re-staged) plus its archives, ~6 GB within a
+    /// few days, until a Mac ran out of disk mid-download. Only versions
+    /// older than the newest one still referenced go, so a download that
+    /// started after the state was read is never touched.
+    pub fn prune_retired_versions(&self) {
+        if !self.state_path().is_file() {
+            return;
+        }
+        // The startup check and a focus check both prune after their shared
+        // check. Side by side, each failed with "access denied" on the files
+        // the other was deleting; the second one has nothing left to do.
+        let Some(_claim) = PruneClaim::take(&self.root) else {
+            return;
+        };
+        let state = self.load();
+        // Every slot names a version to keep; without them the rollback core
+        // would look retired.
+        let Ok(slots) = CoreSlots::load_for_update(&self.root) else {
+            return;
+        };
+        if state.unreadable {
+            return;
+        }
+        let updates = self.root.join("updates");
+        for component in [UpdateComponent::Desktop, UpdateComponent::Core] {
+            let Some(record) = state.layers.get(component.as_str()) else {
+                continue;
+            };
+            let mut keep: HashSet<String> = [
+                Some(&record.current_version),
+                record.available_version.as_ref(),
+                record.staged_version.as_ref(),
+                record.target_version.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+            if component == UpdateComponent::Core {
+                keep.extend(
+                    [&slots.active, &slots.pending, &slots.previous]
+                        .into_iter()
+                        .flatten()
+                        .map(|slot| slot.version.clone()),
+                );
+                // An identical core settles without a restart, so the tree
+                // Codex launched can fall out of every slot while it runs.
+                keep.extend(launched_core_version(&self.root));
+            }
+            let Some(newest_kept) = keep
+                .iter()
+                .filter_map(|version| super::manifest::parse_version(version))
+                .max()
+            else {
+                continue;
+            };
+            let name = component.as_str();
+            for dir in [updates.join(name), updates.join("cache").join(name)] {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let version = entry.file_name().to_string_lossy().into_owned();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    if keep.contains(&version) {
+                        drop_finished_switch_backup(&path);
+                        continue;
+                    }
+                    if super::manifest::parse_version(&version)
+                        .is_none_or(|parsed| parsed >= newest_kept)
+                    {
+                        continue;
+                    }
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => log::info!("[Updates] removed retired {name} {version}"),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            log::warn!("[Updates] cannot remove retired {name} {version}: {error}")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn layer_mut<'a>(
@@ -231,13 +377,27 @@ impl UpdateEngine {
         let remote = self.layer_status(&state, UpdateComponent::Remote, current_remote, live);
         let core = self.layer_status(&state, UpdateComponent::Core, current_core, live);
         let attention = attention_from([&desktop, &remote, &core]);
+        // The command already resolves and verifies current_core. Do not hash
+        // the runtime again on each progress poll. Pending is a staged candidate,
+        // not an attestation that it is running; launch still verifies its tree.
+        let pending = CoreSlots::load(&self.root)
+            .pending
+            .filter(|slot| slot.path.is_file());
+        let core_runtime = super::CoreRuntimeStatus {
+            missing: current_core == "0.0.0",
+            active_version: (current_core != "0.0.0").then(|| current_core.to_string()),
+            pending_version: pending.map(|slot| slot.version),
+        };
         UpdateStatusSnapshot {
             desktop,
             remote,
             core,
+            core_runtime,
             preferences: state.preferences,
             live_auto_update: live,
             attention,
+            checked_at: state.last_checked_at,
+            restart_schedule: None,
         }
     }
 
@@ -380,17 +540,58 @@ impl UpdateEngine {
                 UpdateComponent::Core,
             ],
         };
+        let mut listings = HashMap::new();
+        for item in &components {
+            let repo = item.github_repo();
+            if listings.contains_key(repo) {
+                continue;
+            }
+            let previous = state.release_indexes.get(repo);
+            let mut listed = self
+                .source
+                .list_releases(repo, previous.and_then(|index| index.etag.as_deref()))
+                .map_err(AppError::Message)?;
+            if listed.not_modified {
+                if let Some(previous) = previous {
+                    listed.releases = previous.releases.clone();
+                }
+            } else if !listed.rate_limited {
+                state.release_indexes.insert(
+                    repo.into(),
+                    ReleaseIndex {
+                        etag: listed.etag.clone(),
+                        releases: listed.releases.clone(),
+                    },
+                );
+            }
+            listings.insert(repo, listed);
+        }
         for item in components {
             let current = currents.of(item);
             let record = Self::layer_mut(&mut state, item, current);
+            let was_applied = record.phase == UpdatePhase::Applied;
+            // A release that is already staged and waiting stays waiting. Marking
+            // it Available again makes the next download re-stage it: for Core
+            // that re-extracts the whole tree on every check.
+            let waiting = matches!(
+                record.phase,
+                UpdatePhase::Staged | UpdatePhase::WaitingForRestart | UpdatePhase::WaitingForIdle
+            )
+            .then(|| (record.phase, record.staged_version.clone()));
+            // Preserve repair state unless a strictly newer release supersedes
+            // the failed target; failure must never disable future checks.
+            let incomplete = (item == UpdateComponent::Desktop
+                && record.failure_reason.as_deref() == Some("desktopInstallIncomplete"))
+            .then(|| record.clone());
             record.phase =
                 transition(record.phase, &UpdateEvent::StartCheck).unwrap_or(UpdatePhase::Checking);
             record.operation_id = Some(op.operation_id.clone());
-            let listed = self
-                .source
-                .list_releases(item.github_repo(), None)
-                .map_err(AppError::Message)?;
+            let listed = &listings[item.github_repo()];
             if listed.rate_limited {
+                if let Some(incomplete) = incomplete {
+                    *record = incomplete;
+                    continue;
+                }
                 record.failure_reason = Some("githubRateLimited".into());
                 record.phase = UpdatePhase::Blocked;
                 continue;
@@ -417,16 +618,33 @@ impl UpdateEngine {
                 else {
                     continue;
                 };
-                let raw = self
-                    .source
-                    .fetch_bytes(&manifest_asset.browser_download_url)
-                    .map_err(AppError::Message)?;
-                let sig = self
-                    .source
-                    .fetch_bytes(&sig_asset.browser_download_url)
-                    .map_err(AppError::Message)?;
+                let cached = listed
+                    .not_modified
+                    .then(|| {
+                        release
+                            .tag_name
+                            .strip_prefix(item.tag_prefix())
+                            .filter(|version| super::manifest::parse_version(version).is_some())
+                            .and_then(|version| {
+                                load_checked_manifest(&self.root, item, version).ok()
+                            })
+                    })
+                    .flatten();
+                let (raw, sig) = match cached {
+                    Some(cached) => cached,
+                    None => (
+                        self.source
+                            .fetch_bytes(&manifest_asset.browser_download_url)
+                            .map_err(AppError::Message)?,
+                        self.source
+                            .fetch_bytes(&sig_asset.browser_download_url)
+                            .map_err(AppError::Message)?,
+                    ),
+                };
                 match verify_signed_manifest(&raw, &sig, &self.trust) {
                     Ok(manifest) => {
+                        persist_checked_manifest(&self.root, item, &manifest.version, &raw, &sig)
+                            .map_err(|error| AppError::Message(error.to_string()))?;
                         if item == UpdateComponent::Core {
                             signed_core_candidates.insert(manifest.release_tag.clone(), (raw, sig));
                         }
@@ -445,7 +663,20 @@ impl UpdateEngine {
             let ctx = SelectContext {
                 component: item,
                 channel: state.preferences.channel,
-                current_version: current,
+                current_version: incomplete
+                    .as_ref()
+                    .and_then(|record| {
+                        record
+                            .target_version
+                            .as_deref()
+                            .or(record.staged_version.as_deref())
+                    })
+                    .filter(|target| {
+                        super::manifest::parse_version(target)
+                            .zip(super::manifest::parse_version(current))
+                            .is_some_and(|(target, current)| target > current)
+                    })
+                    .unwrap_or(current),
                 platform: current_platform(),
                 arch: current_arch(),
                 installed_desktop: currents.desktop,
@@ -482,16 +713,37 @@ impl UpdateEngine {
                 record.available_version = Some(picked.version.clone());
                 record.target_version = Some(picked.version);
                 record.release_notes = manifest.release_notes.clone();
+                record.download_total = select_asset(&manifest, item, &AssetTarget::local())
+                    .map_or(0, |asset| asset.size);
+                record.download_bytes = 0;
                 record.manifest = Some(manifest);
-                record.phase = transition(record.phase, &UpdateEvent::FoundAvailable)
-                    .unwrap_or(UpdatePhase::Available);
+                record.phase = match waiting {
+                    Some((phase, Some(staged)))
+                        if record.target_version.as_deref() == Some(staged.as_str())
+                            && self.still_staged(item, record, &staged) =>
+                    {
+                        record.download_bytes = record.download_total;
+                        phase
+                    }
+                    _ => transition(record.phase, &UpdateEvent::FoundAvailable)
+                        .unwrap_or(UpdatePhase::Available),
+                };
                 record.failure_reason = None;
             } else {
                 let record = Self::layer_mut(&mut state, item, current);
-                record.phase = transition(record.phase, &UpdateEvent::NoneAvailable)
-                    .unwrap_or(UpdatePhase::Idle);
+                if let Some(incomplete) = incomplete {
+                    *record = incomplete;
+                    continue;
+                }
+                record.phase = if was_applied {
+                    UpdatePhase::Applied
+                } else {
+                    transition(record.phase, &UpdateEvent::NoneAvailable)
+                        .unwrap_or(UpdatePhase::Idle)
+                };
             }
         }
+        state.last_checked_at = Some(now_secs());
         self.save(&state)?;
         Ok(op)
     }
@@ -551,6 +803,10 @@ impl UpdateEngine {
             self.save(&state)?;
             return Ok(op);
         };
+        let op = UpdateOperation {
+            target_version: Some(manifest.version.clone()),
+            ..op
+        };
         let asset = select_asset(&manifest, component, &target).cloned();
         if asset.is_none() {
             record.phase = UpdatePhase::Failed;
@@ -561,19 +817,55 @@ impl UpdateEngine {
             return Ok(op);
         };
         record.download_total = asset.size;
+        record.download_bytes = 0;
+        self.save(&state)?;
         let url = format!("asset://{}", asset.name);
-        let bytes = self
+        let mut last_progress = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut progress = |bytes| {
+            if bytes != asset.size
+                && last_progress.elapsed() < std::time::Duration::from_millis(500)
+            {
+                return;
+            }
+            last_progress = std::time::Instant::now();
+            let mut latest = self.load();
+            if let Some(record) = latest.layers.get_mut(component.as_str()) {
+                if record.operation_id.as_deref() == Some(&op.operation_id)
+                    && record.phase == UpdatePhase::Downloading
+                {
+                    record.download_bytes = bytes;
+                    if let Err(error) = self.save(&latest) {
+                        log::warn!("[Updates] progress persistence failed: {error}");
+                    }
+                }
+            }
+        };
+        let fetched = self
             .source
-            .fetch_bytes(&url)
+            .fetch_bytes_with_progress(&url, &mut progress)
             .or_else(|_| {
-                self.source.fetch_bytes(&format!(
-                    "https://github.com/{}/releases/download/{}/{}",
-                    component.github_repo(),
-                    manifest.release_tag,
-                    asset.name
-                ))
-            })
-            .map_err(AppError::Message)?;
+                self.source.fetch_bytes_with_progress(
+                    &format!(
+                        "https://github.com/{}/releases/download/{}/{}",
+                        component.github_repo(),
+                        manifest.release_tag,
+                        asset.name
+                    ),
+                    &mut progress,
+                )
+            });
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let record = Self::layer_mut(&mut state, component, &current);
+                record.phase = UpdatePhase::Failed;
+                record.failure_reason = Some(error.clone());
+                self.save(&state)?;
+                self.record_journal(&op, UpdatePhase::Failed, Some(error.clone()))?;
+                return Err(AppError::Message(error));
+            }
+        };
+        let record = Self::layer_mut(&mut state, component, &current);
         record.download_bytes = bytes.len() as u64;
         record.phase =
             transition(record.phase, &UpdateEvent::StartVerify).unwrap_or(UpdatePhase::Verifying);
@@ -664,6 +956,18 @@ impl UpdateEngine {
         let reason = record.failure_reason.clone();
         self.save(&state)?;
         self.record_journal(&op, phase, reason)?;
+        if component == UpdateComponent::Core && phase == UpdatePhase::WaitingForRestart {
+            match self.settle_pending_identical_to_active() {
+                Ok(true) => {
+                    return Ok(UpdateOperation {
+                        phase: UpdatePhase::Applied,
+                        ..op
+                    })
+                }
+                Ok(false) => {}
+                Err(error) => log::warn!("[Updates] identical core stays pending: {error}"),
+            }
+        }
         Ok(op)
     }
 
@@ -716,11 +1020,21 @@ impl UpdateEngine {
     /// Only the relaunched build can tell whether the install happened, so
     /// Applied is decided here by the running version, never at launch time.
     pub fn reconcile_desktop_after_restart(&self, running: &str) -> AppResult<Option<UpdatePhase>> {
+        self.reconcile_desktop_with_integrity(running, Ok(()))
+    }
+
+    fn reconcile_desktop_with_integrity(
+        &self,
+        running: &str,
+        integrity: Result<(), String>,
+    ) -> AppResult<Option<UpdatePhase>> {
         let mut state = self.load();
         let Some(record) = state.layers.get_mut(UpdateComponent::Desktop.as_str()) else {
             return Ok(None);
         };
-        if record.phase != UpdatePhase::Applying {
+        if record.phase != UpdatePhase::Applying
+            && !(record.phase == UpdatePhase::Applied && integrity.is_err())
+        {
             return Ok(None);
         }
         let target = record
@@ -732,7 +1046,8 @@ impl UpdateEngine {
             .and_then(super::manifest::parse_version)
             .zip(super::manifest::parse_version(running))
             .is_some_and(|(target, running)| running >= target);
-        if reached {
+        let integrity_error = integrity.err();
+        if reached && integrity_error.is_none() {
             record.phase = UpdatePhase::Applied;
             record.current_version = running.to_string();
             record.available_version = None;
@@ -743,10 +1058,17 @@ impl UpdateEngine {
         } else {
             // The staged installer stays, so downloading again reuses it.
             record.phase = UpdatePhase::Failed;
-            record.failure_reason = Some("desktopInstallDidNotComplete".into());
+            record.failure_reason = Some(
+                if integrity_error.is_some() {
+                    "desktopInstallIncomplete"
+                } else {
+                    "desktopInstallDidNotComplete"
+                }
+                .into(),
+            );
         }
         let phase = record.phase;
-        let reason = record.failure_reason.clone();
+        let reason = integrity_error.or_else(|| record.failure_reason.clone());
         let op = UpdateOperation {
             operation_id: record
                 .operation_id
@@ -759,6 +1081,134 @@ impl UpdateEngine {
         self.save(&state)?;
         self.record_journal(&op, phase, reason)?;
         Ok(Some(phase))
+    }
+
+    pub(crate) fn prepare_cached_desktop_repair(&self) -> AppResult<()> {
+        let mut state = self.load();
+        let Some(record) = state.layers.get_mut(UpdateComponent::Desktop.as_str()) else {
+            return Ok(());
+        };
+        if record.phase != UpdatePhase::Failed
+            || record.failure_reason.as_deref() != Some("desktopInstallIncomplete")
+        {
+            return Ok(());
+        }
+        let staged = record
+            .staged_asset
+            .as_ref()
+            .ok_or_else(|| AppError::Message("nothingStaged".into()))?;
+        let manifest = record
+            .manifest
+            .as_ref()
+            .ok_or_else(|| AppError::Message("missingManifest".into()))?;
+        let asset = select_asset(manifest, UpdateComponent::Desktop, &AssetTarget::local())
+            .ok_or_else(|| AppError::Message("missingAsset".into()))?;
+        super::manifest::verify_asset_file(staged, &asset.sha256)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        record.phase = UpdatePhase::WaitingForRestart;
+        self.save(&state)
+    }
+
+    fn reconcile_identical_bundled_core(&self) -> AppResult<()> {
+        if self.settle_pending_identical_to_active()? {
+            return Ok(());
+        }
+        let bundled =
+            crate::enhanced_runtime::desktop_manager::packaged_enhanced_executable(&self.root);
+        self.reconcile_core_with_bundled(bundled.as_deref())
+    }
+
+    /// Settles a pending core whose signed files are the active core's. A Mac
+    /// ships no bundled core, so such a pending used to wait for a managed
+    /// Codex restart that the update panel never offers, and the panel kept
+    /// asking for an update after every Vellum restart.
+    fn settle_pending_identical_to_active(&self) -> AppResult<bool> {
+        let slots = CoreSlots::load(&self.root);
+        // The running launch is on `previous` when an earlier identical core
+        // settled since Codex last started; that tree has to stay a slot.
+        let launched_previous = slots.previous.as_ref().is_some_and(|previous| {
+            launched_core_version(&self.root) == Some(previous.version.clone())
+        });
+        let (Some(active), Some(pending)) = (slots.active, slots.pending) else {
+            return Ok(false);
+        };
+        if !super::core_slots::same_core_tree(&active, &pending)
+            || !super::core_slots::verified_slot(&self.root, &pending, &self.trust)
+            || !super::core_slots::verified_slot(&self.root, &active, &self.trust)
+        {
+            return Ok(false);
+        }
+        self.settle_pending_core(
+            pending,
+            "pending core has the same signed files as the active core",
+            launched_previous,
+        )?;
+        Ok(true)
+    }
+
+    fn reconcile_core_with_bundled(&self, bundled: Option<&Path>) -> AppResult<()> {
+        // A verified active slot is still a runnable core; do not bypass its
+        // managed next-start handoff merely because no bundled image exists.
+        if bundled.is_none()
+            && CoreSlots::load(&self.root)
+                .active
+                .as_ref()
+                .is_some_and(|active| {
+                    super::core_slots::verified_slot(&self.root, active, &self.trust)
+                })
+        {
+            return Ok(());
+        }
+        let Some(slot) = CoreSlots::load(&self.root).pending else {
+            return Ok(());
+        };
+        if !super::core_slots::verified_slot(&self.root, &slot, &self.trust)
+            || bundled.is_some_and(|path| !super::core_slots::bundled_tree_matches(&slot, path))
+        {
+            return Ok(());
+        }
+        self.settle_pending_core(
+            slot,
+            if bundled.is_some() {
+                "pending core already matches the verified bundled tree"
+            } else {
+                "verified pending core recovered a missing bundled core"
+            },
+            false,
+        )
+    }
+
+    fn settle_pending_core(
+        &self,
+        slot: super::core_slots::CoreSlot,
+        note: &str,
+        keep_previous: bool,
+    ) -> AppResult<()> {
+        if keep_previous {
+            super::core_slots::promote_pending_keeping_previous(&self.root)
+        } else {
+            super::core_slots::promote_pending(&self.root)
+        }
+        .map_err(|error| AppError::Message(error.to_string()))?;
+        let mut state = self.load();
+        let record = Self::layer_mut(&mut state, UpdateComponent::Core, &slot.version);
+        record.current_version = slot.version.clone();
+        record.phase = UpdatePhase::Applied;
+        record.failure_reason = None;
+        record.available_version = None;
+        record.target_version = Some(slot.version.clone());
+        record.staged_version = None;
+        let op = UpdateOperation {
+            operation_id: record
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| ulid::Ulid::new().to_string()),
+            component: UpdateComponent::Core,
+            phase: UpdatePhase::Applied,
+            target_version: Some(slot.version),
+        };
+        self.save(&state)?;
+        self.record_journal(&op, UpdatePhase::Applied, Some(note.into()))
     }
 
     pub fn apply(
@@ -779,7 +1229,10 @@ impl UpdateEngine {
                 .unwrap_or_else(|| ulid::Ulid::new().to_string()),
             component,
             phase: record.phase,
-            target_version: record.target_version.clone(),
+            target_version: record
+                .target_version
+                .clone()
+                .or_else(|| record.staged_version.clone()),
         };
         match decision {
             ApplyDecision::Allow => {
@@ -942,6 +1395,70 @@ impl<'a> Currents<'a> {
     }
 }
 
+/// Marks one data root as being pruned, for as long as it lives.
+struct PruneClaim(PathBuf);
+
+static PRUNING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+impl PruneClaim {
+    /// `None` while another prune of `root` is running.
+    fn take(root: &Path) -> Option<Self> {
+        let mut pruning = PRUNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pruning.iter().any(|claimed| claimed == root) {
+            return None;
+        }
+        pruning.push(root.to_path_buf());
+        Some(Self(root.to_path_buf()))
+    }
+}
+
+impl Drop for PruneClaim {
+    fn drop(&mut self) {
+        let mut pruning = PRUNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pruning.retain(|claimed| claimed != &self.0);
+    }
+}
+
+/// The `updates/core/<version>` tree the running bridge was launched from.
+fn launched_core_version(root: &Path) -> Option<String> {
+    use crate::enhanced_runtime::launch_manifest::LaunchManifestV1;
+    let manifest = LaunchManifestV1::read(&LaunchManifestV1::path_in(root)).ok()?;
+    core_version_in(&manifest.enhanced?.executable)
+}
+
+fn core_version_in(executable: &Path) -> Option<String> {
+    let parts = executable
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    parts
+        .windows(3)
+        .find(|window| window[0] == "updates" && window[1] == "core")
+        .map(|window| window[2].clone())
+}
+
+/// `commit_candidate` keeps the replaced tree as `previous` only so a crash
+/// mid-switch can recover; once the switch finished it is dead weight.
+fn drop_finished_switch_backup(slot: &Path) {
+    let previous = slot.join("previous");
+    if !previous.is_dir() {
+        return;
+    }
+    let done = std::fs::read(slot.join("switch.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|marker| marker["phase"] == "done");
+    if done && slot.join("current").join(".complete").is_file() {
+        if let Err(error) = std::fs::remove_dir_all(&previous) {
+            log::warn!("[Updates] cannot remove {}: {error}", previous.display());
+        }
+    }
+}
+
 fn checked_manifest_dir(root: &Path, component: UpdateComponent, version: &str) -> PathBuf {
     root.join("updates")
         .join("manifests")
@@ -1041,7 +1558,9 @@ pub fn get_status(state: &AppState) -> UpdateStatusSnapshot {
     let engine = super::engine(&state.data_root());
     let core_version = current_core_version(state);
     let currents = current_versions(&core_version);
-    engine.snapshot(currents.desktop, currents.remote, currents.core)
+    let mut snapshot = engine.snapshot(currents.desktop, currents.remote, currents.core);
+    snapshot.restart_schedule = super::restart_schedule(state);
+    snapshot
 }
 
 pub async fn check_updates(
@@ -1052,7 +1571,9 @@ pub async fn check_updates(
     let core_version = current_core_version(state);
     let currents = current_versions(&core_version);
     engine.check(component, currents).await?;
-    Ok(engine.snapshot(currents.desktop, currents.remote, currents.core))
+    let mut snapshot = engine.snapshot(currents.desktop, currents.remote, currents.core);
+    snapshot.restart_schedule = super::restart_schedule(state);
+    Ok(snapshot)
 }
 
 pub async fn download_update(
@@ -1092,7 +1613,19 @@ pub async fn download_update(
 /// Startup half of a Desktop update: see
 /// [`UpdateEngine::reconcile_desktop_after_restart`].
 pub fn reconcile_desktop_after_restart(state: &AppState) -> AppResult<Option<UpdatePhase>> {
-    super::engine(&state.data_root()).reconcile_desktop_after_restart(env!("CARGO_PKG_VERSION"))
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            super::install_integrity::cleanup_retired_images(dir);
+        }
+    }
+    let integrity = super::install_integrity::installed_bridge_integrity();
+    let engine = super::engine(&state.data_root());
+    let settled =
+        engine.reconcile_desktop_with_integrity(env!("CARGO_PKG_VERSION"), integrity.clone())?;
+    if integrity.is_ok() {
+        engine.reconcile_identical_bundled_core()?;
+    }
+    Ok(settled)
 }
 
 pub fn cancel_download(state: &AppState, component: UpdateComponent) -> AppResult<UpdateOperation> {
@@ -1274,10 +1807,64 @@ fn current_versions(core: &str) -> Currents<'_> {
 }
 
 fn current_core_version(state: &AppState) -> String {
-    super::resolve_enhanced_runtime(&state.data_root())
-        .map(|runtime| runtime.version)
-        .filter(|version| super::manifest::parse_version(version).is_some())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    current_core_version_at(&state.data_root())
+}
+
+/// What the cached core version was verified against: the slot index and
+/// the active executable's size and mtime. Any install, rollback or edit of
+/// the executable changes one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreVersionKey {
+    root: PathBuf,
+    slots: Option<Vec<u8>>,
+    executable: Option<(u64, Option<SystemTime>)>,
+}
+
+impl CoreVersionKey {
+    fn read(root: &Path) -> Self {
+        let slots = std::fs::read(CoreSlots::path(root)).ok();
+        let executable = CoreSlots::load(root).active.and_then(|slot| {
+            let metadata = std::fs::metadata(&slot.path).ok()?;
+            Some((metadata.len(), metadata.modified().ok()))
+        });
+        Self {
+            root: root.to_path_buf(),
+            slots,
+            executable,
+        }
+    }
+}
+
+static CORE_VERSION_CACHE: std::sync::Mutex<Option<(CoreVersionKey, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Status, check and apply only need the running core's version. Verifying
+/// it hashes the whole signed tree (about 400 MB on macOS), and the update
+/// panel asks for status every second, so reuse the last verification until
+/// the slot index or the executable changes. Launch still verifies the
+/// tree itself through `resolve_enhanced_runtime`.
+fn current_core_version_at(root: &Path) -> String {
+    let key = CoreVersionKey::read(root);
+    if let Ok(cache) = CORE_VERSION_CACHE.lock() {
+        if let Some((cached_key, version)) = cache.as_ref() {
+            if *cached_key == key {
+                return version.clone();
+            }
+        }
+    }
+    let version = match super::resolve_enhanced_runtime(root) {
+        Some(runtime) if super::manifest::parse_version(&runtime.version).is_some() => {
+            runtime.version
+        }
+        Some(_) => env!("CARGO_PKG_VERSION").to_string(),
+        // Missing is not the installed Desktop version. Offer the compatible
+        // core release even when it matches the current Desktop version.
+        None => "0.0.0".into(),
+    };
+    if let Ok(mut cache) = CORE_VERSION_CACHE.lock() {
+        *cache = Some((key, version.clone()));
+    }
+    version
 }
 
 pub fn progress_from(op: &UpdateOperation) -> UpdateProgress {
@@ -1295,6 +1882,39 @@ pub fn progress_from(op: &UpdateOperation) -> UpdateProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_core_version_is_keyed_on_the_slot_index_and_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let empty = CoreVersionKey::read(root);
+        assert_eq!(empty, CoreVersionKey::read(root));
+
+        let exe = root.join("codex");
+        std::fs::write(&exe, b"core-a").unwrap();
+        let slots = CoreSlots::path(root);
+        std::fs::create_dir_all(slots.parent().unwrap()).unwrap();
+        let index = serde_json::json!({
+            "active": {
+                "version": "0.2.10",
+                "digest": "sha256:00",
+                "protocol": "",
+                "path": exe,
+                "helpers": []
+            }
+        });
+        std::fs::write(&slots, serde_json::to_vec(&index).unwrap()).unwrap();
+        let installed = CoreVersionKey::read(root);
+        assert_ne!(empty, installed, "an install changes the slot index");
+        assert!(installed.executable.is_some());
+
+        std::fs::write(&exe, b"core-a-but-longer").unwrap();
+        assert_ne!(
+            installed,
+            CoreVersionKey::read(root),
+            "replacing the executable invalidates the cached verification"
+        );
+    }
     use crate::updates::core_slots::CoreSlot;
     use crate::updates::github::{GithubAsset, GithubRelease, ListedReleases, MemorySource};
     use crate::updates::manifest::{
@@ -1315,6 +1935,23 @@ mod tests {
             UpdateComponent::Desktop if cfg!(target_os = "macos") => "Vellum.app.tar.gz",
             UpdateComponent::Desktop => "Vellum_x64-setup.exe",
         }
+    }
+
+    #[test]
+    fn missing_core_is_reported_in_the_update_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.2",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        let snapshot = engine.snapshot("0.3.1", "0.3.1", "0.0.0");
+        assert!(snapshot.core_runtime.missing);
+        assert!(snapshot.core_runtime.active_version.is_none());
+        assert!(snapshot.core_runtime.pending_version.is_none());
+        assert_eq!(snapshot.core.current_version, "0.0.0");
     }
 
     fn signed_fixture(
@@ -1493,12 +2130,50 @@ mod tests {
         assert_eq!(snap.core.current_version, "bundled");
         assert_eq!(snap.core.staged_version.as_deref(), Some("0.2.0"));
         assert_eq!(snap.core.available_version.as_deref(), Some("0.2.0"));
+        assert_eq!(snap.core_runtime.pending_version.as_deref(), Some("0.2.0"));
+
+        // Checking again finds the same release. It is already pending, so it
+        // keeps waiting instead of being offered (and re-staged) again.
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        let rechecked = engine.snapshot("0.2.9", "0.2.9", "bundled");
+        assert_eq!(rechecked.core.phase, UpdatePhase::WaitingForRestart);
+        assert_eq!(rechecked.core.staged_version.as_deref(), Some("0.2.0"));
+
+        // Once the pending slot is gone the same release is offered again.
+        let mut without_pending = CoreSlots::load(dir.path());
+        without_pending.pending = None;
+        without_pending.save(dir.path()).unwrap();
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.snapshot("0.2.9", "0.2.9", "bundled").core.phase,
+            UpdatePhase::Available
+        );
+        engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            CoreSlots::load(dir.path()).pending.unwrap().version,
+            "0.2.0"
+        );
 
         super::super::core_slots::promote_pending(dir.path()).unwrap();
         let promoted = engine.snapshot("0.2.9", "0.2.9", "0.2.0");
         assert_eq!(promoted.core.phase, UpdatePhase::Applied);
         assert_eq!(promoted.core.current_version, "0.2.0");
         assert!(promoted.core.available_version.is_none());
+        assert!(!promoted.core_runtime.missing);
+        assert_eq!(
+            promoted.core_runtime.active_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert!(promoted.core_runtime.pending_version.is_none());
     }
 
     #[tokio::test]
@@ -1512,10 +2187,80 @@ mod tests {
             b"ignored-for-core",
             recorder,
         );
+        assert!(engine
+            .snapshot("0.2.9", "0.2.9", "bundled")
+            .checked_at
+            .is_none());
         engine.check(None, currents).await.unwrap();
+        let snapshot = engine.snapshot("0.2.9", "0.2.9", "bundled");
+        assert_eq!(snapshot.core.phase, UpdatePhase::Available);
+        // The panel says when Vellum last looked, so the check must be remembered.
+        assert!(snapshot.checked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn conditional_check_reuses_signed_manifests_and_lists_each_repo_once() {
+        struct ConditionalSource {
+            inner: SharedSource,
+            lists: std::sync::atomic::AtomicUsize,
+            fetches: std::sync::atomic::AtomicUsize,
+        }
+        impl super::super::github::ReleaseSource for ConditionalSource {
+            fn list_releases(
+                &self,
+                repo: &str,
+                etag: Option<&str>,
+            ) -> Result<ListedReleases, String> {
+                use std::sync::atomic::Ordering;
+                self.lists.fetch_add(1, Ordering::SeqCst);
+                if etag == Some("release-index-v1") {
+                    return Ok(ListedReleases {
+                        etag: etag.map(str::to_string),
+                        not_modified: true,
+                        rate_limited: false,
+                        retry_after_secs: 0,
+                        releases: Vec::new(),
+                    });
+                }
+                let mut listed = self.inner.list_releases(repo, etag)?;
+                listed.etag = Some("release-index-v1".into());
+                Ok(listed)
+            }
+            fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+                self.fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.fetch_bytes(url)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.0",
+            b"core",
+            Arc::new(RecordingExecutor::default()),
+        );
+        let source = Arc::new(ConditionalSource {
+            inner: engine.source.clone(),
+            lists: Default::default(),
+            fetches: Default::default(),
+        });
+        engine.source = source.clone();
+        engine.check(None, currents).await.unwrap();
+        assert_eq!(source.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(source.fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Re-open like the production command path: ETag/index survive engine creation.
+        let reopened = UpdateEngine::open(dir.path(), engine.trust.clone(), source.clone());
+        reopened.check(None, currents).await.unwrap();
+        assert_eq!(source.lists.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(source.fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
-            engine.snapshot("0.2.9", "0.2.9", "bundled").core.phase,
-            UpdatePhase::Available
+            reopened
+                .snapshot("0.2.9", "0.2.9", "bundled")
+                .core
+                .available_version
+                .as_deref(),
+            Some("0.3.0")
         );
     }
 
@@ -1579,6 +2324,279 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert_eq!(first.operation_id, second.operation_id);
+    }
+
+    #[test]
+    fn a_prune_already_running_on_the_root_is_not_run_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let engine = UpdateEngine::open(
+            root,
+            TrustStore::bundled(),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        );
+        let mut state = PersistedState::default();
+        state
+            .layers
+            .insert("desktop".into(), LayerRecord::new("0.2.0"));
+        engine.save(&state).unwrap();
+        let retired = root.join("updates").join("desktop").join("0.1.0");
+        std::fs::create_dir_all(&retired).unwrap();
+
+        let running = PruneClaim::take(root).expect("no prune is running yet");
+        assert!(PruneClaim::take(root).is_none());
+        engine.prune_retired_versions();
+        assert!(
+            retired.is_dir(),
+            "the second prune must leave the work to the first"
+        );
+
+        drop(running);
+        engine.prune_retired_versions();
+        assert!(!retired.exists());
+        assert!(
+            PruneClaim::take(root).is_some(),
+            "a finished prune releases the root"
+        );
+    }
+
+    fn engine_without_releases(root: &Path) -> UpdateEngine {
+        UpdateEngine::open(
+            root,
+            TrustStore::bundled(),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        )
+    }
+
+    #[test]
+    fn an_unreadable_slot_index_keeps_the_rollback_core_and_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let engine = engine_without_releases(root);
+        let mut state = PersistedState::default();
+        state
+            .layers
+            .insert("core".into(), LayerRecord::new("0.3.0"));
+        engine.save(&state).unwrap();
+        let rollback = root.join("updates").join("core").join("0.2.0");
+        std::fs::create_dir_all(&rollback).unwrap();
+        // A directory in its place: it exists, but reading it fails.
+        let index = CoreSlots::path(root);
+        std::fs::create_dir_all(&index).unwrap();
+
+        engine.prune_retired_versions();
+        assert!(rollback.is_dir(), "the slots it cannot read may name it");
+
+        assert!(super::super::core_slots::promote_pending(root).is_err());
+        assert!(index.is_dir(), "the index must not be replaced");
+    }
+
+    #[test]
+    fn an_unparseable_slot_index_is_kept_aside_before_starting_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = CoreSlots::path(root);
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(&index, b"{\"active\": tru").unwrap();
+
+        super::super::core_slots::promote_pending(root).unwrap();
+
+        let kept: Vec<_> = std::fs::read_dir(index.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("core-slots.json.unreadable-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"{\"active\": tru");
+        assert_eq!(CoreSlots::load(root), CoreSlots::default());
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_without_releases(dir.path());
+        std::fs::create_dir_all(engine.state_path()).unwrap();
+
+        let state = engine.load();
+
+        assert!(state.unreadable);
+        assert!(engine.save(&state).is_err());
+        assert!(engine.state_path().is_dir());
+    }
+
+    #[test]
+    fn retired_update_versions_are_pruned_but_referenced_and_newer_ones_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let engine = UpdateEngine::open(
+            root,
+            TrustStore::bundled(),
+            Arc::new(MemorySource {
+                releases: HashMap::new(),
+                listed: ListedReleases {
+                    etag: None,
+                    not_modified: false,
+                    rate_limited: false,
+                    retry_after_secs: 0,
+                    releases: Vec::new(),
+                },
+            }),
+        );
+        let updates = root.join("updates");
+        let tree = |parts: &[&str]| {
+            let path = parts
+                .iter()
+                .fold(updates.clone(), |path, part| path.join(part));
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        // Nothing is pruned until there is state to say what is in use.
+        tree(&["core", "0.1.0", "current"]);
+        engine.prune_retired_versions();
+        assert!(updates.join("core").join("0.1.0").is_dir());
+
+        let mut state = PersistedState::default();
+        state
+            .layers
+            .insert("desktop".into(), LayerRecord::new("0.2.0"));
+        let mut core = LayerRecord::new("0.4.0");
+        core.staged_version = Some("0.5.0".into());
+        state.layers.insert("core".into(), core);
+        engine.save(&state).unwrap();
+        let slot = |version: &str| {
+            serde_json::json!({"version": version, "digest": "d", "protocol": "p",
+                "path": "x", "helpers": [], "launchId": null})
+        };
+        let slots: CoreSlots = serde_json::from_value(serde_json::json!({
+            "active": slot("0.4.0"), "pending": slot("0.5.0"), "previous": slot("0.3.0")
+        }))
+        .unwrap();
+        slots.save(root).unwrap();
+
+        for version in ["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0", "0.6.0"] {
+            tree(&["core", version, "current"]);
+            tree(&["cache", "core", version]);
+        }
+        for version in ["0.1.0", "0.2.0", "0.3.0"] {
+            tree(&["desktop", version, "current"]);
+            tree(&["cache", "desktop", version]);
+        }
+        tree(&["core", "not-a-version"]);
+        // A finished switch leaves its backup behind; an unfinished one keeps it.
+        tree(&["core", "0.5.0", "previous"]);
+        std::fs::write(updates.join("core/0.5.0/current/.complete"), b"ok").unwrap();
+        std::fs::write(
+            updates.join("core/0.5.0/switch.json"),
+            br#"{"phase":"done"}"#,
+        )
+        .unwrap();
+        tree(&["core", "0.4.0", "previous"]);
+        std::fs::write(
+            updates.join("core/0.4.0/switch.json"),
+            br#"{"phase":"renamingCandidate"}"#,
+        )
+        .unwrap();
+
+        engine.prune_retired_versions();
+
+        let present = |parts: &[&str]| {
+            parts
+                .iter()
+                .fold(updates.clone(), |p, part| p.join(part))
+                .exists()
+        };
+        for base in [&["core"][..], &["cache", "core"][..]] {
+            let at = |version: &str| present(&[base, &[version]].concat());
+            assert!(
+                !at("0.1.0") && !at("0.2.0"),
+                "retired cores stay in {base:?}"
+            );
+            assert!(
+                at("0.3.0") && at("0.4.0") && at("0.5.0"),
+                "slot versions go"
+            );
+            assert!(
+                at("0.6.0"),
+                "a version newer than every reference is a download in flight"
+            );
+        }
+        assert!(present(&["core", "not-a-version"]));
+        assert!(!present(&["core", "0.5.0", "previous"]));
+        assert!(present(&["core", "0.4.0", "previous"]));
+        for base in [&["desktop"][..], &["cache", "desktop"][..]] {
+            let at = |version: &str| present(&[base, &[version]].concat());
+            assert!(!at("0.1.0"), "old desktop installer stays in {base:?}");
+            assert!(at("0.2.0") && at("0.3.0"));
+        }
+    }
+
+    #[test]
+    fn engines_on_one_data_root_share_in_flight_work() {
+        // Commands open a fresh engine per call; the startup check and a focus
+        // check must still see each other's flight.
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let open = |root: &Path| {
+            UpdateEngine::open(
+                root,
+                TrustStore::bundled(),
+                Arc::new(MemorySource {
+                    releases: HashMap::new(),
+                    listed: ListedReleases {
+                        etag: None,
+                        not_modified: false,
+                        rate_limited: false,
+                        retry_after_secs: 0,
+                        releases: Vec::new(),
+                    },
+                }),
+            )
+        };
+        let (a, b, c) = (open(dir.path()), open(dir.path()), open(other.path()));
+        assert!(Arc::ptr_eq(&a.flights, &b.flights));
+        assert!(!Arc::ptr_eq(&a.flights, &c.flights));
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_one_file_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    (0..25).all(|_| write_atomic(&path, format!("{n}").as_bytes()).is_ok())
+                })
+            })
+            .collect();
+        assert!(writers.into_iter().all(|writer| writer.join().unwrap()));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<u8>()
+            .is_ok());
     }
 
     struct RecordingExecutor {
@@ -1809,6 +2827,374 @@ mod tests {
         assert_eq!(snap.desktop.staged_version.as_deref(), Some("0.3.1"));
     }
 
+    #[tokio::test]
+    async fn matching_desktop_version_with_stale_bridge_fails_and_keeps_cached_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Desktop,
+            "0.3.1",
+            b"desk-payload",
+            Arc::new(RecordingExecutor::default()),
+        );
+        engine
+            .check(Some(UpdateComponent::Desktop), currents)
+            .await
+            .unwrap();
+        engine
+            .download(UpdateComponent::Desktop, currents, Vec::new())
+            .await
+            .unwrap();
+        engine
+            .apply(
+                UpdateComponent::Desktop,
+                ApplyDecision::Allow,
+                currents,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .reconcile_desktop_with_integrity(
+                    "0.3.1",
+                    Err("expected new bridge, got old bridge".into())
+                )
+                .unwrap(),
+            Some(UpdatePhase::Failed)
+        );
+        let state = engine.load();
+        let desktop = &state.layers["desktop"];
+        assert_eq!(
+            desktop.failure_reason.as_deref(),
+            Some("desktopInstallIncomplete")
+        );
+        assert!(desktop.staged_asset.as_ref().unwrap().is_file());
+        engine
+            .check(Some(UpdateComponent::Desktop), currents)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.snapshot("0.3.1", "0.2.9", "bundled").desktop.phase,
+            UpdatePhase::Failed
+        );
+        engine.prepare_cached_desktop_repair().unwrap();
+        assert_eq!(
+            engine.snapshot("0.3.1", "0.2.9", "bundled").desktop.phase,
+            UpdatePhase::WaitingForRestart
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_desktop_install_can_be_superseded_only_by_a_newer_release() {
+        for running in ["0.2.9", "0.3.1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let executor = Arc::new(RecordingExecutor::default());
+            let (engine, currents) = fixture_engine(
+                dir.path(),
+                UpdateComponent::Desktop,
+                "0.3.1",
+                b"old installer",
+                executor.clone(),
+            );
+            engine
+                .check(Some(UpdateComponent::Desktop), currents)
+                .await
+                .unwrap();
+            engine
+                .download(UpdateComponent::Desktop, currents, Vec::new())
+                .await
+                .unwrap();
+            engine
+                .apply(
+                    UpdateComponent::Desktop,
+                    ApplyDecision::Allow,
+                    currents,
+                    None,
+                    None,
+                )
+                .unwrap();
+            engine
+                .reconcile_desktop_with_integrity("0.3.1", Err("stale bridge".into()))
+                .unwrap();
+            let current = Currents {
+                desktop: running,
+                ..currents
+            };
+            for published in ["0.3.0", "0.3.1", "0.3.2"] {
+                let (next, _) = fixture_engine(
+                    dir.path(),
+                    UpdateComponent::Desktop,
+                    published,
+                    b"new installer",
+                    executor.clone(),
+                );
+                next.check(Some(UpdateComponent::Desktop), current)
+                    .await
+                    .unwrap();
+                let desktop = next.snapshot(running, "0.2.9", "bundled").desktop;
+                if published != "0.3.2" {
+                    assert_eq!(desktop.phase, UpdatePhase::Failed);
+                    assert_eq!(
+                        desktop.failure_reason.as_deref(),
+                        Some("desktopInstallIncomplete")
+                    );
+                    assert_eq!(desktop.staged_version.as_deref(), Some("0.3.1"));
+                } else {
+                    assert_eq!(desktop.phase, UpdatePhase::Available);
+                    assert_eq!(desktop.target_version.as_deref(), Some("0.3.2"));
+                    assert!(desktop.failure_reason.is_none());
+                    next.prepare_cached_desktop_repair().unwrap();
+                    assert_eq!(
+                        next.snapshot(running, "0.2.9", "bundled").desktop.phase,
+                        UpdatePhase::Available
+                    );
+                    next.download(UpdateComponent::Desktop, current, Vec::new())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        next.snapshot(running, "0.2.9", "bundled")
+                            .desktop
+                            .staged_version
+                            .as_deref(),
+                        Some("0.3.2")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_core_with_the_active_cores_files_settles_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        first
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        first
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        // Nothing is active yet, so the first core still waits for its launch.
+        assert_eq!(
+            first.load().layers["core"].phase,
+            UpdatePhase::WaitingForRestart
+        );
+        super::super::core_slots::promote_pending(dir.path()).unwrap();
+
+        // The next nightly re-labels the same build.
+        let (second, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.2",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        let currents = Currents {
+            core: "0.3.1",
+            ..currents
+        };
+        second
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        let settled = second
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(settled.phase, UpdatePhase::Applied);
+        let slots = CoreSlots::load(dir.path());
+        assert!(slots.pending.is_none());
+        assert_eq!(slots.active.unwrap().version, "0.3.2");
+        assert_eq!(slots.previous.unwrap().version, "0.3.1");
+        let record = &second.load().layers["core"];
+        assert_eq!(record.phase, UpdatePhase::Applied);
+        assert_eq!(record.current_version, "0.3.2");
+        assert!(record.staged_version.is_none());
+    }
+
+    #[test]
+    fn a_core_with_one_different_file_is_not_the_same_core() {
+        let file = |name: &str, sha: &str| super::super::core_slots::CoreSlotFile {
+            path: PathBuf::from(format!("/data/updates/core/0.3.1/current/{name}")),
+            size: 4,
+            sha256: sha.into(),
+        };
+        let active = CoreSlot {
+            version: "0.3.1".into(),
+            digest: "sha256:aa".into(),
+            path: PathBuf::from("/data/updates/core/0.3.1/current/codex"),
+            helpers: vec![PathBuf::from("/data/updates/core/0.3.1/current/helper")],
+            files: vec![file("codex", "aa"), file("helper", "bb")],
+            ..CoreSlot::default()
+        };
+        let relabeled = CoreSlot {
+            version: "0.3.2".into(),
+            digest: "AA".into(),
+            path: PathBuf::from("/data/updates/core/0.3.2/current/codex"),
+            helpers: vec![PathBuf::from("/data/updates/core/0.3.2/current/helper")],
+            files: vec![file("helper", "sha256:BB"), file("codex", "aa")],
+            ..active.clone()
+        };
+        assert!(super::super::core_slots::same_core_tree(
+            &active, &relabeled
+        ));
+        let rebuilt = CoreSlot {
+            files: vec![file("codex", "aa"), file("helper", "cc")],
+            ..relabeled.clone()
+        };
+        assert!(!super::super::core_slots::same_core_tree(&active, &rebuilt));
+        let other_protocol = CoreSlot {
+            protocol: "next".into(),
+            ..relabeled
+        };
+        assert!(!super::super::core_slots::same_core_tree(
+            &active,
+            &other_protocol
+        ));
+    }
+
+    #[test]
+    fn the_launched_core_version_is_read_from_its_tree() {
+        assert_eq!(
+            core_version_in(Path::new(
+                "/Users/me/Library/Application Support/vellum/updates/core/0.2.10-nightly.1/current/codex"
+            ))
+            .as_deref(),
+            Some("0.2.10-nightly.1")
+        );
+        assert_eq!(
+            core_version_in(Path::new("/Applications/Vellum.app/codex")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_bundled_core_recovers_verified_pending_with_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        let pending = CoreSlots::load(dir.path()).pending.unwrap();
+        engine.reconcile_core_with_bundled(None).unwrap();
+        let resolved =
+            super::super::core_slots::resolve_enhanced_runtime_with(dir.path(), &engine.trust)
+                .unwrap();
+        assert_eq!(resolved.path, pending.path);
+        assert_eq!(resolved.helpers, pending.helpers);
+        assert!(!resolved.helpers.is_empty());
+        assert!(CoreSlots::load(dir.path()).pending.is_none());
+        let record = &engine.load().layers["core"];
+        assert_eq!(record.phase, UpdatePhase::Applied);
+        assert_eq!(record.current_version, "0.3.1");
+        assert_eq!(record.target_version.as_deref(), Some("0.3.1"));
+    }
+
+    #[tokio::test]
+    async fn missing_bundled_core_does_not_promote_a_tampered_pending_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &core_archive(),
+            Arc::new(RecordingExecutor::default()),
+        );
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        let pending = CoreSlots::load(dir.path()).pending.unwrap();
+        std::fs::write(&pending.helpers[0], b"tampered").unwrap();
+        engine.reconcile_core_with_bundled(None).unwrap();
+        assert!(CoreSlots::load(dir.path()).pending.is_some());
+        assert!(CoreSlots::load(dir.path()).active.is_none());
+    }
+
+    #[tokio::test]
+    async fn identical_bundled_core_settles_pending_only_after_all_signed_files_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = core_archive();
+        let (engine, currents) = fixture_engine(
+            dir.path(),
+            UpdateComponent::Core,
+            "0.3.1",
+            &payload,
+            Arc::new(RecordingExecutor::default()),
+        );
+        engine
+            .check(Some(UpdateComponent::Core), currents)
+            .await
+            .unwrap();
+        let downloaded = engine
+            .download(UpdateComponent::Core, currents, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(downloaded.target_version.as_deref(), Some("0.3.1"));
+        assert_eq!(
+            Journal::load(dir.path())
+                .by_id(&downloaded.operation_id)
+                .unwrap()
+                .target_version
+                .as_deref(),
+            Some("0.3.1")
+        );
+        let bundled_dir = dir.path().join("bundled");
+        std::fs::create_dir(&bundled_dir).unwrap();
+        let bundled = bundled_dir.join("vellum-enhanced-codex.exe");
+        std::fs::write(&bundled, b"core").unwrap();
+        engine.reconcile_core_with_bundled(Some(&bundled)).unwrap();
+        assert!(
+            CoreSlots::load(dir.path()).pending.is_some(),
+            "matching executable alone cannot skip helper verification"
+        );
+        std::fs::write(bundled_dir.join("codex-command-runner.exe"), b"helper").unwrap();
+        engine.reconcile_core_with_bundled(Some(&bundled)).unwrap();
+        let slots = CoreSlots::load(dir.path());
+        assert!(slots.pending.is_none());
+        assert_eq!(slots.active.unwrap().version, "0.3.1");
+        engine
+            .check(
+                Some(UpdateComponent::Core),
+                Currents {
+                    core: "0.3.1",
+                    ..currents
+                },
+            )
+            .await
+            .unwrap();
+        let state = engine.load();
+        assert_eq!(state.layers["core"].phase, UpdatePhase::Applied);
+        assert_eq!(state.layers["core"].current_version, "0.3.1");
+        assert_eq!(
+            state.layers["core"].target_version.as_deref(),
+            Some("0.3.1")
+        );
+    }
+
     #[test]
     fn reconcile_ignores_a_desktop_layer_that_was_not_applying() {
         let dir = tempfile::tempdir().unwrap();
@@ -2025,7 +3411,7 @@ mod tests {
             assert_eq!(launched[0].0, PathBuf::from("/bin/sh"));
             assert_eq!(launched[0].1[5], "/Applications/Vellum.app");
         } else {
-            assert!(launched[0].1.iter().any(|arg| arg == "/S"));
+            assert!(launched[0].1.iter().any(|arg| arg == "/P"));
             assert!(launched[0].1.iter().any(|arg| arg == "/UPDATE"));
             assert!(launched[0].1.iter().any(|arg| arg == "/R"));
         }

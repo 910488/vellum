@@ -69,7 +69,54 @@ pub async fn get_enhanced_desktop_runtime_status(
 ) -> AppResult<crate::enhanced_runtime::DesktopRuntimeStatus> {
     let status = read_desktop_runtime_status(&state).await?;
     repair_superseded_launch(&state, &status);
+    restore_cleared_lease(&state, &status);
     Ok(status)
+}
+
+/// Puts back a `CODEX_CLI_PATH` that something cleared under a held lease.
+///
+/// The live launch never notices — Desktop read the variable when it started —
+/// so this used to surface only as a restart badge, and following it dropped
+/// Desktop onto native Codex. Re-acquiring needs no restart and no consent: an
+/// absent value has no other owner. A foreign value is left alone.
+fn restore_cleared_lease(
+    state: &AppState,
+    status: &crate::enhanced_runtime::DesktopRuntimeStatus,
+) {
+    if !status.enabled
+        || status.environment_state != "leaseValueMissing"
+        || !state.proxy_status().running
+    {
+        return;
+    }
+    let state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Launch publication owns the lease; let it finish and retry next poll.
+        let Ok(_guard) = state.lifecycle_lock().try_lock() else {
+            return;
+        };
+        let data_root = state.data_root();
+        let Some(lease) = crate::enhanced_runtime::env_lease::EnvironmentLease::read(&data_root)
+        else {
+            return;
+        };
+        match crate::enhanced_runtime::env_lease::acquire(
+            &data_root,
+            &lease.applied_value,
+            &lease.launch_id,
+        ) {
+            Ok(_) => log::warn!(
+                "[EnvLease] CODEX_CLI_PATH was cleared under lease launch={} acquired_at={}; restored at {}",
+                lease.launch_id,
+                lease.acquired_at,
+                chrono::Utc::now().timestamp()
+            ),
+            Err(error) => log::warn!(
+                "[EnvLease] CODEX_CLI_PATH cleared under lease launch={}; restore failed: {error}",
+                lease.launch_id
+            ),
+        }
+    });
 }
 
 async fn read_desktop_runtime_status(
@@ -85,7 +132,7 @@ async fn read_desktop_runtime_status(
         let guard = state.lifecycle_lock().try_lock();
         let status = crate::enhanced_runtime::desktop_runtime_status(&data_root);
         if guard.is_ok() {
-            state.reconcile_enhanced_adoption(status.ready && !status.restart_required);
+            state.reconcile_enhanced_adoption((status.ready || status.bridge_protection_active) && !status.restart_required);
         }
         status
     })
@@ -405,7 +452,25 @@ async fn shared_restart_codex(state: &AppState, force: bool) -> AppResult<Manage
         *slot = Some(rx.clone());
         let state = state.clone();
         tauri::async_runtime::spawn(async move {
-            let result = restart_codex_managed(&state, force).await;
+            // A flight that never ends is a button that never answers again:
+            // every later click joins it. Bound it, and undo the drain a
+            // dropped restart would otherwise leave behind.
+            let result = match tokio::time::timeout(
+                RESTART_FLIGHT_TIMEOUT,
+                restart_codex_managed(&state, force),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    state.set_draining(false);
+                    log::warn!(
+                        "[Restart] managed restart exceeded {}s and was abandoned",
+                        RESTART_FLIGHT_TIMEOUT.as_secs()
+                    );
+                    Ok(ManagedRestart::refused(RuntimeNotice::new("restartTimedOut")))
+                }
+            };
             let encoded = RestartFlight::Done(std::sync::Arc::new(match result {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error.to_string()),
@@ -432,11 +497,40 @@ async fn shared_restart_codex(state: &AppState, force: bool) -> AppResult<Manage
     }
 }
 
+/// Upper bound for one managed restart: drain, stop, relaunch, and the bridge
+/// readiness wait together.
+const RESTART_FLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// How long a restart waits for a Proxy start/stop to release the lifecycle.
+const RESTART_LIFECYCLE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub(crate) async fn restart_codex_managed(
     state: &AppState,
     force: bool,
 ) -> AppResult<ManagedRestart> {
-    let _lifecycle = state.lifecycle_lock().lock().await;
+    log::info!("[Restart] managed restart requested force={force}");
+    let outcome = restart_codex_managed_inner(state, force).await;
+    match &outcome {
+        Ok(result) => log::info!(
+            "[Restart] managed restart finished restarted={} notice={}",
+            result.restarted,
+            result.notice.code
+        ),
+        Err(error) => log::warn!("[Restart] managed restart failed: {error}"),
+    }
+    outcome
+}
+
+async fn restart_codex_managed_inner(
+    state: &AppState,
+    force: bool,
+) -> AppResult<ManagedRestart> {
+    let Ok(_lifecycle) =
+        tokio::time::timeout(RESTART_LIFECYCLE_WAIT, state.lifecycle_lock().lock()).await
+    else {
+        return Ok(ManagedRestart::refused(RuntimeNotice::new(
+            "restartBlockedByLifecycle",
+        )));
+    };
     state.set_draining(true);
     for _ in 0..100 {
         if state.active_requests() == 0 {
@@ -1208,7 +1302,11 @@ fn process_start_time(pid: u32) -> Option<String> {
 fn launch_target_identity(_target: &CodexLaunchTarget) -> String {
     #[cfg(target_os = "windows")]
     {
-        format!("pid:{}", _target.pid)
+        let started = crate::enhanced_runtime::process_info::started_at(_target.pid)
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|time| time.as_nanos().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        format!("pid:{};started:{started}", _target.pid)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1229,7 +1327,7 @@ pub(crate) fn codex_process_identity() -> Option<String> {
     discover_codex_process()
         .ok()
         .flatten()
-        .map(|target| format!("pid:{}", target.pid))
+        .map(|target| launch_target_identity(&target))
 }
 
 #[cfg(target_os = "macos")]

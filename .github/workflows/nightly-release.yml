@@ -29,6 +29,10 @@ on:
         required: true
         default: true
         type: boolean
+      release_notes:
+        description: "Release notes shown in Vellum's update panel; empty lists the commits since the previous tag"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -43,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       core_release: ${{ steps.resolve.outputs.core_release }}
-      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
       core_tag: ${{ steps.resolve.outputs.core_tag }}
       desktop_tag: ${{ steps.resolve.outputs.desktop_tag }}
       publish: ${{ steps.resolve.outputs.publish }}
@@ -64,6 +68,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           SOURCE_REF="${REQUESTED_SOURCE_REF:-codex/dev}"
           CORE_RELEASE="$REQUESTED_CORE_RELEASE"
           if [ -z "$CORE_RELEASE" ]; then
@@ -103,13 +109,13 @@ jobs:
           fi
           {
             echo "core_release=$CORE_RELEASE"
-            echo "source_ref=$SOURCE_REF"
+            echo "source_sha=$SOURCE_SHA"
             echo "core_tag=core-v$VERSION"
             echo "desktop_tag=desktop-v$VERSION"
             echo "publish=$PUBLISH"
           } >> "$GITHUB_OUTPUT"
           printf 'source: %s\ncore: %s\ncore update: %s\ndesktop: %s\npublish: %s\n' \
-            "$SOURCE_REF" "$CORE_RELEASE" "core-v$VERSION" "desktop-v$VERSION" "$PUBLISH" >> "$GITHUB_STEP_SUMMARY"
+            "$SOURCE_SHA" "$CORE_RELEASE" "core-v$VERSION" "desktop-v$VERSION" "$PUBLISH" >> "$GITHUB_STEP_SUMMARY"
 
   core-update:
     name: Publish Enhanced Core hot update
@@ -119,7 +125,7 @@ jobs:
       contents: write
     with:
       tag: ${{ needs.resolve.outputs.core_tag }}
-      source_ref: ${{ needs.resolve.outputs.source_ref }}
+      source_ref: ${{ needs.resolve.outputs.source_sha }}
       enhanced_core_release: ${{ needs.resolve.outputs.core_release }}
       publish: ${{ needs.resolve.outputs.publish == 'true' }}
     secrets: inherit
@@ -132,8 +138,9 @@ jobs:
       contents: write
     with:
       tag: ${{ needs.resolve.outputs.desktop_tag }}
-      source_ref: ${{ needs.resolve.outputs.source_ref }}
+      source_ref: ${{ needs.resolve.outputs.source_sha }}
       enhanced_core_release: ${{ needs.resolve.outputs.core_release }}
       enhanced_core_lock: ${{ needs.core-update.outputs.enhanced_core_lock }}
       publish: ${{ needs.resolve.outputs.publish == 'true' }}
+      release_notes: ${{ inputs.release_notes }}
     secrets: inherit

@@ -7,6 +7,25 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A temporary next to `path` that no other writer in any process shares.
+///
+/// A fixed name (`config.toml.tmp`) or one keyed only by pid lets two threads
+/// writing the same file interleave: one renames the other's half-written
+/// temporary into place, or finds its own already moved away.
+pub fn unique_temporary(path: &Path) -> std::path::PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("vellum"),
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
@@ -16,13 +35,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("vellum"),
-        std::process::id()
-    ));
+    let temporary = unique_temporary(path);
     {
         let mut file = std::fs::File::create(&temporary)?;
         file.write_all(bytes)?;
@@ -76,5 +89,24 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn concurrent_writers_to_one_file_never_publish_a_torn_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let writers: Vec<_> = (0..8u8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let body = vec![b'a' + n; 64 * 1024];
+                    (0..20).all(|_| write_atomic(&path, &body).is_ok())
+                })
+            })
+            .collect();
+        assert!(writers.into_iter().all(|writer| writer.join().unwrap()));
+        let published = std::fs::read(&path).unwrap();
+        assert_eq!(published.len(), 64 * 1024);
+        assert!(published.iter().all(|byte| *byte == published[0]));
     }
 }

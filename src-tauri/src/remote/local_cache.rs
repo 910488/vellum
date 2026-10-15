@@ -80,6 +80,12 @@ impl RemoteLocalCache {
         &self.path
     }
 
+    pub fn has_hosts(&self) -> AppResult<bool> {
+        self.conn.lock().expect("remote cache poisoned")
+            .query_row("SELECT EXISTS(SELECT 1 FROM remote_hosts)", [], |row| row.get(0))
+            .map_err(|error| AppError::Message(error.to_string()))
+    }
+
     pub fn list_hosts(&self) -> AppResult<Vec<CachedHost>> {
         let conn = self.conn.lock().expect("remote cache poisoned");
         let mut stmt = conn
@@ -236,5 +242,22 @@ impl RemoteLocalCache {
         )
         .map_err(|error| AppError::Message(error.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+    #[test]
+    fn host_presence_tracks_an_added_host_without_reading_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RemoteLocalCache::open(dir.path().join("remote.sqlite3")).unwrap();
+        assert!(!cache.has_hosts().unwrap());
+        cache.upsert_host(&CachedHost {
+            id: "host".into(), name: "Host".into(), ssh_alias: "host".into(),
+            broker_url: String::new(), device_id: String::new(), device_token: None,
+            last_thread_id: None, last_ack_seq: 0, cursor_scheme: default_cursor_scheme(),
+        }).unwrap();
+        assert!(cache.has_hosts().unwrap());
     }
 }

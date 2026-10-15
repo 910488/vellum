@@ -32,6 +32,11 @@ const tag = process.env.TAG;
 const prerelease = process.env.PRERELEASE === "true";
 const assetDir = process.env.ASSET_DIR ?? "release-assets";
 const keyId = process.env.VELLUM_UPDATE_KEY_ID;
+const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+if (!/^[0-9a-f]{40}$/.test(sourceCommit) ||
+    (process.env.SOURCE_SHA && process.env.SOURCE_SHA !== sourceCommit)) {
+  throw new Error("SOURCE_SHA must match the actual release checkout commit");
+}
 if (!component || !tag || !keyId) {
   console.error("COMPONENT, TAG, and VELLUM_UPDATE_KEY_ID are required");
   process.exit(1);
@@ -126,7 +131,7 @@ const manifest = {
   schemaVersion: component === "core" ? 2 : 1,
   component,
   version,
-  sourceCommit: process.env.GITHUB_SHA ?? "unknown",
+  sourceCommit,
   releaseTag: tag,
   sequence: Math.floor(Date.now() / 1000),
   keyId,

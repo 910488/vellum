@@ -51,6 +51,7 @@ pub mod lifecycle;
 pub mod live_attribution;
 pub mod official_auth;
 pub mod official_identity;
+mod official_replay;
 pub mod opencode;
 pub mod outbound;
 pub mod profile_adapter;
@@ -124,7 +125,8 @@ pub use diagnostics::{
     CompactionOutcome, DetailLevel, DiagnosticEvent, DiagnosticsSink, InputItemManifest,
     LinkConfidence, NoopSink, OfficialAccountSelected, OfficialAuthMode,
     OfficialReasoningSummaryAction, OfficialRequestPrepared, OfficialRequestTransport,
-    RuntimeDiagnostics, SpawnCompleted, SpawnRequested, SubagentGraphLinked,
+    QuotaPoolCandidateDiagnostic, QuotaPoolDecision, RuntimeDiagnostics, SpawnCompleted,
+    SpawnRequested, SubagentGraphLinked,
     SubagentLinkComparison, SubagentLinkMethod, T3CaptureSession, WebSocketClosed, WebSocketOpened,
     WebSocketTransport, T3_MAX_AGE, T3_MAX_BYTES,
 };
@@ -133,7 +135,7 @@ pub use environment::{
     RuntimePlatform, RuntimeShellKind,
 };
 pub use error::RuntimeError;
-pub use exec::{ProxyRuntime, RuntimeResponse, SubagentIdentityMode};
+pub use exec::{ImageOperation, ProxyRuntime, RawImageBody, RuntimeResponse, SubagentIdentityMode};
 pub use grok_session::{
     conversation_key_from_raw, conversation_key_from_request, grok_request_fingerprint,
     GrokRequestIdentity, GrokSessionRegistry,

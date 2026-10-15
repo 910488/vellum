@@ -74,11 +74,21 @@ impl CoreSlots {
         root.join("updates").join("core-slots.json")
     }
 
+    /// For readers: an index that cannot be read shows no slots.
     pub fn load(root: &Path) -> Self {
-        let Ok(bytes) = std::fs::read(Self::path(root)) else {
-            return Self::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        Self::load_for_update(root).unwrap_or_default()
+    }
+
+    /// For read-modify-write and pruning: an index that exists but cannot be
+    /// read is an error, so it is never replaced by an empty one.
+    pub fn load_for_update(root: &Path) -> std::io::Result<Self> {
+        match super::read_stored_json(&Self::path(root)) {
+            super::StoredJson::Parsed(slots) => Ok(slots),
+            super::StoredJson::Missing | super::StoredJson::SetAside => Ok(Self::default()),
+            super::StoredJson::Unreadable => Err(std::io::Error::other(
+                "core-slots.json could not be read; not overwriting it",
+            )),
+        }
     }
 
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
@@ -128,7 +138,7 @@ pub fn load_signed_core_trust(root: &Path, version: &str) -> Option<(Vec<u8>, Ve
 /// Staging a candidate only writes `pending`. Active launch identity is
 /// untouched, including any recorded launch id / lease.
 pub fn set_pending(root: &Path, pending: CoreSlot) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     let previous_active = slots.active.clone();
     slots.pending = Some(pending);
     slots.save(root)?;
@@ -173,7 +183,7 @@ pub fn conclude_pending_core(
 }
 
 pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(pending) = slots.pending.take() {
         if let Some(active) = slots.active.take() {
             slots.previous = Some(active);
@@ -184,8 +194,20 @@ pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
     Ok(slots)
 }
 
+/// Promotes `pending` but leaves `previous` alone. A core settled without a
+/// restart keeps the running launch on its old tree, and that tree has to
+/// stay a signed slot for the launch to keep verifying.
+pub fn promote_pending_keeping_previous(root: &Path) -> std::io::Result<CoreSlots> {
+    let mut slots = CoreSlots::load_for_update(root)?;
+    if let Some(pending) = slots.pending.take() {
+        slots.active = Some(pending);
+    }
+    slots.save(root)?;
+    Ok(slots)
+}
+
 pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(previous) = slots.previous.take() {
         let rolled_back = slots.active.take();
         slots.active = Some(previous);
@@ -200,7 +222,7 @@ pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
 /// Next-start apply never promoted, so "rollback before the user turn" means
 /// drop `pending` and keep the running `active` identity.
 fn abort_unpromoted_pending(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if slots.previous.is_some() && slots.pending.is_none() {
         return rollback_to_previous(root);
     }
@@ -293,7 +315,7 @@ pub fn signed_core_identity_with(
     })
 }
 
-fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) -> bool {
+pub(super) fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) -> bool {
     let Some((raw, signature)) = load_signed_core_trust(root, &slot.version) else {
         return false;
     };
@@ -373,8 +395,78 @@ fn verified_slot(root: &Path, slot: &CoreSlot, trust: &TrustStore) -> bool {
         && slot.feature_profile == core.feature_profile
         && helpers_match
         && files_match
-        && super::manifest::verify_asset_file(&executable, expected).is_ok()
+        && file_matches_digest(&executable, expected)
         && expected_helpers.iter().all(|helper| helper.is_file())
+}
+
+pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
+    !slot.files.is_empty()
+        && slot.files.iter().all(|file| {
+            let candidate = if file.path == slot.path {
+                bundled.to_path_buf()
+            } else {
+                let Some(name) = file.path.file_name() else {
+                    return false;
+                };
+                bundled.parent().unwrap_or(bundled).join(name)
+            };
+            std::fs::metadata(&candidate).is_ok_and(|meta| meta.len() == file.size)
+                && file_matches_digest(&candidate, &file.sha256)
+        })
+}
+
+/// Nightly releases re-label one core build, so a "new" core is often the
+/// running one under another version: same signed files, same protocol.
+/// Switching to it changes no byte that runs, so it needs no restart.
+pub(super) fn same_core_tree(a: &CoreSlot, b: &CoreSlot) -> bool {
+    fn bare(digest: &str) -> String {
+        digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase()
+    }
+    fn files(slot: &CoreSlot) -> Option<HashSet<(std::ffi::OsString, u64, String)>> {
+        slot.files
+            .iter()
+            .map(|file| {
+                Some((
+                    file.path.file_name()?.to_os_string(),
+                    file.size,
+                    bare(&file.sha256),
+                ))
+            })
+            .collect()
+    }
+    let names = |slot: &CoreSlot| {
+        slot.helpers
+            .iter()
+            .map(|helper| helper.file_name().map(|name| name.to_os_string()))
+            .collect::<Vec<_>>()
+    };
+    !a.files.is_empty()
+        && a.files.len() == b.files.len()
+        && bare(&a.digest) == bare(&b.digest)
+        && a.path.file_name() == b.path.file_name()
+        && a.protocol == b.protocol
+        && a.protocol_compat == b.protocol_compat
+        && a.enhanced_commit == b.enhanced_commit
+        && a.feature_profile == b.feature_profile
+        && names(a) == names(b)
+        && files(a).is_some_and(|left| files(b).is_some_and(|right| left == right))
+}
+
+/// Every status read verifies the active slot, and the macOS tree is about
+/// 400 MB. Read whole on each poll it held a core busy for seconds at a time.
+/// The launch digest cache streams the file and reuses a digest while path,
+/// size and mtime are unchanged, for at most five minutes: the same reuse the
+/// executable hash in the launch manifest already relied on.
+fn file_matches_digest(path: &Path, expected: &str) -> bool {
+    let Ok(actual) = crate::enhanced_runtime::launch_manifest::sha256_file(path) else {
+        return false;
+    };
+    let actual = actual.strip_prefix("sha256:").unwrap_or(&actual);
+    let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
+    actual.eq_ignore_ascii_case(expected)
 }
 
 fn verify_tree_against_signed_target(root: &Path, target: &CoreTarget) -> Result<(), String> {
@@ -404,8 +496,11 @@ fn verify_tree_against_signed_target(root: &Path, target: &CoreTarget) -> Result
                 file.size
             ));
         }
-        super::manifest::verify_asset_file(path, &file.sha256)
-            .map_err(|error| error.to_string())?;
+        if !file_matches_digest(path, &file.sha256) {
+            return Err(format!(
+                "core file {relative} does not match its signed digest"
+            ));
+        }
         observed.insert(key);
         Ok(())
     })?;
@@ -478,6 +573,38 @@ pub fn consume_core_pending_apply() -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_reused_digest_does_not_survive_a_same_size_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("codex");
+        let age = |path: &Path, seconds: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
+                )
+                .unwrap();
+        };
+        std::fs::write(&file, b"signed-core-a").unwrap();
+        age(&file, 3600);
+        let signed = format!("sha256:{}", hex::encode(Sha256::digest(b"signed-core-a")));
+        assert!(file_matches_digest(&file, &signed));
+        assert!(
+            file_matches_digest(&file, &signed),
+            "second read reuses the digest"
+        );
+
+        // Same length as the signed bytes, so only the mtime can tell.
+        std::fs::write(&file, b"altered-core-").unwrap();
+        age(&file, 1800);
+        assert!(
+            !file_matches_digest(&file, &signed),
+            "a new mtime must send the check back to the bytes"
+        );
+    }
+
     fn slot(name: &str) -> CoreSlot {
         CoreSlot {
             version: name.into(),
@@ -491,6 +618,22 @@ mod tests {
             feature_profile: "profile".into(),
             launch_id: Some("launch-live".into()),
         }
+    }
+
+    #[test]
+    fn promoting_while_the_launch_runs_from_previous_keeps_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        CoreSlots {
+            active: Some(slot("relabelled")),
+            pending: Some(slot("relabelled-again")),
+            previous: Some(slot("launched")),
+        }
+        .save(dir.path())
+        .unwrap();
+        let after = promote_pending_keeping_previous(dir.path()).unwrap();
+        assert_eq!(after.active.unwrap().version, "relabelled-again");
+        assert_eq!(after.previous.unwrap().version, "launched");
+        assert!(after.pending.is_none());
     }
 
     #[test]

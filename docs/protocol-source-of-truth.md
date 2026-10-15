@@ -43,6 +43,13 @@ native; a failure after adoption must be surfaced as the real failure.
 ### Proxy and Enhanced Runtime lifecycle
 
 - Starting Proxy automatically attempts to arm Enhanced Runtime.
+- A missing or unverified Enhanced core does not disarm the verified App Server
+  bridge. A bridge-only launch omits the Enhanced binary identity, starts only
+  Official Codex and retains Desktop account/backend relay handling. It reports
+  degraded protection separately from Enhanced readiness. This fallback applies
+  to a new managed launch, never by moving a running turn between children.
+  Existing durable Enhanced bindings retain their history; a bridge-only launch
+  resolves their shared task home through Official until a verified core returns.
 - Stopping Proxy releases Vellum's Enhanced Runtime injection and restores the
   native launch state.
 - There is no independent user-facing enable/disable switch for Enhanced
@@ -352,17 +359,78 @@ floor, but never consumes a Reset credit. The request reaches upstream so its
 actual usage-limit response determines whether it can proceed. Auto Review's
 explicitly selected billing account bypasses this ordinary-request policy.
 
+The optional `balanced` strategy keeps the same admission gates and manual
+fallback. It places a new conversation on the member whose active context
+load is smallest relative to its remaining capacity: normalized weekly/five-hour
+headroom times a relative account size, with member order breaking ties. The
+size starts from the plan (Plus 1, Pro 20, a `lite`/`5x` plan 5; others 1)
+because the usage endpoint reports only percentages and both Pro tiers may
+report `pro`. Once two members have each moved their weekly percentage by at
+least 2 points across 20k routed tokens, tokens per weekly point replaces the
+prior for those members. Calibration counts cached input at one tenth; that is
+a measurement weight, not a claim about billing. Usage of the same account
+outside Vellum reads as a smaller account. Calibration lives in memory, survives
+strategy and settings changes, and restarts at a weekly reset or app restart.
+Ordinary HTTP and WebSocket authorization receive the same routing hints.
+Identity is namespaced by route and upstream model: Codex session+thread,
+otherwise a prompt cache key or WebSocket connection. Conflicting identity or
+no stable identity uses member order rather than guessed affinity. Prompt
+content and cache keys are not changed or sent as additional upstream fields.
+An eligible incumbent is retained throughout a context window. At an explicit
+context-window change, a score improvement must exceed a switching threshold
+that increases with context pressure and observed cached-input ratio. If the
+incumbent no longer passes admission gates, another eligible member is chosen.
+Successful upstream usage refines context estimates and cached-input ratio;
+cached tokens are never treated as a known subscription-quota discount.
+Affinity/load state is bounded, expires after 30 minutes of inactivity, and
+resets on app restart, strategy changes, or disabling the pool. Gate edits and
+priority changes retain affinity, subject to current eligibility. This is a best-effort cache and
+load heuristic, not a guarantee of equal spending or provider cache hits.
+The UI reports the backend's last selection; concurrently active conversations
+may use different accounts. It does not infer the active account from priority.
+
+Routing uses a two-second quota cache while display reads tolerate 30 seconds.
+Quota HTTP connections are reused across misses. Concurrent reads of the same
+token/workspace share one in-flight result, including failures; forced reads
+still reach upstream and invalidate any earlier reading. Balanced routing reads
+up to four independent members concurrently and processes results in member
+order. Rank routing retains its first-usable-member short circuit. Cold reads
+still wait for upstream quota; dispatch timing reports account authorization
+separately from history hydration.
+
 Quota readings are cached for at most 30 seconds per token and workspace;
 force-refresh invalidates the previous reading. Gates control automatic
 rotation, not whether a request can be sent. Usage by other clients and
 in-flight turns can cross a floor before the next reading. No in-flight request
 is replayed automatically after a quota error.
+Enabling a pool does not reassign an existing WebSocket root turn. Incremental
+frames retain the socket's trusted thread identity and last observed full input
+size, so a tool result is not treated as a new tiny session. A usable incumbent
+also keeps its cache at the next root boundary; quota gates, disabling/removing
+the member, or unavailable authentication can permit a boundary migration.
+A native `usage_limit_reached` frame excludes that incumbent only at the next
+root boundary, even if its quota snapshot is stale. A capacity rate limit does
+not set that exclusion, and a subsequent successful response clears it.
+When root metadata is absent, an incremental continuation conservatively stays
+on its current account rather than inventing a safe turn boundary.
+Known native response ids retain bounded routing-only metadata for up to two
+hours (1,024 entries), allowing a reconnect to recover that same thread binding.
+The mapping is route scoped and carries no request body or authorization data.
+Portable dispatch retains the planned request metadata and the caller's current
+Official tool contract; only input/history and account-scoped continuation
+fields are rewritten. Namespace tools are not flattened on Official resumes.
 Each managed credential is a distinct pool member. Multiple user seats in the
 same workspace may be pooled because upstream quota windows can be scoped to
 the authenticated user; their access tokens, quota caches, gates, and rotation
 state remain separate. The pool also accepts credentials from different users
 and workspaces when explicitly enrolled. Reauthenticating a legacy workspace-id
 credential retains its pool membership under the new user-and-workspace id.
+WebSocket reuse, continuation realms, execution usage identity, and refresh
+identity checks use the stable user+workspace credential identity when the
+managed token carries it. The upstream `ChatGPT-Account-Id` header remains the
+workspace id. Two user seats in one workspace must not reuse each other's
+authenticated upstream socket. Manual selection and pool allocation both
+take effect on new turns; already-sent turns keep their resolved credential.
 A configuration change during selection rejects that selection so the caller
 can retry with the new settings.
 
@@ -370,6 +438,21 @@ Each pool routing attempt writes correlated app-log entries for skipped
 members, retries, the selected member, or exhaustion. Entries include an
 opaque selection id, member order, a short credential hash, and a fixed reason
 code. They never include tokens, email addresses, or raw account/workspace ids.
+
+Balanced routing also stores a `quota_pool_decision` diagnostic and one JSON
+app-log line when the selected credential or a candidate's exclusion changes.
+The snapshot includes all enrolled members (including paused or unreadable
+ones), existing hashed account identities, quota headroom/reset timestamps,
+weekly and 5h capacity estimates and their prior/measured sources, external
+usage points, rejected-sample counts, and per-request budget eligibility.
+Changing numeric readings alone does not write another event. A request budget
+is advisory when no candidate fits; the selected manual fallback may still
+carry a quota exclusion. Expired gated readings are labeled reset-pending,
+not assumed to have replenished. Missing quota is retried on subsequent
+routing reads rather than retained in a blacklist; an unknown plan uses the
+Plus prior. Quota rollover clears the window's calibration anchor, pending
+consumption, rejected samples and external-use tally, while retaining learned
+capacity. Manual fallback preserves the actual plan and its calibration.
 
 Opt-in local validation: `cargo test -p vellum --lib live_quota_pool_routing
 -- --ignored --nocapture`. It refreshes existing managed grants, reads real
@@ -657,6 +740,73 @@ The outward error must retain its category:
 - continuation or compaction;
 - stream or transport; or
 - internal invariant failure.
+
+Explicit upstream request rejections (4xx other than authentication, quota,
+408, 409, 425, and 426) retain their typed upstream status but return buffered HTTP 400
+and a string `invalid_prompt` code in WebSocket or already-committed HTTP SSE
+`response.failed` events.
+This prevents unchanged invalid input from being retried across transports.
+The HTTP error envelope keeps its numeric client-facing code and adds
+`upstream_status`; the provider protocol diagnostic category stays intact.
+Quota-bearing 400s remain quota failures, transient 4xx remain retryable,
+and 5xx remain provider-unavailable failures.
+
+Explicit upstream `server_error`, `api_error`, `internal_error`, and
+`service_unavailable` markers in either error type or code are availability
+failures, including Responses terminal events under HTTP 200. Record them as
+503 / `provider_unavailable` / `provider_failure`; native WS and Official SSE
+retain the upstream error frame and its retry semantics. Buffered HTTP client,
+authentication, and quota statuses remain authoritative over body markers.
+
+Official WebSocket-to-HTTP bridges always expand local continuation history
+and remove `previous_response_id`; HTTP cannot consume the WebSocket-only id.
+Account or selection-revision changes also force portable replay on a live
+native connection, independently of what initiated the selection change.
+If local history is missing, the WebSocket boundary emits a wrapped `error`
+with string code `previous_response_not_found` and status 400, which
+[Codex's WebSocket error mapper](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/endpoint/responses_websocket.rs)
+recognizes as a full-request retry. It is not a fatal `invalid_prompt`.
+Local hydration rejection records the selected account and
+`upstream_attempted=false`; dispatched native and bridged exchanges record
+`upstream_attempted=true`. All `generate=false` prewarms remain local, including those received while a
+native inference is in flight. Their completion waits for the running turn,
+and they never enter the upstream pending queue or create inference usage.
+The next request chained to the local warmup id restores its input.
+
+Native error frames preserve upstream codes and payloads verbatim. Nested
+`response.error.type=invalid_request_error` is a fatal request rejection (400),
+just like the top-level error envelope. In contrast,
+`websocket_connection_limit_reached` is recorded as provider-unavailable (503):
+Codex recognizes the preserved code and reconnects instead of treating it as
+an invalid prompt. The proxy does not silently replay an expired turn.
+
+Official HTTP dispatch preserves the explicit `session-id` and `session_id`
+cache-affinity headers from the HTTP request or WebSocket handshake, including
+streaming and retry paths. They are distinct from turn metadata and are never
+forwarded to third-party providers. The caller owns `prompt_cache_key`.
+Same-account HTTP bridge continuation prefers a volatile snapshot of the exact
+dispatched input and completed output, scoped to both route and authorization
+realm. This preserves the serialized input prefix, including developer, image
+and canonical encrypted reasoning items. The cache holds at most 256 snapshots
+and 32 MiB of serialized payload, expires entries after 20 minutes, and never
+writes ciphertext to durable history. On expiry, eviction, missing realm, or
+account/route changes, existing durable portable replay remains the fallback.
+
+The Official durable conversation projection retains caller system/developer
+messages in their original order; the compaction/trajectory projection may
+exclude those messages and must not be reused for conversation persistence.
+Durable history never stores encrypted reasoning. Official replay outside the
+wire cache removes stored provider item IDs while preserving tool `call_id`
+pairing, so a new account receives the caller context without foreign handles.
+Client-carried complete history uses the existing provider-output/id overlap
+gate; repeated user text alone is never deduplicated.
+
+Portable Official sanitization applies only to conversation `input` items.
+The current request owns `tools`, `instructions`, `tool_choice`, and other
+top-level controls; historical request controls never replace them. Tool
+schemas, freeform grammars, and code-mode descriptions are preserved verbatim.
+Official preparation diagnostics compare inbound and effective tool counts,
+serialized byte lengths, and SHA-256 hashes without storing tool definitions.
 
 Include only a bounded, sanitized provider diagnostic. Never replace distinct
 failures with a generic high-demand message, and never expose secrets or an

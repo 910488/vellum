@@ -69,10 +69,10 @@ fn managed_account_changed(
         (&current.auth_posture, &next.auth_posture),
         (
             crate::exec::OfficialWebSocketAuthPosture::Managed {
-                account_id: Some(current),
+                execution_identity: Some(current),
             },
             crate::exec::OfficialWebSocketAuthPosture::Managed {
-                account_id: Some(next),
+                execution_identity: Some(next),
             },
         ) if current != next
     )
@@ -100,10 +100,12 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
     let connection_started = std::time::Instant::now();
     let runtime = state.proxy_runtime();
     let mut official: Option<OfficialSegment> = None;
+    let mut previous_metadata: Option<crate::request::RequestMetadata> = None;
     let mut queued: VecDeque<Value> = VecDeque::new();
     let mut deferred_official: VecDeque<DeferredOfficialTurn> = VecDeque::new();
     let mut deferred_account_handoffs: VecDeque<Value> = VecDeque::new();
     let mut cancelled_response_ids: VecDeque<String> = VecDeque::new();
+    let mut portable_warmup: Option<PortableWarmup> = None;
     let mut turns = 0_u64;
     let mut frames_in = 0_u64;
     let mut frames_out = 0_u64;
@@ -199,7 +201,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
             }
         };
 
-        let (request, preplanned_runtime_request, preplanned_plan, preplanned_execution_id) =
+        let (mut request, preplanned_runtime_request, preplanned_plan, preplanned_execution_id) =
             match work {
                 WebSocketWork::New(request) => (request, None, None, None),
                 WebSocketWork::Deferred(turn) => (
@@ -220,11 +222,66 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
         // whenever the client doesn't tag it.
         match request.get("type").and_then(Value::as_str) {
             Some("response.create") | None => {
+                // Warmup requests do not generate inference. Never forward them
+                // into the native pending queue, where an unanswered warmup can
+                // otherwise live until disconnect and become a phantom failure.
+                if request.get("generate").and_then(Value::as_bool) == Some(false) {
+                    if official
+                        .as_ref()
+                        .is_some_and(|segment| !segment.pending.is_empty())
+                    {
+                        // Preserve terminal ordering: finish the running turn
+                        // before emitting the local warmup completion.
+                        deferred_account_handoffs.push_back(request);
+                        continue;
+                    }
+                    match execute_portable_turn(
+                        &mut client,
+                        &state,
+                        runtime.as_ref(),
+                        &headers,
+                        request,
+                        &connection_id,
+                        &mut queued,
+                        &mut frames_out,
+                        false,
+                        &mut portable_warmup,
+                        None,
+                    )
+                    .await
+                    {
+                        TurnOutcome::Continue => {}
+                        TurnOutcome::Stop(stop_reason) => {
+                            reason = stop_reason;
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 turns += 1;
+                if preplanned_runtime_request.is_none() {
+                    resume_portable_warmup(&mut request, &mut portable_warmup);
+                }
                 let was_deferred = preplanned_plan.is_some();
                 let mut runtime_request = preplanned_runtime_request.clone().unwrap_or_else(|| {
                     runtime_request_from_body(&state, &headers, &request, &connection_id)
                 });
+                let continuation_context = previous_metadata
+                    .clone()
+                    .or_else(|| runtime.official_continuation_context(&runtime_request));
+                apply_socket_affinity(
+                    &mut runtime_request,
+                    continuation_context.as_ref(),
+                    official
+                        .as_ref()
+                        .and_then(|segment| segment.execution_account_hash.as_deref()),
+                    official
+                        .as_ref()
+                        .map_or(0, |segment| segment.last_input_tokens),
+                    official
+                        .as_ref()
+                        .is_some_and(|segment| segment.quota_exhausted),
+                );
                 let request_id = runtime_request.metadata.request_id.clone();
                 let turn_plan = if let Some(plan) = preplanned_plan {
                     WebSocketTurnPlan {
@@ -246,15 +303,23 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     route_id: next_route_id,
                     dispatch: mut turn_dispatch,
                 } = turn_plan;
+                let planned_account_hash = match &turn_dispatch {
+                    WebSocketTurnDispatch::OfficialNative(plan) => {
+                        plan.execution_account_hash.clone()
+                    }
+                    _ => None,
+                };
                 let live_account_handoff = matches!(
                     &turn_dispatch,
                     WebSocketTurnDispatch::OfficialNative(plan)
-                        if request.get("previous_response_id").and_then(Value::as_str).is_some()
+                        if plan.cross_realm_handoff
+                            || request.get("previous_response_id").and_then(Value::as_str).is_some()
                             && official.as_ref().is_some_and(|segment| {
                                 managed_account_changed(
                                     &segment.connection_key,
                                     &plan.connection_key,
-                                )
+                                ) || (segment.selection_revision != plan.selection_revision
+                                    && !runtime_request.metadata.official_socket_affinity.as_ref().is_some_and(|affinity| affinity.turn_in_progress))
                             })
                 );
                 if live_account_handoff {
@@ -265,10 +330,36 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         deferred_account_handoffs.push_back(request);
                         continue;
                     }
-                    runtime_request.metadata.force_portable_official_handoff = true;
-                    turn_dispatch = WebSocketTurnDispatch::PortableReplay {
-                        force_official_handoff: true,
+                    let hydrated = match &turn_dispatch {
+                        WebSocketTurnDispatch::OfficialNative(plan) => {
+                            runtime.hydrate_official_socket_handoff(plan, &request)
+                        }
+                        WebSocketTurnDispatch::PortableReplay { .. } => {
+                            unreachable!("live handoff is only planned for native turns")
+                        }
                     };
+                    match hydrated {
+                        Ok(body) => {
+                            log::info!(
+                                "[OfficialSocket] account handoff replayed on socket connection={connection_id} input_items={}",
+                                crate::request::request_input_items(&body).len()
+                            );
+                            request = body;
+                            runtime_request.body = request.clone();
+                        }
+                        Err(error) => {
+                            // Missing local history keeps the portable path,
+                            // which asks Codex for a full-input retry.
+                            log::warn!(
+                                "[OfficialSocket] account handoff falls back to portable replay connection={connection_id} kind={}",
+                                error.category()
+                            );
+                            runtime_request.metadata.force_portable_official_handoff = true;
+                            turn_dispatch = WebSocketTurnDispatch::PortableReplay {
+                                force_official_handoff: true,
+                            };
+                        }
+                    }
                 }
                 match turn_dispatch {
                     WebSocketTurnDispatch::OfficialNative(official_plan) => {
@@ -323,6 +414,13 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         let reuse = official.as_ref().is_some_and(|segment| {
                             segment.connection_key == official_plan.connection_key
                         });
+                        if reuse
+                            || official
+                                .as_ref()
+                                .is_none_or(|segment| segment.pending.is_empty())
+                        {
+                            previous_metadata = Some(runtime_request.metadata.clone());
+                        }
                         if reuse {
                             let segment = official.as_mut().expect("checked Some above");
                             match send_official_turn(
@@ -419,6 +517,25 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     WebSocketTurnDispatch::PortableReplay {
                         force_official_handoff,
                     } => {
+                        if let Some(hash) = planned_account_hash {
+                            // The shared HTTP executor resolves auth again. Pin
+                            // that resolution to the already planned account,
+                            // and retain the new binding for later increments.
+                            runtime_request.metadata.official_socket_affinity =
+                                Some(crate::request::OfficialSocketAffinity {
+                                    account_hash: hash
+                                        .strip_prefix("sha256:")
+                                        .unwrap_or(&hash)
+                                        .to_owned(),
+                                    turn_in_progress: true,
+                                    input_tokens: runtime_request
+                                        .metadata
+                                        .official_socket_affinity
+                                        .as_ref()
+                                        .map_or(0, |a| a.input_tokens),
+                                    quota_exhausted: false,
+                                });
+                        }
                         if official
                             .as_ref()
                             .is_some_and(|segment| !segment.pending.is_empty())
@@ -440,6 +557,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         // never reaches the portable adapters — the shared
                         // execute() path only hydrates the sanitized/portable
                         // history for this route.
+                        previous_metadata = Some(runtime_request.metadata.clone());
                         close_official_segment(&mut official).await;
                         if !opened {
                             opened = true;
@@ -461,6 +579,8 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                             &mut queued,
                             &mut frames_out,
                             force_official_handoff,
+                            &mut portable_warmup,
+                            Some(runtime_request),
                         )
                         .await
                         {
@@ -644,6 +764,10 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
 /// Official natively pipelines multiple in-flight turns on one socket, so
 /// completions are matched front-to-back.
 struct OfficialSegment {
+    execution_account_hash: Option<String>,
+    last_input_tokens: u64,
+    quota_exhausted: bool,
+    selection_revision: Option<u64>,
     connection_key: OfficialWebSocketConnectionKey,
     write: futures_util::stream::SplitSink<OfficialUpstreamSocket, TungsteniteMessage>,
     read: futures_util::stream::SplitStream<OfficialUpstreamSocket>,
@@ -1061,6 +1185,10 @@ async fn open_official_segment(
     };
     let (write, read) = upstream.split();
     Some(OfficialSegment {
+        execution_account_hash: plan.execution_account_hash.clone(),
+        last_input_tokens: 0,
+        quota_exhausted: false,
+        selection_revision: plan.selection_revision,
         connection_key: plan.connection_key.clone(),
         write,
         read,
@@ -1152,6 +1280,7 @@ async fn send_official_turn(
         .stages
         .request_forwarded_ms
         .get_or_insert(segment.started.elapsed().as_millis() as u64);
+    segment.selection_revision = plan.selection_revision;
     let mut turn = OfficialPendingTurn::new(
         plan,
         request_for_history(request),
@@ -1249,6 +1378,11 @@ async fn handle_official_upstream_frame(
                 }
             }
             if let Some(response) = completed {
+                segment.quota_exhausted = false;
+                segment.last_input_tokens = response
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(segment.last_input_tokens);
                 segment.stages.terminal_ms = Some(segment.started.elapsed().as_millis() as u64);
                 if let Some(mut turn) = segment.pending.pop_front() {
                     if !turn.recorded {
@@ -1277,6 +1411,11 @@ async fn handle_official_upstream_frame(
                     }
                 }
             } else if let Some(failed) = failed {
+                segment.quota_exhausted |= failed
+                    .pointer("/response/error/code")
+                    .or_else(|| failed.pointer("/error/code"))
+                    .and_then(Value::as_str)
+                    == Some("usage_limit_reached");
                 segment.stages.terminal_ms = Some(segment.started.elapsed().as_millis() as u64);
                 let category = official_websocket_failure_category(&failed);
                 let message = failed
@@ -1346,6 +1485,8 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
     queued: &mut VecDeque<Value>,
     frames_out: &mut u64,
     force_official_handoff: bool,
+    portable_warmup: &mut Option<PortableWarmup>,
+    planned_request: Option<RuntimeRequest>,
 ) -> TurnOutcome {
     // The HTTP Responses body has no WebSocket event discriminator.
     if request.get("type").and_then(Value::as_str) == Some("response.create") {
@@ -1354,7 +1495,32 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             .expect("response.create is a JSON object")
             .remove("type");
     }
-    let mut runtime_request = runtime_request_from_body(state, headers, &request, connection_id);
+    // `generate` is a WebSocket-only field: HTTP Responses rejects it with
+    // `Unsupported parameter: generate`. A `generate=false` prewarm is
+    // connection setup, not inference, so it is answered here and its input
+    // is folded into the next turn that chains onto it.
+    if let Some(generate) = request
+        .as_object_mut()
+        .and_then(|object| object.remove("generate"))
+    {
+        if generate == Value::Bool(false) {
+            let (warmup, response) = portable_warmup_response(&request);
+            *portable_warmup = Some(warmup);
+            let turn_started = std::time::Instant::now();
+            return match send_buffered_response_as_websocket_events(client, response, turn_started)
+                .await
+            {
+                Ok(sent) => {
+                    *frames_out += sent.frames_out;
+                    TurnOutcome::Continue
+                }
+                Err(()) => TurnOutcome::Stop("client send failed".into()),
+            };
+        }
+    }
+    let mut runtime_request = planned_request
+        .unwrap_or_else(|| runtime_request_from_body(state, headers, &request, connection_id));
+    runtime_request.body = request.clone();
     runtime_request.metadata.force_portable_official_handoff = force_official_handoff;
     let turn_request_id = runtime_request.metadata.request_id.clone();
     // Minted before dispatch, not read back from `execute` -- this is what
@@ -1537,9 +1703,65 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             if send_runtime_failure(client, &error).await {
                 *frames_out += 1;
             }
-            TurnOutcome::Stop(error.to_string())
+            if matches!(error, RuntimeError::PreviousResponseNotFound(_)) {
+                TurnOutcome::Continue
+            } else {
+                TurnOutcome::Stop(error.to_string())
+            }
         }
     }
+}
+
+/// A `generate=false` prewarm answered locally on the portable path. Codex
+/// chains its next `response.create` onto this id and sends only the input
+/// added since, so the prewarm input must be restored before that turn runs.
+#[derive(Debug)]
+struct PortableWarmup {
+    response_id: String,
+    input: Value,
+}
+
+fn portable_warmup_response(request: &Value) -> (PortableWarmup, Value) {
+    let response_id = format!("resp_vellum_warmup_{}", ulid::Ulid::new());
+    let response = json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "model": request.get("model").cloned().unwrap_or(Value::Null),
+        "output": [],
+    });
+    let warmup = PortableWarmup {
+        response_id,
+        input: request.get("input").cloned().unwrap_or_else(|| json!([])),
+    };
+    (warmup, response)
+}
+
+/// Rewrite a turn chained onto a locally answered prewarm into a standalone
+/// request: the prewarm id exists nowhere upstream or in history. Any other
+/// turn discards the pending prewarm, since Codex only chains the next one.
+fn resume_portable_warmup(request: &mut Value, warmup: &mut Option<PortableWarmup>) {
+    let Some(warmup) = warmup.take() else {
+        return;
+    };
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    if object.get("previous_response_id").and_then(Value::as_str)
+        != Some(warmup.response_id.as_str())
+    {
+        return;
+    }
+    let Value::Array(mut input) = warmup.input else {
+        return;
+    };
+    match object.get("input") {
+        Some(Value::Array(delta)) => input.extend(delta.iter().cloned()),
+        None => {}
+        Some(_) => return,
+    }
+    object.remove("previous_response_id");
+    object.insert("input".into(), Value::Array(input));
 }
 
 fn request_for_history(mut value: Value) -> Value {
@@ -1570,16 +1792,39 @@ fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
 }
 
 fn official_websocket_failure_category(event: &Value) -> &str {
+    let error = event
+        .pointer("/response/error")
+        .or_else(|| event.get("error"));
+    if error.is_some_and(crate::error::is_upstream_server_error) {
+        return "provider_unavailable";
+    }
+    // Codex recognizes this upstream code and reconnects. Preserve the frame
+    // verbatim, but record the expired transport as a retryable availability
+    // failure rather than a fatal prompt error.
+    if error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        == Some("websocket_connection_limit_reached")
+    {
+        return "provider_unavailable";
+    }
     if let Some(category) = event
         .pointer("/response/error/category")
         .and_then(Value::as_str)
     {
         return category;
     }
-    match event.pointer("/error/type").and_then(Value::as_str) {
+    match error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
         Some("invalid_request_error") => "invalid_request",
         Some("authentication_error") => "provider_auth",
-        Some("insufficient_quota") | Some("rate_limit_error") => "provider_quota",
+        // Codex maps the verbatim usage_limit_reached frame to its own
+        // usage-limit error; Vellum only has to account for it as quota.
+        Some("insufficient_quota") | Some("rate_limit_error") | Some("usage_limit_reached") => {
+            "provider_quota"
+        }
         Some(_) | None => "provider_protocol",
     }
 }
@@ -1752,6 +1997,7 @@ fn should_forward_official_header(name: &str) -> bool {
     name == "user-agent"
         || name == "openai-beta"
         || name == "session-id"
+        || name == "session_id"
         || name == "thread-id"
         || name == "x-client-request-id"
         || name == "originator"
@@ -1846,7 +2092,14 @@ fn websocket_handshake_error(
     match status {
         401 | 403 => RuntimeError::ProviderUnauthorized(message),
         429 => RuntimeError::provider_quota(message, None, true),
-        400 | 408 | 409 | 425 | 426 => RuntimeError::ProviderProtocol(message),
+        400 if diagnostic.to_ascii_lowercase().contains("quota") => {
+            RuntimeError::provider_quota(message, None, true)
+        }
+        408 | 409 | 425 | 426 => RuntimeError::ProviderProtocol(message),
+        _ if (400..500).contains(&status) => RuntimeError::ProviderRequestRejected {
+            upstream_status: status,
+            message,
+        },
         500..=599 => RuntimeError::ProviderUnavailable(message),
         _ => RuntimeError::ProviderProtocol(message),
     }
@@ -1882,6 +2135,132 @@ fn runtime_request_from_body<S: ProxyRuntimeState>(
         incoming_auth,
         execution_environment: state.execution_environment(),
         metadata,
+    }
+}
+
+/// A WebSocket response terminal is only a model invocation boundary. Tool
+/// results continue the same Codex root turn, which may span many invocations.
+/// Retain trusted socket identity when an incremental frame omits it; never
+/// inherit across an explicit thread change or a conflicting identity.
+fn apply_socket_affinity(
+    request: &mut RuntimeRequest,
+    previous: Option<&crate::request::RequestMetadata>,
+    account_hash: Option<&str>,
+    input_tokens: u64,
+    quota_exhausted: bool,
+) {
+    let Some(previous) = previous else { return };
+    if request.metadata.codex_identity_conflicted() || previous.codex_identity_conflicted() {
+        return;
+    }
+    if let (Some(current), Some(prior)) =
+        (&request.metadata.codex_identity, &previous.codex_identity)
+    {
+        if current
+            .thread_id
+            .as_ref()
+            .zip(prior.thread_id.as_ref())
+            .is_some_and(|(a, b)| a != b)
+            || current
+                .session_id
+                .as_ref()
+                .zip(prior.session_id.as_ref())
+                .is_some_and(|(a, b)| a != b)
+        {
+            return;
+        }
+    }
+    let roots_present = request
+        .metadata
+        .codex_identity
+        .as_ref()
+        .is_some_and(|id| id.root_turn_id.is_some())
+        || previous
+            .codex_identity
+            .as_ref()
+            .is_some_and(|id| id.root_turn_id.is_some());
+    let current_turn = request.metadata.codex_identity.as_ref().and_then(|id| {
+        if roots_present {
+            id.root_turn_id.as_ref()
+        } else {
+            id.turn_id.as_ref()
+        }
+    });
+    let prior_turn = previous.codex_identity.as_ref().and_then(|id| {
+        if roots_present {
+            id.root_turn_id.as_ref()
+        } else {
+            id.turn_id.as_ref()
+        }
+    });
+    let turn_in_progress = match (current_turn, prior_turn) {
+        (Some(current), Some(prior)) => current == prior,
+        _ => request
+            .body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some(),
+    };
+    if let Some(prior) = &previous.codex_identity {
+        let current = request
+            .metadata
+            .codex_identity
+            .get_or_insert_with(|| prior.clone());
+        current.session_id = current
+            .session_id
+            .clone()
+            .or_else(|| prior.session_id.clone());
+        current.thread_id = current
+            .thread_id
+            .clone()
+            .or_else(|| prior.thread_id.clone());
+        if turn_in_progress {
+            current.root_turn_id = current
+                .root_turn_id
+                .clone()
+                .or_else(|| prior.root_turn_id.clone());
+            current.context_window_id = current
+                .context_window_id
+                .clone()
+                .or_else(|| prior.context_window_id.clone());
+        }
+        if current.session_id == prior.session_id && current.thread_id == prior.thread_id {
+            current.trust = prior.trust;
+        }
+    }
+    let prior = previous.official_socket_affinity.as_ref();
+    let compressed = request
+        .metadata
+        .codex_identity
+        .as_ref()
+        .and_then(|id| id.context_window_id.as_ref())
+        .zip(
+            previous
+                .codex_identity
+                .as_ref()
+                .and_then(|id| id.context_window_id.as_ref()),
+        )
+        .is_some_and(|(a, b)| a != b);
+    let live_account = account_hash.is_some();
+    if let Some(account_hash) = account_hash.or_else(|| prior.map(|a| a.account_hash.as_str())) {
+        let account_hash = account_hash.strip_prefix("sha256:").unwrap_or(account_hash);
+        let same_account = prior.is_some_and(|a| a.account_hash == account_hash);
+        request.metadata.official_socket_affinity = Some(crate::request::OfficialSocketAffinity {
+            account_hash: account_hash.to_owned(),
+            turn_in_progress,
+            input_tokens: if compressed {
+                0
+            } else if input_tokens > 0 {
+                input_tokens
+            } else {
+                prior.filter(|_| same_account).map_or(0, |a| a.input_tokens)
+            },
+            quota_exhausted: if live_account {
+                quota_exhausted
+            } else {
+                prior.is_some_and(|a| same_account && a.quota_exhausted)
+            },
+        });
     }
 }
 
@@ -2033,21 +2412,37 @@ fn record_official_pending_outcome(
     let Some(plan) = turn.plan.as_ref() else {
         return;
     };
-    runtime.finish_terminal_once(
+    let status = match (outcome, error_category) {
+        ("client_cancel" | "client_disconnect", _) => 499,
+        ("protocol_failure", Some("invalid_request")) => 400,
+        (_, Some("provider_unavailable")) => 503,
+        (_, Some("provider_quota")) => 429,
+        _ => 502,
+    };
+    runtime.finish_terminal_once_with_record(
         &turn.execution_id,
-        &plan.route_id,
-        &plan.provider_name,
-        &plan.upstream_model,
-        &turn.request_id,
-        Some(connection_id),
-        turn.started.elapsed().as_millis() as u64,
-        turn.first_byte_ms,
-        turn.first_byte_ms,
-        turn.first_downstream_ms,
         outcome,
-        error_category,
-        error,
-        Some(stages.for_turn(turn)),
+        UsageRecord {
+            route_id: plan.route_id.clone(),
+            provider: plan.provider_name.clone(),
+            model: plan.upstream_model.clone(),
+            status,
+            request_id: Some(turn.request_id.clone()),
+            connection_id: Some(connection_id.to_string()),
+            duration_ms: turn.started.elapsed().as_millis() as u64,
+            first_byte_ms: turn.first_byte_ms,
+            first_event_ms: turn.first_byte_ms,
+            first_downstream_frame_ms: turn.first_downstream_ms,
+            outcome: Some(outcome.to_string()),
+            error_category: error_category.map(str::to_string),
+            error: error.map(str::to_string),
+            stage_times_ms: Some(stages.for_turn(turn)),
+            control_account_hash: plan.control_account_hash.clone(),
+            execution_account_hash: plan.execution_account_hash.clone(),
+            selection_revision: plan.selection_revision,
+            upstream_attempted: Some(true),
+            ..Default::default()
+        },
     );
 }
 
@@ -2375,21 +2770,30 @@ pub async fn send_websocket_failure(client: &mut WebSocket, message: &str) -> bo
         .is_ok()
 }
 
-async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> bool {
-    let value = json!({
-        "type": "response.failed",
-        "sequence_number": 0,
-        "response": {
-            "object": "response",
-            "status": "failed",
+/// Codex parses `response.failed.error` with a string `code`; a numeric one
+/// fails that parse, so the turn surfaced only "response.failed event
+/// received" and Vellum's message was lost. Codex then retries every
+/// failure, so a request Vellum rejects as malformed (HTTP 400 on the HTTP
+/// transport, which Codex treats as fatal) carries `invalid_prompt`, the
+/// code Codex maps to the same non-retryable invalid-request error. The HTTP
+/// status stays available as `status`.
+fn runtime_failure_event(error: &RuntimeError) -> Value {
+    if matches!(error, RuntimeError::PreviousResponseNotFound(_)) {
+        // Codex recognizes this wrapped WS error before parsing Responses
+        // events, discards its incremental request and retries full input.
+        return json!({
+            "type": "error", "status": 400,
             "error": {
-                "type": "vellum_proxy_error",
-                "code": error.http_status().as_u16(),
-                "category": error.category(),
+                "type": "invalid_request_error", "code": "previous_response_not_found",
                 "message": error.to_string()
             }
-        }
-    });
+        });
+    }
+    error.to_response_failed_event()
+}
+
+async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> bool {
+    let value = runtime_failure_event(error);
     client
         .send(AxumWsMessage::Text(value.to_string().into()))
         .await
@@ -2399,6 +2803,148 @@ async fn send_runtime_failure(client: &mut WebSocket, error: &RuntimeError) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socket_request(thread: Option<&str>, root: Option<&str>) -> RuntimeRequest {
+        use crate::codex_metadata::{CodexIdentityTrust, CodexOpaqueId, CodexTurnIdentity};
+        RuntimeRequest {
+            body: json!({"model":"vellum-official", "previous_response_id":"resp_previous", "input":[{"type":"function_call_output","call_id":"call_shell","output":"done"}]}),
+            endpoint: RuntimeEndpoint::Responses,
+            incoming_auth: Default::default(),
+            execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
+            metadata: crate::request::RequestMetadata {
+                connection_id: Some("socket-one".into()),
+                codex_identity: thread.or(root).map(|_| CodexTurnIdentity {
+                    session_id: thread
+                        .map(|_| CodexOpaqueId::new("session_id", "session-one").unwrap()),
+                    thread_id: thread
+                        .map(|thread| CodexOpaqueId::new("thread_id", thread).unwrap()),
+                    root_turn_id: root
+                        .map(|root| CodexOpaqueId::new("root_turn_id", root).unwrap()),
+                    trust: CodexIdentityTrust::Structured,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn incremental_socket_keeps_thread_root_and_cumulative_context() {
+        let first = socket_request(Some("thread-one"), Some("root-one"));
+        let mut next = socket_request(None, Some("root-one"));
+        apply_socket_affinity(
+            &mut next,
+            Some(&first.metadata),
+            Some("sha256:account-a"),
+            300_000,
+            false,
+        );
+        assert_eq!(
+            next.metadata.codex_thread_key(),
+            first.metadata.codex_thread_key()
+        );
+        let affinity = next.metadata.official_socket_affinity.as_ref().unwrap();
+        assert!(affinity.turn_in_progress);
+        assert_eq!(affinity.input_tokens, 300_000);
+        assert_eq!(affinity.account_hash, "account-a");
+        assert_eq!(
+            crate::history::resolve_conversation_key(&next, None).key,
+            "codex:session-one:thread-one"
+        );
+        let route = official_route_config("https://example.test".into()).to_route();
+        assert_eq!(
+            crate::official_auth::OfficialRoutingContext::from_request(&route, &next)
+                .estimated_input_tokens,
+            300_000
+        );
+
+        let previous = next.metadata.clone();
+        let mut boundary = socket_request(None, Some("root-two"));
+        apply_socket_affinity(
+            &mut boundary,
+            Some(&previous),
+            Some("account-a"),
+            300_000,
+            true,
+        );
+        assert!(
+            !boundary
+                .metadata
+                .official_socket_affinity
+                .as_ref()
+                .unwrap()
+                .turn_in_progress
+        );
+        assert!(
+            boundary
+                .metadata
+                .official_socket_affinity
+                .as_ref()
+                .unwrap()
+                .quota_exhausted
+        );
+        assert_eq!(
+            boundary.metadata.codex_thread_key(),
+            first.metadata.codex_thread_key()
+        );
+    }
+
+    #[test]
+    fn socket_affinity_does_not_cross_threads_or_conflicted_identity() {
+        let first = socket_request(Some("thread-one"), Some("root-one"));
+        for conflict in [false, true] {
+            let mut next = socket_request(Some("thread-two"), Some("root-one"));
+            if conflict {
+                next.metadata.codex_identity.as_mut().unwrap().trust =
+                    crate::codex_metadata::CodexIdentityTrust::Conflict;
+            }
+            apply_socket_affinity(
+                &mut next,
+                Some(&first.metadata),
+                Some("account-a"),
+                300_000,
+                false,
+            );
+            assert!(next.metadata.official_socket_affinity.is_none());
+            assert_eq!(
+                next.metadata
+                    .codex_identity
+                    .as_ref()
+                    .unwrap()
+                    .thread_id
+                    .as_deref(),
+                Some("thread-two")
+            );
+        }
+    }
+
+    #[test]
+    fn socket_context_can_shrink_after_compaction_and_usage_limit_is_not_permanent() {
+        let mut first = socket_request(Some("thread-one"), Some("root-one"));
+        first.metadata.official_socket_affinity = Some(crate::request::OfficialSocketAffinity {
+            account_hash: "account-a".into(),
+            turn_in_progress: true,
+            input_tokens: 300_000,
+            quota_exhausted: true,
+        });
+        let mut next = socket_request(None, Some("root-one"));
+        apply_socket_affinity(
+            &mut next,
+            Some(&first.metadata),
+            Some("account-a"),
+            20_000,
+            false,
+        );
+        let affinity = next.metadata.official_socket_affinity.unwrap();
+        assert_eq!(
+            affinity.input_tokens, 20_000,
+            "new actual usage supersedes the old large context"
+        );
+        assert!(
+            !affinity.quota_exhausted,
+            "a successful native response clears its stale quota rejection"
+        );
+    }
     use crate::config::{ProxyRuntimeConfig, RuntimeRouteConfig};
     use crate::inbound::InboundAccessPolicy;
     use crate::route::{RuntimeAuthKind, RuntimeProviderKind, RuntimeWireFormat};
@@ -2409,6 +2955,48 @@ mod tests {
     use axum::Router;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn runtime_failure_code_is_a_string_and_malformed_requests_are_final() {
+        let invalid = runtime_failure_event(&RuntimeError::InvalidRequest("bad shape".into()));
+        let error = &invalid["response"]["error"];
+        assert_eq!(error["code"], "invalid_prompt");
+        assert_eq!(error["status"], 400);
+        assert_eq!(error["category"], "invalid_request");
+        assert!(error["message"].as_str().unwrap().contains("bad shape"));
+
+        let unauthorized =
+            runtime_failure_event(&RuntimeError::ProviderUnauthorized("free tier".into()));
+        let error = &unauthorized["response"]["error"];
+        assert_eq!(error["code"], "provider_unauthorized");
+        assert_eq!(error["status"], 401);
+        assert!(error["code"].is_string());
+    }
+
+    #[test]
+    fn official_handshake_rejections_keep_fatal_and_retryable_codes() {
+        for (status, message, code) in [
+            (400, "Unsupported parameter", "invalid_prompt"),
+            (422, "Invalid input", "invalid_prompt"),
+            (400, "quota exhausted", "provider_quota"),
+            (401, "denied", "provider_unauthorized"),
+            (403, "denied", "provider_unauthorized"),
+            (429, "limited", "provider_quota"),
+            (408, "try later", "provider_protocol"),
+            (409, "try later", "provider_protocol"),
+            (425, "try later", "provider_protocol"),
+            (426, "upgrade", "provider_protocol"),
+            (503, "unavailable", "provider_unavailable"),
+        ] {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(Some(message.as_bytes().to_vec()))
+                .unwrap();
+            let event = runtime_failure_event(&websocket_handshake_error(response));
+            assert_eq!(event["response"]["error"]["code"], code);
+            assert!(event["response"]["error"]["code"].is_string());
+        }
+    }
 
     #[test]
     fn response_create_discriminator_is_preserved_for_route_selection() {
@@ -2502,6 +3090,7 @@ mod tests {
         assert!(should_forward_official_header("openai-beta"));
         assert!(should_forward_official_header("user-agent"));
         assert!(should_forward_official_header("session-id"));
+        assert!(should_forward_official_header("session_id"));
         assert!(should_forward_official_header("thread-id"));
         assert!(should_forward_official_header("x-client-request-id"));
         assert!(should_forward_official_header("originator"));
@@ -2739,17 +3328,96 @@ mod tests {
 
     #[tokio::test]
     async fn official_websocket_account_switch_replays_portable_history_on_new_account() {
+        run_official_websocket_account_switch(false, "switch").await;
+    }
+
+    #[tokio::test]
+    async fn official_reconnect_after_account_switch_replays_history_on_socket() {
+        run_official_websocket_account_switch(false, "switch_reconnect").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_switches_users_in_the_same_workspace() {
+        run_official_websocket_account_switch(true, "switch").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_bridge_replays_same_account_history() {
+        run_official_websocket_account_switch(false, "bridge").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_switch_missing_history_requests_full_input_retry() {
+        run_official_websocket_account_switch(false, "missing").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_selection_revision_change_replays_history() {
+        run_official_websocket_account_switch(false, "revision").await;
+    }
+
+    #[tokio::test]
+    async fn official_same_account_revision_during_root_turn_keeps_native_socket() {
+        run_official_websocket_account_switch(false, "revision_active").await;
+    }
+
+    #[tokio::test]
+    async fn official_reconnect_restores_thread_root_and_context_before_routing() {
+        run_official_websocket_account_switch(false, "revision_active_reconnect").await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_streaming_bridge_replays_history_and_records_account() {
+        run_official_websocket_account_switch(false, "bridge_stream").await;
+    }
+
+    async fn run_official_websocket_account_switch(shared_workspace: bool, mode: &str) {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
+
+        fn desktop_tools() -> Value {
+            json!([
+                serde_json::from_str::<Value>(include_str!("../tests/fixtures/code-mode-exec.json")).unwrap(),
+                {"type":"namespace","name":"collaboration","description":"Coordinate agents", "tools":[
+                    {"type":"function","name":"followup_task","description":"Continue an agent task", "parameters":{
+                        "type":"object", "properties":{"target":{"type":"string"},"message":{"type":"string"}},
+                        "required":["target","message"],"additionalProperties":false}},
+                    {"type":"function","name":"send_message","parameters":{"type":"object", "properties":{"target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"]}}
+                ]}
+            ])
+        }
 
         fn account_hash(account_id: &str) -> String {
             format!("{:x}", Sha256::digest(account_id.as_bytes()))
         }
 
-        fn jwt_for(account_id: &str) -> String {
-            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(json!({"chatgpt_account_id": account_id}).to_string());
+        fn jwt_for(account_id: &str, shared_workspace: bool) -> String {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                if shared_workspace {
+                    json!({"chatgpt_account_id": "shared-workspace", "sub": account_id})
+                } else {
+                    json!({"chatgpt_account_id": account_id})
+                }
+                .to_string(),
+            );
             format!("header.{payload}.signature")
+        }
+
+        fn execution_from_headers(headers: &HeaderMap) -> String {
+            let token = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            token
+                .and_then(crate::chatgpt_identity_from_jwt)
+                .map(|id| id.credential_id)
+                .unwrap_or_else(|| {
+                    headers
+                        .get("chatgpt-account-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                })
         }
 
         fn select_account(root: &std::path::Path, account_id: &str, revision: u64) {
@@ -2767,59 +3435,79 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let auth_root = temp.path().join("official-auth");
+        let identity_for = |account: &str| {
+            crate::chatgpt_identity_from_jwt(&jwt_for(account, shared_workspace))
+                .map_or_else(|| account.to_string(), |id| id.credential_id)
+        };
+        let identity_a = identity_for("acct-a");
+        let identity_b = identity_for("acct-b");
         for account_id in ["acct-a", "acct-b"] {
             let path = auth_root
                 .join("grants")
-                .join(format!("{}.json", account_hash(account_id)));
+                .join(format!("{}.json", account_hash(&identity_for(account_id))));
             crate::official_auth::write_grant_atomic(
                 &path,
                 &crate::official_auth::FileOfficialGrant {
-                    credential_id: None,
-                    account_id: account_id.into(),
-                    access_token: jwt_for(account_id),
+                    credential_id: shared_workspace.then(|| identity_for(account_id)),
+                    account_id: if shared_workspace {
+                        "shared-workspace"
+                    } else {
+                        account_id
+                    }
+                    .into(),
+                    access_token: jwt_for(account_id, shared_workspace),
                     refresh_token: format!("refresh-{account_id}"),
                     expires_at_ms: chrono::Utc::now().timestamp_millis() + 600_000,
                 },
             )
             .unwrap();
         }
-        select_account(&auth_root, "acct-a", 1);
+        select_account(&auth_root, &identity_a, 1);
 
         #[derive(Clone, Default)]
         struct Capture {
             websocket_accounts: Arc<Mutex<Vec<String>>>,
+            websocket_frames: Arc<Mutex<Vec<(String, Value)>>>,
             http_requests: Arc<Mutex<Vec<(String, Value)>>>,
+            http_headers: Arc<Mutex<Vec<HeaderMap>>>,
+            responses: Arc<AtomicUsize>,
         }
 
         let capture = Capture::default();
         let get_capture = capture.clone();
         let post_capture = capture.clone();
+        let check_contract = mode != "missing";
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
                 let capture = get_capture.clone();
                 async move {
-                    capture.websocket_accounts.lock().unwrap().push(
-                        headers
-                            .get("chatgpt-account-id")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
+                    assert_eq!(headers["session-id"], "bridge-affinity");
+                    assert_eq!(headers["session_id"], "bridge-affinity-legacy");
+                    let account = execution_from_headers(&headers);
+                    capture.websocket_accounts.lock().unwrap().push(account.clone());
                     ws.on_upgrade(move |mut socket| async move {
                         while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
                             let request: Value = serde_json::from_str(&text).unwrap();
                             if request.get("type").and_then(Value::as_str)
                                 == Some("response.create")
                             {
+                                assert_eq!(request["tools"], desktop_tools(), "native WS contract");
+                                capture
+                                    .websocket_frames
+                                    .lock()
+                                    .unwrap()
+                                    .push((account.clone(), request.clone()));
+                                let turn_count = capture.responses.fetch_add(1, Ordering::SeqCst) + 1;
                                 socket
                                     .send(AxumWsMessage::Text(
                                         json!({
                                             "type": "response.completed",
                                             "response": {
-                                                "id": "resp_account_a",
+                                                "id": if turn_count == 1 { "resp_account_a" } else { "resp_account_next" },
                                                 "object": "response",
                                                 "status": "completed",
+                                                "usage":{"input_tokens":300_000,"output_tokens":10,"input_tokens_details":{"cached_tokens":297_000}},
                                                 "output": [{
                                                     "type": "message",
                                                     "role": "assistant",
@@ -2844,13 +3532,18 @@ mod tests {
                 move |headers: HeaderMap, axum::extract::Json(body): axum::extract::Json<Value>| {
                     let capture = post_capture.clone();
                     async move {
-                        let account = headers
-                            .get("chatgpt-account-id")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string();
+                        if check_contract {
+                            assert_eq!(
+                                body["tools"],
+                                desktop_tools(),
+                                "HTTP resume must not flatten or replace collaboration tools"
+                            );
+                        }
+                        capture.http_headers.lock().unwrap().push(headers.clone());
+                        let account = execution_from_headers(&headers);
+                        let streaming = body["stream"] == true;
                         capture.http_requests.lock().unwrap().push((account, body));
-                        axum::Json(json!({
+                        let response = json!({
                             "id": "resp_account_b",
                             "object": "response",
                             "status": "completed",
@@ -2859,7 +3552,18 @@ mod tests {
                                 "role": "assistant",
                                 "content": [{"type": "output_text", "text": "answer from B"}]
                             }]
-                        }))
+                        });
+                        if streaming {
+                            axum::response::IntoResponse::into_response((
+                                [("content-type", "text/event-stream")],
+                                format!(
+                                    "data: {}\n\n",
+                                    json!({"type": "response.completed", "response": response})
+                                ),
+                            ))
+                        } else {
+                            axum::response::IntoResponse::into_response(axum::Json(response))
+                        }
                     }
                 },
             ),
@@ -2882,6 +3586,7 @@ mod tests {
         let mut state = StaticProxyState::from_config(config).unwrap();
         state.mark_listener_ready();
         let state = Arc::new(state);
+        let runtime = state.proxy_runtime();
         let proxy = build_headless_router(
             Arc::clone(&state),
             InboundAccessPolicy::test_only_disabled(),
@@ -2892,16 +3597,27 @@ mod tests {
             let _ = axum::serve(proxy_listener, proxy).await;
         });
 
-        let (mut client, _) =
-            tokio_tungstenite::connect_async(format!("ws://{proxy_address}/v1/responses"))
-                .await
-                .unwrap();
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut handshake = format!("ws://{proxy_address}/v1/responses")
+            .into_client_request()
+            .unwrap();
+        handshake
+            .headers_mut()
+            .insert("session-id", "bridge-affinity".parse().unwrap());
+        handshake
+            .headers_mut()
+            .insert("session_id", "bridge-affinity-legacy".parse().unwrap());
+        let (mut client, _) = tokio_tungstenite::connect_async(handshake.clone())
+            .await
+            .unwrap();
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
                     "input": [{"role": "user", "content": "first question"}],
+                    "tools": desktop_tools(),
+                    "client_metadata":{"x-codex-turn-metadata":{"session_id":"switch-session","thread_id":"switch-thread","root_turn_id":"root-one"}},
                     "stream": false
                 })
                 .to_string()
@@ -2922,15 +3638,44 @@ mod tests {
             "response.completed"
         );
 
-        select_account(&auth_root, "acct-b", 2);
+        if mode == "revision_active_reconnect" || mode == "switch_reconnect" {
+            let _ = client.close(None).await;
+            let (replacement, _) = tokio_tungstenite::connect_async(handshake).await.unwrap();
+            client = replacement;
+        }
+
+        if !mode.starts_with("bridge") {
+            select_account(
+                &auth_root,
+                if mode.starts_with("revision") {
+                    &identity_a
+                } else {
+                    &identity_b
+                },
+                2,
+            );
+        }
+        let tools = desktop_tools();
+        // An account or selection change on a live Official socket replays
+        // the history on a socket; only Auto Review keeps the HTTP bridge.
+        let socket_handoff = matches!(mode, "switch" | "switch_reconnect" | "revision");
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
-                    "previous_response_id": "resp_account_a",
+                    "tools": tools, "tool_choice":"auto", "parallel_tool_calls":true,
+                    "client_metadata":{"x-codex-turn-metadata":{"root_turn_id":if mode.starts_with("revision_active") {"root-one"} else {"root-two"}}},
+                    "include":["reasoning.encrypted_content"],
+                    "text":{"format":{"type":"text"}},
+                    "reasoning":{"effort":"high","summary":"auto"},
+                    "prompt_cache_key":"account-switch-contract",
+                    "previous_response_id": if mode == "missing" { "resp_not_in_history" } else { "resp_account_a" },
+                    "instructions": if mode.starts_with("bridge") {
+                        "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
+                    } else { "be brief" },
                     "input": [{"role": "user", "content": "follow-up question"}],
-                    "stream": false
+                    "stream": mode == "bridge_stream"
                 })
                 .to_string()
                 .into(),
@@ -2945,10 +3690,35 @@ mod tests {
                 .unwrap();
             if let TungsteniteMessage::Text(text) = frame {
                 let event: Value = serde_json::from_str(&text).unwrap();
+                if event["type"] == "error" || event["type"] == "response.failed" {
+                    assert_eq!(mode, "missing", "unexpected failure: {event}");
+                    assert_eq!(event["error"]["code"], "previous_response_not_found");
+                    assert!(capture.http_requests.lock().unwrap().is_empty());
+                    let rows = runtime.usage_records().unwrap();
+                    let row = rows.last().unwrap();
+                    assert_eq!(row.upstream_attempted, Some(false));
+                    assert_eq!(
+                        row.execution_account_hash.as_deref(),
+                        Some(format!("sha256:{}", account_hash(&identity_b)).as_str())
+                    );
+                    client.send(TungsteniteMessage::Text(json!({
+                        "type": "response.create", "model": "vellum-official",
+                        "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
+                        "input": [{"role": "user", "content": "first question"},
+                            {"role": "assistant", "content": "answer from A"},
+                            {"role": "user", "content": "follow-up question"}],
+                        "stream": false
+                    }).to_string().into())).await.unwrap();
+                    continue;
+                }
                 if event["type"] == "response.completed" {
                     assert_eq!(
                         event["response"]["id"],
-                        "resp_account_b",
+                        if mode.starts_with("revision_active") || socket_handoff {
+                            "resp_account_next"
+                        } else {
+                            "resp_account_b"
+                        },
                         "websocket accounts={:?}, http requests={:?}",
                         capture.websocket_accounts.lock().unwrap(),
                         capture.http_requests.lock().unwrap()
@@ -2959,18 +3729,137 @@ mod tests {
         }
 
         let websocket_accounts = capture.websocket_accounts.lock().unwrap().clone();
-        assert_eq!(websocket_accounts, ["acct-a"]);
         let requests = capture.http_requests.lock().unwrap().clone();
+        if socket_handoff {
+            let expected = if mode.starts_with("switch") {
+                &identity_b
+            } else {
+                &identity_a
+            };
+            assert!(
+                requests.is_empty(),
+                "handoff must not use HTTP: {requests:?}"
+            );
+            assert_eq!(websocket_accounts.last(), Some(expected));
+            let frames = capture.websocket_frames.lock().unwrap().clone();
+            assert_eq!(frames.len(), 2);
+            let (account, body) = &frames[1];
+            assert_eq!(account, expected);
+            assert!(
+                body.get("previous_response_id").is_none(),
+                "old response id must not reach the replacement socket: {body}"
+            );
+            // Only conversation items may change; every request control and
+            // the tool manifest stay exactly what Codex sent.
+            let mut original = json!({
+                "type": "response.create",
+                "model": "vellum-official",
+                "tools": tools, "tool_choice":"auto", "parallel_tool_calls":true,
+                "client_metadata":{"x-codex-turn-metadata":{"root_turn_id":"root-two"}},
+                "include":["reasoning.encrypted_content"],
+                "text":{"format":{"type":"text"}},
+                "reasoning":{"effort":"high","summary":"auto"},
+                "prompt_cache_key":"account-switch-contract",
+                "instructions": "be brief",
+                "stream": false
+            });
+            let mut sent = body.clone();
+            sent.as_object_mut().unwrap().remove("input");
+            original["model"] = sent["model"].clone();
+            assert_eq!(sent, original);
+            let input_text = body["input"].to_string();
+            assert!(input_text.contains("first question"), "{input_text}");
+            assert!(input_text.contains("answer from A"), "{input_text}");
+            assert!(input_text.contains("follow-up question"), "{input_text}");
+            let rows = runtime.usage_records().unwrap();
+            let row = rows.last().unwrap();
+            assert_eq!(row.status, 200);
+            assert_eq!(
+                row.conversation_identity.as_deref(),
+                Some("codex:switch-session:switch-thread")
+            );
+            assert_eq!(
+                row.execution_account_hash.as_deref(),
+                Some(format!("sha256:{}", account_hash(expected)).as_str())
+            );
+            let _ = client.close(None).await;
+            proxy_task.abort();
+            upstream_task.abort();
+            return;
+        }
+        assert_eq!(
+            websocket_accounts,
+            if mode == "revision_active_reconnect" {
+                vec![identity_a.clone(), identity_a.clone()]
+            } else {
+                vec![identity_a.clone()]
+            }
+        );
+        if mode.starts_with("revision_active") {
+            assert!(
+                requests.is_empty(),
+                "same-account revision must not discard the running root's native continuation"
+            );
+            let rows = runtime.usage_records().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.status == 200
+                && row.conversation_identity.as_deref()
+                    == Some("codex:switch-session:switch-thread")));
+            let _ = client.close(None).await;
+            proxy_task.abort();
+            upstream_task.abort();
+            return;
+        }
+        for headers in capture.http_headers.lock().unwrap().iter() {
+            assert_eq!(headers["session-id"], "bridge-affinity");
+            assert_eq!(headers["session_id"], "bridge-affinity-legacy");
+        }
         assert_eq!(
             requests.len(),
             1,
             "account handoff must use one portable POST"
         );
-        assert_eq!(requests[0].0, "acct-b");
+        assert_eq!(
+            requests[0].0,
+            if mode.starts_with("bridge") || mode == "revision" {
+                identity_a.clone()
+            } else {
+                identity_b.clone()
+            }
+        );
         assert!(
             requests[0].1.get("previous_response_id").is_none(),
             "old account response id must not reach the new account: {}",
             requests[0].1
+        );
+        if mode != "missing" {
+            let body = &requests[0].1;
+            assert_eq!(body["tools"], tools, "mode={mode}");
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["parallel_tool_calls"], true);
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(body["text"], json!({"format":{"type":"text"}}));
+            assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+            assert_eq!(body["prompt_cache_key"], "account-switch-contract");
+            assert_eq!(
+                body["instructions"],
+                if mode.starts_with("bridge") {
+                    "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
+                } else {
+                    "be brief"
+                }
+            );
+        }
+        let rows = runtime.usage_records().unwrap();
+        let row = rows.last().unwrap();
+        assert_eq!(
+            row.conversation_identity.as_deref(),
+            Some("codex:switch-session:switch-thread")
+        );
+        assert_eq!(row.upstream_attempted, Some(true));
+        assert_eq!(
+            row.execution_account_hash.as_deref(),
+            Some(format!("sha256:{}", account_hash(&requests[0].0)).as_str())
         );
         let input_text = requests[0].1["input"].to_string();
         assert!(input_text.contains("first question"), "{input_text}");
@@ -3417,6 +4306,240 @@ mod tests {
         proxy_task.abort();
         official_task.abort();
         third_party_task.abort();
+    }
+
+    #[test]
+    fn portable_warmup_only_resumes_the_turn_chained_onto_it() {
+        let (warmup, response) = portable_warmup_response(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": "a"}],
+            "generate": false
+        }));
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"], json!([]));
+
+        let mut pending = Some(warmup);
+        let mut unrelated = json!({"previous_response_id": "resp_other", "input": []});
+        resume_portable_warmup(&mut unrelated, &mut pending);
+        assert!(pending.is_none(), "a non-chained turn discards the prewarm");
+        assert_eq!(unrelated["previous_response_id"], "resp_other");
+
+        let (warmup, _) = portable_warmup_response(&json!({
+            "input": [{"role": "user", "content": "a"}]
+        }));
+        assert_ne!(response["id"], warmup.response_id.as_str());
+        let mut chained = json!({
+            "previous_response_id": warmup.response_id,
+            "input": [{"role": "user", "content": "b"}]
+        });
+        let mut pending = Some(warmup);
+        resume_portable_warmup(&mut chained, &mut pending);
+        assert!(chained.get("previous_response_id").is_none());
+        assert_eq!(
+            chained["input"],
+            json!([
+                {"role": "user", "content": "a"},
+                {"role": "user", "content": "b"}
+            ])
+        );
+    }
+
+    /// Codex prewarms a WebSocket turn with `generate=false`, then chains the
+    /// real turn onto the prewarm id with only the new input. On the portable
+    /// HTTP path neither field may reach the provider: HTTP Responses rejects
+    /// `generate`, and the prewarm id exists nowhere upstream.
+    #[tokio::test]
+    async fn portable_websocket_answers_prewarm_locally_and_restores_its_input() {
+        run_portable_prewarm(false).await;
+    }
+
+    #[tokio::test]
+    async fn official_websocket_bridge_answers_prewarm_locally() {
+        run_portable_prewarm(true).await;
+    }
+
+    async fn run_portable_prewarm(official: bool) {
+        use axum::extract::Json;
+        use axum::routing::post;
+
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let bodies_srv = Arc::clone(&bodies);
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let bodies = Arc::clone(&bodies_srv);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    axum::Json(json!({
+                        "id": "resp_third_party",
+                        "object": "response",
+                        "status": "completed",
+                        "output": []
+                    }))
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream).await;
+        });
+
+        let route = RuntimeRouteConfig {
+            route_id: "third-party".into(),
+            catalog_id: "vlm-third-party".into(),
+            name: "ThirdParty".into(),
+            base_url: format!("http://{upstream_address}/v1"),
+            provider_kind: if official {
+                RuntimeProviderKind::Official
+            } else {
+                RuntimeProviderKind::OpenAiCompatible
+            },
+            auth_kind: RuntimeAuthKind::None,
+            wire: RuntimeWireFormat::Responses,
+            server_side_resume: false,
+            streaming: false,
+            reasoning: true,
+            vision: false,
+            upstream_model: "third-party-upstream".into(),
+            context_window: Some(128_000),
+            reasoning_capabilities: Default::default(),
+            compaction_capabilities: Default::default(),
+            compaction_policy: Default::default(),
+            tool_capabilities: Default::default(),
+            credential_id: None,
+            catalog_entry: None,
+            chat_capabilities: Default::default(),
+            insecure_http_policy: Default::default(),
+            access_mode: None,
+        };
+        let config = ProxyRuntimeConfig {
+            models: vec![route],
+            ..ProxyRuntimeConfig::default()
+        };
+        let mut state = StaticProxyState::from_config(config).unwrap();
+        state.mark_listener_ready();
+        let state = Arc::new(state);
+        let proxy = build_headless_router(
+            Arc::clone(&state),
+            InboundAccessPolicy::test_only_disabled(),
+        );
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, proxy).await;
+        });
+
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{proxy_address}/v1/responses"))
+                .await
+                .unwrap();
+        async fn send_and_complete(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            frame: Value,
+        ) -> Value {
+            client
+                .send(TungsteniteMessage::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+            loop {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                let TungsteniteMessage::Text(text) = message else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(&text).unwrap();
+                match event["type"].as_str() {
+                    Some("response.completed") => return event,
+                    Some("response.failed") => panic!("turn failed: {event}"),
+                    _ => {}
+                }
+            }
+        }
+
+        let tools = json!([serde_json::from_str::<Value>(include_str!(
+            "../tests/fixtures/code-mode-exec.json"
+        ))
+        .unwrap()]);
+        let warmup = send_and_complete(
+            &mut client,
+            json!({
+                "type": "response.create",
+                "model": "vlm-third-party",
+                "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
+                "input": [{"role": "user", "content": "first"}],
+                "stream": false,
+                "tools": [], "tool_choice": "none",
+                "generate": false
+            }),
+        )
+        .await;
+        let warmup_id = warmup["response"]["id"].as_str().unwrap().to_string();
+        assert!(
+            bodies.lock().unwrap().is_empty(),
+            "prewarm must not reach upstream"
+        );
+
+        let turn = send_and_complete(
+            &mut client,
+            json!({
+                "type": "response.create",
+                "model": "vlm-third-party",
+                "instructions": "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
+                "previous_response_id": warmup_id,
+                "input": [{"role": "user", "content": "second"}],
+                "stream": false,
+                "tools": tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": true,
+                "include": ["reasoning.encrypted_content"],
+                "text": {"format":{"type":"text"}},
+                "reasoning": {"effort":"high","summary":"auto"},
+                "prompt_cache_key":"bridge-contract"
+            }),
+        )
+        .await;
+        assert_eq!(turn["response"]["id"], "resp_third_party");
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let upstream_body = &bodies[0];
+        if official {
+            assert_eq!(upstream_body["tools"], tools);
+            assert_eq!(upstream_body["tool_choice"], "auto");
+            assert_eq!(upstream_body["parallel_tool_calls"], true);
+            assert_eq!(
+                upstream_body["include"],
+                json!(["reasoning.encrypted_content"])
+            );
+            assert_eq!(upstream_body["text"], json!({"format":{"type":"text"}}));
+            assert_eq!(
+                upstream_body["reasoning"],
+                json!({"effort":"high","summary":"auto"})
+            );
+            assert_eq!(upstream_body["prompt_cache_key"], "bridge-contract");
+            assert_eq!(upstream_body["instructions"],
+                "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy");
+        }
+        assert!(upstream_body.get("generate").is_none(), "{upstream_body}");
+        assert!(
+            upstream_body.get("previous_response_id").is_none(),
+            "{upstream_body}"
+        );
+        let text = upstream_body["input"].to_string();
+        let first = text.find("first").expect("prewarm input restored");
+        let second = text.find("second").expect("turn input kept");
+        assert!(first < second, "{text}");
+
+        let _ = client.close(None).await;
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -4246,35 +5369,296 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn official_websocket_top_level_error_is_terminal_invalid_request() {
+    async fn native_prewarm_during_inference_never_becomes_phantom_usage() {
+        run_native_prewarm_during_inference(false).await;
+    }
+
+    #[tokio::test]
+    async fn native_prewarm_during_inference_does_not_block_next_real_turn() {
+        run_native_prewarm_during_inference(true).await;
+    }
+
+    async fn run_native_prewarm_during_inference(next_turn: bool) {
+        let first_seen = Arc::new(tokio::sync::Notify::new());
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(AtomicUsize::new(0));
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
-            get(|ws: WebSocketUpgrade| async move {
-                ws.on_upgrade(|mut socket| async move {
-                    while let Some(Ok(message)) = socket.recv().await {
-                        let AxumWsMessage::Text(text) = message else {
-                            continue;
-                        };
-                        let value: Value = serde_json::from_str(&text).unwrap();
-                        if value.get("type").and_then(Value::as_str) == Some("response.create") {
+            get({
+                let first_seen = first_seen.clone();
+                let closed = closed.clone();
+                let seen = seen.clone();
+                move |ws: WebSocketUpgrade| {
+                    let first_seen = first_seen.clone();
+                    let closed = closed.clone();
+                    let seen = seen.clone();
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            let Some(Ok(AxumWsMessage::Text(_))) = socket.recv().await else {
+                                return;
+                            };
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            first_seen.notify_one();
+                            // Keep inference in flight while the client sends prewarm.
+                            // This upstream deliberately never answers a warmup frame.
+                            if let Ok(Some(Ok(AxumWsMessage::Text(_)))) = tokio::time::timeout(
+                                std::time::Duration::from_millis(100),
+                                socket.recv(),
+                            )
+                            .await
+                            {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                            }
                             socket
                                 .send(AxumWsMessage::Text(
-                                    json!({
-                                        "type": "error",
-                                        "status": 400,
-                                        "error": {
-                                            "type": "invalid_request_error",
-                                            "message": "Invalid `previous_response_id`."
-                                        }
-                                    })
+                                    json!({"type":"response.completed","response":{
+                        "id":"resp_real","status":"completed","output":[]}})
                                     .to_string()
                                     .into(),
                                 ))
                                 .await
                                 .unwrap();
-                        }
+                            if next_turn {
+                                let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await
+                                else {
+                                    panic!("missing next real turn");
+                                };
+                                let body: Value = serde_json::from_str(&text).unwrap();
+                                assert!(body.get("generate").is_none());
+                                assert!(body.get("previous_response_id").is_none());
+                                assert_eq!(
+                                    body["input"],
+                                    json!([
+                                        {"role":"user","content":"warmup"},
+                                        {"role":"user","content":"next turn"}
+                                    ])
+                                );
+                                seen.fetch_add(1, Ordering::SeqCst);
+                                socket
+                                    .send(AxumWsMessage::Text(
+                                        json!({"type":"response.completed","response":{
+                            "id":"resp_next","status":"completed","output":[]}})
+                                        .to_string()
+                                        .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
+                            socket.send(AxumWsMessage::Close(None)).await.unwrap();
+                            closed.notify_one();
+                        })
                     }
-                })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let mut state = StaticProxyState::from_config(ProxyRuntimeConfig {
+            models: vec![official_route_config(format!(
+                "http://{address}/backend-api/codex"
+            ))],
+            ..Default::default()
+        })
+        .unwrap();
+        state.mark_listener_ready();
+        let state = Arc::new(state);
+        let runtime = state.proxy_runtime();
+        let proxy = build_headless_router(state, InboundAccessPolicy::test_only_disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, proxy).await;
+        });
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/v1/responses"))
+                .await
+                .unwrap();
+        client
+            .send(TungsteniteMessage::Text(
+                json!({"type":"response.create","model":"vellum-official",
+            "input":[{"role":"user","content":"real turn"}],"stream":true})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_seen.notified())
+            .await
+            .unwrap();
+        client
+            .send(TungsteniteMessage::Text(
+                json!({"type":"response.create","model":"vellum-official",
+            "input":[{"role":"user","content":"warmup"}],"generate":false})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let TungsteniteMessage::Text(text) = frame {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event.pointer("/response/id").and_then(Value::as_str) == Some("resp_real") {
+                    break;
+                }
+            }
+        }
+        if next_turn {
+            let warmup_id = loop {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if let TungsteniteMessage::Text(text) = frame {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "response.completed" {
+                        break event["response"]["id"].as_str().unwrap().to_owned();
+                    }
+                }
+            };
+            client
+                .send(TungsteniteMessage::Text(
+                    json!({"type":"response.create","model":"vellum-official",
+                "previous_response_id":warmup_id,"input":[{"role":"user","content":"next turn"}],
+                "stream":true})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(frame) = client.next().await {
+                if matches!(frame.unwrap(), TungsteniteMessage::Close(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), closed.notified())
+            .await
+            .unwrap();
+        let rows = runtime.usage_records().unwrap();
+        let expected_turns = if next_turn { 2 } else { 1 };
+        assert_eq!(
+            rows.len(),
+            expected_turns,
+            "prewarm must not create a failed usage row: {rows:?}"
+        );
+        assert!(rows.iter().all(|row| row.status == 200), "{rows:?}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            expected_turns,
+            "prewarm must stay local"
+        );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn official_server_error_type_and_code_are_retryable_provider_failures() {
+        for (field, value) in [
+            ("type", "server_error"),
+            ("type", "api_error"),
+            ("type", "internal_error"),
+            ("type", "service_unavailable"),
+            ("code", "server_error"),
+            ("code", "internal_error"),
+        ] {
+            let mut error = json!({"message":"An error occurred while processing your request. You can retry your request."});
+            error[field] = json!(value);
+            for event in [
+                json!({"type":"error","error":error.clone()}),
+                json!({"type":"response.failed","response":{"error":error.clone()}}),
+            ] {
+                run_official_error_frame(event, "provider_unavailable", 503).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn official_websocket_top_level_error_is_terminal_invalid_request() {
+        run_official_error_frame(
+            json!({"type":"error","status":400,"error":{
+            "type":"invalid_request_error","message":"Invalid `previous_response_id`."}}),
+            "invalid_request",
+            400,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn official_content_policy_rejection_is_fatal_without_frame_rewriting() {
+        run_official_error_frame(
+            json!({"type":"response.failed","response":{"error":{
+            "type":"invalid_request_error","code":"content_policy_violation",
+            "message":"This content was flagged for possible cybersecurity risk."}}}),
+            "invalid_request",
+            400,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn official_connection_lifetime_limit_keeps_codex_retry_code() {
+        run_official_error_frame(
+            json!({"type":"error","status":400,"error":{
+            "type":"invalid_request_error","code":"websocket_connection_limit_reached",
+            "message":"Responses websocket connection limit reached (60 minutes)"}}),
+            "provider_unavailable",
+            503,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn official_usage_limit_frame_is_recorded_as_quota() {
+        run_official_error_frame(
+            json!({"type":"error","status":429,"error":{
+            "type":"usage_limit_reached","plan_type":"plus","resets_at":1_791_900_000_i64,
+            "message":"The usage limit has been reached"}}),
+            "provider_quota",
+            429,
+        )
+        .await;
+    }
+
+    async fn run_official_error_frame(expected: Value, category: &str, status: u16) {
+        let frame = expected.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let upstream_attempts = attempts.clone();
+        let upstream = Router::new().route(
+            "/backend-api/codex/responses",
+            get(move |ws: WebSocketUpgrade| {
+                let frame = frame.clone();
+                let attempts = upstream_attempts.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let AxumWsMessage::Text(text) = message else {
+                                continue;
+                            };
+                            let value: Value = serde_json::from_str(&text).unwrap();
+                            if value.get("type").and_then(Value::as_str) == Some("response.create")
+                            {
+                                attempts.fetch_add(1, Ordering::SeqCst);
+                                socket
+                                    .send(AxumWsMessage::Text(frame.to_string().into()))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    })
+                }
             }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4329,14 +5713,16 @@ mod tests {
             panic!("expected top-level error text, got {frame:?}");
         };
         let event: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(event["type"], "error");
+        assert_eq!(event, expected, "upstream frame must survive verbatim");
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if runtime.usage_records().unwrap().iter().any(|record| {
-                    record.outcome.as_deref() == Some("protocol_failure")
-                        && record.error_category.as_deref() == Some("invalid_request")
-                }) {
+                if runtime
+                    .usage_records()
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.error_category.as_deref() == Some(category))
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -4348,17 +5734,25 @@ mod tests {
             .usage_records()
             .unwrap()
             .into_iter()
-            .find(|record| record.error_category.as_deref() == Some("invalid_request"))
+            .find(|record| record.error_category.as_deref() == Some(category))
             .unwrap();
-        assert_eq!(record.status, 400, "{record:?}");
-        assert!(
-            record
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("previous_response_id")),
-            "{record:?}"
+        assert_eq!(record.status, status, "{record:?}");
+        assert_eq!(
+            record.outcome.as_deref(),
+            Some(
+                if category == "provider_protocol" || category == "invalid_request" {
+                    "protocol_failure"
+                } else {
+                    "provider_failure"
+                }
+            )
         );
-
+        assert_eq!(record.upstream_attempted, Some(true));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "native errors must not trigger a hidden retry or account change"
+        );
         let _ = client.close(None).await;
         proxy_task.abort();
         upstream_task.abort();
@@ -4648,14 +6042,22 @@ mod tests {
         upstream_task.abort();
     }
 
-    #[tokio::test]
-    async fn third_party_websocket_surfaces_http_426_as_response_failed() {
+    async fn assert_portable_upstream_rejection(
+        status: u16,
+        expected_status: u16,
+        expected_code: &str,
+    ) {
         use axum::http::StatusCode;
         use axum::routing::post;
 
         let upstream = Router::new().route(
             "/v1/responses",
-            post(|| async { StatusCode::from_u16(426).expect("426") }),
+            post(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    axum::Json(json!({"error": {"message": "Unsupported parameter: previous_response_id"}})),
+                )
+            }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = upstream_listener.local_addr().unwrap();
@@ -4724,7 +6126,7 @@ mod tests {
             .unwrap();
         let failed = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
             .await
-            .expect("426 must fail the turn immediately")
+            .expect("upstream rejection must fail the turn immediately")
             .unwrap()
             .unwrap();
         let TungsteniteMessage::Text(text) = failed else {
@@ -4732,24 +6134,75 @@ mod tests {
         };
         let event: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(event["type"], "response.failed");
+        assert_eq!(event["response"]["error"]["code"], expected_code);
+        assert!(event["response"]["error"]["code"].is_string());
+        assert_eq!(event["response"]["error"]["status"], expected_status);
+        if expected_status == 400 {
+            assert_eq!(event["response"]["error"]["upstream_status"], status);
+        }
         assert_eq!(event["response"]["error"]["category"], "provider_protocol");
         assert!(
             event["response"]["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("426")),
+                .is_some_and(|message| message.contains(&status.to_string())),
             "{event}"
         );
         let records = runtime.usage_records().unwrap();
         assert!(
             records.iter().any(|record| {
-                record.route_id == "grok-cli" && record.status == 502 && record.error.is_some()
+                record.route_id == "grok-cli"
+                    && record.status == expected_status
+                    && record.error.is_some()
             }),
             "failed Grok turns must land in usage: {records:?}"
         );
 
+        let http = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .json(&json!({"model": "vlm-grok", "input": [{"role": "user", "content": "hi"}], "stream": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(http.status().as_u16(), expected_status);
+        let payload: Value = http.json().await.unwrap();
+        assert_eq!(payload["error"]["code"], expected_status);
+        assert_eq!(payload["error"]["category"], "provider_protocol");
+        if expected_status == 400 {
+            assert_eq!(payload["error"]["upstream_status"], status);
+        }
+        let streaming = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .json(&json!({"model": "vlm-grok", "input": [{"role": "user", "content": "hi"}], "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(streaming.status().as_u16(), 200);
+        let transcript = streaming.text().await.unwrap();
+        let event: Value = transcript
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["type"] == "response.failed")
+            .expect("terminal failure event");
+        assert_eq!(event["response"]["error"]["code"], expected_code);
+        assert!(event["response"]["error"]["code"].is_string());
+        assert_eq!(event["response"]["error"]["status"], expected_status);
         let _ = client.close(None).await;
         proxy_task.abort();
         upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn third_party_websocket_upstream_400_is_a_string_invalid_prompt_and_http_400() {
+        assert_portable_upstream_rejection(400, 400, "invalid_prompt").await;
+        assert_portable_upstream_rejection(422, 400, "invalid_prompt").await;
+    }
+
+    #[tokio::test]
+    async fn third_party_websocket_surfaces_http_426_as_response_failed() {
+        for status in [408, 409, 425, 426] {
+            assert_portable_upstream_rejection(status, 502, "provider_protocol").await;
+        }
     }
 
     #[tokio::test]

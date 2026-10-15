@@ -2,7 +2,7 @@ use crate::model::{LunaReserveQuota, QuotaPeriod, QuotaPeriodUnit, QuotaSnapshot
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -10,8 +10,22 @@ pub const ROUTING_QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::fr
 
 #[derive(Clone)]
 struct CachedQuota {
+    #[cfg(test)]
+    offline_fixture: bool,
     fetched_at: std::time::Instant,
     windows: Vec<QuotaSnapshot>,
+}
+
+impl CachedQuota {
+    fn is_fresh(&self, ttl: std::time::Duration) -> bool {
+        // Synthetic manager fixtures have no upstream to refresh from. Keep
+        // them deterministic on slow CI; real cache entries still use the TTL.
+        #[cfg(test)]
+        if self.offline_fixture {
+            return true;
+        }
+        cache_is_fresh(self.fetched_at, ttl)
+    }
 }
 
 fn quota_cache() -> &'static tokio::sync::RwLock<HashMap<String, CachedQuota>> {
@@ -19,11 +33,47 @@ fn quota_cache() -> &'static tokio::sync::RwLock<HashMap<String, CachedQuota>> {
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
+// Keep the connection pool across routing cache misses. Rebuilding a client
+// for every member used to pay DNS/TCP/TLS setup on each two-second refresh.
+fn quota_client() -> Result<&'static reqwest::Client, CodexQuotaError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| CodexQuotaError::Request(error.clone()))
+}
+
+// Coalesce concurrent misses for the same token/workspace. Weak entries keep
+// the registry bounded by active queries without retaining token material.
+type QuotaQueryLock = tokio::sync::Mutex<Option<(std::time::Instant, CodexQuotaError)>>;
+
+fn quota_query_lock(key: &str) -> Arc<QuotaQueryLock> {
+    type QueryLocks = HashMap<String, Weak<QuotaQueryLock>>;
+    static LOCKS: OnceLock<Mutex<QueryLocks>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(None));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
 fn cache_is_fresh(fetched_at: std::time::Instant, ttl: std::time::Duration) -> bool {
     fetched_at.elapsed() < ttl
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CodexQuotaError {
     #[error("OpenAI OAuth token was rejected")]
     Unauthorized,
@@ -59,13 +109,49 @@ pub async fn query_with_cache_ttl(
     force_refresh: bool,
     cache_ttl: std::time::Duration,
 ) -> Result<Vec<QuotaSnapshot>, CodexQuotaError> {
+    query_with_client(
+        quota_client()?,
+        USAGE_URL,
+        access_token,
+        account_id,
+        route_id,
+        force_refresh,
+        cache_ttl,
+    )
+    .await
+}
+
+async fn query_with_client(
+    client: &reqwest::Client,
+    usage_url: &str,
+    access_token: &str,
+    account_id: &str,
+    route_id: &str,
+    force_refresh: bool,
+    cache_ttl: std::time::Duration,
+) -> Result<Vec<QuotaSnapshot>, CodexQuotaError> {
     // The display route id is not necessarily a credential selector. Key by a
     // one-way digest of the access token so two users in the same workspace do
     // not share quota, while no token material is retained in the cache key.
     let cache_key = format!("{account_id}:{:x}", Sha256::digest(access_token.as_bytes()));
+    let requested_at = std::time::Instant::now();
+    let query_lock = quota_query_lock(&cache_key);
+    let mut guard = query_lock.lock().await;
+    if !force_refresh {
+        if let Some((failed_at, error)) = guard.as_ref() {
+            if *failed_at >= requested_at {
+                // Share a failed in-flight read too, rather than making each
+                // queued caller pay another upstream timeout. Later requests
+                // can retry; this is not a persistent error cache.
+                return Err(error.clone());
+            }
+        }
+    }
+    // Recheck after acquiring the per-account lock: another caller may have
+    // refreshed while we waited. Forced reads still always reach upstream.
     if !force_refresh {
         if let Some(cached) = quota_cache().read().await.get(&cache_key).cloned() {
-            if cache_is_fresh(cached.fetched_at, cache_ttl) {
+            if cached.is_fresh(cache_ttl) {
                 return Ok(cached
                     .windows
                     .into_iter()
@@ -79,13 +165,47 @@ pub async fn query_with_cache_ttl(
     }
     // A failed forced refresh must not resurrect an older usable reading.
     quota_cache().write().await.remove(&cache_key);
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|error| CodexQuotaError::Request(error.to_string()))?;
+    let windows = match fetch_quota_windows(
+        client,
+        usage_url,
+        access_token,
+        account_id,
+        route_id,
+        force_refresh,
+    )
+    .await
+    {
+        Ok(windows) => windows,
+        Err(error) => {
+            *guard = Some((std::time::Instant::now(), error.clone()));
+            return Err(error);
+        }
+    };
+    *guard = None;
+    let mut cache = quota_cache().write().await;
+    cache.retain(|_, entry| entry.is_fresh(QUOTA_CACHE_TTL));
+    cache.insert(
+        cache_key,
+        CachedQuota {
+            #[cfg(test)]
+            offline_fixture: false,
+            fetched_at: std::time::Instant::now(),
+            windows: windows.clone(),
+        },
+    );
+    Ok(windows)
+}
+
+async fn fetch_quota_windows(
+    client: &reqwest::Client,
+    usage_url: &str,
+    access_token: &str,
+    account_id: &str,
+    route_id: &str,
+    force_refresh: bool,
+) -> Result<Vec<QuotaSnapshot>, CodexQuotaError> {
     let mut request = client
-        .get(USAGE_URL)
+        .get(usage_url)
         .bearer_auth(access_token)
         .header("ChatGPT-Account-Id", account_id)
         .header("User-Agent", "codex-cli")
@@ -130,15 +250,6 @@ pub async fn query_with_cache_ttl(
             window.luna_reserve = None;
         }
     }
-    let mut cache = quota_cache().write().await;
-    cache.retain(|_, entry| entry.fetched_at.elapsed() < QUOTA_CACHE_TTL);
-    cache.insert(
-        cache_key,
-        CachedQuota {
-            fetched_at: std::time::Instant::now(),
-            windows: windows.clone(),
-        },
-    );
     Ok(windows)
 }
 
@@ -249,6 +360,7 @@ pub(crate) async fn seed_test_quota(token: &str, account: &str, windows: Vec<Quo
     quota_cache().write().await.insert(
         key,
         CachedQuota {
+            offline_fixture: true,
             fetched_at: std::time::Instant::now(),
             windows,
         },
@@ -259,6 +371,179 @@ pub(crate) async fn seed_test_quota(token: &str, account: &str, windows: Vec<Quo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Exercise the production cache/HTTP path with fake tokens and a local
+    // keep-alive server; no managed accounts or external usage are accessed.
+    async fn local_usage_server() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let request_counter = Arc::clone(&request_counter);
+                        clients.spawn(async move {
+                            let mut pending = Vec::new();
+                            loop {
+                                let mut chunk = [0_u8; 4096];
+                                let count = socket.read(&mut chunk).await.unwrap();
+                                if count == 0 { break; }
+                                pending.extend_from_slice(&chunk[..count]);
+                                if !pending.windows(4).any(|part| part == b"\r\n\r\n") {
+                                    continue;
+                                }
+                                request_counter.fetch_add(1, Ordering::SeqCst);
+                                let unauthorized = pending.windows(8).any(|part| part == b"rejected");
+                                pending.clear();
+                                // Ensure concurrent callers overlap before the cache fills.
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                let (status, body) = if unauthorized {
+                                    ("401 Unauthorized", "{}")
+                                } else {
+                                    ("200 OK", r#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#)
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}", body.len()
+                                );
+                                if socket.write_all(response.as_bytes()).await.is_err() { break; }
+                            }
+                        });
+                    }
+                    _ = clients.join_next(), if !clients.is_empty() => {}
+                }
+            }
+        });
+        (url, connections, requests, server)
+    }
+
+    #[tokio::test]
+    async fn routing_cache_misses_reuse_the_http_connection() {
+        use std::sync::atomic::Ordering;
+        let (url, connections, requests, server) = local_usage_server().await;
+        let client = quota_client().unwrap();
+        // Zero TTL guarantees two real reads rather than hiding a new
+        // connection behind the cache. Different accounts share transport only.
+        for account in ["reuse-first", "reuse-second"] {
+            let result = query_with_client(
+                client,
+                &url,
+                "fake-reuse-token",
+                account,
+                "route",
+                false,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result[0].used_percent, 10.0);
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_routing_misses_share_one_read_and_keep_route_ids() {
+        use std::sync::atomic::Ordering;
+        let (url, connections, requests, server) = local_usage_server().await;
+        let client = quota_client().unwrap();
+        let reads = (0..8).map(|index| {
+            let url = &url;
+            async move {
+                let route = format!("concurrent-{index}");
+                let windows = query_with_client(
+                    client,
+                    url,
+                    "fake-concurrent-token",
+                    "concurrent-account",
+                    &route,
+                    false,
+                    ROUTING_QUOTA_CACHE_TTL,
+                )
+                .await
+                .unwrap();
+                assert_eq!(windows[0].route_id, route);
+            }
+        });
+        futures_util::future::join_all(reads).await;
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_reads_share_the_failure_without_serial_retries() {
+        use std::sync::atomic::Ordering;
+        let (url, _, requests, server) = local_usage_server().await;
+        let client = quota_client().unwrap();
+        let reads = (0..8).map(|_| {
+            query_with_client(
+                client,
+                &url,
+                "rejected",
+                "concurrent-failure",
+                "route",
+                false,
+                ROUTING_QUOTA_CACHE_TTL,
+            )
+        });
+        for result in futures_util::future::join_all(reads).await {
+            assert!(matches!(result, Err(CodexQuotaError::Unauthorized)));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            query_with_client(
+                client,
+                &url,
+                "rejected",
+                "concurrent-failure",
+                "route",
+                false,
+                ROUTING_QUOTA_CACHE_TTL
+            )
+            .await,
+            Err(CodexQuotaError::Unauthorized)
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_forced_refresh_cannot_restore_a_cached_reading() {
+        let (url, _, _, server) = local_usage_server().await;
+        let client = quota_client().unwrap();
+        seed_test_quota("rejected", "refresh-test", vec![]).await;
+        assert!(matches!(
+            query_with_client(
+                client,
+                &url,
+                "rejected",
+                "refresh-test",
+                "route",
+                true,
+                QUOTA_CACHE_TTL
+            )
+            .await,
+            Err(CodexQuotaError::Unauthorized)
+        ));
+        let key = format!("refresh-test:{:x}", Sha256::digest(b"rejected"));
+        assert!(!quota_cache().read().await.contains_key(&key));
+        server.abort();
+    }
 
     fn reserve_usage() -> Value {
         json!({
@@ -324,6 +609,58 @@ mod tests {
         let fetched_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
         assert!(!cache_is_fresh(fetched_at, ROUTING_QUOTA_CACHE_TTL));
         assert!(cache_is_fresh(fetched_at, QUOTA_CACHE_TTL));
+    }
+
+    #[tokio::test]
+    async fn offline_quota_fixtures_survive_routing_and_display_cache_expiry() {
+        use std::sync::atomic::Ordering;
+        let (url, _, requests, server) = local_usage_server().await;
+        let token = "offline-expired-fixture";
+        let account = "offline-expired-workspace";
+        let windows = parse_quota_windows(
+            account,
+            &json!({ "rate_limit": {
+                "primary_window": { "used_percent": 10, "limit_window_seconds": 18000 }
+            }}),
+        )
+        .unwrap();
+        seed_test_quota(token, account, windows).await;
+        let key = format!("{account}:{:x}", Sha256::digest(token.as_bytes()));
+        // Reproduce a slow CI worker without sleeping or contacting upstream.
+        quota_cache()
+            .write()
+            .await
+            .get_mut(&key)
+            .unwrap()
+            .fetched_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        // A real refresh prunes stale cache entries as well. Offline fixtures
+        // must survive that sweep when other tests refresh in parallel.
+        query_with_client(
+            quota_client().unwrap(),
+            &url,
+            "local-refresh-token",
+            "local-refresh-workspace",
+            "local-refresh-route",
+            false,
+            ROUTING_QUOTA_CACHE_TTL,
+        )
+        .await
+        .unwrap();
+        let result = query_with_client(
+            quota_client().unwrap(),
+            &url,
+            token,
+            account,
+            "offline-route",
+            false,
+            ROUTING_QUOTA_CACHE_TTL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0].used_percent, 10.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(result[0].route_id, "offline-route");
+        server.abort();
     }
 
     #[tokio::test]

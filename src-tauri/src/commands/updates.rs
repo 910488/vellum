@@ -10,9 +10,23 @@ fn emit_progress(app: &tauri::AppHandle, op: &UpdateOperation) {
     let _ = app.emit(UPDATES_PROGRESS_EVENT, crate::updates::progress_from(op));
 }
 
+/// Update commands read the signed core tree. Synchronous Tauri commands
+/// run on the main thread, where that work starves the event loop: on macOS
+/// the window froze and the exit for a Desktop update never ran, so the swap
+/// script gave up. Run them on the blocking pool instead.
+async fn off_main_thread<T: Send + 'static>(
+    state: &AppState,
+    work: impl FnOnce(AppState) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    let state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || work(state))
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?
+}
+
 #[tauri::command]
-pub fn get_update_status(state: State<'_, AppState>) -> AppResult<UpdateStatusSnapshot> {
-    Ok(crate::updates::get_status(&state))
+pub async fn get_update_status(state: State<'_, AppState>) -> AppResult<UpdateStatusSnapshot> {
+    off_main_thread(&state, |state| Ok(crate::updates::get_status(&state))).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -28,27 +42,30 @@ pub async fn check_updates(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn set_update_preferences(
+pub async fn set_update_preferences(
     channel: Option<String>,
     auto_check: Option<bool>,
     auto_download: Option<bool>,
     core_idle_handoff: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<UpdatePreferences> {
-    let mut preferences = crate::updates::get_status(&state).preferences;
-    if let Some(channel) = channel.as_deref().and_then(crate::updates::Channel::parse) {
-        preferences.channel = channel;
-    }
-    if let Some(auto_check) = auto_check {
-        preferences.auto_check = auto_check;
-    }
-    if let Some(auto_download) = auto_download {
-        preferences.auto_download = auto_download;
-    }
-    if let Some(core_idle_handoff) = core_idle_handoff {
-        preferences.core_idle_handoff = core_idle_handoff;
-    }
-    crate::updates::set_preferences(&state, preferences)
+    off_main_thread(&state, move |state| {
+        let mut preferences = crate::updates::get_status(&state).preferences;
+        if let Some(channel) = channel.as_deref().and_then(crate::updates::Channel::parse) {
+            preferences.channel = channel;
+        }
+        if let Some(auto_check) = auto_check {
+            preferences.auto_check = auto_check;
+        }
+        if let Some(auto_download) = auto_download {
+            preferences.auto_download = auto_download;
+        }
+        if let Some(core_idle_handoff) = core_idle_handoff {
+            preferences.core_idle_handoff = core_idle_handoff;
+        }
+        crate::updates::set_preferences(&state, preferences)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -66,7 +83,7 @@ pub async fn download_update(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn apply_update(
+pub async fn apply_update(
     app: tauri::AppHandle,
     component: String,
     host_id: Option<String>,
@@ -74,7 +91,10 @@ pub fn apply_update(
 ) -> AppResult<UpdateOperation> {
     let component = UpdateComponent::parse(&component)
         .ok_or_else(|| crate::error::AppError::Message("unknown component".into()))?;
-    let op = crate::updates::apply_update(&state, component, host_id)?;
+    let op = off_main_thread(&state, move |state| {
+        crate::updates::apply_update(&state, component, host_id)
+    })
+    .await?;
     emit_progress(&app, &op);
     Ok(op)
 }
@@ -93,10 +113,7 @@ pub async fn restart_to_apply_desktop_update(
 ) -> AppResult<UpdateOperation> {
     let state = (*state).clone();
     let desktop = crate::updates::get_status(&state).desktop;
-    if !matches!(
-        desktop.phase,
-        UpdatePhase::Staged | UpdatePhase::WaitingForRestart
-    ) {
+    if !desktop_is_staged(desktop.phase) {
         return Err(AppError::Message("nothingStaged".into()));
     }
     let activity = crate::updates::desktop_apply_input(&state, false);
@@ -106,12 +123,22 @@ pub async fn restart_to_apply_desktop_update(
     if activity.core_in_progress {
         return Err(AppError::Message("coreBusy".into()));
     }
+    restart_now(&app, &state).await
+}
 
+fn desktop_is_staged(phase: UpdatePhase) -> bool {
+    matches!(phase, UpdatePhase::Staged | UpdatePhase::WaitingForRestart)
+}
+
+async fn restart_now(app: &tauri::AppHandle, state: &AppState) -> AppResult<UpdateOperation> {
     let proxy_was_running = state.proxy_status().running;
-    let applied = crate::shutdown_for_exit(&state, true).await;
+    let applied = crate::shutdown_for_exit(state, true).await;
     if let Some(Ok(op)) = &applied {
         if op.phase == UpdatePhase::Applying {
-            emit_progress(&app, op);
+            if proxy_was_running {
+                crate::updates::remember_running_proxy(&state.data_root());
+            }
+            emit_progress(app, op);
             // Let the reply reach the window before the process goes away.
             let handle = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -123,14 +150,14 @@ pub async fn restart_to_apply_desktop_update(
     }
 
     if proxy_was_running {
-        if let Err(error) = crate::commands::proxy::start_proxy_inner(&state).await {
+        if let Err(error) = crate::commands::proxy::start_proxy_inner(state).await {
             log::warn!("[Updates] proxy did not restart after a failed desktop apply: {error}");
         }
     }
     match applied {
         Some(Err(error)) => Err(error),
         _ => {
-            let desktop = crate::updates::get_status(&state).desktop;
+            let desktop = crate::updates::get_status(state).desktop;
             Err(AppError::Message(
                 desktop
                     .failure_reason
@@ -140,28 +167,98 @@ pub async fn restart_to_apply_desktop_update(
     }
 }
 
+/// Check, then download what this machine needs. See
+/// [`crate::updates::update_vellum`].
+#[tauri::command]
+pub async fn update_vellum(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<UpdateStatusSnapshot> {
+    let snapshot = crate::updates::update_vellum(&state).await?;
+    let _ = app.emit(UPDATES_PROGRESS_EVENT, &snapshot.attention);
+    Ok(snapshot)
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestartToUpdate {
+    /// The installer has started and this process is about to exit.
+    Restarting,
+    /// Work is running; Vellum restarts on its own once it finishes.
+    Scheduled,
+}
+
+/// The update panel's restart. Unlike [`restart_to_apply_desktop_update`]
+/// it does not refuse while a turn is running: it schedules the restart for
+/// when the turn and every proxy request have finished.
+#[tauri::command]
+pub async fn restart_to_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<RestartToUpdate> {
+    let state = (*state).clone();
+    crate::updates::engine(&state.data_root()).prepare_cached_desktop_repair()?;
+    let desktop = crate::updates::get_status(&state).desktop;
+    if !desktop_is_staged(desktop.phase) {
+        return Err(AppError::Message("nothingStaged".into()));
+    }
+    let activity = crate::updates::desktop_apply_input(&state, false);
+    if activity.proxy_active_requests == 0 && !activity.core_in_progress {
+        crate::updates::cancel_scheduled_restart();
+        restart_now(&app, &state).await?;
+        return Ok(RestartToUpdate::Restarting);
+    }
+    let version = desktop.staged_version.or(desktop.target_version);
+    let watcher_state = state.clone();
+    crate::updates::schedule_restart(state, version, move || async move {
+        let desktop = crate::updates::get_status(&watcher_state).desktop;
+        if !desktop_is_staged(desktop.phase) {
+            log::warn!(
+                "[Updates] scheduled restart dropped: desktop is {}",
+                desktop.phase.as_str()
+            );
+            return;
+        }
+        if let Err(error) = restart_now(&app, &watcher_state).await {
+            log::error!("[Updates] scheduled desktop restart failed: {error}");
+        }
+    });
+    Ok(RestartToUpdate::Scheduled)
+}
+
+#[tauri::command]
+pub fn cancel_scheduled_restart() -> bool {
+    crate::updates::cancel_scheduled_restart()
+}
+
 #[tauri::command(rename_all = "camelCase")]
-pub fn cancel_update_download(
+pub async fn cancel_update_download(
     app: tauri::AppHandle,
     component: String,
     state: State<'_, AppState>,
 ) -> AppResult<UpdateOperation> {
     let component = UpdateComponent::parse(&component)
         .ok_or_else(|| crate::error::AppError::Message("unknown component".into()))?;
-    let op = crate::updates::cancel_download(&state, component)?;
+    let op = off_main_thread(&state, move |state| {
+        crate::updates::cancel_download(&state, component)
+    })
+    .await?;
     emit_progress(&app, &op);
     Ok(op)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn rollback_update(
+pub async fn rollback_update(
     app: tauri::AppHandle,
     component: String,
     state: State<'_, AppState>,
 ) -> AppResult<UpdateOperation> {
     let component = UpdateComponent::parse(&component)
         .ok_or_else(|| crate::error::AppError::Message("unknown component".into()))?;
-    let op = crate::updates::rollback_update(&state, component)?;
+    let op = off_main_thread(&state, move |state| {
+        crate::updates::rollback_update(&state, component)
+    })
+    .await?;
     emit_progress(&app, &op);
     Ok(op)
 }

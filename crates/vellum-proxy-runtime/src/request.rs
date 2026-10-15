@@ -27,6 +27,7 @@ pub enum RuntimeEndpoint {
     ChatCompletions,
     Compact,
     Search,
+    Images,
 }
 
 /// The authorization context of the *incoming* request. Only the fields that
@@ -44,10 +45,19 @@ pub struct IncomingAuthContext {
     pub openai_account: Option<String>,
 }
 
+/// Explicit cache-affinity headers, distinct from authorization and turn identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialCacheAffinity {
+    pub session_id: Option<String>,
+    pub session_id_legacy: Option<String>,
+}
+
 /// Per-request metadata for diagnostics and telemetry. Never carries secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestMetadata {
+    #[serde(default)]
+    pub official_cache_affinity: OfficialCacheAffinity,
     pub request_id: String,
     pub received_at_ms: u64,
     /// Auto Review run id when this request is a guardian execution (M9);
@@ -77,6 +87,9 @@ pub struct RequestMetadata {
     /// client socket by the Responses WebSocket bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<String>,
+    /// Proxy-owned socket affinity, never populated from caller JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_socket_affinity: Option<OfficialSocketAffinity>,
     /// Normalized Codex turn and subagent identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_identity: Option<CodexTurnIdentity>,
@@ -96,6 +109,31 @@ pub struct RequestMetadata {
     /// identifier the accounts list already shows in the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_official_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialSocketAffinity {
+    /// Full SHA-256 hex of the execution credential id, without the
+    /// `sha256:` prefix the usage records carry. Compare with `is_account`;
+    /// the diagnostic `account_hash` is a different, truncated form.
+    pub account_hash: String,
+    pub turn_in_progress: bool,
+    pub input_tokens: u64,
+    pub quota_exhausted: bool,
+}
+
+impl OfficialSocketAffinity {
+    pub fn hash_account(account_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(account_id.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn is_account(&self, account_id: &str) -> bool {
+        self.account_hash == Self::hash_account(account_id)
+    }
 }
 
 impl RequestMetadata {
@@ -182,6 +220,7 @@ mod tests {
             },
             execution_environment: ExecutionEnvironment::posix_reference(),
             metadata: RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req-1".into(),
                 received_at_ms: 1_700_000_000_000,
                 review_run_id: None,
@@ -189,6 +228,7 @@ mod tests {
                 guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
+                official_socket_affinity: None,
                 codex_identity: None,
                 codex_capabilities: None,
                 force_portable_official_handoff: false,
@@ -214,6 +254,7 @@ mod tests {
         };
 
         let metadata = RequestMetadata {
+            official_cache_affinity: Default::default(),
             request_id: "req-2".into(),
             received_at_ms: 1_700_000_000_000,
             review_run_id: None,
@@ -221,6 +262,7 @@ mod tests {
             guardian_dispatch: false,
             primary_failure_reason: None,
             connection_id: None,
+            official_socket_affinity: None,
             codex_identity: Some(identity),
             codex_capabilities: None,
             force_portable_official_handoff: false,

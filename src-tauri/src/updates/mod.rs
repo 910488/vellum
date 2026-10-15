@@ -11,12 +11,15 @@ mod core_slots;
 mod desktop_install;
 mod engine;
 mod github;
+mod install_integrity;
 mod journal;
 mod machine;
 mod manifest;
 mod observe;
 mod remote_helper;
 mod remote_host;
+mod resume;
+mod schedule;
 mod select;
 mod trust;
 
@@ -45,6 +48,7 @@ pub use github::{
 pub use observe::{desktop_apply_input, live_idle_evidence, live_idle_evidence_from};
 pub use remote_helper::{apply_remote_package, FakeRemoteHost, RemoteApplyPlan, RemoteBackend};
 pub use remote_host::{idle_from_host_facts, observe_remote_host, AppRemoteBackend};
+pub use schedule::{cancel_scheduled_restart, restart_schedule, schedule_restart, RestartSchedule};
 
 pub use journal::{Journal, JournalEntry};
 pub use machine::{UpdateEvent, UpdatePhase};
@@ -52,6 +56,7 @@ pub use manifest::{
     sign_raw, verify_asset_sha256, verify_signed_manifest, AssetRef, CompatRange, CoreFile,
     CoreManifest, CoreTarget, UpdateManifest, MANIFEST_SCHEMA_VERSION,
 };
+pub use resume::{remember_running_proxy, take_proxy_resume};
 pub use select::{select_compatible, Channel, ReleaseCandidate, SelectContext, Selection};
 pub use trust::{live_auto_update_enabled, TrustStore};
 
@@ -65,12 +70,16 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
     std::fs::create_dir_all(parent)?;
+    // Unique per write, not just per process: two writers of the same file in
+    // one process must not share (and rename away) each other's temporary.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("update"),
-        std::process::id()
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
         let mut file = std::fs::File::create(&temporary)?;
@@ -94,6 +103,72 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// An update control file as read from disk. Only a missing file means
+/// "nothing recorded"; a file that exists but cannot be read must never be
+/// replaced by defaults.
+pub(crate) enum StoredJson<T> {
+    Missing,
+    Parsed(T),
+    /// Did not parse. The bytes were copied aside first, so starting over
+    /// from defaults loses nothing.
+    SetAside,
+    /// Could not be read (or not copied aside). Writers must leave it alone.
+    Unreadable,
+}
+
+pub(crate) fn read_stored_json<T: serde::de::DeserializeOwned>(path: &Path) -> StoredJson<T> {
+    let mut attempt = 0;
+    let bytes = loop {
+        match std::fs::read(path) {
+            Ok(bytes) => break bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return StoredJson::Missing
+            }
+            Err(error) if attempt < 3 => {
+                attempt += 1;
+                log::warn!(
+                    "[Updates] {} is not readable yet (attempt {attempt}): {error}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                log::warn!(
+                    "[Updates] cannot read {}; leaving it untouched: {error}",
+                    path.display()
+                );
+                return StoredJson::Unreadable;
+            }
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => StoredJson::Parsed(value),
+        Err(parse_error) => {
+            let aside = path.with_extension(format!(
+                "json.unreadable-{}",
+                chrono::Utc::now().timestamp_millis()
+            ));
+            match write_atomic(&aside, &bytes) {
+                Ok(()) => {
+                    log::warn!(
+                        "[Updates] {} did not parse ({parse_error}); kept it as {} and started over",
+                        path.display(),
+                        aside.display()
+                    );
+                    StoredJson::SetAside
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[Updates] {} did not parse and cannot be kept aside ({error}); leaving it untouched",
+                        path.display()
+                    );
+                    StoredJson::Unreadable
+                }
+            }
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -101,7 +176,8 @@ use crate::model::UPDATES_PROGRESS_EVENT;
 use crate::state::AppState;
 
 const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-const AUTO_CHECK_JITTER_SECS: u64 = 30 * 60;
+const PREVIEW_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const AUTO_CHECK_JITTER_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -209,9 +285,24 @@ pub struct UpdateStatusSnapshot {
     pub desktop: LayerStatus,
     pub remote: LayerStatus,
     pub core: LayerStatus,
+    pub core_runtime: CoreRuntimeStatus,
     pub preferences: UpdatePreferences,
     pub live_auto_update: bool,
     pub attention: UpdateAttention,
+    /// Unix seconds of the last check that reached GitHub.
+    #[serde(default)]
+    pub checked_at: Option<i64>,
+    /// A Desktop restart that waits for running work to finish.
+    #[serde(default)]
+    pub restart_schedule: Option<RestartSchedule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreRuntimeStatus {
+    pub active_version: Option<String>,
+    pub pending_version: Option<String>,
+    pub missing: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,43 +340,134 @@ pub fn spawn_auto_check(app: AppHandle, data_root: PathBuf) {
     tauri::async_runtime::spawn(async move {
         // Startup check after a short delay so window paint is not blocked.
         tokio::time::sleep(Duration::from_secs(8)).await;
+        let mut last_attempt = None;
+        let mut jitter = auto_check_jitter_secs();
         loop {
             let state = (*app.state::<AppState>()).clone();
-            if should_auto_check(live_auto_update_enabled(), &get_status(&state).preferences) {
-                if let Ok(snapshot) = check_updates(&state, None).await {
+            let snapshot = get_status(&state);
+            let preferences = snapshot.preferences;
+            let now = unix_seconds();
+            // Re-read the channel each minute instead of retaining a six-hour
+            // sleep after the user switches from Stable to Preview. A local
+            // attempt also bounds retries when a network error prevents the
+            // persisted successful-check timestamp from advancing.
+            let due = last_attempt.is_none()
+                || now.saturating_sub(last_attempt.max(snapshot.checked_at).unwrap_or(now))
+                    >= (auto_check_interval(preferences.channel).as_secs() + jitter) as i64;
+            if should_auto_check(live_auto_update_enabled(), &preferences) && due {
+                last_attempt = Some(now);
+                jitter = auto_check_jitter_secs();
+                let result = if preferences.auto_download {
+                    update_vellum(&state).await
+                } else {
+                    check_updates(&state, None).await
+                };
+                if let Ok(snapshot) = result {
                     let _ = app.emit(UPDATES_PROGRESS_EVENT, &snapshot.attention);
-                    if snapshot.preferences.auto_download {
-                        for component in [
-                            UpdateComponent::Desktop,
-                            UpdateComponent::Remote,
-                            UpdateComponent::Core,
-                        ] {
-                            let layer = match component {
-                                UpdateComponent::Desktop => &snapshot.desktop,
-                                UpdateComponent::Remote => &snapshot.remote,
-                                UpdateComponent::Core => &snapshot.core,
-                            };
-                            // Remote packages are per host; they are fetched
-                            // when a host is updated, not in the background.
-                            if component != UpdateComponent::Remote
-                                && layer.live_auto_update
-                                && layer.phase == UpdatePhase::Available
-                            {
-                                let _ = download_update(&state, component, None).await;
-                            }
-                        }
-                    }
                 }
             }
-            let jitter = auto_check_jitter_secs();
-            tokio::time::sleep(AUTO_CHECK_INTERVAL + Duration::from_secs(jitter)).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
     let _ = data_root;
 }
 
+/// One "update Vellum": check, then fetch what this machine needs.
+///
+/// Desktop is only staged; it installs when Vellum quits or on an explicit
+/// restart. A downloaded core is pending and the next Codex launch takes it.
+/// Remote hosts that opted into idle updates get their package and apply it
+/// when they are idle. A failure in one part is recorded on its layer and
+/// does not stop the others.
+pub async fn update_vellum(state: &AppState) -> crate::error::AppResult<UpdateStatusSnapshot> {
+    let snapshot = check_updates(state, None).await?;
+    let root = state.data_root();
+    let _ = tokio::task::spawn_blocking(move || engine(&root).prune_retired_versions()).await;
+    if !snapshot.live_auto_update {
+        return Ok(snapshot);
+    }
+    for component in [UpdateComponent::Desktop, UpdateComponent::Core] {
+        let layer = match component {
+            UpdateComponent::Desktop => &snapshot.desktop,
+            _ => &snapshot.core,
+        };
+        if layer.phase == UpdatePhase::Available {
+            if let Err(error) = download_update(state, component, None).await {
+                log::warn!("[Updates] {} download failed: {error}", component.as_str());
+            }
+        }
+    }
+    if matches!(
+        snapshot.remote.phase,
+        UpdatePhase::Available | UpdatePhase::Staged | UpdatePhase::WaitingForIdle
+    ) {
+        for host in snapshot
+            .remote
+            .hosts
+            .iter()
+            .filter(|host| host.idle_auto_update)
+        {
+            let id = host.host_id.clone();
+            let result = match download_update(state, UpdateComponent::Remote, Some(id.clone()))
+                .await
+            {
+                Ok(_) => apply_update(state, UpdateComponent::Remote, Some(id.clone())).map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                log::warn!("[Updates] remote host {id} update failed: {error}");
+            }
+        }
+    }
+    Ok(get_status(state))
+}
+
 fn should_auto_check(live_enabled: bool, preferences: &UpdatePreferences) -> bool {
     live_enabled && preferences.auto_check
+}
+
+fn auto_check_interval(channel: Channel) -> Duration {
+    match channel {
+        Channel::Preview => PREVIEW_CHECK_INTERVAL,
+        Channel::Stable => AUTO_CHECK_INTERVAL,
+    }
+}
+
+fn focus_check_due(checked_at: Option<i64>, now: i64) -> bool {
+    checked_at.is_some_and(|last| now.saturating_sub(last) >= 15 * 60)
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub fn check_on_focus(app: &AppHandle) {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    static FOCUS_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+    static LAST_FOCUS_ATTEMPT: AtomicI64 = AtomicI64::new(0);
+    let state = (*app.state::<AppState>()).clone();
+    let snapshot = get_status(&state);
+    let now = unix_seconds();
+    if should_auto_check(snapshot.live_auto_update, &snapshot.preferences)
+        && focus_check_due(snapshot.checked_at, now)
+        && now.saturating_sub(LAST_FOCUS_ATTEMPT.load(Ordering::Acquire)) >= 15 * 60
+        && !FOCUS_CHECK_RUNNING.swap(true, Ordering::AcqRel)
+    {
+        LAST_FOCUS_ATTEMPT.store(now, Ordering::Release);
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = if snapshot.preferences.auto_download {
+                update_vellum(&state).await
+            } else {
+                check_updates(&state, None).await
+            } {
+                log::warn!("[Updates] focus check failed: {error}");
+            }
+            FOCUS_CHECK_RUNNING.store(false, Ordering::Release);
+        });
+    }
 }
 
 fn auto_check_jitter_secs() -> u64 {
@@ -295,7 +477,8 @@ fn auto_check_jitter_secs() -> u64 {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let digest = Sha256::digest(now.to_le_bytes());
-    u64::from(digest[0]) % (AUTO_CHECK_JITTER_SECS + 1)
+    u64::from_le_bytes(digest[..8].try_into().expect("digest prefix"))
+        % (AUTO_CHECK_JITTER_SECS + 1)
 }
 
 pub(crate) fn engine(data_root: &std::path::Path) -> UpdateEngine {
@@ -309,6 +492,27 @@ pub(crate) fn engine(data_root: &std::path::Path) -> UpdateEngine {
 #[cfg(test)]
 mod auto_check_tests {
     use super::*;
+
+    #[test]
+    fn preview_checks_often_without_changing_stable_interval() {
+        assert_eq!(
+            auto_check_interval(Channel::Preview),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            auto_check_interval(Channel::Stable),
+            Duration::from_secs(21600)
+        );
+        assert!(auto_check_jitter_secs() <= 300);
+    }
+
+    #[test]
+    fn focus_checks_wait_fifteen_minutes_and_leave_first_check_to_startup() {
+        assert!(!focus_check_due(None, 1000));
+        assert!(!focus_check_due(Some(100), 999));
+        assert!(focus_check_due(Some(100), 1000));
+        assert!(!focus_check_due(Some(1000), 100));
+    }
 
     #[test]
     fn preference_disables_scheduled_checks() {

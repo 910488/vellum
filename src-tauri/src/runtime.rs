@@ -41,8 +41,12 @@ pub fn snapshot_catalog(root: &Path, catalog: &Path) -> AppResult<Option<Catalog
     std::fs::create_dir_all(&history)
         .map_err(|error| AppError::Message(format!("無法建立型錄歷史目錄：{error}")))?;
     let path = history.join(format!("{id}.json"));
-    if !path.exists() {
-        std::fs::write(&path, bytes)
+    // Versions are content-addressed, so a file whose bytes no longer hash to
+    // its name (a write cut short by a crash or a full disk) is rewritten
+    // rather than kept as if it were the saved version.
+    let saved = std::fs::read(&path).is_ok_and(|existing| catalog_id(&existing) == id);
+    if !saved {
+        crate::enhanced_runtime::atomic::write_atomic(&path, &bytes)
             .map_err(|error| AppError::Message(format!("無法保存型錄版本：{error}")))?;
     }
     prune_catalog_versions(&history, MAX_CATALOG_VERSIONS)?;
@@ -67,7 +71,12 @@ pub fn rollback_catalog(root: &Path, id: &str, target: &Path) -> AppResult<()> {
     }
     let bytes = std::fs::read(&source)
         .map_err(|error| AppError::Message(format!("無法讀取型錄版本：{error}")))?;
-    let tmp = target.with_extension("rollback.tmp");
+    if catalog_id(&bytes) != id {
+        return Err(AppError::Message(format!(
+            "型錄版本 {id} 已損毀，未修改目前的模型型錄"
+        )));
+    }
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(target);
     std::fs::write(&tmp, bytes)
         .map_err(|error| AppError::Message(format!("無法寫入回滾型錄：{error}")))?;
     std::fs::rename(&tmp, target)
@@ -149,6 +158,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fetched_at_alone_never_requires_a_codex_restart() {
+        assert!(!catalog_requires_restart(
+            br#"{"fetched_at":"2026-10-12","models":[{"slug":"sol"}]}"#,
+            br#"{"fetched_at":"2026-10-13","models":[{"slug":"sol"}]}"#
+        ));
+    }
+
+    #[test]
     fn catalog_restart_ignores_cache_metadata_but_preserves_model_changes() {
         let original = serde_json::json!({
             "fetched_at": "old", "etag": "old", "client_version": "old",
@@ -189,6 +206,30 @@ mod tests {
         snapshot_catalog(temp.path(), &catalog).unwrap();
         rollback_catalog(temp.path(), &first.id, &catalog).unwrap();
         assert_eq!(std::fs::read(catalog).unwrap(), b"{\"models\":[1]}");
+    }
+
+    #[test]
+    fn a_truncated_catalog_version_is_resaved_and_never_rolled_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog.json");
+        std::fs::write(&catalog, b"{\"models\":[1]}").unwrap();
+        let first = snapshot_catalog(temp.path(), &catalog).unwrap().unwrap();
+        let saved = std::path::PathBuf::from(&first.path);
+
+        // A crash cut the saved version short.
+        std::fs::write(&saved, b"{\"models\"").unwrap();
+        std::fs::write(&catalog, b"{\"models\":[2]}").unwrap();
+        let error = rollback_catalog(temp.path(), &first.id, &catalog).unwrap_err();
+        assert!(error.to_string().contains("已損毀"), "{error}");
+        assert_eq!(std::fs::read(&catalog).unwrap(), b"{\"models\":[2]}");
+
+        // Snapshotting the same content again repairs the saved version.
+        std::fs::write(&catalog, b"{\"models\":[1]}").unwrap();
+        snapshot_catalog(temp.path(), &catalog).unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"models\":[1]}");
+        std::fs::write(&catalog, b"{\"models\":[2]}").unwrap();
+        rollback_catalog(temp.path(), &first.id, &catalog).unwrap();
+        assert_eq!(std::fs::read(&catalog).unwrap(), b"{\"models\":[1]}");
     }
 
     #[test]

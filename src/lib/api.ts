@@ -70,6 +70,7 @@ import type {
   SshTrustStatus,
   PendingHostFingerprint,
   UpdateStatusSnapshot,
+  RestartToUpdate,
   UpdateOperation,
   UpdatePreferences,
   UpdateComponent,
@@ -178,6 +179,8 @@ function previewUpdateStatus(): UpdateStatusSnapshot {
     preferences: { channel: "stable", autoCheck: true, autoDownload: true, coreIdleHandoff: false },
     liveAutoUpdate: false,
     attention: "none",
+    checkedAt: null,
+    restartSchedule: null,
   };
 }
 
@@ -218,18 +221,27 @@ function previewEnhancedRuntimeStatus(): EnhancedDesktopRuntimeStatus {
   };
 }
 
+export type RemoteSidebarMode = "auto" | "show" | "hide";
+let previewRemoteSidebarMode: RemoteSidebarMode = "auto";
 export const api = {
   getRemoteManagerFeatureFlags(): Promise<{
     nativeCodexRemoteManager: boolean;
+    showInSidebar?: boolean;
+    sidebarMode?: RemoteSidebarMode;
     legacyBrokerHostsDropped?: string[];
   }> {
-    if (!hasTauri()) return delay({ nativeCodexRemoteManager: false, legacyBrokerHostsDropped: [] });
+    if (!hasTauri()) return delay({ nativeCodexRemoteManager: true, showInSidebar: previewRemoteSidebarMode === "show", sidebarMode: previewRemoteSidebarMode, legacyBrokerHostsDropped: [] });
     return call("get_remote_manager_feature_flags");
+  },
+
+  setRemoteSidebarMode(mode: RemoteSidebarMode): Promise<{ showInSidebar: boolean; sidebarMode: RemoteSidebarMode }> {
+    if (!hasTauri()) { previewRemoteSidebarMode = mode; return delay({ showInSidebar: mode === "show", sidebarMode: mode }); }
+    return afterSettingsChange(call<{ showInSidebar: boolean; sidebarMode: RemoteSidebarMode }>("set_remote_sidebar_mode", { mode })).then((flags) => { window.dispatchEvent(new Event("vellum:remote-sidebar-changed")); return flags; });
   },
 
   discoverRemoteConnections(): Promise<RemoteHostCandidate[]> {
     if (!hasTauri()) return delay([]);
-    return call<RemoteHostCandidate[]>("discover_remote_connections");
+    return call<RemoteHostCandidate[]>("discover_remote_connections").then((hosts) => { window.dispatchEvent(new Event("vellum:remote-sidebar-changed")); return hosts; });
   },
 
   inspectRemoteHost(hostId: string): Promise<RemoteHostStatus> {
@@ -1250,6 +1262,20 @@ export const api = {
   restartToApplyDesktopUpdate(): Promise<UpdateOperation> {
     if (!hasTauri()) return delay({ operationId: "preview", component: "desktop", phase: "applying", targetVersion: null });
     return call<UpdateOperation>("restart_to_apply_desktop_update");
+  },
+  /** Check, then download what this machine needs; Desktop is staged, not installed. */
+  updateVellum(): Promise<UpdateStatusSnapshot> {
+    if (!hasTauri()) return delay(previewUpdateStatus());
+    return call<UpdateStatusSnapshot>("update_vellum");
+  },
+  /** Restarts into the staged update now, or once running work has finished. */
+  restartToUpdate(): Promise<RestartToUpdate> {
+    if (!hasTauri()) return delay("scheduled" as const);
+    return call<RestartToUpdate>("restart_to_update");
+  },
+  cancelScheduledRestart(): Promise<boolean> {
+    if (!hasTauri()) return delay(true);
+    return call<boolean>("cancel_scheduled_restart");
   },
   cancelUpdateDownload(component: UpdateComponent): Promise<UpdateOperation> {
     if (!hasTauri()) return delay({ operationId: "preview", component, phase: "available", targetVersion: null });

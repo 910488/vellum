@@ -1,18 +1,35 @@
-//! Production verifying keys. An empty or placeholder key keeps live
-//! auto-update disabled; fixture tests inject their own `TrustStore`.
+//! Production verifying keys. Fixture tests inject their own `TrustStore`.
+//!
+//! The verifying key is public, so release builds carry the production key
+//! even when the build environment does not set one. Local `build:main` and
+//! `build:mac` builds used to come out without it, and a build without the key
+//! can never update itself: its users had to find and install a new version by
+//! hand. Debug builds stay off unless the environment opts in, so `tauri dev`
+//! never stages an installer and runs it on exit.
 
 use ed25519_dalek::VerifyingKey;
 
-/// Compile-time hex of the production Ed25519 verifying key. Empty in
-/// development and CI until the release-signing Environment is configured.
-const BUNDLED_KEY_HEX: &str = match option_env!("VELLUM_UPDATE_PUBLIC_KEY") {
+/// Ed25519 key behind `secrets.VELLUM_UPDATE_SIGNING_KEY`; the same value
+/// as the repository variable `VELLUM_UPDATE_PUBLIC_KEY`.
+const PRODUCTION_KEY_HEX: &str = "64f2f1d3d9f482f0194b8bcb63ce0ec4c3168f2ccda81617ad36e4f9dd67dd27";
+const PRODUCTION_KEY_ID: &str = "vellum-updates-2026-09";
+
+const fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
+    match value {
+        Some(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+const BUNDLED_KEY_HEX: &str = match non_empty(option_env!("VELLUM_UPDATE_PUBLIC_KEY")) {
     Some(value) => value,
-    None => "",
+    None if cfg!(debug_assertions) => "",
+    None => PRODUCTION_KEY_HEX,
 };
 
-const BUNDLED_KEY_ID: &str = match option_env!("VELLUM_UPDATE_KEY_ID") {
+const BUNDLED_KEY_ID: &str = match non_empty(option_env!("VELLUM_UPDATE_KEY_ID")) {
     Some(value) => value,
-    None => "vellum-updates-unconfigured",
+    None => PRODUCTION_KEY_ID,
 };
 
 #[derive(Debug, Clone)]
@@ -74,6 +91,12 @@ pub fn parse_verifying_key(hex_key: &str) -> Option<VerifyingKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_key_is_a_valid_verifying_key() {
+        // A typo here would silently turn auto-update off in every release.
+        assert!(parse_verifying_key(PRODUCTION_KEY_HEX).is_some());
+    }
 
     #[test]
     fn bundled_trust_matches_the_compile_time_key() {

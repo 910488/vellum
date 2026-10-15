@@ -379,6 +379,7 @@ pub struct ProxyRuntime {
     lifecycle: Arc<dyn RequestLifecycle>,
     transport: Arc<dyn UpstreamTransport>,
     history: Arc<dyn HistoryStore>,
+    official_replay: Arc<crate::official_replay::OfficialReplayCache>,
     /// Shared Grok session/turn-index registry (moved out of Desktop's
     /// per-caller bookkeeping ??see `crate::grok_session`). One instance per
     /// running `ProxyRuntime`, so Desktop and the headless daemon each get
@@ -481,8 +482,17 @@ struct PendingSubagentSpawn {
 /// without bound for the lifetime of the process. They now carry the same
 /// `created` timestamp every other entry does, and `prune` retains all four
 /// maps by both a TTL and a hard capacity cap.
+#[derive(Clone)]
+struct OfficialAttemptUsage {
+    control_account_hash: Option<String>,
+    execution_account_hash: Option<String>,
+    selection_revision: Option<u64>,
+    upstream_attempted: bool,
+}
+
 struct TimestampedSender {
     sender: watch::Sender<bool>,
+    official_attempt: Option<OfficialAttemptUsage>,
     created: tokio::time::Instant,
 }
 
@@ -636,6 +646,27 @@ fn claim_terminal_once_raw(
     won
 }
 
+// Read before the terminal claim releases the registration. Both buffered
+// and streaming collectors share this context; early hydration failures keep
+// the selected account and explicitly record that no upstream was attempted.
+fn enrich_official_attempt_usage(
+    registry: &Arc<Mutex<ParentCancelRegistry>>,
+    execution_id: &str,
+    record: &mut UsageRecord,
+) {
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(context) = registry
+        .sockets
+        .get(execution_id)
+        .and_then(|entry| entry.official_attempt.as_ref())
+    {
+        record.control_account_hash = context.control_account_hash.clone();
+        record.execution_account_hash = context.execution_account_hash.clone();
+        record.selection_revision = context.selection_revision;
+        record.upstream_attempted = Some(context.upstream_attempted);
+    }
+}
+
 /// Free-function counterpart to
 /// [`ProxyRuntime::finish_terminal_once_with_record`], for stream-collector
 /// closures (see [`claim_terminal_once_raw`]).
@@ -645,8 +676,9 @@ fn finish_terminal_once_with_record_raw(
     usage: &Arc<dyn UsageStore>,
     execution_id: &str,
     outcome: &str,
-    record: UsageRecord,
+    mut record: UsageRecord,
 ) -> bool {
+    enrich_official_attempt_usage(registry, execution_id, &mut record);
     if !claim_terminal_once_raw(registry, execution_id, outcome) {
         return false;
     }
@@ -733,7 +765,7 @@ impl Drop for CancelRegistration {
 pub(crate) enum OfficialWebSocketAuthPosture {
     None,
     PreserveIncoming,
-    Managed { account_id: Option<String> },
+    Managed { execution_identity: Option<String> },
     Bearer { credential_id: Option<String> },
 }
 
@@ -773,6 +805,7 @@ pub(crate) struct WebSocketTurnPlan {
 /// turn may reuse an already-open segment; `upstream_model`/`route_id` are
 /// per-turn and never gate reuse on their own.
 pub(crate) struct OfficialWebSocketPlan {
+    request_metadata: crate::request::RequestMetadata,
     pub connection_key: OfficialWebSocketConnectionKey,
     pub upstream_url: String,
     pub upstream_model: String,
@@ -784,6 +817,9 @@ pub(crate) struct OfficialWebSocketPlan {
     pub execution_account_hash: Option<String>,
     pub selection_revision: Option<u64>,
     pub continuation_realm: Option<String>,
+    /// The request continues a response owned by another account. It must be
+    /// rebuilt as a full-input frame before it reaches this plan's socket.
+    pub cross_realm_handoff: bool,
     managed_auth: Option<OfficialAuthorization>,
     _guard: RequestGuard,
 }
@@ -804,6 +840,7 @@ impl ProxyRuntime {
             lifecycle,
             transport,
             history: Arc::new(MemoryHistoryStore::new()),
+            official_replay: Arc::new(crate::official_replay::OfficialReplayCache::default()),
             grok_sessions: Arc::new(GrokSessionRegistry::new()),
             opencode_quota: Arc::new(crate::opencode::OpenCodeQuotaCooldown::new()),
             usage: Arc::new(MemoryUsageStore::new()),
@@ -941,16 +978,13 @@ impl ProxyRuntime {
         error: Option<&str>,
         stage_times_ms: Option<Value>,
     ) -> bool {
-        if !self.claim_terminal_once(execution_id, outcome) {
-            return false;
-        }
         let status = match (outcome, error_category) {
             ("success", _) => 200,
             ("client_cancel" | "client_disconnect" | "user_stopped_proxy", _) => 499,
             ("protocol_failure", Some("invalid_request")) => 400,
             _ => 502,
         };
-        let record = UsageRecord {
+        let mut record = UsageRecord {
             route_id: route_id.to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -968,6 +1002,10 @@ impl ProxyRuntime {
             agent_attribution: self.agent_attribution_for_execution(execution_id),
             ..Default::default()
         };
+        enrich_official_attempt_usage(&self.parent_cancel, execution_id, &mut record);
+        if !self.claim_terminal_once(execution_id, outcome) {
+            return false;
+        }
         let result = self.usage.record(&record);
         if let Err(message) = result {
             // The terminal claim is deliberately kept (INV-CANCEL-1): a lost
@@ -1008,9 +1046,10 @@ impl ProxyRuntime {
             .as_ref()
             .and_then(|n| n.parent_turn_id.as_ref())
             .map(|t| t.as_str().to_string());
-        let root_turn_id = node
+        let root_turn_id = binding
+            .root_turn_id
             .as_ref()
-            .and_then(|n| n.root_turn_id.as_ref())
+            .or_else(|| node.as_ref().and_then(|n| n.root_turn_id.as_ref()))
             .map(|t| t.as_str().to_string());
         let context_window_id = binding
             .context_window_id
@@ -1059,6 +1098,7 @@ impl ProxyRuntime {
         outcome: &str,
         mut record: UsageRecord,
     ) -> bool {
+        enrich_official_attempt_usage(&self.parent_cancel, execution_id, &mut record);
         if !self.claim_terminal_once(execution_id, outcome) {
             return false;
         }
@@ -1270,8 +1310,7 @@ impl ProxyRuntime {
         requested_body: &Value,
         effective_body: &Value,
     ) {
-        let (control_account_hash, execution_account_hash) =
-            official_usage_identity(auth, request);
+        let (control_account_hash, execution_account_hash) = official_usage_identity(auth, request);
         let (auth_mode, selection_revision, selection_verified) = match auth {
             ResolvedAuth::OfficialManaged {
                 selection_revision,
@@ -1291,8 +1330,29 @@ impl ProxyRuntime {
         let effective_reasoning_summary = official_reasoning_summary_label(effective_body);
         let summary_omitted = requested_reasoning_summary.as_deref() == Some("none")
             && effective_reasoning_summary.is_none();
+        // Capture the actual inbound declaration, before hydrate/sanitize.
+        // Counts, byte lengths and hashes reveal contract loss without logging
+        // descriptions, schemas, instructions, credentials or prompt text.
+        let tools_manifest = |body: &Value| {
+            body.get("tools").map(|tools| {
+                let encoded = serde_json::to_string(tools).unwrap_or_default();
+                (
+                    tools.as_array().map_or(0, |tools| tools.len() as u64),
+                    encoded.len() as u64,
+                    sha256_hex(&encoded),
+                )
+            })
+        };
+        let requested_tools = tools_manifest(&request.body);
+        let effective_tools = tools_manifest(effective_body);
         self.record_diagnostic(DiagnosticEvent::OfficialRequestPrepared(
             OfficialRequestPrepared {
+                requested_tool_count: requested_tools.as_ref().map(|tools| tools.0),
+                requested_tool_bytes: requested_tools.as_ref().map(|tools| tools.1),
+                requested_tools_hash: requested_tools.as_ref().map(|tools| tools.2.clone()),
+                effective_tool_count: effective_tools.as_ref().map(|tools| tools.0),
+                effective_tool_bytes: effective_tools.as_ref().map(|tools| tools.1),
+                effective_tools_hash: effective_tools.as_ref().map(|tools| tools.2.clone()),
                 request_id: request.metadata.request_id.clone(),
                 route_id: route.route_id.clone(),
                 catalog_id: route.catalog_id.clone(),
@@ -1517,6 +1577,7 @@ impl ProxyRuntime {
             execution_id.to_string(),
             TimestampedSender {
                 sender,
+                official_attempt: None,
                 created: tokio::time::Instant::now(),
             },
         );
@@ -2441,6 +2502,28 @@ impl ProxyRuntime {
         self
     }
 
+    pub(crate) fn official_continuation_context(
+        &self,
+        request: &RuntimeRequest,
+    ) -> Option<RequestMetadata> {
+        let model = request_model(request).ok()?;
+        let route = self.catalog.resolve_model(model)?.route;
+        if route.provider_kind != RuntimeProviderKind::Official {
+            return None;
+        }
+        if let Some(id) = request
+            .body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+        {
+            self.official_replay
+                .continuation_context(id, &route.route_id)
+        } else {
+            self.official_replay
+                .thread_context(&request.metadata.codex_thread_key()?, &route.route_id)
+        }
+    }
+
     /// Resolve one WebSocket `response.create` against a fresh catalog
     /// snapshot. Every turn is routed independently: the selected model is
     /// this turn's only routing authority, and there is no connection-level
@@ -2472,7 +2555,9 @@ impl ProxyRuntime {
             return Ok(WebSocketTurnPlan {
                 route_id: route.route_id,
                 dispatch: WebSocketTurnDispatch::PortableReplay {
-                    force_official_handoff: false,
+                    // HTTP Responses cannot consume WS continuation ids, even
+                    // on the same account (notably Auto Review).
+                    force_official_handoff: route.provider_kind == RuntimeProviderKind::Official,
                 },
             });
         }
@@ -2502,18 +2587,14 @@ impl ProxyRuntime {
         let (control_account_hash, execution_account_hash) =
             official_usage_identity(&auth, request);
         let continuation_realm = official_continuation_realm(&route, &auth);
-        if self.is_cross_realm_official_continuation(
+        // A response id from another account cannot be resumed here. The
+        // socket layer rebuilds the turn as one full-input frame on this
+        // account's socket (see `hydrate_official_socket_handoff`).
+        let cross_realm_handoff = self.is_cross_realm_official_continuation(
             &route,
             &request.body,
             continuation_realm.as_deref(),
-        )? {
-            return Ok(WebSocketTurnPlan {
-                route_id: route.route_id,
-                dispatch: WebSocketTurnDispatch::PortableReplay {
-                    force_official_handoff: true,
-                },
-            });
-        }
+        )?;
         let effective_body =
             crate::adapter::prepare_openai_official_native(&request.body, &route.upstream_model);
         self.record_official_request_prepared(
@@ -2533,6 +2614,7 @@ impl ProxyRuntime {
         Ok(WebSocketTurnPlan {
             route_id: route.route_id.clone(),
             dispatch: WebSocketTurnDispatch::OfficialNative(OfficialWebSocketPlan {
+                request_metadata: request.metadata.clone(),
                 connection_key,
                 upstream_url,
                 upstream_model: route.upstream_model.clone(),
@@ -2549,10 +2631,61 @@ impl ProxyRuntime {
                     _ => None,
                 },
                 continuation_realm,
+                cross_realm_handoff,
                 managed_auth,
                 _guard: guard,
             }),
         })
+    }
+
+    /// Rebuild a chained Official socket turn as one standalone full-input
+    /// frame for a socket on another account or selection revision.
+    ///
+    /// A foreign `previous_response_id` cannot be resumed on this account.
+    /// Converting the turn to an HTTP Responses request instead was rejected
+    /// for every Desktop thread carrying the Codex-reserved `collaboration`
+    /// namespace (`'collaboration.followup_task' is reserved ... must match
+    /// the configured schema`), while the same manifest is accepted on the
+    /// socket. Staying on the socket keeps Codex's request controls, tool
+    /// manifest and handshake headers; only the conversation items change,
+    /// exactly as on the HTTP handoff path.
+    pub(crate) fn hydrate_official_socket_handoff(
+        &self,
+        plan: &OfficialWebSocketPlan,
+        frame: &Value,
+    ) -> Result<Value, RuntimeError> {
+        let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
+        let route = snapshot
+            .routes
+            .iter()
+            .map(|snapshot| &snapshot.route)
+            .find(|route| route.route_id == plan.route_id)
+            .ok_or_else(|| {
+                RuntimeError::RouteNotFound(format!("route not configured: {}", plan.route_id))
+            })?;
+        let mut body = frame.clone();
+        let hydration = self.hydrate_request_history(
+            route,
+            frame,
+            &mut body,
+            true,
+            plan.continuation_realm.as_deref(),
+        )?;
+        let mut replay = hydration.replay_context();
+        let before = crate::request::request_input_items(&body);
+        if let Some(input) = body.get_mut("input") {
+            sanitize_for_official(input);
+        }
+        let after = crate::request::request_input_items(&body);
+        realign_identities_after_item_filter(&mut replay, &before, &after)?;
+        self.materialize_local_compactions(
+            route.provider_kind,
+            &mut body,
+            false,
+            hydration.continuation_mode == ContinuationMode::PortableSemanticReplay,
+            &mut replay,
+        )?;
+        Ok(body)
     }
 
     /// Resolve one WebSocket connection against a captured route snapshot.
@@ -2636,6 +2769,20 @@ impl ProxyRuntime {
         .map_err(RuntimeError::History)?;
         self.record_subagent_spawn_requests(parent_request_id, execution_id, response);
         let details = usage_details_from_response(response);
+        if let (Some(id), Some(hash)) = (
+            response.get("id").and_then(Value::as_str),
+            plan.execution_account_hash.as_deref(),
+        ) {
+            let mut metadata = plan.request_metadata.clone();
+            metadata.official_socket_affinity = Some(crate::request::OfficialSocketAffinity {
+                account_hash: hash.strip_prefix("sha256:").unwrap_or(hash).into(),
+                turn_in_progress: true,
+                input_tokens: details.input_tokens,
+                quota_exhausted: false,
+            });
+            self.official_replay
+                .remember_context(id, &plan.route_id, metadata);
+        }
         // Routed through the same atomic terminal guard as every other
         // path (P0): an Official native completion racing a parent cancel
         // or a client disconnect can no longer double-write this turn's
@@ -2670,6 +2817,7 @@ impl ProxyRuntime {
                 control_account_hash: plan.control_account_hash.clone(),
                 execution_account_hash: plan.execution_account_hash.clone(),
                 selection_revision: plan.selection_revision,
+                upstream_attempted: Some(true),
                 stage_times_ms,
                 ..Default::default()
             },
@@ -3502,6 +3650,25 @@ impl ProxyRuntime {
             .map_err(RuntimeError::LifecycleDraining)
     }
 
+    fn note_official_attempt(
+        &self,
+        execution_id: &str,
+        request: &RuntimeRequest,
+        auth: &ResolvedAuth,
+        upstream_attempted: bool,
+    ) {
+        let (control_account_hash, execution_account_hash) = official_usage_identity(auth, request);
+        let mut registry = self.parent_cancel.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = registry.sockets.get_mut(execution_id) {
+            entry.official_attempt = Some(OfficialAttemptUsage {
+                control_account_hash,
+                execution_account_hash,
+                selection_revision: official_selection_revision(auth),
+                upstream_attempted,
+            });
+        }
+    }
+
     async fn execute_upstream(
         &self,
         request: UpstreamRequest,
@@ -3623,6 +3790,7 @@ impl ProxyRuntime {
             self.harness_options,
             self.delegation_runtime_wired,
         );
+        stages.mark("routed");
         // Official continuation realm is account-scoped. Resolve its auth
         // snapshot before deciding whether `previous_response_id` may remain
         // native; the same snapshot is retained for the eventual dispatch.
@@ -3641,6 +3809,12 @@ impl ProxyRuntime {
         } else {
             None
         };
+        if let Some(auth) = resolved_official_auth.as_ref() {
+            self.note_official_attempt(execution_id, request, auth, false);
+        }
+        // Bookmarks are cumulative. Separate account/quota authorization
+        // from history hydration so cold routing reads are attributable.
+        stages.mark("auth_resolved");
         let current_official_realm = resolved_official_auth
             .as_ref()
             .and_then(|auth| official_continuation_realm(route, auth));
@@ -3659,7 +3833,8 @@ impl ProxyRuntime {
         // the foreign chain has to become portable visible history first.
         let official_route_switch =
             self.is_cross_route_official_continuation(route, &request.body)?;
-        let official_account_switch = request.metadata.force_portable_official_handoff
+        let official_account_switch = (route.provider_kind == RuntimeProviderKind::Official
+            && request.metadata.force_portable_official_handoff)
             || self.is_cross_realm_official_continuation(
                 route,
                 &request.body,
@@ -3683,6 +3858,7 @@ impl ProxyRuntime {
                 &request.body,
                 &mut execution_body,
                 official_handoff,
+                current_official_realm.as_deref(),
             )?
         };
         let portable_replay = hydration.continuation_mode
@@ -3692,7 +3868,12 @@ impl ProxyRuntime {
         let mut replay = hydration.replay_context();
         if official_handoff {
             let before = crate::request::request_input_items(&execution_body);
-            sanitize_for_official(&mut execution_body);
+            // Only conversation items cross the continuation realm. Request
+            // controls and tool schemas are caller-owned, even when schema
+            // properties happen to share names with provider-owned fields.
+            if let Some(input) = execution_body.get_mut("input") {
+                sanitize_for_official(input);
+            }
             let after = crate::request::request_input_items(&execution_body);
             realign_identities_after_item_filter(&mut replay, &before, &after)?;
         }
@@ -4437,6 +4618,9 @@ impl ProxyRuntime {
                 )
                 .await;
         }
+        if route.provider_kind == RuntimeProviderKind::Official {
+            self.note_official_attempt(execution_id, request, &auth, true);
+        }
         let mut response = match self
             .execute_upstream(
                 UpstreamRequest {
@@ -4448,6 +4632,7 @@ impl ProxyRuntime {
                         &request.body,
                         &conversation_key,
                         &encoded_body,
+                        Some(&request.metadata),
                     ),
                     body: encoded_body.clone(),
                     timeout: non_streaming_timeout(route),
@@ -4489,6 +4674,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: non_streaming_timeout(route),
@@ -4548,6 +4734,7 @@ impl ProxyRuntime {
                                         &request.body,
                                         &conversation_key,
                                         &encoded_body,
+                                        Some(&request.metadata),
                                     ),
                                     body: encoded_body.clone(),
                                     timeout: non_streaming_timeout(route),
@@ -4591,6 +4778,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: non_streaming_timeout(route),
@@ -4623,6 +4811,16 @@ impl ProxyRuntime {
             continuation_realm.as_deref(),
         )
         .map_err(RuntimeError::History)?;
+        if route.provider_kind == RuntimeProviderKind::Official {
+            let wire_body: Value = serde_json::from_slice(&encoded_body)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            self.official_replay.record(
+                &wire_body,
+                &normalized,
+                &route.route_id,
+                continuation_realm.as_deref(),
+            );
+        }
         // M7: usage accounting mirrors Desktop's per-request ledger. Routed
         // through the same atomic terminal guard every streaming path uses
         // (`finish_terminal_once_with_record`), so a buffered success also
@@ -4978,6 +5176,7 @@ impl ProxyRuntime {
                         &request.body,
                         &conversation_key,
                         &encoded_body,
+                        Some(&request.metadata),
                     ),
                     body: encoded_body,
                     timeout: non_streaming_timeout(route),
@@ -5496,6 +5695,7 @@ impl ProxyRuntime {
                         &request.body,
                         &conversation_key,
                         &encoded_body,
+                        Some(&request.metadata),
                     ),
                     body: encoded_body.clone(),
                     timeout: None,
@@ -5570,7 +5770,7 @@ impl ProxyRuntime {
         route: &RuntimeModelRoute,
         request: &RuntimeRequest,
     ) -> Result<RuntimeResponse, RuntimeError> {
-        let mut auth = ResolvedAuth::resolve(
+        let auth = ResolvedAuth::resolve(
             route,
             request,
             self.credentials.as_ref(),
@@ -5592,11 +5792,87 @@ impl ProxyRuntime {
                 &request.body,
                 &conversation_key,
                 &encoded_body,
+                Some(&request.metadata),
             ),
             body: encoded_body.clone(),
             timeout: None,
             max_response_bytes: None,
         };
+        let response = self
+            .execute_official_with_refresh(route, auth, upstream_request)
+            .await?;
+        Ok(raw_upstream_response(response))
+    }
+
+    /// Execute a Codex image request (`images/generations` or
+    /// `images/edits`).
+    ///
+    /// Codex's image-generation extension calls these against the active
+    /// provider's base URL, so every session pointed at Vellum lands here —
+    /// third-party sessions included. Image generation is an OpenAI service,
+    /// so the request is forwarded byte-for-byte (an edit may be multipart) to
+    /// the first Official route, whichever model the session is on. The body
+    /// names an image model, not a catalog model, so the route cannot be
+    /// resolved from it. With no Official route there is nowhere to send it,
+    /// and the caller gets a reason instead of a bare 404.
+    pub async fn execute_image(
+        &self,
+        operation: ImageOperation,
+        request: RuntimeRequest,
+        body: RawImageBody,
+    ) -> Result<RuntimeResponse, RuntimeError> {
+        let _guard = self.begin_lifecycle()?;
+        let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
+        let route = snapshot
+            .routes
+            .iter()
+            .map(|snapshot| &snapshot.route)
+            .find(|route| route.provider_kind == RuntimeProviderKind::Official)
+            .ok_or_else(|| {
+                RuntimeError::UnsupportedMode(
+                    "image generation needs a ChatGPT account: add one in Vellum to generate images"
+                        .into(),
+                )
+            })?;
+        let auth = ResolvedAuth::resolve(
+            route,
+            &request,
+            self.credentials.as_ref(),
+            self.official_auth.as_ref(),
+            self.grok_sessions.as_ref(),
+            Some(self.history.as_ref()),
+        )
+        .await?;
+        let endpoint = official_image_endpoint(&route.base_url, operation);
+        let upstream_request = |auth: &ResolvedAuth| {
+            let mut headers = auth.upstream_headers(&route.upstream_model);
+            if let Some(content_type) = &body.content_type {
+                headers.push(("content-type".into(), content_type.clone()));
+            }
+            headers.extend(body.forwarded_headers.iter().cloned());
+            UpstreamRequest {
+                method: "POST".into(),
+                url: endpoint.clone(),
+                headers,
+                body: body.bytes.clone(),
+                timeout: None,
+                max_response_bytes: None,
+            }
+        };
+        let response = self
+            .execute_official_with_refresh(route, auth, upstream_request)
+            .await?;
+        Ok(raw_upstream_response(response))
+    }
+
+    /// Send one Official request; on 401/403 with a Vellum-managed account,
+    /// refresh the token for the same account and send it once more.
+    async fn execute_official_with_refresh(
+        &self,
+        route: &RuntimeModelRoute,
+        mut auth: ResolvedAuth,
+        upstream_request: impl Fn(&ResolvedAuth) -> UpstreamRequest,
+    ) -> Result<UpstreamResponse, RuntimeError> {
         let mut response = self
             .transport
             .execute(&upstream_request(&auth))
@@ -5641,16 +5917,7 @@ impl ProxyRuntime {
                 }
             }
         }
-        let content_type = response
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.clone());
-        Ok(RuntimeResponse::Raw {
-            status: response.status,
-            content_type,
-            body: response.body,
-        })
+        Ok(response)
     }
 
     /// Streaming dispatch (M5): the request body is already prepared and
@@ -5682,6 +5949,7 @@ impl ProxyRuntime {
                 &request.body,
                 &conversation_key,
                 &encoded_body,
+                Some(&request.metadata),
             ),
             body: encoded_body.clone(),
             // Streaming has no overall deadline; the caller enforces
@@ -5708,6 +5976,9 @@ impl ProxyRuntime {
             return Err(error);
         }
         let send_started = std::time::Instant::now();
+        if route.provider_kind == RuntimeProviderKind::Official {
+            self.note_official_attempt(execution_id, request, &auth, true);
+        }
         let mut upstream = match self.open_upstream_stream(&upstream_request).await {
             Ok(upstream) => upstream,
             Err(error) => {
@@ -5767,6 +6038,7 @@ impl ProxyRuntime {
                                     &request.body,
                                     &conversation_key,
                                     &encoded_body,
+                                    Some(&request.metadata),
                                 ),
                                 body: encoded_body.clone(),
                                 timeout: None,
@@ -5824,18 +6096,14 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: None,
                             max_response_bytes: None,
                         })
                         .await?;
-                    self.note_opencode_quota(
-                        route,
-                        upstream.status,
-                        &upstream.headers,
-                        &[],
-                    );
+                    self.note_opencode_quota(route, upstream.status, &upstream.headers, &[]);
                     if !(200..300).contains(&upstream.status) {
                         let retry_status = upstream.status;
                         let retry_error_body = drain_upstream_error_body(&mut upstream).await?;
@@ -5879,6 +6147,7 @@ impl ProxyRuntime {
                                 &request.body,
                                 &conversation_key,
                                 &encoded_body,
+                                Some(&request.metadata),
                             ),
                             body: encoded_body.clone(),
                             timeout: None,
@@ -5978,6 +6247,7 @@ impl ProxyRuntime {
                             &parent_request_id,
                             &execution_id,
                             request_body,
+                            dispatch_body,
                             conversation_key,
                             upstream,
                             control_account_hash,
@@ -7068,6 +7338,7 @@ impl ProxyRuntime {
         parent_request_id: &str,
         execution_id: &str,
         request_body: Value,
+        wire_body: Value,
         conversation_key: String,
         upstream: UpstreamStream,
         control_account_hash: Option<String>,
@@ -7079,6 +7350,7 @@ impl ProxyRuntime {
         agent_attribution: Option<crate::usage::AgentUsageAttribution>,
     ) -> impl futures_util::Stream<Item = Result<Bytes, RuntimeError>> + 'static {
         let history = self.history.clone();
+        let official_replay = self.official_replay.clone();
         let usage = self.usage.clone();
         let parent_cancel = Arc::clone(&self.parent_cancel);
         let parent_request_id = parent_request_id.to_string();
@@ -7127,6 +7399,7 @@ impl ProxyRuntime {
                                     continuation_realm.as_deref(),
                                 ) {
                                     Ok(_) => {
+                                        official_replay.record(&wire_body, &response, &route_id, continuation_realm.as_deref());
                                         terminal_response_recorded = true;
                                         yield ok(bytes);
                                     }
@@ -7158,6 +7431,25 @@ impl ProxyRuntime {
             }
             let completed = tracker.completed_response();
             let terminal_error = tracker.terminal_error();
+            if completed.is_none() {
+                let failure = tracker.terminal_error_event().as_ref()
+                    .map(provider_error_from_terminal_event)
+                    .unwrap_or_else(|| RuntimeError::ProviderProtocol(stream_error.clone()
+                        .unwrap_or_else(|| "Upstream stream ended without response.completed".into())));
+                finish_terminal_once_with_record_raw(&parent_cancel, &diagnostics, &usage, &execution_id, outcome_for_error(&failure), UsageRecord {
+                    route_id: route_id.clone(), provider: provider.clone(), model: model.clone(),
+                    status: failure.http_status().as_u16(), error: Some(failure.to_string()),
+                    error_category: Some(failure.category().into()), outcome: Some(outcome_for_error(&failure).into()),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    first_byte_ms, first_event_ms: first_byte_ms,
+                    request_id: Some(parent_request_id.clone()),
+                    conversation_identity: Some(conversation_key.clone()),
+                    control_account_hash: control_account_hash.clone(), execution_account_hash: execution_account_hash.clone(),
+                    selection_revision, upstream_attempted: Some(true),
+                    review_run_id: guardian.run_id.clone(), review_role: guardian.role.clone(), review_reason: guardian.reason.clone(),
+                    agent_attribution: agent_attribution.clone(), ..Default::default()
+                });
+            }
             if completed.is_none() && terminal_error.is_none() && stream_error.is_none() {
                 let message = "Upstream stream ended without response.completed".to_string();
                 yield ok(Bytes::from(failed_sse_event(&message)));
@@ -7220,6 +7512,8 @@ impl ProxyRuntime {
                     ) {
                         let message = format!("history durability failed: {error}");
                         yield ok(Bytes::from(failed_sse_event(&message)));
+                    } else {
+                        official_replay.record(&wire_body, &response, &route_id, continuation_realm.as_deref());
                     }
                 }
             }
@@ -7238,6 +7532,7 @@ impl ProxyRuntime {
         request: &Value,
         body: &mut Value,
         force_portable: bool,
+        current_official_realm: Option<&str>,
     ) -> Result<HydrationOutcome, RuntimeError> {
         // First-turn store:false / ZDR on Official must request encrypted
         // reasoning even without a previous_response_id, so a later stateless
@@ -7256,10 +7551,36 @@ impl ProxyRuntime {
         else {
             return Ok(HydrationOutcome::first_turn(input_len));
         };
-        let chain = self
+        // A bridge strips previous_response_id, but same-account replay is
+        // still a native wire contract. Durable portable projections cannot
+        // preserve its prefix (image/opaque items were filtered).
+        if force_portable && route.provider_kind == RuntimeProviderKind::Official {
+            if let Some(entry) =
+                self.official_replay
+                    .get(previous, &route.route_id, current_official_realm)
+            {
+                return Ok(crate::replay::hydrate_input_with_mode(
+                    body,
+                    &[entry],
+                    ContinuationMode::PortableSemanticReplay,
+                ));
+            }
+        }
+        let mut chain = self
             .history
             .get_chain(previous)
             .map_err(RuntimeError::History)?;
+        if force_portable && route.provider_kind == RuntimeProviderKind::Official {
+            // A cache miss must not replay provider-issued item identities from
+            // a different account. call_id is caller-owned tool pairing state.
+            for entry in &mut chain {
+                for item in entry.input_items.iter_mut().chain(&mut entry.output_items) {
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove("id");
+                    }
+                }
+            }
+        }
         let previous_route_id = chain.last().map(|entry| entry.route_id.as_str());
         let decision = if force_portable {
             crate::continuation::ContinuationDecision {
@@ -7278,10 +7599,7 @@ impl ProxyRuntime {
             ContinuationMode::StatelessEncryptedReplay
             | ContinuationMode::PortableSemanticReplay => {
                 if chain.is_empty() {
-                    return Err(RuntimeError::Continuation(format!(
-                        "cannot continue conversation: previous_response_id `{previous}` has no local history (mode={:?})",
-                        decision.mode
-                    )));
+                    return Err(RuntimeError::PreviousResponseNotFound(previous.to_string()));
                 }
                 let mut outcome =
                     crate::replay::hydrate_input_with_mode(body, &chain, decision.mode);
@@ -8272,6 +8590,7 @@ async fn open_chat_continuation_stream(
                 request_body,
                 conversation_key,
                 &encoded_body,
+                None,
             ),
             body: encoded_body,
             timeout: None,
@@ -8307,9 +8626,25 @@ fn json_upstream_headers(
     inbound_body: &Value,
     conversation_key: &str,
     upstream_body: &[u8],
+    metadata: Option<&RequestMetadata>,
 ) -> Vec<(String, String)> {
     let mut headers = auth.upstream_headers(&route.upstream_model);
     headers.push(("content-type".into(), "application/json".into()));
+    if route.provider_kind == RuntimeProviderKind::Official {
+        if let Some(metadata) = metadata {
+            for (name, value) in [
+                ("session-id", &metadata.official_cache_affinity.session_id),
+                (
+                    "session_id",
+                    &metadata.official_cache_affinity.session_id_legacy,
+                ),
+            ] {
+                if let Some(value) = value {
+                    headers.push((name.into(), value.clone()));
+                }
+            }
+        }
+    }
     if route.effective_provider_profile().is_some() {
         headers.extend(crate::opencode::identity_headers(
             inbound_body,
@@ -8367,9 +8702,11 @@ fn official_usage_identity(
         .as_deref()
         .map(hashed_account_identity);
     let execution = match auth {
-        ResolvedAuth::OfficialManaged { account_id, .. } => {
-            account_id.as_deref().map(hashed_account_identity)
-        }
+        ResolvedAuth::OfficialManaged {
+            account_id, token, ..
+        } => crate::official_auth::managed_execution_identity(token, account_id.as_deref())
+            .as_deref()
+            .map(hashed_account_identity),
         ResolvedAuth::OfficialPreserveIncoming { account, .. } => {
             account.as_deref().map(hashed_account_identity)
         }
@@ -8401,29 +8738,41 @@ fn official_refresh_matches_snapshot(
     refreshed: &OfficialAuthorization,
 ) -> bool {
     refreshed.account_id == rejected.account_id
+        && crate::official_auth::managed_execution_identity(
+            &refreshed.access_token,
+            refreshed.account_id.as_deref(),
+        ) == crate::official_auth::managed_execution_identity(
+            &rejected.access_token,
+            rejected.account_id.as_deref(),
+        )
         && refreshed.selection_revision == rejected.selection_revision
         && refreshed.selection_verified
 }
 
 fn hashed_account_identity(account_id: &str) -> String {
-    let digest = Sha256::digest(account_id.as_bytes());
-    let encoded = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("sha256:{encoded}")
+    format!(
+        "sha256:{}",
+        crate::request::OfficialSocketAffinity::hash_account(account_id)
+    )
 }
 
 /// Stable realm fingerprint compatible with Desktop's durable
 /// `response_realm.realm_fingerprint`. Raw account ids never reach history.
 fn official_continuation_realm(route: &RuntimeModelRoute, auth: &ResolvedAuth) -> Option<String> {
     let account = match auth {
-        ResolvedAuth::OfficialManaged { account_id, .. } => account_id.as_deref(),
-        ResolvedAuth::OfficialPreserveIncoming { account, .. } => account.as_deref(),
+        ResolvedAuth::OfficialManaged {
+            account_id, token, ..
+        } => crate::official_auth::managed_execution_identity(token, account_id.as_deref()),
+        ResolvedAuth::OfficialPreserveIncoming { account, .. } => account.clone(),
         _ => None,
     }?;
     let mut hasher = Sha256::new();
-    for part in ["official", route.base_url.as_str(), "chatgpt", account] {
+    for part in [
+        "official",
+        route.base_url.as_str(),
+        "chatgpt",
+        account.as_str(),
+    ] {
         hasher.update(part.trim().to_ascii_lowercase().as_bytes());
         hasher.update([0]);
     }
@@ -8543,8 +8892,13 @@ fn official_websocket_auth_posture(
         ResolvedAuth::OfficialPreserveIncoming { .. } => {
             OfficialWebSocketAuthPosture::PreserveIncoming
         }
-        ResolvedAuth::OfficialManaged { account_id, .. } => OfficialWebSocketAuthPosture::Managed {
-            account_id: account_id.clone(),
+        ResolvedAuth::OfficialManaged {
+            account_id, token, ..
+        } => OfficialWebSocketAuthPosture::Managed {
+            execution_identity: crate::official_auth::managed_execution_identity(
+                token,
+                account_id.as_deref(),
+            ),
         },
         ResolvedAuth::Bearer(_) => OfficialWebSocketAuthPosture::Bearer {
             credential_id: route.credential_id.clone(),
@@ -8590,10 +8944,27 @@ fn bounded_provider_diagnostic(body: &[u8]) -> String {
     normalized.chars().take(512).collect()
 }
 
-/// Persist an exchange and, for Official compaction responses, bind every
-/// opaque compaction id to a provider-independent source window. The daemon
-/// uses the shared HistoryStore directly (there is no Desktop bridge), so
-/// this must live in the runtime for bundled macOS/Linux proxy images too.
+/// Durable conversation projection, distinct from compaction/trajectory input.
+fn sanitize_official_durable_history(items: &[Value]) -> Vec<Value> {
+    items
+        .iter()
+        .flat_map(|item| {
+            if matches!(
+                crate::compaction::classify_item(item),
+                crate::compaction::ItemRole::System
+            ) {
+                // Caller context is not compactor input: losing it changes the
+                // permissions and tool instructions on a later account handoff.
+                vec![crate::compaction::strip_opaque_fields(item.clone())]
+            } else {
+                sanitize_portable_history(std::slice::from_ref(item))
+            }
+        })
+        .collect()
+}
+
+/// Persist an exchange and bind Official opaque compaction ids to portable
+/// source windows. Shared by Desktop and headless daemon history stores.
 fn record_exchange_with_official_compactions(
     history: &dyn HistoryStore,
     request: &Value,
@@ -8604,7 +8975,9 @@ fn record_exchange_with_official_compactions(
     continuation_realm: Option<&str>,
 ) -> Result<bool, String> {
     // Keep Official wire payloads untouched for Codex, but persist a separate
-    // portable projection for a later provider switch. Opaque OpenAI state is
+    // durable conversation projection for a later provider/account switch.
+    // Caller system/developer context is retained, unlike compactor input.
+    // Opaque OpenAI state is
     // valid only on the native route/account realm.
     let (portable_request, portable_response) = if official {
         let mut portable_request = request.clone();
@@ -8612,14 +8985,14 @@ fn record_exchange_with_official_compactions(
             .get_mut("input")
             .and_then(Value::as_array_mut)
         {
-            *input = sanitize_portable_history(input);
+            *input = sanitize_official_durable_history(input);
         }
         let mut portable_response = response.clone();
         if let Some(output) = portable_response
             .get_mut("output")
             .and_then(Value::as_array_mut)
         {
-            *output = sanitize_portable_history(output);
+            *output = sanitize_official_durable_history(output);
         }
         (portable_request, portable_response)
     } else {
@@ -8758,6 +9131,60 @@ fn compaction_trigger_response(request: &Value, item: Value) -> RuntimeResponse 
     RuntimeResponse::Sse(futures_util::stream::iter(payload).boxed())
 }
 
+/// Hand an Official upstream reply back unchanged: status, content type and
+/// body.
+fn raw_upstream_response(response: UpstreamResponse) -> RuntimeResponse {
+    let content_type = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone());
+    RuntimeResponse::Raw {
+        status: response.status,
+        content_type,
+        body: response.body,
+    }
+}
+
+/// The two image operations Codex's image-generation extension calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageOperation {
+    /// `images/generations`: a prompt with no reference image.
+    Generate,
+    /// `images/edits`: a prompt with one or more reference images.
+    Edit,
+}
+
+impl ImageOperation {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Generate => "images/generations",
+            Self::Edit => "images/edits",
+        }
+    }
+}
+
+/// An image request body exactly as Codex sent it. It is never parsed: an
+/// edit may be `multipart/form-data`, whose boundary lives in `content_type`.
+#[derive(Debug, Clone, Default)]
+pub struct RawImageBody {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    /// Codex's own image-request headers (`x-codex-image*`), passed through
+    /// so the upstream can correlate the call with its turn.
+    pub forwarded_headers: Vec<(String, String)>,
+}
+
+fn official_image_endpoint(base_url: &str, operation: ImageOperation) -> String {
+    let base = base_url.trim_end_matches('/');
+    let path = operation.path();
+    if base.ends_with("/v1") || base.ends_with("/codex") {
+        format!("{base}/{path}")
+    } else {
+        format!("{base}/v1/{path}")
+    }
+}
+
 fn alpha_search_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/v1") || base.ends_with("/codex") {
@@ -8798,6 +9225,14 @@ fn decode_non_streaming_response(
     let body: Value = serde_json::from_slice(&response.body).map_err(|error| {
         RuntimeError::ProviderProtocol(format!("upstream returned a non-JSON body: {error}"))
     })?;
+    if body.get("error").is_some_and(Value::is_object)
+        || matches!(
+            body.get("type").and_then(Value::as_str),
+            Some("response.failed" | "error")
+        )
+    {
+        return Err(provider_error_from_terminal_event(&body));
+    }
     if route.provider_kind == RuntimeProviderKind::Official {
         Ok(body)
     } else {
@@ -8844,6 +9279,20 @@ fn provider_error_from_upstream(
     body: &[u8],
     headers: &[(String, String)],
 ) -> RuntimeError {
+    // HTTP status remains authoritative for client/auth/quota errors.
+    if !(400..500).contains(&status)
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|body| {
+                body.pointer("/response/error")
+                    .or_else(|| body.get("error"))
+                    .cloned()
+            })
+            .as_ref()
+            .is_some_and(crate::error::is_upstream_server_error)
+    {
+        return RuntimeError::ProviderUnavailable(provider_error_message(body, status));
+    }
     let message = provider_error_message(body, status);
     let retry_after = if status == 429 {
         crate::opencode::parse_retry_after(headers)
@@ -8852,6 +9301,36 @@ fn provider_error_from_upstream(
         crate::opencode::parse_retry_after(headers)
     };
     provider_error_for_status_with_retry(status, &message, retry_after, true)
+}
+
+fn provider_error_from_terminal_event(event: &Value) -> RuntimeError {
+    let error = event
+        .pointer("/response/error")
+        .or_else(|| event.get("error"));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream Responses failure");
+    if error.is_some_and(crate::error::is_upstream_server_error) {
+        return RuntimeError::ProviderUnavailable(message.into());
+    }
+    let status = match error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("invalid_request_error") => 400,
+        Some("authentication_error") => 401,
+        Some("insufficient_quota" | "rate_limit_error" | "usage_limit_reached") => 429,
+        _ => match event
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+        {
+            Some(status) => status,
+            None => return RuntimeError::ProviderProtocol(message.into()),
+        },
+    };
+    provider_error_for_status(status, message)
 }
 
 fn provider_error_for_status_with_retry(
@@ -8876,12 +9355,19 @@ fn provider_error_for_status_with_retry(
                     upstream_attempted,
                 )
             } else {
-                RuntimeError::ProviderProtocol(format!("upstream HTTP {status}: {diagnostic}"))
+                RuntimeError::ProviderRequestRejected {
+                    upstream_status: status,
+                    message: diagnostic,
+                }
             }
         }
         408 | 409 | 425 | 426 => {
             RuntimeError::ProviderProtocol(format!("upstream HTTP {status}: {diagnostic}"))
         }
+        _ if (400..500).contains(&status) => RuntimeError::ProviderRequestRejected {
+            upstream_status: status,
+            message: diagnostic,
+        },
         _ if (500..600).contains(&status) => RuntimeError::ProviderUnavailable(diagnostic),
         _ => RuntimeError::ProviderProtocol(format!("upstream HTTP {status}: {diagnostic}")),
     }
@@ -8921,15 +9407,12 @@ mod tests {
     #[test]
     fn official_reasoning_summary_diagnostic_is_allowlisted() {
         assert_eq!(
-            official_reasoning_summary_label(&json!({"reasoning": {"summary": "none"}}))
-                .as_deref(),
+            official_reasoning_summary_label(&json!({"reasoning": {"summary": "none"}})).as_deref(),
             Some("none")
         );
         assert_eq!(
-            official_reasoning_summary_label(
-                &json!({"reasoning": {"summary": "must-not-leak"}})
-            )
-            .as_deref(),
+            official_reasoning_summary_label(&json!({"reasoning": {"summary": "must-not-leak"}}))
+                .as_deref(),
             Some("other")
         );
         assert_eq!(
@@ -9101,6 +9584,28 @@ mod tests {
     }
 
     #[test]
+    fn socket_affinity_reads_back_the_execution_hash_it_was_built_from() {
+        // Producers strip the `sha256:` prefix from the execution hash; the
+        // quota pool must match that exact form, not the truncated
+        // diagnostic `account_hash`, or every mid-turn retry is refused.
+        let execution = hashed_account_identity("credential-a");
+        let affinity = crate::request::OfficialSocketAffinity {
+            account_hash: execution.strip_prefix("sha256:").unwrap().into(),
+            turn_in_progress: true,
+            input_tokens: 0,
+            quota_exhausted: false,
+        };
+        assert!(affinity.is_account("credential-a"));
+        assert!(!affinity.is_account("credential-b"));
+        assert_ne!(
+            affinity.account_hash,
+            crate::account_hash("credential-a")
+                .trim_start_matches("sha256:")
+                .to_string()
+        );
+    }
+
+    #[test]
     fn official_usage_identity_distinguishes_control_a_from_execution_b() {
         let mut request = request(json!({"model": "official"}));
         request.incoming_auth.openai_account = Some("control-a".into());
@@ -9166,6 +9671,7 @@ mod tests {
             &serde_json::json!({}),
             "conversation-test",
             b"{}",
+            None,
         );
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-type") && value == "application/json"
@@ -9184,6 +9690,7 @@ mod tests {
             &serde_json::json!({"model": "deepseek-v4.1-flash"}),
             raw_conversation_key,
             br#"{"model":"deepseek-v4.1-flash"}"#,
+            None,
         );
         let session = headers
             .iter()
@@ -10512,6 +11019,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_http_server_failures_record_retryable_availability() {
+        for status in [200, 500, 502, 503] {
+            let body =
+                json!({"error":{"type":"server_error","message":"You can retry your request."}});
+            let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+                status,
+                headers: vec![],
+                body: serde_json::to_vec(&body).unwrap(),
+            }]));
+            let runtime = official_runtime_with_transport(transport);
+            let error = runtime
+                .execute(
+                    request(json!({"model":"vlm-test","input":"hi"})),
+                    "http-server-failure",
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.http_status().as_u16(), 503);
+            assert_eq!(error.category(), "provider_unavailable");
+            assert_eq!(
+                error.to_response_failed_event()["response"]["error"]["code"],
+                "provider_unavailable"
+            );
+            let records = runtime.usage_records().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, 503);
+            assert_eq!(
+                records[0].error_category.as_deref(),
+                Some("provider_unavailable")
+            );
+            assert_eq!(records[0].outcome.as_deref(), Some("provider_failure"));
+        }
+    }
+
+    #[test]
+    fn http_server_markers_do_not_override_client_or_quota_status() {
+        let body = br#"{"error":{"type":"server_error","message":"rejected"}}"#;
+        let invalid = provider_error_from_upstream(400, body, &[]);
+        assert_eq!(invalid.http_status().as_u16(), 400);
+        assert_eq!(
+            invalid.to_response_failed_event()["response"]["error"]["code"],
+            "invalid_prompt"
+        );
+        let quota = provider_error_from_upstream(429, body, &[]);
+        assert_eq!(quota.http_status().as_u16(), 429);
+        assert_eq!(quota.category(), "provider_quota");
+    }
+
+    #[tokio::test]
+    async fn official_http_stream_terminal_failure_keeps_type_and_code_for_accounting() {
+        for (error, status, category) in [
+            (
+                json!({"type":"server_error","message":"You can retry your request."}),
+                503,
+                "provider_unavailable",
+            ),
+            (
+                json!({"code":"internal_error","message":"You can retry your request."}),
+                503,
+                "provider_unavailable",
+            ),
+            (
+                json!({"type":"invalid_request_error","message":"Invalid prompt"}),
+                400,
+                "provider_protocol",
+            ),
+            (
+                json!({"type":"usage_limit_reached","message":"usage exhausted"}),
+                429,
+                "provider_quota",
+            ),
+        ] {
+            let event = json!({"type":"response.failed","response":{"error":error}});
+            let wire = format!("data: {event}\n\n");
+            let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: wire.as_bytes().to_vec(),
+            }]));
+            let runtime = official_runtime_with_transport(transport);
+            let RuntimeResponse::Sse(mut stream) = runtime
+                .execute(
+                    request(json!({"model":"vlm-test","input":"hi","stream":true})),
+                    "http-sse-failure",
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected SSE");
+            };
+            let mut downstream = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                downstream.extend_from_slice(&chunk.unwrap());
+            }
+            assert!(
+                String::from_utf8(downstream)
+                    .unwrap()
+                    .contains(&event.to_string()),
+                "upstream retry semantics must survive unchanged"
+            );
+            let records = runtime.usage_records().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, status);
+            assert_eq!(records[0].error_category.as_deref(), Some(category));
+            assert_eq!(
+                records[0].outcome.as_deref(),
+                Some(if status == 400 {
+                    "protocol_failure"
+                } else {
+                    "provider_failure"
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn provider_statuses_map_to_stable_error_categories() {
         let cases: &[(u16, Value, &str)] = &[
             (
@@ -10591,6 +11214,43 @@ mod tests {
         assert!(message.contains("bad request"), "{message}");
         assert!(message.contains("invalid"), "{message}");
         assert!(message.contains("Input must be a list"), "{message}");
+    }
+
+    #[test]
+    fn upstream_rejections_preserve_fatal_and_retryable_classes() {
+        for status in [400, 404, 405, 413, 415, 422] {
+            let error =
+                provider_error_for_status(status, "Unsupported parameter: previous_response_id");
+            assert!(
+                matches!(error, RuntimeError::ProviderRequestRejected { upstream_status, .. } if upstream_status == status)
+            );
+            assert_eq!(error.http_status().as_u16(), 400);
+            assert_eq!(error.to_error_payload()["error"]["upstream_status"], status);
+            assert_eq!(error.category(), "provider_protocol");
+        }
+        for status in [408, 409, 425, 426] {
+            let error = provider_error_for_status(status, "try later");
+            assert!(matches!(error, RuntimeError::ProviderProtocol(_)));
+            assert_eq!(error.http_status().as_u16(), 502);
+        }
+        for status in [401, 403] {
+            assert!(matches!(
+                provider_error_for_status(status, "denied"),
+                RuntimeError::ProviderUnauthorized(_)
+            ));
+        }
+        for status in [400, 429] {
+            assert!(matches!(
+                provider_error_for_status(status, "quota exhausted"),
+                RuntimeError::ProviderQuota { .. }
+            ));
+        }
+        for status in [500, 502, 503] {
+            assert_eq!(
+                provider_error_for_status(status, "failed").category(),
+                "provider_unavailable"
+            );
+        }
     }
 
     #[test]
@@ -10877,10 +11537,9 @@ mod tests {
     #[tokio::test]
     async fn official_websocket_plan_records_safe_effective_request_diagnostics() {
         let events = Arc::new(RecordingStore::new());
-        let runtime = official_runtime_with_transport(Arc::new(RecordingTransport::new(
-            Vec::new(),
-        )))
-        .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
+        let runtime =
+            official_runtime_with_transport(Arc::new(RecordingTransport::new(Vec::new())))
+                .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
         let request = request(json!({
             "type": "response.create",
             "model": "vlm-test",
@@ -11031,9 +11690,7 @@ mod tests {
                 .await
                 .unwrap()
                 .dispatch,
-            WebSocketTurnDispatch::PortableReplay {
-                force_official_handoff: true
-            }
+            WebSocketTurnDispatch::OfficialNative(plan) if plan.cross_realm_handoff
         ));
 
         let external = request(json!({
@@ -11051,6 +11708,543 @@ mod tests {
                 .dispatch,
             WebSocketTurnDispatch::OfficialNative(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn official_account_handoff_preserves_caller_developer_context() {
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let developer = json!({"type":"message","role":"developer","content":[
+            {"type":"input_text","text":"Permissions: workspace-write; approval never. Use exec for shell and apply_patch. Follow AGENTS.md and developer instructions."}]});
+        let system = json!({"type":"message","role":"system","content":"Caller system context"});
+        let first = json!({"type":"response.create","model":"vlm-test","input":[
+            system.clone(), developer.clone(),
+            {"type":"message","role":"user","content":"Fix the issue"},
+            {"type":"reasoning","id":"rs_account_a","encrypted_content":"account-a-ciphertext"},
+            {"type":"function_call","id":"fc_account_a","call_id":"call_shell","name":"exec","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_shell","output":"workspace ready"}]});
+        let response = json!({"id":"resp_context_a","output":[
+            {"type":"message","id":"msg_account_a","role":"assistant","content":[
+                {"type":"output_text","text":"I will continue using the tools."}]}]});
+        let mut plan = runtime
+            .prepare_official_websocket(&request(first.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate a completed native turn in the previous account's realm.
+        plan.continuation_realm = Some("account-a-realm".into());
+        runtime
+            .record_official_websocket_completion(
+                &plan,
+                &first,
+                "context-thread",
+                "request-a",
+                "execution-a",
+                &response,
+                1,
+                Some(1),
+                Some(1),
+                "connection",
+                None,
+            )
+            .unwrap();
+        let next = request(json!({"type":"response.create","model":"vlm-test",
+            "previous_response_id":"resp_context_a","input":[{"role":"user","content":"Continue"}]}));
+        assert!(matches!(
+            runtime
+                .prepare_websocket_turn(&next)
+                .await
+                .unwrap()
+                .dispatch,
+            WebSocketTurnDispatch::OfficialNative(plan) if plan.cross_realm_handoff
+        ));
+        runtime.execute(next, "context-account-b").await.unwrap();
+        let sent = transport.requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["input"][0], system);
+        assert_eq!(body["input"][1], developer);
+        assert!(body.get("previous_response_id").is_none());
+        let wire = body.to_string();
+        assert!(!wire.contains("account-a-ciphertext"));
+        assert!(!wire.contains("msg_account_a"));
+        assert!(wire.contains("workspace ready") && wire.contains("I will continue"));
+    }
+
+    #[test]
+    fn official_durable_context_is_not_compaction_or_trajectory_input() {
+        let history = Arc::new(MemoryHistoryStore::new());
+        let developer = json!({"type":"message","role":"developer","content":"Permissions and tool instructions"});
+        let items = vec![
+            developer.clone(),
+            json!({"role":"user","content":"task"}),
+            json!({"type":"reasoning","id":"rs_old","encrypted_content":"old-account-secret"}),
+        ];
+        record_exchange_with_official_compactions(
+            history.as_ref(),
+            &json!({"input":items}),
+            &json!({"id":"resp_durable_context","output":[]}),
+            "official-route",
+            true,
+            None,
+            Some("old-realm"),
+        )
+        .unwrap();
+        let runtime = runtime_with(sample_route(None)).with_history_store(history);
+        let original = json!({"previous_response_id":"resp_durable_context","input":[{"role":"user","content":"continue"}]});
+        let mut body = original.clone();
+        runtime
+            .hydrate_request_history(&sample_route(None), &original, &mut body, false, None)
+            .unwrap();
+        assert_eq!(
+            body["input"][0], developer,
+            "portable instructions also belong to third-party callers"
+        );
+        assert!(!body.to_string().contains("old-account-secret"));
+        let portable = sanitize_portable_history(&items);
+        assert_eq!(portable, vec![items[1].clone()]);
+        let ids = vec!["system".into(), "user".into(), "reasoning".into()];
+        let provenance =
+            crate::compaction::sanitize_portable_history_with_provenance(&items, &ids).unwrap();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].value, items[1]);
+        assert_eq!(provenance[0].original_index, 1);
+    }
+
+    #[tokio::test]
+    async fn balanced_account_migration_replays_history_without_cross_account_previous_id() {
+        let history = Arc::new(MemoryHistoryStore::new());
+        history.record_exchange_with_context(
+            &json!({"model":"vlm-test","input":[{"role":"user","content":"original task"}]}),
+            &json!({"id":"resp_old_account","output":[{"role":"assistant","content":"prior answer"}]}),
+            "route-1",None,Some("old-account-realm")).unwrap();
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime =
+            official_runtime_with_transport(transport.clone()).with_history_store(history);
+        let req = request(json!({"type":"response.create","model":"vlm-test",
+            "previous_response_id":"resp_old_account","input":[{"role":"user","content":"continue"}]}));
+        assert!(matches!(
+            runtime.prepare_websocket_turn(&req).await.unwrap().dispatch,
+            WebSocketTurnDispatch::OfficialNative(plan) if plan.cross_realm_handoff
+        ));
+        runtime.execute(req, "balanced_migration").await.unwrap();
+        let sent = transport.requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("previous_response_id").is_none());
+        let replay = body["input"].to_string();
+        assert!(
+            replay.contains("original task")
+                && replay.contains("prior answer")
+                && replay.contains("continue")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_bridge_history_keeps_exact_input_prefix() {
+        for (streaming, full_history) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            run_review_bridge_cache(streaming, full_history).await;
+        }
+    }
+
+    async fn run_review_bridge_cache(streaming: bool, full_history: bool) {
+        let response = json!({"id":"resp_review_cache_1","status":"completed","output":[
+            {"type":"message","id":"msg_review_1","role":"assistant","content":[
+                {"type":"output_text","text":"{\"outcome\":\"allow\"}"}]}]});
+        let upstream_response = |response: &Value| UpstreamResponse {
+            status: 200,
+            headers: vec![],
+            body: if streaming {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":response})
+                )
+                .into_bytes()
+            } else {
+                serde_json::to_vec(response).unwrap()
+            },
+        };
+        let transport = Arc::new(RecordingTransport::new(vec![
+            upstream_response(&response),
+            upstream_response(
+                &json!({"id":"resp_review_cache_2","status":"completed","output":[]}),
+            ),
+        ]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let mut first = json!({"model":"vlm-test","prompt_cache_key":"guardian:parent", "store":false,
+            "instructions":"You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy",
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}],
+            "input":[{"type":"message","role":"developer","content":"Stable environment instructions"},
+                {"type":"reasoning","id":"rs_cache","encrypted_content":"opaque-cache-state"},
+                {"type":"message","role":"user","content":"Long stable parent transcript"}]});
+        first["stream"] = json!(streaming);
+        first["include"] = json!(["reasoning.encrypted_content"]);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("session-id", "review-session".parse().unwrap());
+        headers.insert("session_id", "review-legacy-session".parse().unwrap());
+        let mut req = request(first.clone());
+        req.metadata = crate::server::build_request_metadata(
+            &headers,
+            &first,
+            RuntimeEndpoint::Responses,
+            Some("bridge".into()),
+        );
+        if let RuntimeResponse::Sse(mut stream) =
+            runtime.execute(req, "review_cache_1").await.unwrap()
+        {
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+        }
+        let mut second = first.clone();
+        second["previous_response_id"] = json!("resp_review_cache_1");
+        let next = json!({"type":"message","role":"user","content":"Next planned action"});
+        second["input"] = if full_history {
+            let mut items = first["input"].as_array().unwrap().clone();
+            items.extend(response["output"].as_array().unwrap().iter().cloned());
+            items.push(next);
+            json!(items)
+        } else {
+            json!([next])
+        };
+        let mut req = request(second.clone());
+        req.metadata = crate::server::build_request_metadata(
+            &headers,
+            &second,
+            RuntimeEndpoint::Responses,
+            Some("bridge".into()),
+        );
+        req.metadata.force_portable_official_handoff = true;
+        if let RuntimeResponse::Sse(mut stream) =
+            runtime.execute(req, "review_cache_2").await.unwrap()
+        {
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+        }
+        let sent = transport.requests.lock().unwrap();
+        let before: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        let after: Value = serde_json::from_slice(&sent[1].body).unwrap();
+        for field in ["instructions", "tools", "prompt_cache_key"] {
+            assert_eq!(before[field], after[field]);
+        }
+        let count = before["input"].as_array().unwrap().len();
+        let prefix = &after["input"].as_array().unwrap()[..count];
+        let a = serde_json::to_vec(&before["input"]).unwrap();
+        let b = serde_json::to_vec(prefix).unwrap();
+        let mismatch = a.iter().zip(&b).position(|(a, b)| a != b);
+        assert!(
+            a == b,
+            "replayed input prefix changed at byte {mismatch:?}; lengths {} / {}",
+            a.len(),
+            b.len()
+        );
+        assert_eq!(after["input"][count], response["output"][0]);
+        assert!(after.get("previous_response_id").is_none());
+        assert_eq!(
+            after["input"].as_array().unwrap().len(),
+            count + 2,
+            "no duplicate client history"
+        );
+        for request in sent.iter() {
+            for (name, value) in [
+                ("session-id", "review-session"),
+                ("session_id", "review-legacy-session"),
+            ] {
+                assert!(request
+                    .headers
+                    .iter()
+                    .any(|pair| pair.0 == name && pair.1 == value));
+            }
+        }
+        let persisted = runtime.history.get_chain("resp_review_cache_1").unwrap();
+        assert!(
+            !serde_json::to_string(&persisted)
+                .unwrap()
+                .contains("opaque-cache-state"),
+            "wire cache must never persist opaque state"
+        );
+    }
+
+    #[tokio::test]
+    async fn official_http_keeps_only_explicit_cache_affinity_headers() {
+        let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let body = json!({"model":"vlm-test","input":"hello","prompt_cache_key":"guardian:parent"});
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("session-id", "stable-session".parse().unwrap());
+        headers.insert("session_id", "stable-legacy-session".parse().unwrap());
+        headers.insert("x-secret-unrelated", "do-not-forward".parse().unwrap());
+        let mut req = request(body.clone());
+        req.metadata = crate::server::build_request_metadata(
+            &headers,
+            &body,
+            RuntimeEndpoint::Responses,
+            Some("ws_bridge".into()),
+        );
+        let third_party_headers = json_upstream_headers(
+            &ResolvedAuth::None,
+            &sample_route(None),
+            &body,
+            "conversation",
+            b"{}",
+            Some(&req.metadata),
+        );
+        assert!(!third_party_headers
+            .iter()
+            .any(|pair| pair.0 == "session-id" || pair.0 == "session_id"));
+        runtime.execute(req, "cache_headers").await.unwrap();
+        let sent = transport.requests.lock().unwrap();
+        for (name, value) in [
+            ("session-id", "stable-session"),
+            ("session_id", "stable-legacy-session"),
+        ] {
+            assert!(
+                sent[0]
+                    .headers
+                    .iter()
+                    .any(|pair| pair.0 == name && pair.1 == value),
+                "missing {name}"
+            );
+        }
+        assert!(!sent[0]
+            .headers
+            .iter()
+            .any(|pair| pair.0 == "x-secret-unrelated"));
+    }
+
+    #[tokio::test]
+    async fn official_content_policy_http_rejection_is_not_retried() {
+        let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+            status: 400,
+            headers: vec![],
+            body: br#"{"error":{"type":"invalid_request_error","code":"content_policy_violation","message":"This content was flagged for possible cybersecurity risk"}}"#.to_vec(),
+        }, scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let error = runtime
+            .execute(
+                request(json!({"model":"vlm-test","input":"policy rejection"})),
+                "policy_rejected",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::ProviderRequestRejected {
+                upstream_status: 400,
+                ..
+            }
+        ));
+        assert_eq!(error.http_status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "a deterministic rejection must not retry or fail over"
+        );
+    }
+
+    #[tokio::test]
+    async fn official_handoff_preserves_desktop_tool_contract() {
+        for (force, code_mode) in [(false, false), (true, false), (false, true), (true, true)] {
+            let history = Arc::new(MemoryHistoryStore::new());
+            history.record_exchange_with_context(
+                &json!({"model":"vlm-test","instructions":"obsolete instructions", "tools":[], "tool_choice":"none", "input":[{"role":"user","content":"original task"}]}),
+                &json!({"id":"resp_contract_old","output":[{"role":"assistant","content":"prior answer"}]}),
+                "route-1", None, Some("old-account-realm")).unwrap();
+            let transport = Arc::new(RecordingTransport::new(vec![scripted_ok_response()]));
+            let events = Arc::new(RecordingStore::new());
+            let runtime = official_runtime_with_transport(transport.clone())
+                .with_history_store(history)
+                .with_diagnostics_sink(Arc::clone(&events) as Arc<dyn DiagnosticsSink>);
+            let mut original = json!({
+                "model":"vlm-test", "previous_response_id":"resp_contract_old",
+                "instructions":"Keep using the declared tools to complete the task.",
+                "tools":[
+                    {"type":"function","name":"exec_command","description":"Run a shell command",
+                     "parameters":{"type":"object","properties":{"cmd":{"type":"string"},
+                         "reasoning_content":{"type":"string"}},"required":["cmd"],"additionalProperties":false}},
+                    {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
+                    {"type":"namespace","name":"mcp","description":"Connected tools", "tools":[
+                        {"type":"function","name":"read","parameters":{"type":"object","properties":{}}}]},
+                    {"type":"namespace","name":"collaboration","tools":[
+                        {"type":"function","name":"followup_task","parameters":{"type":"object","properties":{
+                            "target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"],"additionalProperties":false}}]},
+                    {"type":"web_search","search_context_size":"medium"}
+                ],
+                "tool_choice":"auto", "parallel_tool_calls":true,
+                "include":["reasoning.encrypted_content"],
+                "text":{"format":{"type":"text"}}, "reasoning":{"effort":"high","summary":"auto"},
+                "prompt_cache_key":"desktop-thread", "store":false,
+                "input":[{"type":"reasoning","id":"rs_valid","encrypted_content":"opaque-ciphertext"},
+                    {"type":"reasoning","id":"foreign_reasoning","summary":[{"type":"summary_text","text":"foreign summary"}]},
+                    {"type":"message","role":"user","content":"continue"}]
+            });
+            if code_mode {
+                original["tools"] = json!([serde_json::from_str::<Value>(include_str!(
+                    "../tests/fixtures/code-mode-exec.json"
+                ))
+                .unwrap()]);
+            }
+            let mut req = request(original.clone());
+            req.metadata.force_portable_official_handoff = force;
+            let WebSocketTurnDispatch::OfficialNative(plan) =
+                runtime.prepare_websocket_turn(&req).await.unwrap().dispatch
+            else {
+                panic!("an account handoff stays on the Official socket");
+            };
+            assert!(plan.cross_realm_handoff);
+            // Socket handoff: only conversation items change.
+            let frame = runtime
+                .hydrate_official_socket_handoff(&plan, &original)
+                .unwrap();
+            for (key, value) in original.as_object().unwrap() {
+                if !["input", "previous_response_id"].contains(&key.as_str()) {
+                    assert_eq!(
+                        &frame[key], value,
+                        "socket handoff force={force}, field={key}"
+                    );
+                }
+            }
+            assert!(frame.get("previous_response_id").is_none());
+            assert!(frame["input"].to_string().contains("original task"));
+            assert!(frame["input"].to_string().contains("prior answer"));
+            assert!(!frame["input"].to_string().contains("foreign summary"));
+            drop(plan);
+            // HTTP clients still take the portable handoff with the same contract.
+            runtime.execute(req, "handoff_contract").await.unwrap();
+            let sent = transport.requests.lock().unwrap();
+            let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+            for (key, value) in original.as_object().unwrap() {
+                if !["model", "input", "previous_response_id"].contains(&key.as_str()) {
+                    assert_eq!(&body[key], value, "handoff force={force}, field={key}");
+                }
+            }
+            assert!(body.get("previous_response_id").is_none());
+            assert!(body["input"].to_string().contains("original task"));
+            assert!(body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "rs_valid"
+                    && item["encrypted_content"] == "opaque-ciphertext"));
+            assert!(!body["input"].to_string().contains("foreign summary"));
+            let recorded = events.events.lock().unwrap();
+            let manifest = recorded
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    DiagnosticEvent::OfficialRequestPrepared(prepared) => Some(prepared),
+                    _ => None,
+                })
+                .unwrap();
+            let tools = original["tools"].to_string();
+            assert_eq!(
+                manifest.requested_tool_count,
+                Some(if code_mode { 1 } else { 5 })
+            );
+            assert_eq!(manifest.requested_tool_count, manifest.effective_tool_count);
+            assert_eq!(manifest.requested_tool_bytes, Some(tools.len() as u64));
+            assert_eq!(manifest.requested_tool_bytes, manifest.effective_tool_bytes);
+            assert_eq!(manifest.requested_tools_hash, Some(sha256_hex(&tools)));
+            assert_eq!(manifest.requested_tools_hash, manifest.effective_tools_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn official_capacity_429_does_not_retry_or_change_execution_account() {
+        let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
+            status: 429,
+            headers: vec![("retry-after".into(), "3".into())],
+            body: br#"{"error":{"message":"Codex is at capacity, please try again later","code":"turn_rate_limit_exceeded"}}"#.to_vec(),
+        }, scripted_ok_response()]));
+        let runtime = official_runtime_with_transport(transport.clone());
+        let error = runtime
+            .execute(
+                request(json!({"model":"vlm-test","input":"first"})),
+                "capacity_first",
+            )
+            .await
+            .unwrap_err();
+        // ProviderQuota includes transient upstream rate limits; it does not
+        // mark an Official account exhausted or install OpenCode cooldowns.
+        assert_eq!(
+            error.http_status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(error.retry_after_secs(), Some(3));
+        assert!(error.to_string().contains("turn_rate_limit_exceeded"));
+        runtime
+            .execute(
+                request(json!({"model":"vlm-test","input":"retry"})),
+                "capacity_retry",
+            )
+            .await
+            .unwrap();
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 2, "one upstream attempt per downstream request");
+        assert_eq!(
+            sent[0].headers, sent[1].headers,
+            "same authorization snapshot"
+        );
+    }
+
+    #[test]
+    fn official_session_identity_keeps_model_switch_affinity_and_separates_review() {
+        let mut route = sample_route(None);
+        let req = request(json!({"model":"sol","prompt_cache_key":"same-thread","input":"hi"}));
+        let before = crate::official_auth::OfficialRoutingContext::from_request(&route, &req);
+        route.upstream_model = "luna".into();
+        let after = crate::official_auth::OfficialRoutingContext::from_request(&route, &req);
+        assert_eq!(before.session_key, after.session_key);
+        let review = request(
+            json!({"model":"codex-auto-review","prompt_cache_key":"same-thread","input":"hi"}),
+        );
+        let review = crate::official_auth::OfficialRoutingContext::from_request(&route, &review);
+        assert_ne!(before.session_key, review.session_key);
+        assert!(review.session_key.unwrap().starts_with("review:"));
+    }
+
+    #[test]
+    fn official_shared_workspace_identity_keeps_refresh_but_separates_users() {
+        use base64::Engine as _;
+        let token = |user: &str, revision: u32| {
+            format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                    json!({ "sub": user, "chatgpt_account_id": "shared", "iat": revision })
+                        .to_string()
+                )
+            )
+        };
+        let authorization = |user: &str, revision: u32| OfficialAuthorization {
+            access_token: token(user, revision),
+            account_id: Some("shared".into()),
+            selection_revision: Some(3),
+            selection_verified: true,
+        };
+        assert!(official_refresh_matches_snapshot(
+            &authorization("a", 1),
+            &authorization("a", 2)
+        ));
+        assert!(!official_refresh_matches_snapshot(
+            &authorization("a", 1),
+            &authorization("b", 2)
+        ));
+        let auth = |user: &str| ResolvedAuth::OfficialManaged {
+            token: token(user, 1),
+            account_id: Some("shared".into()),
+            selection_revision: Some(3),
+            selection_verified: true,
+        };
+        let route = sample_route(None);
+        assert_ne!(
+            official_continuation_realm(&route, &auth("a")),
+            official_continuation_realm(&route, &auth("b"))
+        );
+        assert_ne!(
+            official_usage_identity(&auth("a"), &request(json!({}))).1,
+            official_usage_identity(&auth("b"), &request(json!({}))).1
+        );
     }
 
     #[test]
@@ -11277,6 +12471,159 @@ mod tests {
             .headers
             .iter()
             .any(|(_, value)| value == "Bearer refreshed-token"));
+    }
+
+    fn image_runtime(
+        routes: Vec<RuntimeModelRoute>,
+        responses: Vec<UpstreamResponse>,
+    ) -> (ProxyRuntime, Arc<RecordingTransport>) {
+        let transport = Arc::new(RecordingTransport::new(responses));
+        let runtime = ProxyRuntime::new(
+            Arc::new(FixedCatalog { routes }),
+            Arc::new(MemoryCredentialProvider::new()),
+            Arc::new(RefreshingOfficial {
+                token: std::sync::Mutex::new("image-token".into()),
+                refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(CountingRequestLifecycle::new()),
+            transport.clone(),
+        );
+        (runtime, transport)
+    }
+
+    fn official_image_route() -> RuntimeModelRoute {
+        let mut route = sample_route(None);
+        route.catalog_id = "gpt-official".into();
+        route.provider_kind = RuntimeProviderKind::Official;
+        route.auth_kind = RuntimeAuthKind::ChatGpt;
+        route.base_url = "https://chatgpt.test/backend-api/codex".into();
+        route
+    }
+
+    #[tokio::test]
+    async fn image_generation_forwards_to_the_official_route_from_a_third_party_session() {
+        // Codex 0.160's image extension posts to whichever provider the
+        // session uses. A third-party session must still reach OpenAI, and
+        // the body (an image model, not a catalog model) goes through as-is.
+        let (runtime, transport) = image_runtime(
+            vec![sample_route(None), official_image_route()],
+            vec![UpstreamResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: br#"{"data":[{"b64_json":"aW1n"}]}"#.to_vec(),
+            }],
+        );
+        let body = br#"{"model":"gpt-image-2","prompt":"a cabin"}"#.to_vec();
+        let response = runtime
+            .execute_image(
+                ImageOperation::Generate,
+                request(Value::Null),
+                RawImageBody {
+                    bytes: body.clone(),
+                    content_type: Some("application/json".into()),
+                    forwarded_headers: vec![("x-codex-imagegen-request-id".into(), "ig_1".into())],
+                },
+            )
+            .await
+            .unwrap();
+        let RuntimeResponse::Raw {
+            status, body: out, ..
+        } = response
+        else {
+            panic!("image responses must pass through raw");
+        };
+        assert_eq!(status, 200);
+        assert_eq!(out, br#"{"data":[{"b64_json":"aW1n"}]}"#);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url,
+            "https://chatgpt.test/backend-api/codex/images/generations"
+        );
+        assert_eq!(requests[0].body, body);
+        let header = |name: &str| {
+            requests[0]
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("authorization"), Some("Bearer image-token"));
+        assert_eq!(header("content-type"), Some("application/json"));
+        assert_eq!(header("x-codex-imagegen-request-id"), Some("ig_1"));
+    }
+
+    #[tokio::test]
+    async fn image_edit_keeps_the_multipart_body_and_boundary() {
+        let (runtime, transport) = image_runtime(
+            vec![official_image_route()],
+            vec![UpstreamResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: b"{}".to_vec(),
+            }],
+        );
+        let content_type = "multipart/form-data; boundary=XyZ";
+        let body =
+            b"--XyZ\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nmug\r\n--XyZ--\r\n"
+                .to_vec();
+        runtime
+            .execute_image(
+                ImageOperation::Edit,
+                request(Value::Null),
+                RawImageBody {
+                    bytes: body.clone(),
+                    content_type: Some(content_type.into()),
+                    forwarded_headers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].url,
+            "https://chatgpt.test/backend-api/codex/images/edits"
+        );
+        assert_eq!(requests[0].body, body);
+        assert!(requests[0]
+            .headers
+            .iter()
+            .any(|(key, value)| key == "content-type" && value == content_type));
+    }
+
+    #[tokio::test]
+    async fn image_request_without_an_official_route_explains_why() {
+        let (runtime, transport) = image_runtime(vec![sample_route(None)], Vec::new());
+        let error = runtime
+            .execute_image(
+                ImageOperation::Generate,
+                request(Value::Null),
+                RawImageBody::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::UnsupportedMode(ref message)
+            if message.contains("ChatGPT account")));
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn official_image_endpoint_follows_the_base_url_shape() {
+        assert_eq!(
+            official_image_endpoint(
+                "https://chatgpt.com/backend-api/codex/",
+                ImageOperation::Edit
+            ),
+            "https://chatgpt.com/backend-api/codex/images/edits"
+        );
+        assert_eq!(
+            official_image_endpoint("https://api.openai.com/v1", ImageOperation::Generate),
+            "https://api.openai.com/v1/images/generations"
+        );
+        assert_eq!(
+            official_image_endpoint("https://api.openai.com", ImageOperation::Generate),
+            "https://api.openai.com/v1/images/generations"
+        );
     }
 
     #[tokio::test]
@@ -12817,8 +14164,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, RuntimeError::Continuation(message) if message.contains("no local history")),
-            "expected fail-closed Continuation, got {error:?}"
+            matches!(&error, RuntimeError::PreviousResponseNotFound(id) if id == "resp_ghost"),
+            "expected recoverable missing response, got {error:?}"
         );
         assert_eq!(
             transport.requests.lock().unwrap().len(),
@@ -15577,6 +16924,7 @@ mod tests {
                     id.clone(),
                     TimestampedSender {
                         sender,
+                        official_attempt: None,
                         created: tokio::time::Instant::now(),
                     },
                 );

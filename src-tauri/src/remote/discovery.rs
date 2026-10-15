@@ -267,9 +267,25 @@ fn resolve_ssh(alias: &str) -> Result<SshResolved, String> {
 }
 
 fn parse_ssh_aliases(raw: &str) -> Vec<String> {
+    use crate::remote::ssh_isolation::{SSH_BEGIN_PREFIX, SSH_END_PREFIX};
     let mut aliases = BTreeSet::new();
+    // Remote Manager writes its own `vellum-remote-<host id>` alias for every
+    // host it bootstraps. Offering that back as a new host registers the same
+    // machine twice, under a name made of another host's id.
+    let mut in_managed_block = false;
     for line in raw.lines() {
         let line = line.trim();
+        if line.starts_with(SSH_BEGIN_PREFIX.trim_end()) {
+            in_managed_block = true;
+            continue;
+        }
+        if line.starts_with(SSH_END_PREFIX.trim_end()) {
+            in_managed_block = false;
+            continue;
+        }
+        if in_managed_block {
+            continue;
+        }
         let Some(rest) = line
             .strip_prefix("Host ")
             .or_else(|| line.strip_prefix("host "))
@@ -380,6 +396,23 @@ mod tests {
         assert!(found
             .iter()
             .any(|item| item.ssh_alias == "beta" && item.source == "openSsh"));
+    }
+
+    #[test]
+    fn skips_remote_manager_managed_aliases() {
+        let raw = format!(
+            "Host jetson
+  User me
+{begin}remote-1
+Host vellum-remote-remote-1
+  HostName 10.0.0.2
+{end}remote-1
+Host after
+",
+            begin = crate::remote::ssh_isolation::SSH_BEGIN_PREFIX,
+            end = crate::remote::ssh_isolation::SSH_END_PREFIX,
+        );
+        assert_eq!(parse_ssh_aliases(&raw), vec!["after".to_string(), "jetson".to_string()]);
     }
 
     #[test]

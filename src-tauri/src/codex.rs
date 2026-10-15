@@ -389,7 +389,7 @@ fn push_unique_codex_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf
 /// hash changes across Desktop updates, so discovery must enumerate the
 /// versioned children instead of persisting one resolved path.
 #[cfg(windows)]
-fn desktop_runtime_codex_candidates(local_app_data: &Path) -> Vec<PathBuf> {
+pub(crate) fn desktop_runtime_codex_candidates(local_app_data: &Path) -> Vec<PathBuf> {
     let runtime_root = local_app_data.join("OpenAI/Codex/bin");
     let mut discovered = std::fs::read_dir(&runtime_root)
         .into_iter()
@@ -437,17 +437,21 @@ fn local_codex_candidates_from(
     }
     #[cfg(not(windows))]
     let _ = local_app_data;
-    // A macOS GUI app inherits launchd's PATH, which has neither Homebrew nor
-    // Codex on it, so a bare `codex` fails with "No such file or directory"
-    // even with Codex Desktop installed. Only existing files are probed;
-    // `codex_not_found_detail` names the rest when none of them is there.
+    // On macOS only the CLI inside Codex Desktop counts. A package-manager
+    // `codex` (Homebrew, npm) is a `#!/usr/bin/env node` script: started from
+    // a GUI app it exits with "env: node" before it speaks any protocol, and
+    // the failure then reads as a protocol mismatch. A bare `codex` on PATH is
+    // the same script when Vellum was started from a shell. Missing every
+    // Desktop location is reported as Desktop's CLI not being found.
     #[cfg(target_os = "macos")]
-    for executable in crate::install_paths::macos_codex_cli_candidates(dirs::home_dir().as_deref())
+    for executable in
+        crate::install_paths::macos_codex_desktop_cli_candidates(dirs::home_dir().as_deref())
     {
         if executable.is_file() {
             push_unique_codex_candidate(&mut candidates, executable);
         }
     }
+    #[cfg(not(target_os = "macos"))]
     push_unique_codex_candidate(&mut candidates, PathBuf::from("codex"));
     candidates
 }
@@ -457,7 +461,7 @@ fn local_codex_candidates_from(
 fn codex_search_locations() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        crate::install_paths::macos_codex_cli_candidates(dirs::home_dir().as_deref())
+        crate::install_paths::macos_codex_desktop_cli_candidates(dirs::home_dir().as_deref())
     }
     #[cfg(windows)]
     {
@@ -483,6 +487,12 @@ fn codex_not_found_detail() -> String {
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
+    if cfg!(target_os = "macos") {
+        return format!(
+            "找不到 ChatGPT（Codex Desktop）內建的 Codex CLI；請安裝或更新 ChatGPT，或以 VELLUM_CODEX_BIN 指定路徑。Homebrew／npm 的 codex 不會被採用。已找過：{}",
+            searched.join("、")
+        );
+    }
     searched.push("PATH 上的 codex".into());
     format!(
         "找不到 Codex CLI；請確認已安裝 Codex Desktop，或以 VELLUM_CODEX_BIN 指定路徑。已找過：{}",
@@ -1666,6 +1676,7 @@ pub fn apply_proxy_config(
         .transpose()?
     {
         relinquish_legacy_openai_base_url(&mut document, &original_doc, &previous_applied);
+        relinquish_legacy_image_generation(&mut document, &original_doc, &previous_applied);
     }
     document["model_provider"] = value(VELLUM_PROVIDER_NAME);
     document["model_catalog_json"] = value(path_string(&paths.catalog)?);
@@ -1690,7 +1701,10 @@ pub fn apply_proxy_config(
     // its own threshold and compact the thread locally, which is what the
     // Enhanced runtime is there to do.
     set_feature(&mut document, "enable_request_compression", false);
-    set_feature(&mut document, "image_generation", false);
+    // `image_generation` is left to the user. Codex 0.160's image extension
+    // posts `images/generations` and `images/edits` to the provider base URL,
+    // and the proxy forwards both to the Official route, so there is no
+    // longer a reason to switch it off.
     clear_conflicting_global_compaction_keys(&mut document);
     remove_reserved_provider_tables(&mut document);
     write_vellum_provider(&mut document, proxy_base_url, boundary_key)?;
@@ -1762,6 +1776,28 @@ fn relinquish_legacy_openai_base_url(
         None => {
             current.as_table_mut().remove(KEY);
         }
+    }
+}
+
+/// Earlier versions pinned `features.image_generation = false`, which hides
+/// Codex's image tool. Hand the flag back: where the live value is still the
+/// one Vellum wrote, restore the user's pre-Vellum value (or remove it). A
+/// value the user changed while Vellum ran is theirs and stays.
+fn relinquish_legacy_image_generation(
+    current: &mut DocumentMut,
+    original: &DocumentMut,
+    previous_applied: &DocumentMut,
+) {
+    const KEY: &str = "image_generation";
+    if !items_equal(
+        feature_item(current, KEY),
+        feature_item(previous_applied, KEY),
+    ) {
+        return;
+    }
+    match feature_item(original, KEY) {
+        Some(item) => set_feature_item(current, KEY, item.clone()),
+        None => remove_feature(current, KEY),
     }
 }
 
@@ -2077,14 +2113,19 @@ fn write_text_atomic(path: &Path, content: &str) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("設定路徑沒有父目錄".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("無法建立設定目錄：{error}")))?;
-    let tmp = path.with_extension("toml.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(path);
     std::fs::write(&tmp, content)
         .map_err(|error| AppError::Message(format!("無法寫入暫存設定：{error}")))?;
     // The config now carries the proxy boundary key, so it is a secret file.
     // Tightened on the temp file, before the rename publishes it.
-    restrict_to_current_user(&tmp)?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| AppError::Message(format!("無法原子替換設定：{error}")))
+    if let Err(error) = restrict_to_current_user(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::Message(format!("無法原子替換設定：{error}"))
+    })
 }
 
 /// Restrict a file to the current user.
@@ -2102,36 +2143,98 @@ fn restrict_to_current_user(path: &Path) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        // `icacls /inheritance:r` drops inherited entries, then the owner is
-        // granted full control explicitly. Failure is reported rather than
-        // ignored: silently leaving a broad ACL on a file holding the boundary
-        // key would defeat the point of writing it there.
-        let output = crate::process::background_command("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("{}:F", current_windows_user()?))
-            .output()
+        // Failure is reported rather than ignored: silently leaving a broad
+        // ACL on a file holding the boundary key would defeat the point of
+        // writing it there.
+        owner_only_acl(path)
             .map_err(|error| AppError::Message(format!("無法設定設定檔 ACL：{error}")))?;
-        if !output.status.success() {
-            return Err(AppError::Message(format!(
-                "無法設定設定檔 ACL：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
     }
     let _ = path;
     Ok(())
 }
 
+/// What `icacls <path> /inheritance:r /grant:r <user>:F` did, without the
+/// child process: a protected DACL holding one full-control entry for the
+/// process user. While Windows ends the session new console processes fail
+/// to start, and icacls failing there left config.toml pointing at a Proxy
+/// that the shutdown was about to take away.
 #[cfg(windows)]
-fn current_windows_user() -> AppResult<String> {
-    let domain = std::env::var("USERDOMAIN").ok();
-    let user = std::env::var("USERNAME")
-        .map_err(|_| AppError::Message("無法取得目前 Windows 使用者".into()))?;
-    Ok(match domain {
-        Some(domain) if !domain.trim().is_empty() => format!("{domain}\\{user}"),
-        _ => user,
-    })
+fn owner_only_acl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
+        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut needed = 0u32;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    // u64 keeps the SID pointer inside TOKEN_USER aligned.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    let read_error = std::io::Error::last_os_error();
+    unsafe { CloseHandle(token) };
+    if read == 0 {
+        return Err(read_error);
+    }
+    let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: user.User.Sid.cast(),
+        },
+    };
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    unsafe { LocalFree(acl.cast()) };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
@@ -2142,11 +2245,13 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("lease 路徑沒有父目錄".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| AppError::Message(format!("無法建立 lease 目錄：{error}")))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::enhanced_runtime::atomic::unique_temporary(path);
     std::fs::write(&tmp, bytes)
         .map_err(|error| AppError::Message(format!("無法寫入 lease：{error}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|error| AppError::Message(format!("無法替換 lease：{error}")))
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::Message(format!("無法替換 lease：{error}"))
+    })
 }
 
 #[cfg(test)]
@@ -2157,6 +2262,67 @@ mod tests {
         "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_acl_leaves_one_protected_entry() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl, ACL,
+            ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SE_DACL_PROTECTED,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("config.toml");
+        std::fs::write(&file, "model = \"x\"\n").unwrap();
+        owner_only_acl(&file).unwrap();
+
+        let wide: Vec<u16> = file
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut size = ACL_SIZE_INFORMATION::default();
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        unsafe {
+            assert_ne!(
+                GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ),
+                0
+            );
+            assert_ne!(
+                GetSecurityDescriptorControl(descriptor, &mut control, &mut revision),
+                0
+            );
+            LocalFree(descriptor);
+        }
+        assert_eq!(size.AceCount, 1, "only the owner's entry survives");
+        assert_ne!(control & SE_DACL_PROTECTED, 0, "inheritance is cut off");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "model = \"x\"\n");
+    }
 
     #[test]
     fn parses_codex_cli_versions_for_native_subagent_gate() {
@@ -2206,7 +2372,9 @@ mod tests {
     fn a_missing_codex_says_where_it_looked_and_how_to_fix_it() {
         let detail = codex_not_found_detail();
         assert!(detail.contains("VELLUM_CODEX_BIN"));
-        assert!(detail.contains("PATH"));
+        if !cfg!(target_os = "macos") {
+            assert!(detail.contains("PATH"));
+        }
         for location in codex_search_locations() {
             assert!(detail.contains(&location.display().to_string()));
         }
@@ -2516,10 +2684,110 @@ mod tests {
             Some(false),
             "Vellum's inbound contract only accepts identity encoding"
         );
+        assert!(
+            feature_item(&applied, "image_generation").is_none(),
+            "the proxy serves Codex's image extension, so the flag stays the user's"
+        );
+    }
+
+    /// A lease written by a version that pinned `image_generation = false`
+    /// must not keep image generation off: the next apply hands the flag back
+    /// to the user's own value.
+    #[test]
+    fn applying_proxy_relinquishes_a_legacy_image_generation_pin() {
+        for (original, expected) in [
+            ("model_provider = \"openai\"\n", None),
+            (
+                "model_provider = \"openai\"\n[features]\nimage_generation = true\n",
+                Some(true),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+            let previous_applied =
+                "model_provider = \"vellum\"\n[features]\nimage_generation = false\n";
+            std::fs::write(&paths.config, previous_applied).unwrap();
+            write_json_atomic(
+                &paths.lease,
+                &ConfigLeaseV2 {
+                    schema_version: LEASE_SCHEMA_VERSION,
+                    owner: build_lease_owner(15721),
+                    original_hash: hash_config(original),
+                    applied_hash: hash_config(previous_applied),
+                    original_config: original.into(),
+                    applied_config: previous_applied.into(),
+                    boundary_credential_id: vellum_proxy_runtime::BOUNDARY_CREDENTIAL_ID.into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .unwrap();
+
+            apply_proxy_config(
+                &paths,
+                "http://127.0.0.1:15721/v1",
+                &SubagentSettings::default(),
+                TEST_BOUNDARY_KEY,
+                15721,
+            )
+            .unwrap();
+
+            let applied = std::fs::read_to_string(&paths.config)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                feature_item(&applied, "image_generation").and_then(Item::as_bool),
+                expected,
+                "original: {original}"
+            );
+        }
+    }
+
+    /// A user who turned image generation off while Vellum ran keeps it off.
+    #[test]
+    fn applying_proxy_keeps_an_image_generation_value_the_user_set_during_the_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        let original = "model_provider = \"openai\"\n";
+        let previous_applied = "model_provider = \"vellum\"\n";
+        std::fs::write(
+            &paths.config,
+            "model_provider = \"vellum\"\n[features]\nimage_generation = false\n",
+        )
+        .unwrap();
+        write_json_atomic(
+            &paths.lease,
+            &ConfigLeaseV2 {
+                schema_version: LEASE_SCHEMA_VERSION,
+                owner: build_lease_owner(15721),
+                original_hash: hash_config(original),
+                applied_hash: hash_config(previous_applied),
+                original_config: original.into(),
+                applied_config: previous_applied.into(),
+                boundary_credential_id: vellum_proxy_runtime::BOUNDARY_CREDENTIAL_ID.into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        apply_proxy_config(
+            &paths,
+            "http://127.0.0.1:15721/v1",
+            &SubagentSettings::default(),
+            TEST_BOUNDARY_KEY,
+            15721,
+        )
+        .unwrap();
+
+        let applied = std::fs::read_to_string(&paths.config)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
         assert_eq!(
-            applied["features"]["image_generation"].as_bool(),
-            Some(false),
-            "this third-party path does not expose the backend image extension"
+            feature_item(&applied, "image_generation").and_then(Item::as_bool),
+            Some(false)
         );
     }
 

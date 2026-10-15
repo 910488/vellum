@@ -11,16 +11,16 @@ use serde_json::{json, Value};
 use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::body::{
-    error_envelope, models_list_payload, parse_json_request, request_body_error_response,
-    ModelListEntry, RequestBodyError, MAX_REQUEST_BODY_BYTES,
+    decode_request_body_with_limit, error_envelope, models_list_payload, parse_json_request,
+    request_body_error_response, ModelListEntry, RequestBodyError, MAX_REQUEST_BODY_BYTES,
 };
 use crate::error::RuntimeError;
-use crate::exec::{stream_open_frame, ProxyRuntime, RuntimeResponse};
+use crate::exec::{stream_open_frame, ImageOperation, ProxyRuntime, RawImageBody, RuntimeResponse};
 use crate::inbound::{InboundAccessPolicy, BOUNDARY_KEY_HEADER};
 use crate::request::{IncomingAuthContext, RequestMetadata, RuntimeEndpoint, RuntimeRequest};
 use crate::resource::{collect_request_body, CollectBodyError, ResourcePolicy};
 use crate::state::ProxyRuntimeState;
-use crate::streaming::{failed_sse_event, failed_sse_event_with_category};
+use crate::streaming::{failed_sse_event, failed_sse_event_for_runtime_error};
 use crate::websocket::responses_websocket;
 use crate::PROXY_RUNTIME_VERSION;
 
@@ -109,6 +109,10 @@ where
         .route("/v1/responses/compact", post(compact::<S>))
         .route("/responses/compact", post(compact::<S>))
         .route("/v1/alpha/search", post(search::<S>))
+        .route("/v1/images/generations", post(image_generate::<S>))
+        .route("/images/generations", post(image_generate::<S>))
+        .route("/v1/images/edits", post(image_edit::<S>))
+        .route("/images/edits", post(image_edit::<S>))
         .with_state(state)
         // Applied after `with_state` so it covers every route uniformly:
         // HTTP, SSE, the WebSocket upgrade, health, diagnostics, models,
@@ -402,6 +406,16 @@ pub(crate) fn build_request_metadata(
         .map(|id| crate::codex_metadata::resolve_codex_capabilities(None, Some(id), None));
 
     RequestMetadata {
+        official_cache_affinity: crate::request::OfficialCacheAffinity {
+            session_id: headers
+                .get("session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            session_id_legacy: headers
+                .get("session_id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        },
         request_id,
         received_at_ms: now_ms(),
         review_run_id: None,
@@ -409,6 +423,7 @@ pub(crate) fn build_request_metadata(
         guardian_dispatch: false,
         primary_failure_reason: None,
         connection_id,
+        official_socket_affinity: None,
         codex_identity,
         codex_capabilities,
         force_portable_official_handoff: false,
@@ -557,11 +572,8 @@ async fn responses<S: ProxyRuntimeState>(
                     send(Ok(Bytes::from(failed_sse_event(&message)))).await;
                 }
                 Err(error) => {
-                    send(Ok(Bytes::from(failed_sse_event_with_category(
-                        error.category(),
-                        &error.to_string(),
-                    ))))
-                    .await;
+                    send(Ok(Bytes::from(failed_sse_event_for_runtime_error(&error))))
+                        .await;
                 }
             }
         });
@@ -793,6 +805,96 @@ async fn search<S: ProxyRuntimeState>(State(state): State<Arc<S>>, request: Requ
             )
                 .into_response()
         }
+        Err(error) => error.into_error_response(),
+    }
+}
+
+async fn image_generate<S: ProxyRuntimeState>(
+    State(state): State<Arc<S>>,
+    request: Request,
+) -> Response {
+    image(state, ImageOperation::Generate, request).await
+}
+
+async fn image_edit<S: ProxyRuntimeState>(
+    State(state): State<Arc<S>>,
+    request: Request,
+) -> Response {
+    image(state, ImageOperation::Edit, request).await
+}
+
+/// Codex's image-generation extension (0.160+) calls the image API on the
+/// provider's base URL. The body stays opaque bytes — an edit may be
+/// multipart — and only the headers needed to forward it are carried along.
+async fn image<S: ProxyRuntimeState>(
+    state: Arc<S>,
+    operation: ImageOperation,
+    request: Request,
+) -> Response {
+    let endpoint = match operation {
+        ImageOperation::Generate => "/v1/images/generations",
+        ImageOperation::Edit => "/v1/images/edits",
+    };
+    let resources = state.proxy_runtime().resource_policy();
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+    let wire = match collect_request_body(body, MAX_REQUEST_BODY_BYTES, &resources).await {
+        Ok((bytes, _budget)) => bytes,
+        Err(CollectBodyError::Resource(error)) => return error.into_error_response(),
+        Err(CollectBodyError::WireTooLarge | CollectBodyError::Read(_)) => {
+            return request_body_error_response(endpoint, RequestBodyError::WireTooLarge)
+        }
+    };
+    // Same rule as every other route: a compressed body is refused, never
+    // decoded and never forwarded.
+    let bytes = match decode_request_body_with_limit(&headers, &wire, MAX_REQUEST_BODY_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => return request_body_error_response(endpoint, error),
+    };
+    let header_value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let forwarded_headers = headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with("x-codex-image"))
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+        })
+        .collect();
+    // Only a JSON body can carry routing hints (`prompt_cache_key`); a
+    // multipart edit is routed on headers alone.
+    let routing_body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let metadata = build_request_metadata(&headers, &routing_body, RuntimeEndpoint::Images, None);
+    let runtime_request = RuntimeRequest {
+        body: routing_body,
+        endpoint: RuntimeEndpoint::Images,
+        incoming_auth: IncomingAuthContext {
+            authorization: header_value("authorization"),
+            openai_account: header_value("openai-account"),
+        },
+        execution_environment: state.execution_environment(),
+        metadata,
+    };
+    let body = RawImageBody {
+        bytes,
+        content_type: header_value("content-type"),
+        forwarded_headers,
+    };
+    match state
+        .proxy_runtime()
+        .execute_image(operation, runtime_request, body)
+        .await
+    {
+        Ok(RuntimeResponse::Raw {
+            status,
+            content_type,
+            body,
+        }) => raw_response(status, content_type, body),
+        Ok(RuntimeResponse::Json(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(RuntimeResponse::Sse(_)) => unreachable!("image requests never return SSE"),
         Err(error) => error.into_error_response(),
     }
 }
@@ -2058,6 +2160,41 @@ mod tests {
             0,
             "a compressed body must never be decompressed or forwarded"
         );
+    }
+
+    #[tokio::test]
+    async fn image_routes_exist_and_explain_a_missing_chatgpt_account() {
+        // Codex 0.160 posts image requests to the provider base URL. These
+        // used to fall through to axum's empty 404, which Codex showed as
+        // `http 404 Not Found: Some("")`.
+        let app = build_headless_router(sample_state(), unguarded());
+        for uri in [
+            "/v1/images/generations",
+            "/images/generations",
+            "/v1/images/edits",
+            "/images/edits",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"model":"gpt-image-2","prompt":"x"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("ChatGPT account"),
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]

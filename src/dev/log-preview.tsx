@@ -13,10 +13,12 @@
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { Log } from "@/screens/Log";
 import type { RequestLog, UsageActivity } from "@/types";
+import { paginatePreviewLog } from "@/dev/paginatePreviewLog";
 
 import "@/styles/tokens.css";
 import "@/styles/base.css";
@@ -48,7 +50,9 @@ function requestLog(scene: Scene): RequestLog {
       outputTokens: 180 + ((index * 131) % 3_400),
       cachedInputTokens: index % 3 === 0 ? 3_100 + ((index * 53) % 40_000) : 0,
       status: bad ? (index % 34 === 3 ? 429 : 502) : 200,
-      error: bad ? "upstream returned 502 after 2 retries (connection reset by peer)" : null,
+      error: bad ? (index % 34 === 3 ? "upstream HTTP 429: rate limit exceeded; retry_after=60" : "upstream returned 502 after 2 retries (connection reset by peer)") : null,
+      errorCategory: bad ? (index % 34 === 3 ? "provider_quota" : "provider_unavailable") : null,
+      retryAfter: bad && index % 34 === 3 ? 60 : null,
       durationMs: 900 + ((index * 613) % 46_000),
       firstByteMs: 210 + ((index * 37) % 1_800),
       createdAt: now - index * 137,
@@ -131,11 +135,11 @@ function usageActivity(scene: Scene): UsageActivity {
 }
 
 function installFixture(sceneOf: () => Scene) {
-  const invoke = async (cmd: string): Promise<unknown> => {
+  const invoke = async (cmd: string, args?: Parameters<typeof paginatePreviewLog>[1]): Promise<unknown> => {
     const scene = sceneOf();
     switch (cmd) {
       case "get_request_log":
-        return requestLog(scene);
+        return paginatePreviewLog(requestLog(scene), args);
       case "get_usage_activity":
         return usageActivity(scene);
       case "get_boot_telemetry":
@@ -150,6 +154,7 @@ function installFixture(sceneOf: () => Scene) {
 const THEMES = ["dark", "light"] as const;
 
 function Harness() {
+  usePreviewCaptureReady();
   const [scene, setScene] = useState<Scene>("busy");
   const [pref, setPref] = useState<LocalePreference>(getLocalePreference());
   const [theme, setTheme] = useState<(typeof THEMES)[number]>("light");

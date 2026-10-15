@@ -5836,6 +5836,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vellum-quota-pool-replay"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "vellum-proxy-runtime",
+]
+
+[[package]]
 name = "vellum-remote-agent"
 version = "0.3.0"
 dependencies = [

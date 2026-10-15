@@ -1,5 +1,7 @@
 import { useLocaleFormat } from "@/i18n/useLocaleFormat";
 import { useTranslation } from "react-i18next";
+import { operationalErrorKey } from "@/lib/operationalError";
+import { Notice } from "@/components/ui";
 /**
  * 模型 —— 換 Codex 用的模型，以及加供應商。
  *
@@ -41,6 +43,7 @@ import {
   normalizeQuotaPool,
   quotaPoolAccounts,
   quotaPoolRotation,
+  quotaPoolLastSelection,
 } from "@/lib/quotaPool";
 import { providerState } from "@/lib/vocabulary";
 import { Btn, Cap, Card, Confirm, Empty, KV, Meter, Pill, Row, Rows, State, Toggle, Tray } from "@/components/ui";
@@ -212,6 +215,7 @@ function AccountQuota({
   );
   return (
     <span className="acct__quota">
+      {/* 順序由 accountQuotaWindows 決定：短的在上，5 小時窗在每週窗上面。 */}
       {windows.map((window) => {
         // 閘門只設在每週窗。5 小時窗與每週窗的換算會改，拿它當設定值等於把
         // 一個會變的比例寫進使用者的設定裡；每週窗才是硬標準。
@@ -630,6 +634,27 @@ export function Models({
     () => quotaPoolRotation(pooledAccounts),
     [normalizedQuotaPool, pooledAccounts],
   );
+  const lastPoolSelection = quotaPoolLastSelection(
+    { ...normalizedQuotaPool, activeAccountId: quotaPool?.activeAccountId }, pooledAccounts,
+  );
+
+  useEffect(() => {
+    if (!normalizedQuotaPool.enabled || quotaPoolBusy) return;
+    let alive = true;
+    let pending = false;
+    const update = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const status = await api.getCodexQuotaPool();
+        if (alive) setQuotaPool((current) => current
+          ? { ...current, activeAccountId: status.activeAccountId } : status);
+      } catch { /* Keep the last observation when the local status read fails. */ }
+      finally { pending = false; }
+    };
+    const timer = window.setInterval(() => void update(), 5000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [normalizedQuotaPool.enabled, quotaPoolBusy]);
 
   async function saveQuotaPool(settings: QuotaPoolSettings) {
     const previous = quotaPool;
@@ -1459,7 +1484,7 @@ export function Models({
         </div>
       </div>
 
-      {error ? <p className="note">{error}</p> : null}
+      {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : null}
 
       <Card>
         <Cap>{t("models.ui.chatgpt.title")}</Cap>
@@ -1486,9 +1511,22 @@ export function Models({
 
         {normalizedQuotaPool.enabled ? (
           <div className="quota-pool__head">
+            <label>
+              {t("models.ui.pool.strategyLabel")}{" "}
+              <select
+                value={normalizedQuotaPool.strategy}
+                disabled={quotaPoolBusy}
+                onChange={(event) => void saveQuotaPool({ ...normalizedQuotaPool,
+                  strategy: event.target.value === "balanced" ? "balanced" : "rank" })}
+              >
+                <option value="rank">{t("models.ui.pool.strategyRank")}</option>
+                <option value="balanced">{t("models.ui.pool.strategyBalanced")}</option>
+              </select>
+            </label>
+            <p className="prose">{t(normalizedQuotaPool.strategy === "balanced"
+              ? "models.ui.pool.balancedHint" : "models.ui.pool.rankHint")}</p>
             {pooledAccounts.some((entry) => entry.member.inPool) ? (
               <>
-                <small>{t("models.ui.pool.rankHint")}</small>
                 {(() => {
                   const members = pooledAccounts.filter((entry) => entry.member.inPool);
                   const total = members.reduce(
@@ -1526,12 +1564,9 @@ export function Models({
                         <span className="quota-pool__confluence-rest" style={{ flexGrow: Math.max(0, members.length * 100 - total) }} />
                       </div>
                       <p className="prose">
-                        {poolRotation.length
-                          ? t("models.ui.pool.currentAndNext", {
-                              current: codexAccountLabel(poolRotation[0]!.account),
-                              next: poolRotation[1] ? codexAccountLabel(poolRotation[1].account) : t("common.emDash"),
-                            })
-                          : t("models.ui.pool.stalled")}
+                        {t("models.ui.pool.lastSelected", { account: lastPoolSelection
+                          ? codexAccountLabel(lastPoolSelection.account) : t("common.emDash") })}
+                        {!poolRotation.length ? ` ${t("models.ui.pool.stalled")}` : ""}
                       </p>
                     </div>
                   );
@@ -1584,7 +1619,7 @@ export function Models({
 
         {oauth?.accounts.length ? (
           normalizedQuotaPool.enabled ? (
-            <Rows>
+            <Rows className="official-account-list">
               {pooledAccounts.map((entry) => {
                 const account = entry.account;
                 const accountLabel = codexAccountLabel(account);
@@ -1600,14 +1635,12 @@ export function Models({
                 );
                 const resetsOpen = openResets === account.accountId;
                 const soonest = credits ? soonestResetExpiry(credits.credits) : null;
-                const rank =
-                  poolRotation.findIndex(
-                    (candidate) => candidate.account.accountId === account.accountId,
-                  ) + 1;
                 const memberOrder = pooledAccounts.filter((candidate) => candidate.member.inPool);
                 const memberRank = memberOrder.findIndex(
                   (candidate) => candidate.account.accountId === account.accountId,
                 );
+                const rank = memberRank + 1;
+                const lastSelected = lastPoolSelection?.account.accountId === account.accountId;
                 // 拖曳中的閘門值只存在畫面上，放開才寫回設定。一次只拖得動
                 // 一道閘門，所以這裡只要記住是哪一個帳號、拉到多少。
                 const floor =
@@ -1619,9 +1652,10 @@ export function Models({
                 const reason = entry.member.inPool
                   ? entry.reason
                     ? t(`models.ui.pool.reason.${entry.reason}`)
-                    : rank === 1
-                      ? t("models.ui.pool.using")
-                      : rank === 2
+                    : lastSelected
+                      ? t("models.ui.pool.selectedLast")
+                      : normalizedQuotaPool.enabled && normalizedQuotaPool.strategy === "rank"
+                        && poolRotation[0]?.account.accountId === account.accountId
                         ? t("models.ui.pool.next")
                         : t("models.ui.pool.standby")
                   : t("models.ui.pool.outside");
@@ -1631,7 +1665,7 @@ export function Models({
                   <Row
                     key={account.accountId}
                     label={
-                      <span className={`acct__rank${rank === 1 ? " acct__rank--active" : ""}`}>
+                      <span className={`acct__rank${lastSelected ? " acct__rank--active" : ""}`}>
                         <b>{rank || t("common.emDash")}</b>
                         <span>{accountLabel}</span>
                         {reorderable ? (
@@ -1719,7 +1753,7 @@ export function Models({
                             soft
                             mini
                             disabled={quotaPoolBusy || oauthBusy}
-                            title={t("models.ui.fiveHour.autoHint")}
+                            title={t("quotaActions.fiveHourHint")}
                             onClick={() =>
                               updatePoolMember(account.accountId, (member) => ({
                                 ...member,
@@ -1729,8 +1763,8 @@ export function Models({
                           >
                             {t(
                               entry.member.maintainFiveHourWindow
-                                ? "models.ui.fiveHour.autoOn"
-                                : "models.ui.fiveHour.autoOff",
+                                ? "tabPolish.fiveHourOn"
+                                : "tabPolish.fiveHourOff",
                             )}
                           </Btn>
                           ) : null}
@@ -1751,6 +1785,7 @@ export function Models({
                               }`}
                               aria-expanded={resetsOpen}
                               aria-controls={`resets-tray-${account.accountId}`}
+                              title={t("quotaActions.resetHint")}
                               aria-label={t(
                                 resetsOpen ? "models.ui.reset.hide" : "models.ui.reset.show",
                               )}
@@ -1760,13 +1795,15 @@ export function Models({
                                 )
                               }
                             >
-                              {`Reset ${available}`}
+                              {t("quotaActions.resetCount", { count: available })}
                               <i className="pill__caret" data-open={resetsOpen} aria-hidden="true" />
                             </button>
                           )}
                         </span>
                         {entry.member.inPool ? (
-                          <>
+                          <details className="acct-menu">
+                            <summary aria-label={t("tabPolish.moreActions")}>⋯</summary>
+                            <div className="acct-menu__items">
                             <Btn
                               soft
                               mini
@@ -1794,7 +1831,8 @@ export function Models({
                             >
                               {t("models.ui.pool.remove")}
                             </Btn>
-                          </>
+                            </div>
+                          </details>
                         ) : (
                           <Btn
                             soft
@@ -1874,7 +1912,7 @@ export function Models({
                           soft
                           mini
                           disabled={quotaPoolBusy || oauthBusy}
-                          title={t("models.ui.fiveHour.autoHint")}
+                          title={t("quotaActions.fiveHourHint")}
                           onClick={() =>
                             updatePoolMember(account.accountId, (member) => ({
                               ...member,
@@ -1884,8 +1922,8 @@ export function Models({
                         >
                           {t(
                             cadenceMember?.maintainFiveHourWindow
-                              ? "models.ui.fiveHour.autoOn"
-                              : "models.ui.fiveHour.autoOff",
+                              ? "tabPolish.fiveHourOn"
+                              : "tabPolish.fiveHourOff",
                           )}
                         </Btn>
                         ) : null}
@@ -1908,6 +1946,7 @@ export function Models({
                             }`}
                             aria-expanded={resetsOpen}
                             aria-controls={`resets-tray-${account.accountId}`}
+                              title={t("quotaActions.resetHint")}
                             aria-label={t(
                               resetsOpen ? "models.ui.reset.hide" : "models.ui.reset.show",
                             )}
@@ -1917,7 +1956,7 @@ export function Models({
                               )
                             }
                           >
-                            {`Reset ${available}`}
+                            {t("quotaActions.resetCount", { count: available })}
                             <i className="pill__caret" data-open={resetsOpen} aria-hidden="true" />
                           </button>
                         )}
@@ -1996,7 +2035,7 @@ export function Models({
         <Confirm
           open={poolRulesOpen}
           title={t("models.ui.pool.rulesTitle")}
-          facts={(["gate", "fiveHour", "order", "pause", "reset", "empty"] as const).map((key) => ({
+          facts={(["gate", "fiveHour", "order", "smart", "pause", "reset", "empty"] as const).map((key) => ({
             key: t(`models.ui.pool.rule.${key}.title`),
             value: t(`models.ui.pool.rule.${key}.body`),
           }))}
@@ -2009,9 +2048,7 @@ export function Models({
       {grokRoute ? (
         <Card>
           <Cap>{t("models.ui.grok.title")}</Cap>
-          <p className="prose" style={{ marginTop: 12 }}>
-            {t("models.ui.grok.description")}
-          </p>
+          {grokAccounts?.accounts.length ? <p className="prose" style={{ marginTop: 12 }}>{t("models.ui.grok.description")}</p> : null}
 
           {grokLogin?.state === "waiting" ? (
             <div className="detect" style={{ marginTop: 16 }}>
@@ -2084,10 +2121,10 @@ export function Models({
               })}
             </Rows>
           ) : (
-            <Empty>{t("models.ui.grok.empty")}</Empty>
+            <div className="empty-inline"><span>{t("models.ui.grok.empty")}</span><Btn soft mini disabled={grokBusy !== null} onClick={() => void startGrokLogin()}>{t("models.ui.grok.add")}</Btn></div>
           )}
 
-          <div className="rowline" style={{ marginTop: 16 }}>
+          {grokAccounts?.accounts.length ? <div className="rowline" style={{ marginTop: 16 }}>
             <Btn disabled={grokBusy !== null} onClick={() => void startGrokLogin()}>
               {grokBusy === "login" ? t("models.ui.oauth.waiting") : t("models.ui.grok.add")}
             </Btn>
@@ -2098,7 +2135,7 @@ export function Models({
             >
               {grokBusy === "models" ? t("common.processing") : t("models.ui.grok.refreshModels")}
             </Btn>
-          </div>
+          </div> : null}
         </Card>
       ) : null}
 
@@ -2516,6 +2553,9 @@ export function Models({
         <div>
           <Cap>{t("models.ui.modelCatalog.title")}</Cap>
         </div>
+        {routes.some((route) => providerState({ enabled: route.enabled, proxyRunning: catalogStatus.proxyRunning,
+          applied: modelRoutes.some((model) => model.routeId === route.id && catalogStatus.injectedModelIds.includes(model.catalogId)) }).state === "pending")
+          ? <Notice tone="warn">{t("models.ui.modelCatalog.footerNote")}</Notice> : null}
         <p className="rows__hint" style={{ marginTop: 8 }}>
           {t("models.ui.modelCatalog.hint")}
         </p>
@@ -2977,9 +3017,6 @@ export function Models({
           </div>
         )}
       </Card>
-      <p className="note">
-        {t("models.ui.modelCatalog.footerNote")}
-      </p>
 
       {pendingConfirm ? (
         <Confirm

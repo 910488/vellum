@@ -60,7 +60,8 @@ pub struct LaunchManifestV1 {
     pub launch_id: String,
     pub created_at: i64,
     pub official: RuntimeBinaryIdentity,
-    pub enhanced: RuntimeBinaryIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhanced: Option<RuntimeBinaryIdentity>,
     pub model_provider_map_path: PathBuf,
     pub model_provider_map_sha256: String,
     pub binding_db: PathBuf,
@@ -82,6 +83,30 @@ pub struct RelayBinaryIdentity {
 }
 
 impl LaunchManifestV1 {
+    pub fn providers(&self) -> super::TrustedProviderSet {
+        if self.enhanced.is_none() {
+            super::TrustedProviderSet::new(
+                self.official_provider_ids
+                    .iter()
+                    .chain(&self.third_party_provider_ids)
+                    .cloned()
+                    .collect(),
+                Vec::new(),
+            )
+        } else {
+            super::TrustedProviderSet::new(
+                self.official_provider_ids.clone(),
+                self.third_party_provider_ids.clone(),
+            )
+        }
+    }
+
+    pub fn enhanced_digest(&self) -> String {
+        self.enhanced
+            .as_ref()
+            .map(|identity| identity.runtime_digest.clone())
+            .unwrap_or_default()
+    }
     /// Where the bridge looks when Codex Desktop starts it with none of our
     /// environment. `LAUNCH_MANIFEST_ENV` overrides it for gates and tests.
     pub fn default_path() -> PathBuf {
@@ -125,10 +150,10 @@ impl LaunchManifestV1 {
         if self.official_provider_ids.is_empty() {
             return Err(LaunchManifestError::Incomplete("officialProviderIds"));
         }
-        if self.third_party_provider_ids.is_empty() {
+        if self.third_party_provider_ids.is_empty() && self.enhanced.is_some() {
             return Err(LaunchManifestError::Incomplete("thirdPartyProviderIds"));
         }
-        for identity in [&self.official, &self.enhanced] {
+        for identity in std::iter::once(&self.official).chain(self.enhanced.as_ref()) {
             if !identity.executable.is_absolute() {
                 return Err(LaunchManifestError::RelativePath(
                     identity.executable.clone(),
@@ -177,7 +202,11 @@ impl LaunchManifestV1 {
                 });
             }
         }
-        for (name, identity) in [("official", &self.official), ("enhanced", &self.enhanced)] {
+        for (name, identity) in std::iter::once(("official", &self.official)).chain(
+            self.enhanced
+                .as_ref()
+                .map(|identity| ("enhanced", identity)),
+        ) {
             identity.verify_on_disk(name)?;
         }
         let map = sha256_file(&self.model_provider_map_path)?;
@@ -220,6 +249,16 @@ struct DigestCacheEntry {
 
 static DIGEST_CACHE: OnceLock<Mutex<Vec<DigestCacheEntry>>> = OnceLock::new();
 
+// Coarse filesystems can assign one mtime to consecutive same-size writes.
+// Only reuse hashes computed outside that timestamp's possible write window.
+const DIGEST_MTIME_SETTLE_TIME: Duration = Duration::from_secs(2);
+
+fn digest_metadata_is_settled(modified: Option<SystemTime>, now: SystemTime) -> bool {
+    modified
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > DIGEST_MTIME_SETTLE_TIME)
+}
+
 pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     let metadata = std::fs::metadata(path).map_err(|error| LaunchManifestError::Read {
         path: path.to_path_buf(),
@@ -227,10 +266,14 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     })?;
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let modified = metadata.modified().ok();
+    // Decide before reading: a slow hash must not make a racy observation
+    // eligible for caching merely because the timestamp aged during the read.
+    let cacheable = digest_metadata_is_settled(modified, SystemTime::now());
     let cache = DIGEST_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(entries) = cache.lock() {
         if let Some(entry) = entries.iter().find(|entry| {
-            entry.path == canonical
+            cacheable
+                && entry.path == canonical
                 && entry.len == metadata.len()
                 && entry.modified == modified
                 && entry.checked_at.elapsed() <= Duration::from_secs(300)
@@ -246,10 +289,12 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 256 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(|error| LaunchManifestError::Read {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| LaunchManifestError::Read {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
         if read == 0 {
             break;
         }
@@ -258,13 +303,15 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
     if let Ok(mut entries) = cache.lock() {
         entries.retain(|entry| entry.path != canonical);
-        entries.push(DigestCacheEntry {
-            path: canonical,
-            len: metadata.len(),
-            modified,
-            digest: digest.clone(),
-            checked_at: Instant::now(),
-        });
+        if cacheable {
+            entries.push(DigestCacheEntry {
+                path: canonical,
+                len: metadata.len(),
+                modified,
+                digest: digest.clone(),
+                checked_at: Instant::now(),
+            });
+        }
         if entries.len() > 16 {
             entries.remove(0);
         }
@@ -307,6 +354,25 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn digest_cache_requires_a_settled_known_timestamp() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        assert!(!digest_metadata_is_settled(None, now));
+        assert!(!digest_metadata_is_settled(
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
+        assert!(!digest_metadata_is_settled(Some(now), now));
+        assert!(!digest_metadata_is_settled(
+            Some(now - DIGEST_MTIME_SETTLE_TIME),
+            now
+        ));
+        assert!(digest_metadata_is_settled(
+            Some(now - Duration::from_secs(3)),
+            now
+        ));
+    }
+
     fn identity(root: &Path, name: &str) -> RuntimeBinaryIdentity {
         let executable = root.join(format!("{name}.exe"));
         fs::write(&executable, name.as_bytes()).unwrap();
@@ -326,7 +392,7 @@ mod tests {
             launch_id: "launch-1".into(),
             created_at: 10,
             official: identity(root, "official"),
-            enhanced: identity(root, "enhanced"),
+            enhanced: Some(identity(root, "enhanced")),
             model_provider_map_sha256: sha256_file(&map_path).unwrap(),
             model_provider_map_path: map_path,
             binding_db: root.join("bindings.sqlite3"),
@@ -341,10 +407,38 @@ mod tests {
     }
 
     #[test]
+    fn bridge_only_manifest_has_no_enhanced_binary_to_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(fixture(temp.path())).unwrap();
+        value.as_object_mut().unwrap().remove("enhanced");
+        value["enhancedCore"] = serde_json::json!("missing");
+        let manifest: LaunchManifestV1 = serde_json::from_value(value).unwrap();
+        manifest.validate().unwrap();
+        manifest.verify_on_disk().unwrap();
+        assert_eq!(
+            super::super::RuntimeRouter::new(manifest.providers())
+                .plane_for_provider("qwen")
+                .unwrap(),
+            super::super::ExecutionPlane::OfficialCodex
+        );
+        assert!(serde_json::to_value(&manifest)
+            .unwrap()
+            .get("enhanced")
+            .is_none());
+    }
+
+    #[test]
     fn official_helper_verification_is_independent_of_unused_enhanced_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let manifest = fixture(temp.path());
-        fs::remove_file(&manifest.enhanced.executable).unwrap();
+        fs::remove_file(
+            &manifest
+                .enhanced
+                .as_ref()
+                .expect("Enhanced launch")
+                .executable,
+        )
+        .unwrap();
         fs::remove_file(&manifest.model_provider_map_path).unwrap();
         manifest.official.verify_on_disk("official").unwrap();
         assert!(manifest.verify_on_disk().is_err());
@@ -368,7 +462,15 @@ mod tests {
         assert_eq!(loaded, manifest);
         loaded.verify_on_disk().unwrap();
 
-        fs::write(&loaded.enhanced.executable, b"tampered").unwrap();
+        fs::write(
+            &loaded
+                .enhanced
+                .as_ref()
+                .expect("Enhanced launch")
+                .executable,
+            b"tampered",
+        )
+        .unwrap();
         assert!(
             super::super::app_server_bridge::BridgeConfig::load(&path, vec!["app-server".into()])
                 .is_err(),
@@ -407,7 +509,11 @@ mod tests {
         ));
 
         let mut manifest = fixture(temp.path());
-        manifest.enhanced.executable = PathBuf::from("enhanced.exe");
+        manifest
+            .enhanced
+            .as_mut()
+            .expect("Enhanced launch")
+            .executable = PathBuf::from("enhanced.exe");
         assert!(matches!(
             manifest.validate(),
             Err(LaunchManifestError::RelativePath(_))

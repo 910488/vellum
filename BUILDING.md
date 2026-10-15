@@ -45,6 +45,25 @@ Settings reports the bridge as missing rather than pretending it is there.
 
 ## The Enhanced Codex core, and the helpers next to it
 
+Windows Desktop-only hot updates use `tauri.hot-update.conf.json` and
+`installer-hot-update-hooks.nsh`: their payload replaces the bridge and relay,
+but never retires the existing core or helpers. The full installer derives its
+retirement flags from the staged executable files. POSTINSTALL restores any
+retired executable that the payload did not replace; startup cleanup deletes an
+old image only when its original path already contains a replacement.
+
+A downloaded core normally stays pending until Vellum performs a managed Codex
+restart and observes the new launch. Restarting Vellum alone does not arm that
+handoff. Startup can settle a pending core without a managed restart when its
+entire signed tree matches the bundled tree, or when both the bundled core and
+a verified active slot are missing. The latter recovery verifies the pending
+core and every helper, promotes the slot, and settles update state and journal.
+
+Run `scripts/qa/test-installer-locked-bridge.ps1` for an isolated Windows
+regression using disposable fake executables. It exercises locked replacement,
+retirement rollback, Desktop-only core preservation, and POSTINSTALL recovery;
+it never invokes the production global taskkill hook.
+
 The Enhanced core is built from the public, commit-pinned
 [`910488/enhanced-codex-core`](https://github.com/910488/enhanced-codex-core)
 repository, not from this repository. Its artifact workflow builds:
@@ -177,6 +196,19 @@ version. `source_ref` selects the Vellum source, and `enhanced_core_release`
 can pin an explicit `vellum-core-<40-hex>` release instead of resolving the
 latest one. Turning off `publish` leaves both signed releases as drafts.
 
+The entry workflow resolves `source_ref` to one full `source_sha` before either
+component release starts. Core and Desktop receive the same SHA; every build
+and signing checkout is pinned to that commit. The signing job verifies HEAD
+against the resolved SHA, release notes end at it, and the manifest records the
+actual checkout HEAD rather than the workflow event's `GITHUB_SHA`. New release
+tags also target that SHA.
+
+To verify on the next authorized release run, dispatch with a branch source,
+record resolve's SHA, then push a harmless commit to that branch while builds
+are running. All platform and signing checkouts, manifest `sourceCommit`, and
+release tag must still name the original SHA; generated notes must omit the
+later commit. The bundled core/Desktop pair must report the same source SHA.
+
 For testing or publishing one hot-update surface independently, run the
 `Publish signed hot update` Action. Its `component` selector maps directly to
 the three updater streams: `desktop` builds the Vellum app, `remote` builds the
@@ -194,6 +226,31 @@ component for clean/offline installation.
 The core release completes before the Desktop build starts. This ordering and
 the immutable Enhanced Core tag ensure that update assets and bundled assets
 cannot drift to different Enhanced Core commits during one release run.
+
+Windows self-updates launch NSIS with `/P /UPDATE /R` (passive progress, then
+relaunch). The preinstall hook retires bridge/core/relay images with unique
+`.old-*` names before writing their replacements; a failed rename restores
+this run's retired images in reverse order, then aborts the installation
+after relaunching the existing Desktop so the user is not left
+without Vellum. Startup checks the packaged bridge against this host's embedded
+digest before marking the Desktop update applied. An incomplete install stays
+failed across background checks unless a strictly newer release supersedes the
+failed version, and can retry its verified cached installer
+from the update panel. Startup removes retired images that are no longer locked.
+
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File
+scripts/qa/test-installer-locked-bridge.ps1` on Windows with Tauri's cached NSIS
+toolset. It creates isolated fake executables under the temp directory, models
+immediate respawn, demonstrates the failed legacy overwrite, and runs an actual
+NSIS test installer using the production rename macro. It never runs the global
+sidecar taskkill hook or changes the installed Vellum. Artifacts are retained
+under the printed temp path for inspection.
+
+Core slot promotion normally waits for a verified new core launch, rather than
+a Vellum restart. If a signed pending core and every signed helper already match
+the newly bundled files, startup can settle that identical tree without waiting
+for another Codex restart; otherwise pending remains until safe launch validation.
+The renderer preview is `/preview/updates-preview.html` on an isolated Vite port.
 
 `codex-code-mode-host` links `rusty_v8` and downloads a prebuilt archive from
 GitHub. If that download fails, the rest of the build still succeeds and only

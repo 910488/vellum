@@ -146,13 +146,15 @@ export function Pill({
   children,
   tone = "default",
   dot = false,
+  title,
 }: {
   children: ReactNode;
   tone?: PillTone;
   dot?: boolean;
+  title?: string;
 }) {
   return (
-    <span className={`pill${tone !== "default" ? ` pill--${tone}` : ""}`}>
+    <span className={`pill${tone !== "default" ? ` pill--${tone}` : ""}`} title={title}>
       {dot ? <i className="pill__dot" /> : null}
       {children}
     </span>
@@ -161,8 +163,8 @@ export function Pill({
 
 /* ---------- 狀態列 ---------- */
 
-export function Rows({ children }: { children: ReactNode }) {
-  return <div className="rows">{children}</div>;
+export function Rows({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <div className={`rows ${className}`}>{children}</div>;
 }
 
 export function Row({ label, children }: { label: ReactNode; children: ReactNode }) {
@@ -250,7 +252,7 @@ export function Notice({
       <span className="notice__tag">{t(`common.notice.${tone}`)}</span>
       <div className="notice__body">{children}</div>
       {acts ? <div className="notice__acts">{acts}</div> : null}
-      {raw ? <p className="notice__raw">{raw}</p> : null}
+      {raw ? <details className="notice__raw"><summary>{t("tabPolish.details")}</summary><pre>{raw}</pre></details> : null}
     </div>
   );
 }

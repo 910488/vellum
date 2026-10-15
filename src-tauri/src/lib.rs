@@ -7,6 +7,7 @@ pub mod boot;
 pub mod budget;
 pub mod catalog;
 pub mod codex;
+mod codex_restart;
 pub mod codex_oauth;
 pub mod codex_profile;
 pub mod codex_quota;
@@ -26,6 +27,7 @@ pub mod grok_auth;
 pub mod harness;
 pub mod history;
 pub mod install_paths;
+mod log_retention;
 pub mod loop_guard;
 pub mod model;
 pub mod panic_hook;
@@ -36,6 +38,8 @@ pub mod proxy;
 pub mod proxy_prepare;
 pub mod proxy_runtime_bridge;
 pub mod quota;
+mod quota_pool_router;
+mod quota_pool_diagnostics;
 pub mod remote;
 pub mod review;
 pub mod runtime;
@@ -133,12 +137,11 @@ pub fn run() {
     }));
     builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
-        )
+        .plugin(log_retention::builder().build())
         .setup(|app| {
+            if let Ok(log_root) = app.path().app_log_dir() {
+                log_retention::spawn_archive_cleanup(log_root);
+            }
             let handle = app.handle().clone();
             app.state::<AppState>()
                 .attach_lifecycle_emitter(move |status| {
@@ -160,6 +163,19 @@ pub fn run() {
                 Ok(Some(phase)) => log::info!("[Updates] desktop update settled: {phase:?}"),
                 Ok(None) => {}
                 Err(error) => log::warn!("[Updates] cannot settle desktop update: {error}"),
+            }
+            if crate::updates::take_proxy_resume(&data_root) {
+                let state = (*app.state::<AppState>()).clone();
+                tauri::async_runtime::spawn(async move {
+                    match crate::commands::proxy::start_proxy_inner(&state).await {
+                        Ok(_) => log::info!("[Updates] proxy resumed after the update restart"),
+                        Err(error) => {
+                            log::warn!(
+                                "[Updates] proxy did not resume after the update restart: {error}"
+                            )
+                        }
+                    }
+                });
             }
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
@@ -222,6 +238,9 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                updates::check_on_focus(window.app_handle());
+            }
             // The close button is a data-plane stop, not a cosmetic hide.
             // Leaving the Proxy alive behind a hidden tray window made users
             // reasonably believe Vellum was closed while Codex config and an
@@ -321,6 +340,9 @@ pub fn run() {
             commands::download_update,
             commands::apply_update,
             commands::restart_to_apply_desktop_update,
+            commands::restart_to_update,
+            commands::cancel_scheduled_restart,
+            commands::update_vellum,
             commands::cancel_update_download,
             commands::rollback_update,
             commands::set_remote_update_policy,
@@ -339,6 +361,7 @@ pub fn run() {
             commands::probe_web_search,
             commands::get_subagent_capability,
             remote::commands::get_remote_manager_feature_flags,
+            remote::commands::set_remote_sidebar_mode,
             remote::commands::get_remote_release_status,
             remote::commands::get_desktop_codex_compatibility,
             remote::commands::update_remote_codex_for_desktop,
@@ -380,6 +403,53 @@ pub fn run() {
             remote::ssh_trust::remote_ssh_fetch_fingerprint,
             remote::ssh_trust::remote_ssh_confirm_fingerprint,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running vellum");
+        .build(tauri::generate_context!())
+        .expect("error while building vellum")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                EXIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            tauri::RunEvent::Exit => {
+                cleanup_on_loop_exit(app);
+                // `app.exit` always announces itself with `ExitRequested`; an
+                // `Exit` without one is the OS ending the session. tao would
+                // next handle another window's `WM_ENDSESSION`, hit
+                // `(Destroyed, _) => panic!` and abort with 0xC0000409, which
+                // reads as a crash in the logs and in Windows Error Reporting.
+                // Vellum has nothing left to do, so leave before that.
+                if !EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                    log::info!("[Vellum] session ending; exiting after teardown");
+                    app.cleanup_before_exit();
+                    std::process::exit(0);
+                }
+            }
+            _ => {}
+        });
+}
+
+/// Set once Tauri announces an app-initiated exit; see the `Exit` arm above.
+static EXIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Windows ends the event loop directly on `WM_ENDSESSION` (shutdown,
+/// restart, sign-out): no window is closed and no Vellum exit command runs,
+/// so without this the Codex config, the CODEX_CLI_PATH lease and the
+/// Enhanced sidecars all outlive Vellum. Left alone, tao then panics on the
+/// next window's `WM_ENDSESSION` ("cannot move state from Destroyed") and the
+/// process aborts, so this is the last point where Vellum can still restore
+/// Codex.
+///
+/// Every explicit exit path has already run the same teardown, which is
+/// idempotent; repeating it there costs a few file checks. Windows allows a
+/// few seconds before it terminates the process, hence the bound.
+fn cleanup_on_loop_exit(app: &tauri::AppHandle) {
+    const SESSION_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+    let state = app.state::<AppState>().clone();
+    let finished = tauri::async_runtime::block_on(async move {
+        tokio::time::timeout(SESSION_END_BUDGET, shutdown_for_exit(&state, false))
+            .await
+            .is_ok()
+    });
+    if !finished {
+        log::warn!("[Vellum] exit teardown exceeded {SESSION_END_BUDGET:?}");
+    }
 }

@@ -87,6 +87,8 @@ pub trait PrepareHost: Send + Sync {
     fn precompute_catalog(&self) -> Result<(), String>;
 }
 
+const PREPARE_ATTEMPTS: usize = 3;
+
 #[derive(Default)]
 pub struct PrepareCoordinator {
     cached: Option<Arc<PrepareSnapshot>>,
@@ -111,17 +113,30 @@ impl PrepareCoordinator {
         &mut self,
         host: &H,
         cancel: watch::Receiver<bool>,
-        progress: impl FnMut(&str, u64),
+        mut progress: impl FnMut(&str, u64),
     ) -> AppResult<Arc<PrepareSnapshot>> {
         if let Some(cached) = &self.cached {
             if !*cancel.borrow() && cached.still_valid(host) {
                 return Ok(Arc::clone(cached));
             }
         }
-        let snapshot = run_prepare(host, cancel, progress).await?;
-        let snapshot = Arc::new(snapshot);
-        self.cached = Some(Arc::clone(&snapshot));
-        Ok(snapshot)
+        // The fingerprint reads Codex's model cache, which Codex rewrites on
+        // its own schedule (a freshly started app-server refreshes it within
+        // seconds). A change mid-prepare is a reason to prepare again, not to
+        // fail a Start nobody is watching, such as the resume after an update.
+        for _ in 0..PREPARE_ATTEMPTS {
+            let snapshot = run_prepare(host, cancel.clone(), &mut progress).await?;
+            if snapshot.settings_fingerprint != host.settings_fingerprint() {
+                log::info!("[Proxy] settings changed during prepare; preparing again");
+                continue;
+            }
+            let snapshot = Arc::new(snapshot);
+            self.cached = Some(Arc::clone(&snapshot));
+            return Ok(snapshot);
+        }
+        Err(AppError::Message(
+            "proxy settings kept changing during prepare; retry Start".into(),
+        ))
     }
 
     pub fn invalidate(&mut self) {
@@ -215,11 +230,6 @@ async fn run_prepare<H: PrepareHost + ?Sized>(
         elapsed_ms: catalog_started.elapsed().as_millis() as u64,
     });
     fail_if_cancelled(&cancel)?;
-    if fingerprint != host.settings_fingerprint() {
-        return Err(AppError::Message(
-            "proxy settings changed during prepare; retry Start".into(),
-        ));
-    }
 
     Ok(PrepareSnapshot {
         executable,
@@ -450,6 +460,71 @@ mod tests {
         drop(tx);
         let err = coordinator.prepare(&host, rx).await.unwrap_err();
         assert!(err.to_string().contains("user stopped proxy"));
+        assert!(coordinator.cached.is_none());
+    }
+
+    /// Reports a new fingerprint for the first `drifting_reads` reads.
+    struct DriftingHost {
+        inner: CountingPrepareHost,
+        reads: AtomicU64,
+        drifting_reads: u64,
+    }
+
+    impl PrepareHost for DriftingHost {
+        fn executable_path(&self) -> Option<PathBuf> {
+            self.inner.executable_path()
+        }
+        fn lockfile_path(&self) -> Option<PathBuf> {
+            self.inner.lockfile_path()
+        }
+        fn protocol_version(&self) -> String {
+            self.inner.protocol_version()
+        }
+        fn settings_fingerprint(&self) -> String {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            format!("settings-{}", read.min(self.drifting_reads))
+        }
+        fn discover_capability(&self) -> Result<(), String> {
+            self.inner.discover_capability()
+        }
+        fn probe_schema(&self) -> Result<(), String> {
+            self.inner.probe_schema()
+        }
+        fn precompute_catalog(&self) -> Result<(), String> {
+            self.inner.precompute_catalog()
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_that_change_once_during_prepare_are_prepared_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DriftingHost {
+            inner: CountingPrepareHost::new(dir.path()),
+            reads: AtomicU64::new(0),
+            drifting_reads: 1,
+        };
+        let mut coordinator = PrepareCoordinator::new();
+        let snapshot = coordinator.prepare(&host, live_cancel()).await.unwrap();
+        assert_eq!(host.inner.capability_calls.load(Ordering::SeqCst), 2);
+        assert!(snapshot.still_valid(&host));
+        assert!(coordinator.cached.is_some());
+    }
+
+    #[tokio::test]
+    async fn settings_that_keep_changing_fail_prepare_without_caching() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DriftingHost {
+            inner: CountingPrepareHost::new(dir.path()),
+            reads: AtomicU64::new(0),
+            drifting_reads: u64::MAX,
+        };
+        let mut coordinator = PrepareCoordinator::new();
+        let err = coordinator.prepare(&host, live_cancel()).await.unwrap_err();
+        assert!(err.to_string().contains("kept changing"));
+        assert_eq!(
+            host.inner.capability_calls.load(Ordering::SeqCst),
+            PREPARE_ATTEMPTS as u64
+        );
         assert!(coordinator.cached.is_none());
     }
 

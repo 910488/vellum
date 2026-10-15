@@ -18,6 +18,10 @@ command -v docker >/dev/null || { echo "Docker with buildx is required" >&2; exi
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js is required" >&2; exit 1; }
 
+if [[ "$bundle" != "stage-only" ]]; then
+  bash "$repo/scripts/check-main-ancestry.sh"
+fi
+
 # Docker Desktop's default `docker` buildx driver cannot export
 # `type=docker,dest=...` archives unless its containerd image store is enabled.
 # Use an isolated container builder per architecture so local macOS builds and

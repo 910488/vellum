@@ -2021,6 +2021,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_p".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2028,6 +2029,7 @@ mod tests {
                 guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
+                official_socket_affinity: None,
                 codex_identity: Some(parent_id),
                 codex_capabilities: None,
                 force_portable_official_handoff: false,
@@ -2041,6 +2043,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_c".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2048,6 +2051,7 @@ mod tests {
                 guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
+                official_socket_affinity: None,
                 codex_identity: Some(child_id),
                 codex_capabilities: None,
                 force_portable_official_handoff: false,
@@ -2139,6 +2143,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_conf".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2146,6 +2151,7 @@ mod tests {
                 guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
+                official_socket_affinity: None,
                 codex_identity: Some(conf_id),
                 codex_capabilities: None,
                 force_portable_official_handoff: false,
@@ -2176,6 +2182,7 @@ mod tests {
             incoming_auth: crate::request::IncomingAuthContext::default(),
             execution_environment: crate::environment::ExecutionEnvironment::posix_reference(),
             metadata: crate::request::RequestMetadata {
+                official_cache_affinity: Default::default(),
                 request_id: "req_no_meta".into(),
                 received_at_ms: 1000,
                 review_run_id: None,
@@ -2183,6 +2190,7 @@ mod tests {
                 guardian_dispatch: false,
                 primary_failure_reason: None,
                 connection_id: None,
+                official_socket_affinity: None,
                 codex_identity: None,
                 codex_capabilities: None,
                 force_portable_official_handoff: false,

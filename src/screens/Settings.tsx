@@ -12,14 +12,16 @@ import { useLocaleFormat } from "@/i18n/useLocaleFormat";
  */
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { RemoteSidebarPreference } from "@/components/RemoteSidebarPreference";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { I18N_LANGUAGE_SELECTOR_ENABLED, type LocalePreference } from "@/i18n/locale";
 import { readThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
-import { api } from "@/lib/api";
+import { api, type RemoteSidebarMode } from "@/lib/api";
 import { codexAccountLabel } from "@/lib/codexAccount";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { noticeText } from "@/lib/notice";
-import { Btn, Cap, Card, Confirm, Empty, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
+import { operationalErrorKey } from "@/lib/operationalError";
+import { Btn, Cap, Card, Confirm, Empty, Notice, Row, Rows, Segment, State, Toggle, Tray } from "@/components/ui";
 import {
   REVIEW_POLICIES,
   fallbackShare,
@@ -66,17 +68,22 @@ export function Settings({
   refreshVersion,
   onRefreshComplete,
   active = true,
+  remoteSidebarMode = "auto",
+  onRemoteSidebarMode,
 }: {
   onChanged: () => void;
   onOpenOnboarding: () => void;
   refreshVersion: number;
   onRefreshComplete: (version: number) => void;
   active?: boolean;
+  remoteSidebarMode?: RemoteSidebarMode;
+  onRemoteSidebarMode?: (mode: RemoteSidebarMode) => void;
 }) {
   const { t } = useTranslation();
   const { sinceLabel } = useLocaleFormat();
   const [localePreference, setLocalePreferenceState] = useState<LocalePreference>(getLocalePreference());
   const [themePreference, setThemePreferenceState] = useState<ThemePreference>(readThemePreference);
+  const [settingsGroup, setSettingsGroup] = useState("general");
   const [settings, setSettings] = useState<ReviewSettings | null>(null);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [models, setModels] = useState<ModelRoute[]>([]);
@@ -86,6 +93,7 @@ export function Settings({
   const [dashboardRouteIds, setDashboardRouteIds] = useState<string[]>([]);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [restart, setRestart] = useState<RestartResult | null>(null);
+  const [restartError, setRestartError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [logExporting, setLogExporting] = useState(false);
   const [logExportPath, setLogExportPath] = useState<string | null>(null);
@@ -120,6 +128,17 @@ export function Settings({
   const subagentRef = useRef<SubagentSettings | null>(null);
   const subagentLastSavedRef = useRef<SubagentSettings | null>(null);
   const subagentSaveQueue = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    if (typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+      const group = (visible[0]?.target as HTMLElement | undefined)?.dataset.settingsGroup;
+      if (group) setSettingsGroup(group);
+    }, { rootMargin: "-15% 0px -65% 0px" });
+    document.querySelectorAll("[data-settings-group]").forEach((section) => observer.observe(section));
+    return () => observer.disconnect();
+  }, [settings]);
 
   useEffect(() => {
     let alive = true;
@@ -606,13 +625,14 @@ export function Settings({
   /// 中間畫面必須看得出來它在做事，否則使用者只會再按一次。
   async function restartCodex(force = false) {
     setCodexRestarting(true);
-    setError(null);
+    setRestart(null);
+    setRestartError(null);
     try {
       setRestart(await api.restartCodexSafely(force));
       setRuntime(await api.getRuntimeStatus());
       onChanged();
     } catch (cause) {
-      setError(t("settings.page.errors.restart", { detail: String(cause) }));
+      setRestartError(t("settings.page.errors.restart", { detail: String(cause) }));
     } finally {
       setCodexRestarting(false);
     }
@@ -649,7 +669,7 @@ export function Settings({
           <h2 className="canvas__title">{t("settings.title")}</h2>
         </div>
         <Card>
-          <Empty>{error ?? t("settings.page.loading")}</Empty>
+          {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : <Empty>{t("settings.page.loading")}</Empty>}
         </Card>
       </>
     );
@@ -719,19 +739,34 @@ export function Settings({
 
   return (
     <>
-      <div className="canvas__head">
-        <div>
-          <p className="eyebrow">{t("settings.title")}</p>
-          <h2 className="canvas__title">{t("settings.page.heading")}</h2>
-        </div>
-      </div>
+      {/* 頁名只說一次。原本眉標「設定」、大標又一次「設定」，下面再接一條
+          實心白底的分頁列——一頁三層頂部家具，其中兩層是同一個字。
+          這裡把索引本身當標題：四個分組以標題字級排成一行，所在的那一組
+          是墨，其餘是刮過的舊字，捲動時跟著換。 */}
+      <h2 className="sr-only">{t("tabPolish.settingsTitle")}</h2>
+      <nav className="settings-index" aria-label={t("tabPolish.settingsIndex")}>
+        {["general", "integration", "network", "diagnostics"].map((group) => (
+          <a
+            key={group}
+            href={`#settings-${group}`}
+            aria-current={settingsGroup === group ? "location" : undefined}
+            onClick={() => setSettingsGroup(group)}
+          >
+            {t(`tabPolish.groups.${group}`)}
+          </a>
+        ))}
+      </nav>
 
-      {error ? <p className="note">{error}</p> : null}
+      {error ? <Notice tone="warn" raw={error}>{t(operationalErrorKey(error))}</Notice> : null}
+      <section id="settings-general" className="settings-group" data-settings-group="general">
+        {/* 頁首索引此刻正亮著這一組，緊接著再寫一次就是重複。 */}
+        <h3 className="sr-only">{t("tabPolish.groups.general")}</h3>
 
       {/* 語言與外觀是頁面級偏好，各只有一個控制項。放進 grid2 會讓它們吃掉 1.35fr
           的主欄，把真正的主角（自動審查）擠進窄欄；份量要對得起內容。收成同一張
           卡裡的兩條橫幅。 */}
       <Card quiet className="prefstrips">
+        {onRemoteSidebarMode ? <RemoteSidebarPreference mode={remoteSidebarMode} onChange={onRemoteSidebarMode} /> : null}
       {I18N_LANGUAGE_SELECTOR_ENABLED ? (
         <div className="prefstrip">
           <div className="prefstrip__copy">
@@ -775,6 +810,15 @@ export function Settings({
         </div>
       </Card>
 
+      <Card>
+        <Cap>{t("settings.page.dashboard.title")}</Cap>
+        <p className="note">{t("tabPolish.dashboardHint")}</p>
+        <p className="note">{t("settings.page.dashboard.note", { count: dashboardRouteIds.length })}</p>
+        <Rows>{routes.map((route) => <Row key={route.id} label={route.name}><label className="rowline"><input type="checkbox" checked={dashboardRouteIds.includes(route.id)} onChange={() => toggleDashboardProvider(route.id)} /><span>{route.enabled ? t("common.visible") : t("settings.page.dashboard.disabledVisible")}</span></label></Row>)}</Rows>
+      </Card>
+      </section>
+      <section id="settings-integration" className="settings-group" data-settings-group="integration">
+        <h3>{t("tabPolish.groups.integration")}</h3>
       <div className="grid2">
         <Card>
           <div className="rowline">
@@ -843,9 +887,9 @@ export function Settings({
                     {showsFallback ? <State tone="warn" label={t("settings.page.review.fallbackActive")} /> : null}
                   </span>
                   {showsFallback ? (
-                    <span className="rows__hint" style={{ display: "block" }}>
-                      {stats?.activeReason ?? t("settings.page.review.selectedUnavailable")}
-                    </span>
+                    <div className="rows__hint">
+                      {stats?.activeReason ? <Notice raw={stats.activeReason}>{t(operationalErrorKey(stats.activeReason))}</Notice> : t("settings.page.review.selectedUnavailable")}
+                    </div>
                   ) : null}
                 </Row>
 
@@ -1171,6 +1215,9 @@ export function Settings({
           引擎在設定變了之後自己重建，所以這裡不需要任何「重啟才生效」的提示。
 
           排在壓縮策略之後、顯示偏好之前：這三張講的都是「送出去的請求長什麼樣」。 */}
+      </section>
+      <section id="settings-network" className="settings-group" data-settings-group="network">
+        <h3>{t("tabPolish.groups.network")}</h3>
       {searchSettings ? (
         <Card>
           <div className="rowline">
@@ -1270,7 +1317,7 @@ export function Settings({
                       {searchProbing
                         ? t("settings.page.webSearch.probing")
                         : searchProbeError
-                          ? t("settings.page.webSearch.probeFailed", { detail: searchProbeError })
+                          ? <Notice tone="warn" raw={searchProbeError}>{t(operationalErrorKey(searchProbeError))}</Notice>
                           : searchProbe
                             ? t(
                                 searchProbe.resultCount > 0
@@ -1298,9 +1345,9 @@ export function Settings({
 
               {/* 網域限制是裝一次的東西，數量不固定 —— 收進托盤，收起來時顯示條數。 */}
               <div style={{ marginTop: 16 }}>
+                <p className="note">{t("tabPolish.allowed", { domains: searchSettings.domainPolicy.allow.join(", ") || t("tabPolish.anyDomain") })}<br />{t("tabPolish.blocked", { domains: searchSettings.domainPolicy.block.join(", ") || t("tabPolish.noBlocked") })}</p>
                 <Tray
-                  label={t("settings.page.webSearch.domainTray")}
-                  count={domainRuleCount(searchSettings)}
+                  label={t("tabPolish.domainRules", { count: domainRuleCount(searchSettings) })}
                 >
                   <div className="field" style={{ marginTop: 12 }}>
                     <label className="field__label" htmlFor="websearch-allow">
@@ -1357,27 +1404,9 @@ export function Settings({
         </Card>
       ) : null}
 
-      <Card>
-        <Cap>{t("settings.page.dashboard.title")}</Cap>
-        <p className="note" style={{ marginTop: 10 }}>
-          {t("settings.page.dashboard.note", { count: dashboardRouteIds.length })}
-        </p>
-        <Rows>
-          {routes.map((route) => (
-            <Row key={route.id} label={route.name}>
-              <label className="rowline">
-                <input
-                  type="checkbox"
-                  checked={dashboardRouteIds.includes(route.id)}
-                  onChange={() => toggleDashboardProvider(route.id)}
-                />
-                <span>{route.enabled ? t("common.visible") : t("settings.page.dashboard.disabledVisible")}</span>
-              </label>
-            </Row>
-          ))}
-        </Rows>
-      </Card>
-
+      </section>
+      <section id="settings-diagnostics" className="settings-group" data-settings-group="diagnostics">
+        <h3>{t("tabPolish.groups.diagnostics")}</h3>
       <Card>
         <Cap>{t("settings.page.restore.title")}</Cap>
         <p className="prose" style={{ marginTop: 10 }}>
@@ -1437,15 +1466,20 @@ export function Settings({
           <Row label={t("settings.page.advanced.catalogVersion")}>{runtime?.activeCatalogVersion ?? t("settings.page.advanced.notCreated")}</Row>
           <Row label={t("settings.page.advanced.restartTitle")}>
             <span className="runtime-control">
-              <span className="runtime-control__copy rows__hint">
-                {restart ? noticeText(restart.notice, t) : t("settings.page.advanced.restartHint")}
+              <span
+                className={`runtime-control__copy rows__hint${restartError || (restart && !restart.restarted) ? " rows__hint--warn" : ""}`}
+                role="status"
+              >
+                {codexRestarting
+                  ? t("settings.page.advanced.restarting")
+                  : restartError ?? (restart ? noticeText(restart.notice, t) : t("settings.page.advanced.restartHint"))}
               </span>
               <Btn
                 soft
                 disabled={codexRestarting}
                 onClick={() => void restartCodex()}
               >
-                {t("settings.page.advanced.restartAction")}
+                {codexRestarting ? t("settings.page.advanced.restartingAction") : t("settings.page.advanced.restartAction")}
               </Btn>
               {restartBlockedByTurn ? (
                 <Btn soft disabled={codexRestarting} onClick={() => void restartCodex(true)}>
@@ -1532,7 +1566,7 @@ export function Settings({
       </Card>
 
       <Card quiet>
-        <Cap>{t("settings.page.app.title")}</Cap>
+          <Cap>{t("settings.page.app.title")}</Cap>
         <div className="rowline" style={{ marginTop: 6 }}>
           <Btn soft onClick={() => void api.exitVellum()}>{t("settings.page.app.exit")}</Btn>
           <span className="rows__hint">
@@ -1540,6 +1574,7 @@ export function Settings({
           </span>
         </div>
       </Card>
+      </section>
     </>
   );
 }

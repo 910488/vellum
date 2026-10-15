@@ -13,6 +13,7 @@
  */
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { api } from "@/lib/api";
@@ -36,6 +37,7 @@ const POOL_ACCOUNTS = [
 
 const SCENES = {
   pool: "額度池（三個帳號）",
+  poolMixedWindows: "額度池（混合 5 小時與只有週視窗）",
   fiveHourTight: "5 小時見底、週還很多",
   weeklyTight: "週見底、5 小時剛重置",
   bothHealthy: "兩條都還很鬆",
@@ -75,6 +77,7 @@ function windowsFor(scene: Scene): QuotaSnapshot[] {
       return [window_("week", null, 22, 88), window_("hour", 5, 31, 3.1)];
     case "weeklyOnly":
       return [window_("week", null, 44, 70)];
+    case "poolMixedWindows":
     case "pool":
     case "unavailable":
       return [];
@@ -94,7 +97,7 @@ let poolState: QuotaPoolStatus = {
   activeAccountId: POOL_ACCOUNTS[0]!.accountId,
 };
 
-function installPoolFixture() {
+function installPoolFixture(weeklyOnlyAccount = false) {
   api.getCodexOAuthStatus = () =>
     Promise.resolve({
       authenticated: true,
@@ -113,10 +116,12 @@ function installPoolFixture() {
   api.getCodexOAuthAccountQuota = (accountId: string) => {
     const entry = POOL_ACCOUNTS.find((candidate) => candidate.accountId === accountId);
     if (!entry) return Promise.reject(new Error("unknown account"));
-    return Promise.resolve([
-      window_("hour", 5, 100 - entry.fiveHour, 1.6),
-      window_("week", null, 100 - entry.weekly, 56),
-    ]);
+    const weekly = window_("week", null, 100 - entry.weekly, 56);
+    return Promise.resolve(
+      weeklyOnlyAccount && accountId === POOL_ACCOUNTS[1]!.accountId
+        ? [weekly]
+        : [window_("hour", 5, 100 - entry.fiveHour, 1.6), weekly],
+    );
   };
   api.getCodexOAuthResetCredits = (accountId: string) =>
     Promise.resolve({
@@ -194,13 +199,14 @@ function installFixture(scene: () => Scene) {
 const THEMES = ["light", "dark"] as const;
 
 function Harness() {
+  usePreviewCaptureReady();
   const [scene, setScene] = useState<Scene>("pool");
   const [pref, setPref] = useState<LocalePreference>(getLocalePreference());
   const [theme, setTheme] = useState<(typeof THEMES)[number]>("light");
   const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
-    if (scene === "pool") installPoolFixture();
+    if (scene === "pool" || scene === "poolMixedWindows") installPoolFixture(scene === "poolMixedWindows");
     else installFixture(() => scene);
     setNonce((current) => current + 1);
   }, [scene]);

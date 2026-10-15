@@ -21,10 +21,12 @@ const apiMocks = vi.hoisted(() => ({
   getEnhancedDesktopRuntimeStatus: vi.fn(),
   getOverview: vi.fn(),
   getUpdateStatus: vi.fn(),
+  getRemoteManagerFeatureFlags: vi.fn().mockResolvedValue({ showInSidebar: false, sidebarMode: "auto" }),
   subscribeProxyLifecycle: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({ api: apiMocks }));
+vi.mock("@/lib/api", () => ({ api: apiMocks, recordInvokeResult: vi.fn() }));
+vi.mock("@/screens/Remote", () => ({ Remote: () => <h2>Remote fixture</h2> }));
 
 const stopped: ProxyStatus = {
   running: false,
@@ -90,6 +92,31 @@ describe("proxy lifecycle button state", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it("says loading, not 'no providers', until the first overview arrives", async () => {
+    let resolveOverviews: ((value: unknown[]) => void) | null = null;
+    apiMocks.getProviderOverviews.mockImplementation(
+      () => new Promise((resolve) => { resolveOverviews = resolve; }),
+    );
+    render(
+      <Today
+        proxy={stopped}
+        overview={overview}
+        onNavigate={() => {}}
+        onChanged={() => {}}
+        onProxyChanged={() => {}}
+        refreshVersion={0}
+        onRefreshComplete={() => {}}
+        active
+      />,
+    );
+    await waitFor(() => expect(resolveOverviews).not.toBeNull());
+    expect(screen.queryByText(i18n.t("today.providers.empty"))).toBeNull();
+    expect(screen.queryByText(i18n.t("today.quota.noData"))).toBeNull();
+    expect(screen.getAllByText(i18n.t("common.loading")).length).toBeGreaterThanOrEqual(2);
+    resolveOverviews!([]);
+    expect(await screen.findByText(i18n.t("today.providers.empty"))).not.toBeNull();
   });
 
   it("applies a lifecycle event on Today without polling getProxyStatus", async () => {
@@ -311,6 +338,7 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
 
   beforeEach(() => {
     emitLifecycle = null;
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarMode: "auto" });
     apiMocks.getProviderOverviews.mockResolvedValue([]);
     apiMocks.listRoutes.mockResolvedValue([]);
     apiMocks.listSessions.mockResolvedValue([]);
@@ -341,6 +369,18 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it("unmounts a hidden Remote tab and falls back to Today", async () => {
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: true, sidebarMode: "auto" });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: i18n.t("navigation.remote.label") }));
+    expect(await screen.findByRole("heading", { name: "Remote fixture" })).toBeTruthy();
+    apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({ showInSidebar: false, sidebarMode: "auto" });
+    window.dispatchEvent(new Event("vellum:remote-sidebar-changed"));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Remote fixture" })).toBeNull());
+    expect(screen.queryByRole("button", { name: i18n.t("navigation.remote.label") })).toBeNull();
+    expect(screen.getByRole("button", { name: new RegExp(i18n.t("navigation.today.label")) }).getAttribute("aria-current")).toBe("page");
   });
 
   it("shows preparing stages from events while the start command is still in flight", async () => {

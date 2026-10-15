@@ -457,15 +457,15 @@ impl GrokAccountManager {
         let bytes = serde_json::to_vec_pretty(&store)
             .map_err(|error| AppError::Message(format!("encode Grok accounts: {error}")))?;
         let path = self.root.join("accounts.json");
-        let temporary = self.root.join("accounts.json.tmp");
+        // `rename` replaces the destination on every platform. Deleting it
+        // first left a window in which a crash lost every Grok account.
+        let temporary = crate::enhanced_runtime::atomic::unique_temporary(&path);
         std::fs::write(&temporary, bytes)
             .map_err(|error| AppError::Message(format!("write Grok accounts: {error}")))?;
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|error| AppError::Message(format!("replace Grok accounts: {error}")))?;
-        }
-        std::fs::rename(temporary, path)
-            .map_err(|error| AppError::Message(format!("commit Grok accounts: {error}")))
+        std::fs::rename(&temporary, path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            AppError::Message(format!("commit Grok accounts: {error}"))
+        })
     }
 }
 

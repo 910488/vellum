@@ -1175,7 +1175,8 @@ impl UsageStore {
                         stream_quality, first_output_delta_ms,
                         first_reasoning_delta_ms, COALESCE(output_delta_count, 0),
                         COALESCE(reasoning_delta_count, 0),
-                        request_id, control_account_hash, execution_account_hash
+                        request_id, control_account_hash, execution_account_hash,
+                        error_category, retry_after
                  FROM request_usage
                  WHERE (?1 = 0 OR status >= 400)
                    AND (?2 = '' OR route_id = ?2)
@@ -1209,6 +1210,8 @@ impl UsageStore {
                         .map(|id| vellum_proxy_runtime::hash_text(&id)),
                     control_account_hash: row.get(19)?,
                     execution_account_hash: row.get(20)?,
+                    error_category: row.get(21)?,
+                    retry_after: row.get(22)?,
                 })
             })
             .map_err(|error| AppError::Message(format!("讀取請求紀錄失敗：{error}")))?
@@ -2736,6 +2739,28 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.id == page.entries[0].id));
+    }
+
+    #[test]
+    fn request_log_exposes_error_category_and_retry_after_without_parsing_raw_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        store
+            .record(&UsageRecord {
+                route_id: "official".into(),
+                provider: "Official".into(),
+                model: "fixture".into(),
+                status: 429,
+                error: Some("private raw diagnostic".into()),
+                error_category: Some("provider_quota".into()),
+                retry_after: Some(60),
+                ..Default::default()
+            })
+            .unwrap();
+        let log = store.request_log(10).unwrap();
+        assert_eq!(log.entries[0].error_category.as_deref(), Some("provider_quota"));
+        assert_eq!(log.entries[0].retry_after, Some(60));
+        assert_eq!(log.entries[0].error.as_deref(), Some("private raw diagnostic"));
     }
 
     fn spawn_requested_fixture(

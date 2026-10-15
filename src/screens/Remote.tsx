@@ -12,6 +12,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { operationalErrorKey } from "@/lib/operationalError";
 import { api } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { Btn, Cap, Card, Confirm, Empty, Meter, Notice, Row, Rows, State, Tray } from "@/components/ui";
@@ -816,7 +817,7 @@ export function Remote({
     <>
       <div className="canvas__head">
         <div>
-          <h2 className="canvas__title">{t("remote.title")}</h2>
+          <h2 className="canvas__title">{t("navigation.remote.label")}</h2>
           <p className="note">{t("remote.blurb")}</p>
         </div>
         <Btn soft onClick={() => void load()} disabled={busy !== null || discovering}>
@@ -997,7 +998,7 @@ export function Remote({
                     <Btn mini soft onClick={exportBundle} disabled={busy !== null}>{t("remote.act.bundle")}</Btn>
                   </>}
                 >
-                  {immediateDesktopProtocolFailure
+                  {operationalErrorKey(failure.raw) === "tabPolish.loginExpired" ? t("tabPolish.loginExpired") : immediateDesktopProtocolFailure
                     ? t("remote.error.desktopCodexMismatch")
                     : immediateAppOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
@@ -1021,7 +1022,7 @@ export function Remote({
                     <Btn mini soft onClick={exportBundle} disabled={busy !== null}>{t("remote.act.bundle")}</Btn>
                   </>}
                 >
-                  {operationDesktopProtocolFailure
+                  {operationalErrorKey(ownOperation.message ?? "") === "tabPolish.loginExpired" ? t("tabPolish.loginExpired") : operationDesktopProtocolFailure
                     ? t("remote.error.desktopCodexMismatch")
                     : appOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
@@ -1075,17 +1076,17 @@ export function Remote({
               ) : null}
               {pairings.length ? (
                 <div className="accounts">
-                  {pairings.map((row) => (
+                  {pairings.map((row, index) => (
                     <div className="accounts__row" key={row.accountId}>
                       <span className="accounts__who">
-                        <b>{row.email ?? row.accountId}</b>
+                        <b title={row.accountId}>{row.email ?? t("tabPolish.account", { index: index + 1 })}</b>
                         {row.workspaceName ? (
                           <small className="rows__hint">{row.workspaceName}</small>
                         ) : null}
                         {row.isDesktopDefault ? (
                           <small className="rows__hint">{t("remote.account.desktopCurrent")}</small>
                         ) : null}
-                        {row.detail ? <small className="accounts__why">{row.detail}</small> : null}
+                        {row.detail ? <Notice tone="warn" raw={row.detail}>{t(operationalErrorKey(row.detail))}</Notice> : null}
                       </span>
                       <State
                         tone={row.detail ? "quiet" : row.credentialState === "expired" ? "warn" : row.paired || row.active ? "ok" : "quiet"}
@@ -1411,7 +1412,7 @@ export function Remote({
                   label={sessions ? t(`remote.sessions.observability.${sessions.observability}`) : t("common.loading")}
                 />
               </div>
-              {!sessions ? <Empty>{t("remote.sessions.unknown")}</Empty> : !sessions.threads.length ? (
+              {!sessions ? null : !sessions.threads.length ? (
                 <Empty>{sessions.observability === "nativeAppServer" ? t("remote.sessions.empty") : t("remote.sessions.unreadable")}</Empty>
               ) : (
                 <div className="remote-session-list">
@@ -1488,7 +1489,7 @@ export function Remote({
                 拆除。名字要講出後果，而且不能跟「匯出診斷包」擺在同一排 ——
                 肌肉記憶會按錯。 */}
             <div className="remote-danger">
-              <b>{t("remote.act.restore")}</b>
+              <b>{t("tabPolish.restoreHost")}</b>
               <p>{t("remote.danger.body")}</p>
               <Btn danger onClick={() => setPending("restore")} disabled={!selectedHostId || busy !== null || operationRunning}>
                 {t("remote.act.restore")}

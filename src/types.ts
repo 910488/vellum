@@ -170,7 +170,7 @@ export interface CodexOAuthStatus {
   accounts: CodexOAuthAccount[];
 }
 
-export type QuotaPoolStrategy = "rank";
+export type QuotaPoolStrategy = "rank" | "balanced";
 
 export interface QuotaPoolMember {
   accountId: string;
@@ -357,6 +357,9 @@ export interface EnhancedProtocolCompatibility {
 
 export interface EnhancedDesktopRuntimeStatus {
   configured: boolean;
+  enhancedCore?: "missing" | "available";
+  bridgePrepared?: boolean;
+  bridgeProtectionActive?: boolean;
   /** The user asked for Enhanced and the settings verified. */
   enabled: boolean;
   /** The pinned artifact, protocol hash and model map verify on disk. */
@@ -379,6 +382,7 @@ export interface EnhancedDesktopRuntimeStatus {
   environmentState:
     | "leased"
     | "released"
+    | "leaseValueMissing"
     | "orphanedBridge"
     | "foreignValue"
     | "unreadable"
@@ -430,6 +434,8 @@ export interface EnhancedDesktopRuntimeStatus {
    *  it with a managed restart on its own; this flag is what the screen says
    *  while that is happening. */
   launchCoreDrift: boolean;
+  /** A downloaded Enhanced core waits for the managed Codex restart. */
+  pendingCore?: boolean;
   blockers: string[];
 }
 
@@ -936,6 +942,8 @@ export interface RequestLogEntry {
   cachedInputTokens?: number;
   status: number;
   error: string | null;
+  errorCategory?: string | null;
+  retryAfter?: number | null;
   durationMs: number;
   firstByteMs: number | null;
   createdAt: number;
@@ -1571,10 +1579,24 @@ export interface UpdateStatusSnapshot {
   desktop: LayerStatus;
   remote: LayerStatus;
   core: LayerStatus;
+  coreRuntime?: { activeVersion: string | null; pendingVersion: string | null; missing: boolean };
   preferences: UpdatePreferences;
   liveAutoUpdate: boolean;
   attention: UpdateAttention;
+  /** Unix seconds of the last check that reached GitHub. */
+  checkedAt: number | null;
+  /** A Desktop restart waiting for running work to finish. */
+  restartSchedule: RestartSchedule | null;
 }
+
+export interface RestartSchedule {
+  version: string | null;
+  openTurns: number;
+  activeRequests: number;
+  since: number;
+}
+
+export type RestartToUpdate = "restarting" | "scheduled";
 
 export interface UpdateOperation {
   operationId: string;

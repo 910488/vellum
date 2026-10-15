@@ -90,6 +90,7 @@ struct ProxyControl {
     draining: bool,
     restart_reasons: Vec<RuntimeNotice>,
     restart_process_identity: Option<String>,
+    codex_process_baseline: Option<crate::codex_restart::ProcessBaseline>,
     /// The launch id of a superseded live launch this session already spent
     /// its one automatic repair on. See [`AppState::claim_launch_repair`].
     repaired_launch_id: Option<String>,
@@ -117,6 +118,22 @@ struct Inner {
     /// Proxy apply and hot-updates them while the Proxy is running.
     #[serde(default)]
     subagent: SubagentSettings,
+    #[serde(default)]
+    remote_sidebar_forced: bool,
+    /// Hide the Remote Manager even when managed hosts exist. Kept separate
+    /// from `remote_sidebar_forced` so older settings files read as "auto".
+    #[serde(default)]
+    remote_sidebar_hidden: bool,
+}
+
+/// Whether the Remote Manager sits in the sidebar. `Auto` shows it once a
+/// managed host exists; `Show` and `Hide` override that either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteSidebarMode {
+    Auto,
+    Show,
+    Hide,
 }
 
 pub struct ActiveRequestGuard {
@@ -197,7 +214,7 @@ impl AppState {
     ) -> AppResult<Self> {
         let lease_active = root == app_data_dir()
             && crate::codex::has_active_lease(&crate::codex::CodexPaths::discover(&root));
-        let mut inner = load_inner(&root).unwrap_or_else(|| Inner {
+        let mut inner = load_inner(&root)?.unwrap_or_else(|| Inner {
             routes: seed_routes(),
             review: ReviewSettings {
                 route_id: "grok-cli".to_string(),
@@ -208,6 +225,8 @@ impl AppState {
             findings: Vec::new(),
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
+            remote_sidebar_forced: false,
+            remote_sidebar_hidden: false,
         });
         let migrated = migrate_seeded_route_names(&mut inner.routes)
             | migrate_opencode_access_modes(&mut inner.routes)
@@ -290,6 +309,7 @@ impl AppState {
                 draining: false,
                 restart_reasons: Vec::new(),
                 restart_process_identity: None,
+                codex_process_baseline: None,
                 repaired_launch_id: None,
                 live_applied: Vec::new(),
                 active_catalog_version: None,
@@ -936,6 +956,29 @@ impl AppState {
 
     pub fn subagent_settings(&self) -> SubagentSettings {
         self.inner.lock().expect("state poisoned").subagent.clone()
+    }
+
+    pub(crate) fn remote_sidebar_mode(&self) -> RemoteSidebarMode {
+        let inner = self.inner.lock().expect("app state poisoned");
+        if inner.remote_sidebar_hidden {
+            RemoteSidebarMode::Hide
+        } else if inner.remote_sidebar_forced {
+            RemoteSidebarMode::Show
+        } else {
+            RemoteSidebarMode::Auto
+        }
+    }
+
+    pub(crate) fn set_remote_sidebar_mode(&self, mode: RemoteSidebarMode) -> AppResult<()> {
+        let mut inner = self.inner.lock().expect("app state poisoned");
+        let previous = (inner.remote_sidebar_forced, inner.remote_sidebar_hidden);
+        inner.remote_sidebar_forced = mode == RemoteSidebarMode::Show;
+        inner.remote_sidebar_hidden = mode == RemoteSidebarMode::Hide;
+        if let Err(error) = try_persist_inner(&self.data_root, &inner) {
+            (inner.remote_sidebar_forced, inner.remote_sidebar_hidden) = previous;
+            return Err(AppError::Message(error));
+        }
+        Ok(())
     }
 
     /// Validate and persist sub-agent defaults.
@@ -1851,6 +1894,44 @@ impl AppState {
         }
     }
 
+    pub(crate) fn set_codex_process_baseline(
+        &self,
+        baseline: Option<crate::codex_restart::ProcessBaseline>,
+    ) {
+        self.proxy.lock().expect("proxy state poisoned").codex_process_baseline = baseline;
+    }
+
+    pub(crate) fn reconcile_codex_proxy_contract(
+        &self,
+        identity: &str,
+        current: Option<&crate::codex_restart::ProxyContract>,
+        successful_request: bool,
+    ) -> bool {
+        let mut proxy = self.proxy.lock().expect("proxy state poisoned");
+        if !proxy.codex_process_baseline.as_ref().is_some_and(|baseline| baseline.matches(identity, current, successful_request)) {
+            return false;
+        }
+        let baseline = proxy.codex_process_baseline.as_mut().expect("matched baseline");
+        let persist = successful_request && !baseline.contract_loaded;
+        baseline.contract_loaded = true;
+        let confirmed = persist.then(|| baseline.clone());
+        // A successful unchanged transport does not acknowledge a real catalog
+        // change or Enhanced adoption; clear only the transport restart reasons.
+        proxy.restart_reasons.retain(|reason| !matches!(reason.code.as_str(), "codexRunning" | "proxyStoppedCodexRestartRequired"));
+        if proxy.restart_reasons.is_empty() {
+            proxy.restart_process_identity = None;
+        }
+        drop(proxy);
+        if let Some(confirmed) = confirmed {
+            confirmed.persist(&self.data_root);
+        }
+        true
+    }
+
+    pub(crate) fn has_codex_proxy_restart_reason(&self) -> bool {
+        self.proxy.lock().expect("proxy state poisoned").restart_reasons.iter().any(|reason| reason.code == "codexRunning")
+    }
+
     /// Records a restart reason together with the Codex instance that still
     /// has the previous configuration loaded. Keeping both writes under one
     /// lock prevents a status poll from observing an unreconcilable reason
@@ -1900,14 +1981,19 @@ impl AppState {
             proxy.restart_process_identity = None;
             return;
         }
-        let Some(previous) = proxy.restart_process_identity.as_deref() else {
-            return;
-        };
         let Some(current) = current_identity.as_deref() else {
             // Codex is between stop and start. Keep waiting for a new instance.
             return;
         };
-        if current != previous {
+        // A reason recorded while no Codex was running has no old instance to
+        // outlive: the first Codex seen afterwards started with the new
+        // configuration. Waiting for a PID change there kept the badge lit
+        // until a managed restart, whatever Codex actually loaded.
+        let restarted = proxy
+            .restart_process_identity
+            .as_deref()
+            .is_none_or(|previous| previous != current);
+        if restarted {
             proxy.restart_reasons.clear();
             proxy.restart_process_identity = None;
             let notice = RuntimeNotice::new("codexRestartDetected");
@@ -2361,9 +2447,54 @@ fn settings_path(root: &std::path::Path) -> PathBuf {
     root.join("settings.json")
 }
 
-fn load_inner(root: &std::path::Path) -> Option<Inner> {
-    let bytes = std::fs::read(settings_path(root)).ok()?;
-    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+/// `Ok(None)` means "start from the seed": no settings file exists, or the
+/// one that does could not be parsed and was first kept aside. The seed is
+/// persisted over `settings.json` by the next change, so it must never stand
+/// in for a file that is merely unreadable right now (a sync client or an
+/// antivirus scan holding it) or that this build cannot parse (written by a
+/// newer version before a rollback).
+fn load_inner(root: &std::path::Path) -> AppResult<Option<Inner>> {
+    let path = settings_path(root);
+    let mut attempt = 0;
+    let bytes = loop {
+        match std::fs::read(&path) {
+            Ok(bytes) => break bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if attempt < 4 => {
+                attempt += 1;
+                log::warn!("[State] 設定檔暫時無法讀取，重試 {attempt}：{error}");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(AppError::Message(format!(
+                    "無法讀取設定檔 {}：{error}；為避免用預設值覆蓋，未啟動",
+                    path.display()
+                )))
+            }
+        }
+    };
+    let Some(inner) = parse_inner(&bytes) else {
+        let aside = root.join(format!(
+            "settings.json.unreadable-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        crate::enhanced_runtime::atomic::write_atomic(&aside, &bytes).map_err(|error| {
+            AppError::Message(format!(
+                "設定檔無法解析，且無法另存 {}：{error}；未覆蓋原檔",
+                aside.display()
+            ))
+        })?;
+        log::warn!(
+            "[State] 設定檔無法解析，已另存為 {} 後改用預設值",
+            aside.display()
+        );
+        return Ok(None);
+    };
+    Ok(Some(inner))
+}
+
+fn parse_inner(bytes: &[u8]) -> Option<Inner> {
+    let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(error) => {
             log::warn!("[State] 忽略損壞的設定檔：{error}");
@@ -2496,6 +2627,8 @@ mod tests {
             findings: Vec::new(),
             web_search: crate::web_search::WebSearchSettings::default(),
             subagent: SubagentSettings::default(),
+            remote_sidebar_forced: false,
+            remote_sidebar_hidden: false,
         };
         inner
             .routes
@@ -2504,7 +2637,7 @@ mod tests {
             .unwrap()
             .wire = WireFormat::Chat;
         persist_inner(dir.path(), &inner);
-        let reopened = load_inner(dir.path()).unwrap();
+        let reopened = load_inner(dir.path()).unwrap().unwrap();
         let grok = reopened
             .routes
             .iter()
@@ -2518,6 +2651,36 @@ mod tests {
             .find(|route| route.provider_kind == ProviderKind::GrokCli)
             .unwrap();
         assert_eq!(grok.wire, WireFormat::Responses);
+    }
+
+    #[test]
+    fn unparseable_settings_are_kept_aside_before_the_seed_replaces_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = br#"{"routes":"written by a newer Vellum"}"#;
+        std::fs::write(settings_path(dir.path()), original).unwrap();
+        assert!(load_inner(dir.path()).unwrap().is_none());
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.unreadable-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_stop_startup_instead_of_being_reseeded() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file belongs: reading fails, but not NotFound.
+        std::fs::create_dir(settings_path(dir.path())).unwrap();
+        assert!(load_inner(dir.path()).is_err());
+        assert!(AppState::try_with_data_dir(dir.path().to_path_buf()).is_err());
+        assert!(settings_path(dir.path()).is_dir());
     }
 
     #[test]
@@ -3167,6 +3330,22 @@ mod tests {
             .live_applied
             .iter()
             .any(|notice| notice.code == "codexRestartDetected"));
+    }
+
+    /// Changing the catalog while Codex was closed recorded a reason with no
+    /// process to outlive, and nothing but a managed restart could clear it:
+    /// the badge stayed lit across any number of Codex launches.
+    #[test]
+    fn a_reason_recorded_while_codex_was_closed_clears_when_codex_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state.mark_restart_required(RuntimeNotice::new("routesAndCatalogUpdated"));
+
+        state.reconcile_codex_restart(None);
+        assert!(state.runtime_status().restart_required);
+
+        state.reconcile_codex_restart(Some("300:3000".into()));
+        assert!(!state.runtime_status().restart_required);
     }
 
     #[test]

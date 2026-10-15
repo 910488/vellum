@@ -30,6 +30,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  main-ancestry:
+    name: Contains origin/main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Warn when this build is behind main
+        run: bash scripts/check-main-ancestry.sh
+
   remote-payload:
     name: Embedded Remote Manager payload
     if: github.event_name != 'workflow_dispatch' || inputs.remote_manager

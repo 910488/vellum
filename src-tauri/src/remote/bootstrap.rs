@@ -634,13 +634,37 @@ fn install_managed_ssh_isolation(
 
 fn ensure_isolation_identity(path: &Path) -> AppResult<String> {
     let pub_path = path.with_extension("pub");
-    if path.is_file() && pub_path.is_file() {
-        return fs::read_to_string(&pub_path).map_err(|error| AppError::Message(error.to_string()));
+    if path.is_file() {
+        if pub_path.is_file() {
+            return fs::read_to_string(&pub_path)
+                .map_err(|error| AppError::Message(error.to_string()));
+        }
+        // Hosts already trust this private key. Generating over it would make
+        // ssh-keygen ask whether to overwrite, and would lock those hosts out.
+        let output = background_command("ssh-keygen")
+            .arg("-y")
+            .arg("-f")
+            .arg(path)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| AppError::Message(format!("SshKeygenFailed: {error}")))?;
+        if !output.status.success() {
+            return Err(AppError::Message(format!(
+                "SshKeygenFailed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let public = String::from_utf8(output.stdout)
+            .map_err(|_| AppError::Message("SshKeygenFailed: public key is not UTF-8".into()))?;
+        crate::enhanced_runtime::atomic::write_atomic(&pub_path, public.as_bytes())
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        return Ok(public);
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| AppError::Message(error.to_string()))?;
     }
-    let status = std::process::Command::new("ssh-keygen")
+    let status = background_command("ssh-keygen")
+        .stdin(Stdio::null())
         .args([
             "-t",
             "ed25519",
@@ -920,6 +944,30 @@ mod tests {
         assert!(
             apply > iso,
             "apply_managed_ssh_isolation is the install helper"
+        );
+    }
+
+    #[test]
+    fn an_isolation_key_without_its_public_half_is_kept_not_regenerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("vellum_ed25519");
+        let created = ensure_isolation_identity(&identity).unwrap();
+        let private = fs::read(&identity).unwrap();
+        fs::remove_file(identity.with_extension("pub")).unwrap();
+
+        let recovered = ensure_isolation_identity(&identity).unwrap();
+
+        assert_eq!(fs::read(&identity).unwrap(), private);
+        let key = |line: &str| {
+            line.split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(key(&recovered), key(&created));
+        assert_eq!(
+            fs::read_to_string(identity.with_extension("pub")).unwrap(),
+            recovered
         );
     }
 
