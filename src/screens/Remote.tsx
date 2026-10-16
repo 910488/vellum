@@ -82,9 +82,9 @@ export function Remote(props: RemoteProps) {
         {/* ---------- 工作面 ---------- */}
         <RemoteHostWork model={model} />
         {/* ---------- ChatGPT account catalog ---------- */}
-        {selectedHostId && host ? <RemoteHandoff key={selectedHostId} hostId={selectedHostId} hostName={host.displayName} active={active} /> : null}
+        {selectedHostId && host ? <RemoteHandoff key={`handoff-${selectedHostId}`} hostId={selectedHostId} hostName={host.displayName} active={active} /> : null}
 
-        {selectedHostId && status?.agent && status.managerState !== "unmanaged" ? <RemoteModels key={selectedHostId} hostId={selectedHostId} disabled={busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed} revision={probeVersion} onOperation={trackOperation} onCatalog={setModelObservation} /> : null}
+        {selectedHostId && status?.agent && status.managerState !== "unmanaged" ? <RemoteModels key={`models-${selectedHostId}`} hostId={selectedHostId} disabled={busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed} revision={probeVersion} onOperation={trackOperation} onCatalog={setModelObservation} /> : null}
         <RemoteAccountCatalog model={model} />
         <details className="remote-advanced">
           <summary>{t("remoteWork.advanced")}</summary>

@@ -3,11 +3,7 @@ import type { RemoteController } from './useRemoteController';
 export function RemoteThreadDetails({ model }: {
   model: RemoteController;
 }) {
-  const {
-    t,
-    sessions,
-    unknown,
-  } = model;
+  const { t, sessions, unknown } = model;
   return <><Card>
     <div className="remote-title-row">
       <div><Cap>{t("remote.sessions.cap")}</Cap><h3 className="remote-title">{t("remote.sessions.title")}</h3></div>

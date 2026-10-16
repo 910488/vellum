@@ -33,7 +33,10 @@ export function useRemotePresentation(context: ReturnType<typeof useRemoteConnec
     managerState: status?.managerState ?? "unmanaged",
     agentReachable: Boolean(status?.agent),
   });
-  const blockers = visibleBlockers(status?.blockedReasons ?? [], (status?.managerState ?? "unmanaged") === "unmanaged");
+  const blockers = visibleBlockers(
+    status?.blockedReasons ?? [],
+    (status?.managerState ?? "unmanaged") === "unmanaged",
+  );
   // 工作面只顯示屬於這一台的作業。跑在別台上的用一句話提示，不假裝是這裡的事。
   const ownOperation = operation && operation.hostId === selectedHostId ? operation : null;
   const strayOperation = operation && operation.hostId !== selectedHostId && operationRunning

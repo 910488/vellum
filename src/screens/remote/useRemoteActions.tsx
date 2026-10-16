@@ -16,47 +16,44 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
     setPending,
     primaryActionKey,
     trackOperation,
+    ownOperation,
   } = context;
   async function run(actionKey: string, work: () => Promise<void>) {
-    if (busyRef.current !== null)
-      return;
+    if (busyRef.current !== null) return;
     if (selectedHostId && actionKey !== "remote.trust.confirm") {
       const alreadyConfirmed = sshTrust?.hostId === selectedHostId && sshTrust.confirmed;
       const trusted = alreadyConfirmed || await ensureSshTrust(selectedHostId);
-      if (!trusted)
-        return;
+      if (!trusted) return;
     }
     busyRef.current = actionKey;
     setBusy(actionKey);
     setFailure(null);
     try {
       await work();
-    }
-    catch (cause) {
+    } catch (cause) {
       setFailure({ actionKey, raw: String(cause) });
       retry.current = () => void run(actionKey, work);
       // 失敗後把狀態重讀一次。使用者需要知道主機**現在**是什麼樣子，
       // 而不是動手之前的那張快照 —— 這也讓「上面的狀態是最新的」這句話成立。
       void load();
-    }
-    finally {
+    } finally {
       busyRef.current = null;
       setBusy(null);
     }
   }
   function confirmSshTrust() {
-    if (!selectedHostId || !sshTrust?.fingerprint)
-      return;
+    if (!selectedHostId || !sshTrust?.fingerprint) return;
     const hostId = selectedHostId;
     const fingerprint = sshTrust.fingerprint.fingerprint;
     void run("remote.trust.confirm", async () => {
       try {
         await api.confirmRemoteSshFingerprint(hostId, fingerprint);
-      }
-      catch (cause) {
-        setSshTrust((current) => (current && current.hostId === hostId
-          ? { ...current, fetchError: String(cause) }
-          : current));
+      } catch (cause) {
+        setSshTrust((current) => (
+          current && current.hostId === hostId
+            ? { ...current, fetchError: String(cause) }
+            : current
+        ));
         throw cause;
       }
       setSshTrust({
@@ -71,8 +68,7 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
   }
   function runPending(kind: PendingKind) {
     setPending(null);
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     switch (kind) {
       case "bootstrap":
         return void run(primaryActionKey, async () => {
@@ -109,11 +105,13 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
     }
   }
   function exportBundle() {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     void run("remote.act.bundle", async () => { await api.createRemoteSupportBundle(selectedHostId); });
   }
-  function retryOperation() { setPending("bootstrap"); }
+  function retryOperation() {
+    if (ownOperation?.kind === "oneClickRestore") return setPending("restore");
+    return setPending("bootstrap");
+  }
   return {
     ...context,
     run,

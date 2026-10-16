@@ -34,8 +34,8 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
   }, []);
   const ensureSshTrust = useCallback((hostId: string): Promise<boolean> => {
     const existing = sshTrustRequests.current.get(hostId);
-    if (existing)
-      return existing;
+    if (existing) return existing;
+
     const request = (async () => {
       setSshTrust({ hostId, confirmed: false, checking: true, fingerprint: null, fetchError: null });
       try {
@@ -47,8 +47,7 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
         try {
           const fingerprint = status.fingerprint ?? await api.fetchRemoteSshFingerprint(hostId);
           setSshTrust({ hostId, confirmed: false, checking: false, fingerprint, fetchError: null });
-        }
-        catch (cause) {
+        } catch (cause) {
           setSshTrust({
             hostId,
             confirmed: false,
@@ -58,8 +57,7 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
           });
         }
         return false;
-      }
-      catch (cause) {
+      } catch (cause) {
         setSshTrust({
           hostId,
           confirmed: false,
@@ -80,8 +78,7 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
   }, []);
   const inspectHost = useCallback(async (hostId: string) => {
     const trusted = await ensureSshTrust(hostId);
-    if (!trusted)
-      return;
+    if (!trusted) return;
     const myGeneration = (probeGenerations.current[hostId] ?? 0) + 1;
     probeGenerations.current[hostId] = myGeneration;
     // Never clear the previously-good status here: an already-probed host
@@ -90,28 +87,21 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
     setProbingHostId(hostId);
     try {
       const next = await api.inspectRemoteHost(hostId);
-      if (probeGenerations.current[hostId] !== myGeneration)
-        return;
+      if (probeGenerations.current[hostId] !== myGeneration) return;
       setStatuses((current) => ({ ...current, [hostId]: next }));
       setLastUpdated((current) => ({ ...current, [hostId]: Date.now() }));
       setProbeErrors((current) => {
-        if (!(hostId in current))
-          return current;
-        const {
-          ...rest,
-        } = current;
+        if (!(hostId in current)) return current;
+        const { [hostId]: _dropped, ...rest } = current;
         return rest;
       });
-    }
-    catch (cause) {
-      if (probeGenerations.current[hostId] !== myGeneration)
-        return;
+    } catch (cause) {
+      if (probeGenerations.current[hostId] !== myGeneration) return;
       // 探測失敗是那一台主機的屬性，不是整頁的警報。標在它自己那一列上。
       // A host-key change is a hard fail: surface the backend error and never
       // offer an auto-accept button.
       setProbeErrors((current) => ({ ...current, [hostId]: String(cause) }));
-    }
-    finally {
+    } finally {
       if (probeGenerations.current[hostId] === myGeneration) {
         setProbingHostId((current) => current === hostId ? null : current);
       }
@@ -137,25 +127,23 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
       setHosts(discovered);
       setSelectedHostId((current) => current ?? discovered[0]?.vellumHostId ?? null);
       const discoveredIds = new Set(discovered.map((host) => host.vellumHostId));
-      setStatuses((current) => Object.fromEntries(Object.entries(current).filter(([hostId]) => discoveredIds.has(hostId))));
+      setStatuses((current) => Object.fromEntries(
+        Object.entries(current).filter(([hostId]) => discoveredIds.has(hostId)),
+      ));
       // Live SSH inspection is deferred until after discovery paints. Probe
       // only the selected host instead of blocking this tab on every alias.
       setProbeVersion((current) => current + 1);
-    }
-    catch (cause) {
+    } catch (cause) {
       setDiscoveryError(String(cause));
-    }
-    finally {
+    } finally {
       setDiscovering(false);
-      if (refreshVersion > 0)
-        onRefreshComplete(refreshVersion);
+      if (refreshVersion > 0) onRefreshComplete(refreshVersion);
     }
   }, [refreshVersion, onRefreshComplete]);
   const loadPairings = useCallback(async (hostId: string) => {
     try {
       setPairings(await api.listRemoteCodexAccountPairings(hostId));
-    }
-    catch (cause) {
+    } catch (cause) {
       setPairings([]);
       setDiscoveryError(String(cause));
     }
@@ -163,8 +151,7 @@ export function useRemoteConnection(context: ReturnType<typeof useRemoteState>) 
   const loadExecutionAccounts = useCallback(async (hostId: string) => {
     try {
       setExecutionAccounts(await api.listRemoteOfficialExecutionAccounts(hostId));
-    }
-    catch {
+    } catch {
       // Older agents have no managed Official execution-account API.
       setExecutionAccounts([]);
     }

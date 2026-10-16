@@ -11,7 +11,7 @@ export type RemoteProps = {
   onRefreshComplete: (version: number) => void;
   active?: boolean;
 };
-export function useRemoteState({ refreshVersion, onRefreshComplete, active = true, }: RemoteProps) {
+export function useRemoteState({ refreshVersion, onRefreshComplete, active = true }: RemoteProps) {
   const { t } = useTranslation();
   const { locale } = useLocaleFormat();
   const handoffs = useHandoffRecords();
@@ -21,9 +21,7 @@ export function useRemoteState({ refreshVersion, onRefreshComplete, active = tru
   const [selectedHostId, setSelectedHostId] = useState<string | null>(() => handoffReviewTarget()?.host ?? null);
   useEffect(() => {
     const review = (event: Event) => {
-      setSelectedHostId((event as CustomEvent<{
-        host: string;
-      }>).detail.host);
+      setSelectedHostId((event as CustomEvent<{ host: string }>).detail.host);
       setFailure(null);
     };
     window.addEventListener("vellum:handoff-review", review);
@@ -39,10 +37,7 @@ export function useRemoteState({ refreshVersion, onRefreshComplete, active = tru
   // 三條錯誤通道，刻意不共用一個 state。上一版全部塞進同一個 `error`，
   // 結果背景探測失敗會把使用者剛按出來的動作失敗蓋掉。
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
-  const [failure, setFailure] = useState<{
-    actionKey: string;
-    raw: string;
-  } | null>(null);
+  const [failure, setFailure] = useState<{ actionKey: string; raw: string } | null>(null);
   const [probeErrors, setProbeErrors] = useState<Record<string, string>>({});
   const [featureEnabled, setFeatureEnabled] = useState<boolean | null>(null);
   const [release, setRelease] = useState<RemoteReleaseStatus | null>(null);
@@ -67,11 +62,7 @@ export function useRemoteState({ refreshVersion, onRefreshComplete, active = tru
   const pairQueueRestoreAccount = useRef<string | null>(null);
   const [pairQueueLength, setPairQueueLength] = useState(0);
   const [resumeBootstrapAfterPairing, setResumeBootstrapAfterPairing] = useState(false);
-  const [takeoverPrompt, setTakeoverPrompt] = useState<{
-    hostId: string;
-    operationId: string;
-    token: string;
-  } | null>(null);
+  const [takeoverPrompt, setTakeoverPrompt] = useState<{ hostId: string; operationId: string; token: string } | null>(null);
   // Remote control identity A stays synchronized with Desktop. Official
   // execution identities B belong only to Vellum proxy authorization.
   const [executionAccounts, setExecutionAccounts] = useState<RemoteOfficialExecutionAccount[]>([]);

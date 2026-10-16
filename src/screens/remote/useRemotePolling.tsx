@@ -34,8 +34,7 @@ export function useRemotePolling(context: ReturnType<typeof useRemoteAccounts>) 
   } = context;
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     void inspectHost(selectedHostId);
   }, [selectedHostId, probeVersion, inspectHost]);
   /* Desktop 換 ChatGPT 帳號時只推這一台。記在後端而不是這裡的 state，因為切帳號
@@ -55,10 +54,7 @@ export function useRemotePolling(context: ReturnType<typeof useRemoteAccounts>) 
     }
     let cancelled = false;
     api.getDesktopCodexCompatibility(selectedHostId)
-      .then((next) => {
-        if (!cancelled)
-          setDesktopCodex(next);
-      })
+      .then((next) => { if (!cancelled) setDesktopCodex(next); })
       .catch((cause) => {
         if (!cancelled) {
           setDesktopCodex({
@@ -77,24 +73,21 @@ export function useRemotePolling(context: ReturnType<typeof useRemoteAccounts>) 
     return () => { cancelled = true; };
   }, [selectedHostId, statuses, probeVersion]);
   useEffect(() => {
-    if (!operation || operation.state !== "running")
-      return;
+    if (!operation || operation.state !== "running") return;
     return startVisiblePoll({
       active,
       intervalMs: 1000,
       load: async () => {
         await api.getRemoteOperation(operation.operationId).then((next) => {
           trackOperation(next);
-          if (next.state !== "running")
-            void load();
+          if (next.state !== "running") void load();
         }).catch((cause) => setDiscoveryError(String(cause)));
       },
     });
   }, [operation, load, trackOperation, active]);
   useEffect(() => {
     const current = selectedHostId ? statuses[selectedHostId]?.agent?.grok : null;
-    if (!selectedHostId || !current?.loginPending)
-      return;
+    if (!selectedHostId || !current?.loginPending) return;
     return startVisiblePoll({
       active,
       intervalMs: 2000,
@@ -110,14 +103,8 @@ export function useRemotePolling(context: ReturnType<typeof useRemoteAccounts>) 
     }
     let cancelled = false;
     api.getRemoteSessionSummary(selectedHostId)
-      .then((next) => {
-        if (!cancelled)
-          setSessions(next);
-      })
-      .catch(() => {
-        if (!cancelled)
-          setSessions(null);
-      });
+      .then((next) => { if (!cancelled) setSessions(next); })
+      .catch(() => { if (!cancelled) setSessions(null); });
     return () => { cancelled = true; };
   }, [selectedHostId, probeVersion]);
   useEffect(() => {
@@ -128,8 +115,7 @@ export function useRemotePolling(context: ReturnType<typeof useRemoteAccounts>) 
     void loadExecutionAccounts(selectedHostId);
   }, [selectedHostId, probeVersion, loadExecutionAccounts]);
   useEffect(() => {
-    if (!selectedHostId || !executionLogin)
-      return;
+    if (!selectedHostId || !executionLogin) return;
     return startVisiblePoll({
       active,
       intervalMs: Math.max(2000, executionLogin.interval * 1000),
@@ -147,18 +133,15 @@ export function useRemotePolling(context: ReturnType<typeof useRemoteAccounts>) 
     });
   }, [selectedHostId, executionLogin, loadExecutionAccounts, active]);
   useEffect(() => {
-    if (!selectedHostId || !chatgptLogin)
-      return;
+    if (!selectedHostId || !chatgptLogin) return;
     return startVisiblePoll({
       active,
       intervalMs: 2000,
       load: async () => {
         await api.pollRemoteCodexAccountLogin(selectedHostId).then(async (next) => {
-          if (next.state !== "synchronized")
-            return;
+          if (next.state !== "synchronized") return;
           setChatgptLogin(null);
-          if (await advancePairQueue(selectedHostId))
-            return;
+          if (await advancePairQueue(selectedHostId)) return;
           await loadPairings(selectedHostId);
           await inspectHost(selectedHostId);
           if (resumeBootstrapAfterPairing) {

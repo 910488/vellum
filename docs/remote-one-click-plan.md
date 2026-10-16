@@ -448,6 +448,21 @@ remedy，失敗期間主按鈕停用；原始錯誤位於工作面下方預設�
 與合格模型後僅改模型意圖，保留原 policy overrides，再走既有 controlled converge
 （包括 preflight、等待閒置、接手確認與 verify）。前端不再組合 plan／apply 來部署。
 
+拆檔語意複查（對照 `dc309ae:src/screens/Remote.tsx`）：
+- 修復 `inspectHost` 遺失的 computed-key 排除，成功重新探測只清掉該主機的錯誤；
+  保留其他主機錯誤與探測 generation 防護，補 UI 回歸測試。
+- 恢復 `retryOperation` 的還原分支：還原失敗後的重試仍須輸入主機名稱，不能改成
+  部署；補 UI 回歸測試。plan／apply 的舊重試入口則依 M5 收斂成 bootstrap。
+- callback 與輪詢 effect 逐段比對，保留既有 `void`、catch、依賴陣列、取消旗標與
+  ref 捕捉；原檔的程式段落恢復原格式。移除的呼叫僅限 M5 淘汰的
+  plan／replan／apply／repair 獨立路徑，修復與模型變更改走 converge。
+- 其餘刻意差異：移除 plan／selectedModels 及舊失敗卡衍生狀態；切換主機／交接
+  review 不再清除已移除的 plan；手動重新掃描會清除畫面上的失敗與已終止作業，
+  不改 journal；模型觀察決定 ChatGPT 卡片顯示。資料與事件處理移入各元件後，
+  閉包仍取自同一輪 controller，沒有改成跨輪快取。
+- 新模型區與交接區採不同 React key 前綴，避免同一主機的兩個兄弟元件共用 key。
+  除以上修復與已核准的 M5 行為調整外，逐段比對完成，無其他差異。
+
 - 工作面只剩：狀態一句話、主要按鈕（部署／重新部署）、進度、失敗時的單一
   remedy。Plan 按鈕拿掉；模型選擇改成部署後「這台可用的模型」清單，可增減並自動
   重新 converge。

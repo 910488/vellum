@@ -23,8 +23,7 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
     setDevicePairing,
   } = context;
   function pairChatGpt(accountId?: string, makeActive = true) {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     if (!accountId) {
       pairQueue.current = [];
       setPairQueueLength(0);
@@ -51,8 +50,7 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
     if (!next) {
       const restoreAccount = pairQueueRestoreAccount.current;
       pairQueueRestoreAccount.current = null;
-      if (restoreAccount)
-        await api.activateRemoteCodexAccount(hostId, restoreAccount).catch(() => { });
+      if (restoreAccount) await api.activateRemoteCodexAccount(hostId, restoreAccount).catch(() => {});
       return false;
     }
     const login = await api.startRemoteCodexAccountLogin(hostId, next);
@@ -62,13 +60,11 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
   }
   /** 把 Desktop 上尚未在這台主機配對的帳號排成一列，一次帶完。 */
   function pairAllChatGptAccounts() {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     const pending = pairings
       .filter((row) => ((!row.paired && !row.active) || row.credentialState === "expired") && !row.detail)
       .map((row) => row.accountId);
-    if (!pending.length)
-      return;
+    if (!pending.length) return;
     pairQueueRestoreAccount.current = activeControlAccount?.accountId ?? null;
     pairQueue.current = pending;
     setPairQueueLength(pending.length);
@@ -78,17 +74,14 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
   }
   /** 跳過這一個帳號，直接走下一個。之後隨時可以從這張卡片單獨補配對。 */
   function skipPairing() {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     setChatgptLogin(null);
     void run("remote.act.chatgptPairSkip", async () => {
-      if (!await advancePairQueue(selectedHostId))
-        await loadPairings(selectedHostId);
+      if (!await advancePairQueue(selectedHostId)) await loadPairings(selectedHostId);
     });
   }
   function activateChatGpt(accountId?: string) {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     void run("remote.act.chatgptActivate", async () => {
       await api.activateRemoteCodexAccount(selectedHostId, accountId);
       await loadPairings(selectedHostId);
@@ -100,21 +93,17 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
   }
   function selectRemoteControlAccount(accountId: string) {
     const account = pairings.find((row) => row.accountId === accountId);
-    if (!account || account.detail)
-      return;
+    if (!account || account.detail) return;
     if ((!account.paired && !account.active) || account.credentialState === "expired") {
       pairChatGpt(account.accountId, true);
       return;
     }
-    if (!account.active)
-      activateChatGpt(account.accountId);
+    if (!account.active) activateChatGpt(account.accountId);
   }
   function addOfficialExecutionAccount() {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     const name = executionDisplayName.trim();
-    if (!name)
-      return;
+    if (!name) return;
     void run("remote.act.executionLogin", async () => {
       const login = await api.startRemoteOfficialExecutionAccountLogin(selectedHostId, name);
       setExecutionLogin(login);
@@ -123,16 +112,14 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
     });
   }
   function selectOfficialExecutionAccount(accountIdHash: string) {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     void run("remote.act.executionSelect", async () => {
       await api.selectRemoteOfficialExecutionAccount(selectedHostId, accountIdHash);
       await loadExecutionAccounts(selectedHostId);
     });
   }
   function selectOfficialExecutionRoute(value: string) {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     if (value === "control") {
       void run("remote.act.executionFollowControl", async () => {
         await api.clearRemoteOfficialExecutionAccountSelection(selectedHostId);
@@ -143,16 +130,14 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
     selectOfficialExecutionAccount(value);
   }
   function removeOfficialExecutionAccount(accountIdHash: string) {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     void run("remote.act.executionRemove", async () => {
       await api.removeRemoteOfficialExecutionAccount(selectedHostId, accountIdHash);
       await loadExecutionAccounts(selectedHostId);
     });
   }
   function pairMobileDevice() {
-    if (!selectedHostId)
-      return;
+    if (!selectedHostId) return;
     void run("remote.act.devicePair", async () => {
       setDevicePairing(await api.startRemoteControlPairing(selectedHostId));
     });

@@ -390,6 +390,19 @@ describe("Remote Manager operations UI", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("clears a host probe error after a successful reinspection", async () => {
+    apiMocks.inspectRemoteHost.mockRejectedValueOnce(new Error("ssh: connect timeout"));
+    const view = renderRemote();
+    const failed = await screen.findByText(i18n.t("remote.probeFailed"));
+    expect(failed.closest("button")?.classList.contains("remote-host--unreachable")).toBe(true);
+
+    view.rerender(<Remote refreshVersion={1} onRefreshComplete={() => {}} />);
+    await inspectedWorkSurface();
+    await waitFor(() => expect(screen.queryByText(i18n.t("remote.probeFailed"))).toBeNull());
+    expect(document.querySelector(".remote-host--unreachable")).toBeNull();
+    expect(apiMocks.inspectRemoteHost).toHaveBeenCalledTimes(2);
+  });
+
   it("formats the last inspection time using the selected UI language and updates it on language changes", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(new Date(2026, 9, 16, 20, 43, 53).getTime());
     try {
@@ -724,7 +737,8 @@ describe("Remote Manager operations UI", () => {
     expect(await screen.findByText("正在部署")).toBeTruthy();
     expect(screen.getByText("排入佇列")).toBeTruthy();
     expect(screen.getByText(/0% · 已經過 0:0\d/)).toBeTruthy();
-    expect(screen.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
+    const surface = within(screen.getByRole("region", { name: i18n.t("remoteWork.label") }));
+    expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
   });
 
   it("explains that on-demand services need a reconnect after reboot", async () => {
@@ -891,7 +905,9 @@ describe("Remote Manager operations UI", () => {
     expect(surface.getAllByRole("button")).toHaveLength(2);
     expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
     expect(surface.getByRole("button", { name: "下一步：重試" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "匯出診斷包" })).toBeNull();
+    expect(surface.queryByRole("button", { name: "匯出診斷包" })).toBeNull();
+    const exportButton = screen.getByRole("button", { name: "匯出診斷包" });
+    expect(exportButton.closest("details")?.open).toBe(false);
     const details = screen.getByText(raw).closest("details");
     expect(details?.open).toBe(false);
     openTray("詳細資料"); expect(details?.open).toBe(true);
@@ -998,6 +1014,28 @@ describe("Remote Manager operations UI", () => {
 
     await waitFor(() => expect(apiMocks.restoreRemoteHost).toHaveBeenCalledWith("jetson"));
     expect(await screen.findByText("正在解除管理")).toBeTruthy();
+  });
+
+  it("retries a failed restore through the host-name gate without starting deployment", async () => {
+    apiMocks.getRemoteOperation.mockResolvedValue({
+      operationId: "one-click-restore-1", hostId: "jetson", kind: "oneClickRestore",
+      phase: "restore", percent: 35, state: "failed", message: "ssh: connect timeout",
+      result: null, updatedAt: "2026-10-16T00:00:00Z",
+    });
+    renderRemote();
+    await inspectedWorkSurface();
+    fireEvent.click(screen.getByRole("button", { name: "解除 Vellum 管理…" }));
+    fireEvent.change(dialog().getByRole("textbox"), { target: { value: "Jetson" } });
+    fireEvent.click(dialog().getByRole("button", { name: "解除 Vellum 管理…" }));
+
+    const surface = within(screen.getByRole("region", { name: i18n.t("remoteWork.label") }));
+    fireEvent.click(await surface.findByRole("button", { name: "下一步：重試" }, { timeout: 2500 }));
+    const confirm = dialog().getByRole<HTMLButtonElement>("button", { name: "解除 Vellum 管理…" });
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(dialog().getByRole("textbox"), { target: { value: "Jetson" } });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(apiMocks.restoreRemoteHost).toHaveBeenCalledTimes(2));
+    expect(apiMocks.bootstrapRemoteHost).not.toHaveBeenCalled();
   });
 
   it("asks the user to confirm the SSH fingerprint before inspect or bootstrap", async () => {
