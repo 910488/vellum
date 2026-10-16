@@ -223,6 +223,58 @@ pub async fn list_remote_handoffs(
 }
 
 #[tauri::command]
+pub async fn capture_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::capture(&state, &handoff_id)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn review_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Review> {
+    off_main_thread(&state, move |state| {
+        super::handoff::review(&state, &handoff_id)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn settle_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+    branch_only: bool,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::settle(&state, &handoff_id, branch_only)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn discard_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::discard(&state, &handoff_id)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn acknowledge_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<()> {
+    off_main_thread(&state, move |state| {
+        super::handoff::acknowledge(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn bootstrap_remote_host(
     state: tauri::State<'_, AppState>,
     host_id: String,

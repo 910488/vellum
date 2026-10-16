@@ -300,7 +300,7 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   model／effort／active 在清單中為未知（null），選中一筆後才讀該筆 sessions rollout，
   驗證身分並取最後的 model／provider／effort／active，沿用 conversation_key_matches。
   不讀 auth；缺設定或仍有本機 turn 時擋下。已建立交接紀錄的 thread 標 handedOff，
-  後續 UI 據此避免重複交出，尚未處理回收後解除標記。
+  UI 據此避免重複交出；安全套用、存成分支或明確捨棄後解除標記。
   preflight 檢查受管 SSH alias、Agent 功能、主機／完整 runtime／版本／模型與憑證；
   新增唯讀 codex.handoffPreflight，僅回傳固定工具清單、Git 2.29+ 能力、provider 名稱與 catalog slug。
   明確 requiredOs 或根目錄 Windows 專用 csproj 與主機 OS 不符即擋下；缺工具的提醒
@@ -321,14 +321,37 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   無 force push；淺 clone 仍拒絕並提示補齊歷史。Git fixture 需要 Git 2.29+。
   本機 refs/vellum-handoff/<id> 在臨時 index 產生 commit 後、第一次遠端寫入前建立，
   用來固定快照，會出現在 git log --all／GUI，並保持 objects 可達。
-  preflight 的 localRefNotice 告知此事；下一段 UI 必須顯示這段提醒。
+  preflight 的 localRefNotice 告知此事；UI 以四語文案顯示這段提醒。
   若初次本機 journal／lock 寫入失敗且尚未進行遠端寫入，立即以 expected snapshot SHA
   清除此 ref；若 ref 被其他動作改過則保留並回報，不刪別人的更新。
   正常流程的清理時點是結果已安全套用到本機、已保存為本機分支，或使用者明確丟棄之後；
-  由下一段結果回收／discard 接上同一個 expected-SHA 清理 helper。running、傳輸失敗、
-  indeterminate 都保留 ref，避免重試換成另一份快照。現階段尚無 apply／discard 入口，
-  所以已寫入 journal 的 ref 會持續保留；不能用時間到了就自動刪除。
-  UI（五個 mock 場景）、結果 fetch／套用／衝突分支與完成通知留待後續段落。
+  結果回收／discard 接上同一個 expected-SHA 清理 helper。running、傳輸失敗、
+  indeterminate 都保留 ref，避免重試換成另一份快照；不能因時間到了就自動刪除。
+  **結果回收與 UI（本輪實作，待驗收）**：新增 capture／review／settle／discard／
+  acknowledge 指令。capture operation 在 RPC 前持久化，fetch 失敗沿用原快照重試；
+  顯式再取部分進度才產生新的 operation。fetch 與 push 一樣使用隔離的 bare repo、
+  受管 SSH 與私有 known_hosts，不讀來源 repo 的 URL rewrite。核對 ref 的實際 SHA，
+  並要求結果 commit 恰有一個 parent，且等於原快照。diffstat 由抓回的 Git objects
+  重新計算，支援二進位檔案與含 tab／換行的檔名，不把遠端的統計直接當成驗證結果。
+  抓回的結果以 refs/vellum-handoff-results/<id> 固定可達性；與快照 ref 一起在收尾清除。
+  套用時重新確認 HEAD 等於 snapshot.base、相關檔案自交出後未變動、真實 index
+  沒有未合併項目，並通過 git apply --check。無關的本機變動可保留；不修改真實 index。
+  條件不符時建立 vellum/handoff-<id> 分支，保留工作樹與 index；不覆寫同名的不同分支。
+  套用前先保存 intent；若中斷後無法確定是否已套用，重試只存成分支，不再次套用。
+  disposition 先持久化，再以 expected SHA 清理兩個 ref；清理失敗可離線重試，不能
+  刪除別人改過的 ref。捨棄不取消遠端 turn；已觀察到終止、或確定尚未送出 turn/start 的
+  紀錄可離線捨棄。running／indeterminate 必須先對帳並等原 turn 終止。
+  compose／blocked／running／back／drift 使用真實元件，預覽台 /preview/remote.html
+  新增五個交接場景、四語切換。thread 用列表選擇，任務第一段由使用者編輯，不假稱已
+  自動整理完整對話；可選任務所需 OS。開始前重跑 preflight，不以舊畫面取代檢查。
+  結果卡顯示摘要、diffstat、完整 binary patch，遇 drift 只提供存成分支，不提供強制套用。
+  App 共用一個輪詢器，避免工作面與通知重複輪詢；關閉 App 後工作仍由遠端 daemon
+  執行，重開或視窗恢復可見時補查結果。完成／停止通知在 Vellum 內保留到明確確認，
+  可切回對應主機與交接紀錄；acknowledged 保存於 Desktop journal。
+  **尚待 Codex App 介面資訊**：目前僅提供遠端 thread ID 複製與 Vellum 內摘要通知。
+  「直接開啟指定遠端 thread」及「在原本機 thread 寫入完成摘要」尚未接通；現有程式庫
+  沒有已驗證的入口，不猜測帶 host 的 URI，也不直接修改 rollout 或另開 turn 注入通知。
+  這兩項保留為 M3b 未完成項，待協調者確認介面後接上。
   收尾仍需用真實 pinned daemon 對照 thread/start 回傳、dotted config override、
   thread/list 與無 override 的 thread/resume；目前測試以 fake daemon／本機 Git fixture 為主。
 - 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、

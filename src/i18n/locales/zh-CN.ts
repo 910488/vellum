@@ -1,6 +1,18 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "handoff": {
+    "requiredOs": "任务需要的操作系统", "detectOs": "根据仓库判断",
+    "hostRepair": "请先部署或修复此主机，再交出工作。", "gitRepair": "请先安装 Git 2.29 或更高版本，再交出工作。", "pairRepair": "请先在此主机配对并启用 ChatGPT。", "copyThread": "复制远端 thread ID", "openThreadHint": "在 Codex App 选择此主机，再用此 ID 打开远端 thread。",
+    "title": "把本机的工作交给 {{host}}", "lede": "远端会从目前的进度接着做，包括尚未 commit 的改动。本机文件保持原样。",
+    "chooseThread": "选择一个本机 thread", "noThreads": "目前没有可接手的近期 Git thread。", "handedOff": "已交出", "changed": "改过的文件", "staged": "已 staged", "untracked": "未跟踪的新文件",
+    "transferNote": "直接通过受管 SSH 传到这台主机，不经过 GitHub；忽略的文件不会传输。", "brief": "远端要做的事", "briefPlaceholder": "完成……接着验证……\n\n背景：本机已经完成……", "briefHint": "第一段写清楚本次任务；需求与进度放在背景。旧需求若说过暂不执行，请说明本次是否改为执行。",
+    "toolWarning": "远端缺少 {{tool}}。请调整命令或安装工具；这条提醒会附在交代末尾。", "preflightReady": "主机、runtime 与模型检查通过。", "refNotice": "交出时会建立 refs/vellum-handoff/<id> 固定快照，Git 历史工具也能看到。结果应用、存为分支或丢弃后清除。",
+    "start": "交给远端", "reset": "重新选择", "checking": "正在检查所选 thread 与主机……", "checkFailed": "此操作未完成，请查看详细信息后重试。", "local": "本机", "remoteThread": "远端 thread", "partialCapture": "这是部分进度，并非完成结果；远端可能仍在执行。", "binary": "二进制", "noChanges": "没有文件变更。", "drift": "本机 HEAD、相关文件已变动，或无法干净应用。请将结果存为分支；本机工作树保持原样。",
+    "apply": "应用到本机工作区", "branch": "存为分支", "fetch": "取回结果", "fetchPartial": "先取回当前进度", "resume": "继续这份交接", "fullDiff": "查看完整 diff", "discard": "丢弃结果", "discardConfirm": "丢弃这份已停止的交接并清除本机快照 ref。本机文件与远端工作树会保留。", "detached": "关闭 Vellum 也会继续执行。", "retryCleanup": "重试清理 ref", "ledger": "交接记录", "new": "交出另一份工作", "noRecords": "这台主机还没有交接记录。", "review": "查看结果", "dismiss": "知道了", "completedNotice": "远端已完成：{{name}}", "partialNotice": "远端已停止，可能有部分结果可回收：{{name}}", "hostCounts": "{{running}} 份进行中 · {{ready}} 份待取回",
+    "states": { "applied": "已应用", "branched": "已存为分支", "discarded": "已丢弃", "back": "可以取回", "partial": "已停止・部分进度", "running": "远端进行中", "uncertain": "等待对账" },
+    "errors": { "HandoffPlatformMismatch": "这份工作需要其他操作系统，请选择兼容的主机。", "HandoffLfsUnsupported": "目前尚不支持接手 LFS 仓库。", "HandoffThreadAlreadyHandedOff": "此 thread 已有未结束的交接，请先查看原记录。", "activeWorkInProgress": "请先完成或中断本机 turn。", "incompleteObservation": "无法确认本机活动，请重试后再交出。", "HandoffThreadSettingsUnavailable": "无法从所选 thread 读取模型与推理强度。", "HandoffRuntimeIncomplete": "Codex runtime 不完整，请先重新部署主机。", "HandoffModelUnavailable": "请先在此主机部署所选 thread 的模型与 provider。", "HandoffManagedSshRequired": "请先部署此主机的受管 SSH。", "HandoffLocalDrift": "本机工作已变动，请重试将结果存为分支。", "HandoffStillRunning": "远端仍在执行或状态不明，请等它停止。", "HandoffBranchExists": "结果分支已存在且内容不同，已保留原分支。", "HandoffResultUnavailable": "目前还没有可用的结果快照。", "HandoffOperationBusy": "另一个交接操作正在执行，请稍后重试。" }
+  },
   "requestErrors": {"quota": "额度用完或请求被限流。", "auth": "登录验证被拒绝，请重新登录。", "cancelled": "请求已取消或连接已关闭。", "protocol": "无法读取上游响应。", "rejected": "请求被上游拒绝。", "unavailable": "上游服务暂时故障。", "other": "请求失败，请查看技术资料。", "retryAfter": "至少等待 {{time}} 后再重试。", "retries": "已重试 {{count}} 次。", "reasons": {"unsupported": "包含不支持的请求选项。", "tools": "工具定义不符合要求的格式。", "continuation": "找不到上一条响应。", "context": "对话超出上下文限制。", "policy": "内容被上游政策拒绝。"}},
   "quotaActions": {"resetCount": "重置次数：{{count}}", "resetHint": "展开可用的重置券；查看列表不会消耗券。", "fiveHourHint": "切换 5 小时窗口自动管理；不会立即消耗重置券。"},
   "bridgeFallback": { "active": "Enhanced core 缺失，发送按钮保护与账号切换仍通过官方 bridge 生效。", "prepared": "Enhanced core 缺失。官方 bridge 已准备好，Codex 接入后保护才会生效。", "failed": "Enhanced core 缺失，bridge 保护未生效。请查看详细信息并修复安装。" },

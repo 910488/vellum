@@ -280,6 +280,22 @@ export const api = {
     return call("list_remote_handoffs");
   },
 
+  captureRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    return call("capture_remote_handoff", { handoffId });
+  },
+  reviewRemoteHandoff(handoffId: string): Promise<import("./remoteHandoff").RemoteHandoffReview> {
+    return call("review_remote_handoff", { handoffId });
+  },
+  settleRemoteHandoff(handoffId: string, branchOnly = false): Promise<RemoteHandoffRecord> {
+    return call("settle_remote_handoff", { handoffId, branchOnly });
+  },
+  discardRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    return call("discard_remote_handoff", { handoffId });
+  },
+  acknowledgeRemoteHandoff(handoffId: string): Promise<void> {
+    return call("acknowledge_remote_handoff", { handoffId });
+  },
+
   getDesktopCodexCompatibility(hostId: string): Promise<DesktopCodexCompatibilityStatus> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call<DesktopCodexCompatibilityStatus>("get_desktop_codex_compatibility", { hostId });

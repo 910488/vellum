@@ -15,6 +15,10 @@ import { useTranslation } from "react-i18next";
 import { operationalErrorKey } from "@/lib/operationalError";
 import { api } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
+import { RemoteHandoff } from "@/components/RemoteHandoff";
+import { useHandoffRecords } from "@/lib/handoffStore";
+import { handoffTerminal } from "@/lib/remoteHandoff";
+import { handoffReviewTarget } from "@/lib/handoffNavigation";
 import { Btn, Cap, Card, Confirm, Empty, Meter, Notice, Row, Rows, State, Tray } from "@/components/ui";
 import {
   configurationStateKey,
@@ -85,9 +89,18 @@ export function Remote({
   active?: boolean;
 }) {
   const { t } = useTranslation();
+  const handoffs = useHandoffRecords();
   const [hosts, setHosts] = useState<RemoteHostCandidate[]>([]);
   const [statuses, setStatuses] = useState<Record<string, RemoteHostStatus>>({});
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(() => handoffReviewTarget()?.host ?? null);
+  useEffect(() => {
+    const review = (event: Event) => {
+      setSelectedHostId((event as CustomEvent<{host: string}>).detail.host);
+      setPlan(null); setSelectedModels([]); setFailure(null);
+    };
+    window.addEventListener("vellum:handoff-review", review);
+    return () => window.removeEventListener("vellum:handoff-review", review);
+  }, []);
   const [plan, setPlan] = useState<RemoteDeploymentPlan | null>(null);
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [operation, setOperation] = useState<RemoteOperationProgress | null>(null);
@@ -908,6 +921,10 @@ export function Remote({
                     {label}
                     {refreshing ? <em className="remote-host__refreshing"> · {t("remote.updating")}</em> : null}
                   </small>
+                  {handoffs.some((r) => r.hostId === item.vellumHostId && !r.result.outcome) ? <small>{t("handoff.hostCounts", {
+                    running: handoffs.filter((r) => r.hostId === item.vellumHostId && !r.result.outcome && !handoffTerminal(r)).length,
+                    ready: handoffs.filter((r) => r.hostId === item.vellumHostId && !r.result.outcome && handoffTerminal(r)).length,
+                  })}</small> : null}
                 </button>
               );
             })}
@@ -1130,6 +1147,8 @@ export function Remote({
             </div>
 
             {/* ---------- ChatGPT account catalog ---------- */}
+            {selectedHostId && host ? <RemoteHandoff key={selectedHostId} hostId={selectedHostId} hostName={host.displayName} active={active} /> : null}
+
             <Card>
               <div className="rowline">
                 <Cap>{t("remote.account.title")}</Cap>

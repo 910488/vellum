@@ -1,6 +1,18 @@
 import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
+  "handoff": {
+    "requiredOs": "任務需要的作業系統", "detectOs": "依儲存庫判斷",
+    "hostRepair": "請先部署或修復這台主機，再交出工作。", "gitRepair": "請先安裝 Git 2.29 以上版本，再交出工作。", "pairRepair": "請先在這台主機配對並啟用 ChatGPT。", "copyThread": "複製遠端 thread ID", "openThreadHint": "在 Codex App 選擇這台主機，再用此 ID 開啟遠端 thread。",
+    "title": "把本機的工作交給 {{host}}", "lede": "遠端會從目前的進度接著做，包括還沒 commit 的改動。本機檔案保持原樣。",
+    "chooseThread": "選一個本機 thread", "noThreads": "目前沒有可接手的近期 Git thread。", "handedOff": "已交出", "changed": "改過的檔案", "staged": "已 staged", "untracked": "未追蹤的新檔案",
+    "transferNote": "直接經受管 SSH 傳到這台主機，不經 GitHub；忽略的檔案不會帶過去。", "brief": "遠端要做的事", "briefPlaceholder": "完成……接著驗證……\n\n背景：本機已經完成……", "briefHint": "第一段寫清楚這次任務；需求與進度放在背景。舊需求若說過先別做，請說明這次是否改為執行。",
+    "toolWarning": "遠端缺少 {{tool}}。請調整指令或安裝工具；這則提醒會附在交代尾端。", "preflightReady": "主機、runtime 與模型檢查通過。", "refNotice": "交出時會建立 refs/vellum-handoff/<id> 固定快照，Git 歷史工具也會看到。結果套用、存成分支或捨棄後清除。",
+    "start": "交給遠端", "reset": "重新選擇", "checking": "正在檢查所選 thread 與主機……", "checkFailed": "這個動作未完成，請查看詳細資訊後重試。", "local": "本機", "remoteThread": "遠端 thread", "partialCapture": "這是部分進度，並非完成結果；遠端可能仍在執行。", "binary": "二進位", "noChanges": "沒有檔案變更。", "drift": "本機 HEAD、相關檔案已變動，或無法乾淨套用。請把結果存成分支；本機工作樹會保持原樣。",
+    "apply": "套用到本機工作區", "branch": "開成分支", "fetch": "拿回結果", "fetchPartial": "先拉回目前進度", "resume": "繼續這份交接", "fullDiff": "看完整 diff", "discard": "捨棄結果", "discardConfirm": "捨棄這份已停止的交接並清除本機快照 ref。本機檔案與遠端工作樹會保留。", "detached": "關掉 Vellum 也會繼續跑。", "retryCleanup": "重試清理 ref", "ledger": "交接紀錄", "new": "交出另一份工作", "noRecords": "這台主機還沒有交接紀錄。", "review": "查看結果", "dismiss": "知道了", "completedNotice": "遠端已完成：{{name}}", "partialNotice": "遠端已停止，可能有部分結果可回收：{{name}}", "hostCounts": "{{running}} 份進行中 · {{ready}} 份待拿回",
+    "states": { "applied": "已套用", "branched": "已存成分支", "discarded": "已捨棄", "back": "可以拿回來", "partial": "已停止・部分進度", "running": "遠端進行中", "uncertain": "等待對帳" },
+    "errors": { "HandoffPlatformMismatch": "這份工作需要其他作業系統，請選擇相容的主機。", "HandoffLfsUnsupported": "目前尚不支援接手 LFS 儲存庫。", "HandoffThreadAlreadyHandedOff": "這個 thread 已有未結束的交接，請先查看原紀錄。", "activeWorkInProgress": "請先完成或中斷本機 turn。", "incompleteObservation": "無法確認本機活動，請重試後再交出。", "HandoffThreadSettingsUnavailable": "無法從所選 thread 讀取模型與推理強度。", "HandoffRuntimeIncomplete": "Codex runtime 不完整，請先重新部署主機。", "HandoffModelUnavailable": "請先在這台主機部署所選 thread 的模型與 provider。", "HandoffManagedSshRequired": "請先部署這台主機的受管 SSH。", "HandoffLocalDrift": "本機工作已變動，請重試將結果存成分支。", "HandoffStillRunning": "遠端仍在執行或狀態不明，請等它停止。", "HandoffBranchExists": "結果分支已存在且內容不同，已保留原分支。", "HandoffResultUnavailable": "目前還沒有可用的結果快照。", "HandoffOperationBusy": "另一個交接動作正在執行，請稍後重試。" }
+  },
   "requestErrors": {"quota": "額度用完或請求被限流。", "auth": "登入驗證遭拒，請重新登入。", "cancelled": "請求已取消或連線已關閉。", "protocol": "無法讀取上游回應。", "rejected": "請求被上游拒絕。", "unavailable": "上游服務暫時故障。", "other": "請求失敗，請查看技術資料。", "retryAfter": "至少等待 {{time}} 後再重試。", "retries": "已重試 {{count}} 次。", "reasons": {"unsupported": "含有不支援的請求選項。", "tools": "工具定義不符合要求的格式。", "continuation": "找不到上一筆回應。", "context": "對話超過上下文限制。", "policy": "內容遭上游政策拒絕。"}},
   "quotaActions": {"resetCount": "重置次數：{{count}}", "resetHint": "展開可用的重置券；查看清單不會消耗券。", "fiveHourHint": "切換 5 小時窗自動管理；不會立即消耗重置券。"},
   "bridgeFallback": { "active": "Enhanced core 缺失，送出鍵保護與帳號切換仍透過官方 bridge 生效。", "prepared": "Enhanced core 缺失。官方 bridge 已準備好，Codex 接上後保護才會生效。", "failed": "Enhanced core 缺失，bridge 保護未生效。請查看詳細資料並修復安裝。" },

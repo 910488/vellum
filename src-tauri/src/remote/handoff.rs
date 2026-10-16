@@ -15,6 +15,10 @@ use super::{RemoteAgentClient, RemoteHostManager};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
+#[path = "handoff_result.rs"]
+mod result;
+pub use result::{acknowledge, capture, discard, review, settle, ResultState, Review};
+
 fn error(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
 }
@@ -56,6 +60,8 @@ pub struct Record {
     pub stage: String,
     pub remote: Option<Value>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub result: ResultState,
 }
 
 trait Transport {
@@ -67,12 +73,25 @@ trait Transport {
         repo: &str,
         reference: &str,
     ) -> AppResult<()>;
+    fn fetch(&self, source: &Path, repo: &str, reference: &str, commit: &str) -> AppResult<()> {
+        let _ = (source, repo, reference, commit);
+        Err(error("HandoffFetchUnavailable"))
+    }
 }
 struct SshTransport {
     client: RemoteAgentClient,
     root: PathBuf,
 }
 impl Transport for SshTransport {
+    fn fetch(&self, source: &Path, repo: &str, reference: &str, commit: &str) -> AppResult<()> {
+        let alias = self
+            .client
+            .target()
+            .ssh_destination
+            .as_deref()
+            .ok_or_else(|| error("HandoffManagedSshRequired"))?;
+        Git::new(source, &self.root).fetch(&self.root, alias, repo, reference, commit)
+    }
     fn rpc(&self, request: Value) -> AppResult<Value> {
         if request["method"] == "agent.version" {
             self.client.agent_version()
@@ -121,7 +140,11 @@ pub fn list_threads(state: &AppState) -> AppResult<Vec<LocalThread>> {
     let records = list(state)?;
     for thread in &mut threads {
         thread.handed_off = records.iter().any(|record| {
-            crate::codex::conversation_key_matches(&thread.thread_id, &record.source.thread_id)
+            record.result.outcome.is_none()
+                && crate::codex::conversation_key_matches(
+                    &thread.thread_id,
+                    &record.source.thread_id,
+                )
         });
     }
     Ok(threads)
@@ -143,7 +166,8 @@ fn selected_thread(state: &AppState, id: &str) -> AppResult<LocalThread> {
         return Err(error("HandoffThreadIdentityAmbiguous"));
     }
     selected.handed_off = list(state)?.iter().any(|record| {
-        crate::codex::conversation_key_matches(&selected.thread_id, &record.source.thread_id)
+        record.result.outcome.is_none()
+            && crate::codex::conversation_key_matches(&selected.thread_id, &record.source.thread_id)
     });
     Ok(selected)
 }
@@ -447,6 +471,7 @@ fn begin(
         stage: "localSnapshot".into(),
         remote: None,
         error: None,
+        result: ResultState::default(),
     };
     let saved = (|| -> AppResult<Lock> {
         let guard = Lock::acquire(root, &record.id)?;
@@ -591,6 +616,9 @@ pub fn resume(state: &AppState, id: &str) -> AppResult<Record> {
     let root = state.data_root();
     let _guard = Lock::acquire(&root, id)?;
     let mut record = load(&root, id)?;
+    if record.result.outcome.is_some() {
+        return Ok(record);
+    }
     let client = transport(state, &record.host_id)?;
     resume_with(&root, &mut record, &client)?;
     Ok(record)
@@ -611,6 +639,9 @@ pub fn poll(state: &AppState, id: &str) -> AppResult<Record> {
     let root = state.data_root();
     let _guard = Lock::acquire(&root, id)?;
     let mut record = load(&root, id)?;
+    if record.result.outcome.is_some() {
+        return Ok(record);
+    }
     let client = transport(state, &record.host_id)?;
     poll_with(&root, &mut record, &client)?;
     Ok(record)

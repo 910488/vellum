@@ -19,6 +19,10 @@ import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { Remote } from "@/screens/Remote";
+import { HandoffNotifications } from "@/components/HandoffNotifications";
+import { refreshHandoffs } from "@/lib/handoffStore";
+import { requestHandoffReview } from "@/lib/handoffNavigation";
+import type { RemoteHandoffRecord, RemoteHandoffThread } from "@/lib/remoteHandoff";
 import type {
   RemoteHostCandidate,
   RemoteHostStatus,
@@ -37,6 +41,11 @@ const SCENES = {
   failed: "失敗",
   appOwned: "被 Codex App 佔住",
   unreachable: "連不上",
+  handoffCompose: "交接：準備交出",
+  handoffBlocked: "交接：平台阻擋",
+  handoffRunning: "交接：遠端進行中",
+  handoffBack: "交接：結果回來",
+  handoffDrift: "交接：本機已變動",
 } as const;
 type Scene = keyof typeof SCENES;
 
@@ -175,9 +184,29 @@ const FAILED: RemoteOperationProgress = {
  * 真的那條路徑（hasTauri() 為真、call() 真的走 invoke）。
  */
 function installFixture(getScene: () => Scene) {
-  const invoke = async (cmd: string): Promise<unknown> => {
+  const thread: RemoteHandoffThread = { threadId: "local-thread", name: "word-count CLI：加 top_words 與命令列介面", repo: "E:\\code_E\\demo-repo", branch: "main", updatedAt: Date.now() / 1000 - 720, model: "GPT-5.6 Sol", modelProvider: "vellum", effort: "high", active: false, handedOff: false };
+  let handoff: RemoteHandoffRecord | null = null;
+  const makeRecord = (running: boolean): RemoteHandoffRecord => ({
+    id: "01JPREVIEWHANDOFF", hostId: "jetson", source: thread,
+    snapshot: { base: "a".repeat(40), commit: "b".repeat(40), localRef: "refs/vellum-handoff/01JPREVIEWHANDOFF", changes: [] },
+    request: {}, stage: "running", error: null,
+    remote: { handoffId: "01JPREVIEWHANDOFF", phase: "running", state: running ? "running" : "completed", threadId: "remote-thread", turnId: "remote-turn", turnStatus: running ? "inProgress" : "completed", plan: ["補上 top_words", "實作命令列介面", "執行測試"], recentOutput: "$ python3 -m unittest -v\ntest_top_words_basic ... ok\ntest_top_words_empty ... ok", summary: running ? "正在補測試。" : "已完成 top_words 與 CLI；6 個測試通過。", capture: null },
+    result: { captureOperation: null, capture: running ? null : { resultRef: "refs/vellum-handoff-results/01JPREVIEWHANDOFF/capture", commit: "c".repeat(40), snapshotCommit: "b".repeat(40), partial: false, diffstat: [{ path: "wordcount.py", added: 46, deleted: 1 }, { path: "wordcount/__main__.py", added: 19, deleted: 0 }, { path: "tests/test_wordcount.py", added: 16, deleted: 0 }] }, fetched: !running, outcome: null, branch: null, applyIntent: false, cleaned: false, acknowledged: false },
+  });
+  if (["handoffRunning", "handoffBack", "handoffDrift"].includes(getScene())) handoff = makeRecord(getScene() === "handoffRunning");
+  const invoke = async (cmd: string, args: Record<string, unknown> = {}): Promise<unknown> => {
     const scene = getScene();
     switch (cmd) {
+      case "list_remote_handoff_threads": return [thread, { ...thread, threadId: "second", name: "修正 restart pill 反覆亮起", branch: "codex/restart-pill" }];
+      case "preflight_remote_handoff": return { thread, changes: [{ path: "wordcount.py", staged: true, untracked: false }, { path: "tests/test_wordcount.py", staged: false, untracked: false }, { path: "NOTES.local.md", staged: false, untracked: true }], blockers: scene === "handoffBlocked" || args.requirements && (args.requirements as {requiredOs?: string}).requiredOs === "windows" ? ["HandoffPlatformMismatch: task requires windows, remote is linux"] : [], warnings: ["Remote tool python is unavailable; use python3 instead."], remoteOs: "linux", localRefNotice: "Snapshot ref retained until apply/discard." };
+      case "list_remote_handoffs": return handoff ? [handoff] : [];
+      case "start_remote_handoff": handoff = makeRecord(true); return handoff;
+      case "poll_remote_handoff": case "resume_remote_handoff": return handoff;
+      case "capture_remote_handoff": if (handoff) { const partial = handoff.remote?.state === "running"; handoff.result = makeRecord(false).result; if (handoff.result.capture) handoff.result.capture.partial = partial; } return handoff;
+      case "review_remote_handoff": return { canApply: scene !== "handoffDrift", patch: "diff --git a/wordcount.py b/wordcount.py\n--- a/wordcount.py\n+++ b/wordcount.py\n@@ -1 +1 @@\n-pass\n+def top_words(text, n): ...\n" };
+      case "settle_remote_handoff": if (handoff) { handoff.result.outcome = args.branchOnly ? "branched" : "applied"; handoff.result.branch = args.branchOnly ? `vellum/handoff-${handoff.id}` : null; handoff.result.cleaned = true; } return handoff;
+      case "discard_remote_handoff": if (handoff) { handoff.result.outcome = "discarded"; handoff.result.cleaned = true; } return handoff;
+      case "acknowledge_remote_handoff": if (handoff) handoff.result.acknowledged = true; return null;
       case "get_remote_manager_feature_flags":
         return { nativeCodexRemoteManager: true, legacyBrokerHostsDropped: [] };
       case "remote_ssh_trust_status":
@@ -273,6 +302,7 @@ function Harness() {
 
   useEffect(() => {
     installFixture(() => scene);
+    void refreshHandoffs();
     setNonce((current) => current + 1);
   }, [scene]);
 
@@ -316,6 +346,7 @@ function Harness() {
           會是一個永遠不捲的版面，也就驗不到這一版最主要的那個決定。 */}
       <div className="shell" style={{ gridTemplateColumns: "minmax(0, 1fr)", gridTemplateRows: "minmax(0, 1fr)" }}>
         <div className="canvas">
+          <HandoffNotifications onReview={requestHandoffReview} />
           <Remote key={`${scene}-${nonce}`} refreshVersion={0} onRefreshComplete={() => {}} />
         </div>
       </div>

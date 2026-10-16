@@ -52,4 +52,30 @@ export interface RemoteHandoffRecord {
     capture: unknown;
   } | null;
   error: string | null;
+  result: {
+    captureOperation: string | null;
+    capture: {
+      resultRef: string; commit: string; snapshotCommit: string; partial: boolean;
+      diffstat: { path: string; added: number | null; deleted: number | null }[];
+    } | null;
+    fetched: boolean;
+    outcome: "applied" | "branched" | "discarded" | null;
+    branch: string | null;
+    applyIntent: boolean;
+    cleaned: boolean;
+    acknowledged: boolean;
+  };
+}
+
+export interface RemoteHandoffReview { canApply: boolean; patch: string }
+
+export function handoffTerminal(record: RemoteHandoffRecord): boolean {
+  return ["completed", "failed", "interrupted"].includes(record.remote?.state ?? "");
+}
+export function handoffState(record: RemoteHandoffRecord): string {
+  if (record.result.outcome) return record.result.outcome;
+  if (record.remote?.state === "completed") return "back";
+  if (record.remote?.state === "failed" || record.remote?.state === "interrupted") return "partial";
+  if (record.stage === "running") return "running";
+  return "uncertain";
 }
