@@ -26,6 +26,15 @@ export function convergePairingSuggested(result: unknown): boolean {
     && "chatgptPairingSuggested" in result && result.chatgptPairingSuggested === true;
 }
 
+export function deploymentWaitControls(operation: { hostId: string; kind: string; state: string; phase: string; result: unknown } | null | undefined, hostId: string | null): { cancel: boolean; token: string | null } {
+  if (!operation || operation.hostId !== hostId || operation.kind !== "oneClickBootstrap" || operation.state !== "running"
+    || !["waitingForIdle", "awaitingTakeover"].includes(operation.phase)) return { cancel: false, token: null };
+  const result = operation.result;
+  const token = operation.phase === "awaitingTakeover" && typeof result === "object" && result !== null && "takeoverToken" in result
+    && typeof result.takeoverToken === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(result.takeoverToken) ? result.takeoverToken : null;
+  return { cancel: true, token };
+}
+
 export function resumeConvergeAfterAccount(operation: { hostId: string; kind: string; state: string; message: string | null } | null | undefined, hostId: string): boolean {
   if (!operation || operation.hostId !== hostId) return false;
   return operation.kind === "oneClickBootstrap"
@@ -38,7 +47,7 @@ export function deploymentVerificationFailure(message: string | null | undefined
 }
 
 export function deploymentPreflightFailure(message: string | null | undefined): string | null {
-  const code = ["bundledReleaseUnavailable", "activeWorkInProgress", "incompleteObservation", "proxyConfigurationSchemaTooNew", "proxyConfigurationUnreadable", "insufficientDiskSpace", "proxyPortConflict", "intelMacUnsupported", "unsupportedRemotePlatform", "guiSessionUnavailable"]
+  const code = ["DeploymentAgentUpgradeRequired", "DeploymentAlreadyRunning", "DeploymentControlUnavailable", "DeploymentConfirmationExpired", "bundledReleaseUnavailable", "activeWorkInProgress", "incompleteObservation", "proxyConfigurationSchemaTooNew", "proxyConfigurationUnreadable", "insufficientDiskSpace", "proxyPortConflict", "intelMacUnsupported", "unsupportedRemotePlatform", "guiSessionUnavailable"]
     .find((code) => message?.includes(code));
   return code ? `remote.blocker.${code}` : null;
 }
@@ -53,7 +62,19 @@ export function proxyMigrationFailure(message: string | null | undefined): strin
 /** A preflight refusal carries a fixed, distro-specific repair hint from the backend. */
 export function psStartTimeFailure(message: string | null | undefined): { repair: string | null } | null {
   if (!message?.includes("psStartTimeUnavailable")) return null;
-  const repair = message.split("; repair:")[1]?.split(/[\r\n]/, 1)[0]?.trim();
+  const structured = message.split("; repairs:")[1]?.split(/[\r\n]/, 1)[0]?.trim();
+  if (structured) {
+    try {
+      const repairs: unknown = JSON.parse(structured);
+      const repair = typeof repairs === "object" && repairs !== null && "psStartTimeUnavailable" in repairs
+        && typeof repairs.psStartTimeUnavailable === "string" ? repairs.psStartTimeUnavailable : null;
+      return { repair };
+    } catch { return { repair: null }; }
+  }
+  // Old single-blocker replies remain readable. Never show another blocker's
+  // repair as a shell command when an older server joins multiple repairs.
+  if (message.split("; repair:")[0]?.includes(",")) return { repair: null };
+  const repair = message.split("; repair:")[1]?.split(/[\r\n]/, 1)[0]?.split(" | ")[0]?.trim();
   return { repair: repair || null };
 }
 
@@ -145,6 +166,10 @@ interface BlockerEntry {
 }
 
 const BLOCKERS: Record<string, BlockerEntry> = {
+  DeploymentAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
+  DeploymentAlreadyRunning: { remedy: null, expectedBeforeBootstrap: false },
+  DeploymentControlUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  DeploymentConfirmationExpired: { remedy: null, expectedBeforeBootstrap: false },
   bundledReleaseUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   activeWorkInProgress: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   unsupportedRemotePlatform: { remedy: null, expectedBeforeBootstrap: false },
@@ -278,6 +303,9 @@ const PHASES = new Set([
   "cleanHostPreflight",
   "hostPreflight",
   "autoFix",
+  "waitingForIdle",
+  "awaitingTakeover",
+  "cancelled",
   "resolvingDesktopCodex",
   "installCodex",
   "nativeDaemon",

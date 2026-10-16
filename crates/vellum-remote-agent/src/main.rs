@@ -154,6 +154,7 @@ fn dispatch(
             "agentVersion": AGENT_VERSION,
             "agentProtocol": AGENT_PROTOCOL_VERSION,
             "proxyMigrationRecovery": true,
+            "confirmedTakeoverIdentity": true,
         })),
         AgentRequest::HostCapabilities => {
             Ok(serde_json::to_value(probe_host()).map_err(|e| e.to_string())?)
@@ -663,14 +664,23 @@ fn dispatch(
                 serde_json::to_value(runtime).map_err(|error| error.to_string())
             },
         ),
-        AgentRequest::CodexStopAppOwned { operation_id } => run_mutation(
+        AgentRequest::CodexStopAppOwned {
+            operation_id,
+            expected_daemon_pid,
+            expected_daemon_identity,
+        } => run_mutation(
             store,
             &operation_id,
             "codex.stopAppOwned",
-            json!({}),
+            json!({"expectedDaemonPid": expected_daemon_pid, "expectedDaemonIdentity": expected_daemon_identity}),
             || {
-                serde_json::to_value(vellum_remote_agent::native_codex::stop_app_owned_native()?)
-                    .map_err(|error| error.to_string())
+                serde_json::to_value(
+                    vellum_remote_agent::native_codex::stop_app_owned_native_expected(
+                        expected_daemon_pid,
+                        expected_daemon_identity.as_deref(),
+                    )?,
+                )
+                .map_err(|error| error.to_string())
             },
         ),
         AgentRequest::CodexRestoreNative { operation_id } => run_mutation(

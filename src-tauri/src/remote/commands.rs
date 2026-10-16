@@ -165,6 +165,8 @@ pub async fn bootstrap_remote_host(
     host_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
     let operation_id = format!("one-click-bootstrap-{}", ulid::Ulid::new());
+    let control = super::converge_control::register(&operation_id, &host_id)?;
+    let registration = super::converge_control::Registration(operation_id.clone());
     let progress = crate::remote::RemoteOperationProgress::queued(
         operation_id.clone(),
         host_id.clone(),
@@ -173,18 +175,27 @@ pub async fn bootstrap_remote_host(
     crate::remote::operation::save(&state.data_root(), &progress)?;
     let owned = state.inner().clone();
     tauri::async_runtime::spawn(async move {
+        let _registration = registration;
         let mut running = progress;
         let progress_root = owned.data_root();
-        let result = crate::remote::bootstrap::one_click_bootstrap(
+        let result = crate::remote::bootstrap::one_click_bootstrap_controlled(
             &owned,
             &host_id,
             |phase, percent, message| {
                 running.phase = phase.into();
                 running.percent = percent;
                 running.message = Some(message.into());
+                running.result = if phase == "awaitingTakeover" {
+                    control
+                        .token()
+                        .map(|token| serde_json::json!({"takeoverToken": token}))
+                } else {
+                    None
+                };
                 running.updated_at = chrono::Utc::now();
                 let _ = crate::remote::operation::save(&progress_root, &running);
             },
+            Some(control.as_ref()),
         )
         .await;
         match result {
@@ -196,15 +207,68 @@ pub async fn bootstrap_remote_host(
                 running.result = serde_json::to_value(result).ok();
             }
             Err(error) => {
-                running.phase = "failed".into();
-                running.state = "failed".into();
+                let cancelled = error.to_string() == "DeploymentCancelled";
+                running.phase = if cancelled { "cancelled" } else { "failed" }.into();
+                running.state = if cancelled { "cancelled" } else { "failed" }.into();
                 running.message = Some(error.to_string());
+                running.result = None;
             }
         }
         running.updated_at = chrono::Utc::now();
         let _ = crate::remote::operation::save(&progress_root, &running);
     });
     crate::remote::operation::load(&state.data_root(), &operation_id)
+}
+
+#[tauri::command]
+pub fn cancel_remote_deployment(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    operation_id: String,
+) -> AppResult<()> {
+    validate_live_deployment(&state.data_root(), &host_id, &operation_id)?;
+    super::converge_control::resolve(&operation_id, &host_id)?.cancel();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn confirm_remote_deployment_takeover(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    operation_id: String,
+    token: String,
+) -> AppResult<()> {
+    let progress = validate_live_deployment(&state.data_root(), &host_id, &operation_id)?;
+    if progress.phase != "awaitingTakeover"
+        || progress
+            .result
+            .as_ref()
+            .and_then(|result| result.get("takeoverToken"))
+            .and_then(serde_json::Value::as_str)
+            != Some(token.as_str())
+    {
+        return Err(crate::error::AppError::Message(
+            "DeploymentConfirmationExpired".into(),
+        ));
+    }
+    super::converge_control::resolve(&operation_id, &host_id)?.confirm(&token)
+}
+
+fn validate_live_deployment(
+    root: &std::path::Path,
+    host_id: &str,
+    operation_id: &str,
+) -> AppResult<crate::remote::RemoteOperationProgress> {
+    let progress = super::operation::load(root, operation_id)?;
+    if progress.host_id != host_id
+        || progress.kind != "oneClickBootstrap"
+        || progress.state != "running"
+    {
+        return Err(crate::error::AppError::Message(
+            "DeploymentControlUnavailable".into(),
+        ));
+    }
+    Ok(progress)
 }
 
 #[tauri::command]
@@ -284,7 +348,7 @@ pub fn get_remote_operation(
     state: tauri::State<'_, AppState>,
     operation_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
-    crate::remote::operation::load(&state.data_root(), &operation_id)
+    crate::remote::operation::load_reconciled(&state.data_root(), &operation_id)
 }
 
 fn restart_remote_native_codex_inner(
@@ -455,10 +519,7 @@ pub async fn cancel_remote_grok_login(
 /// the original single-account behaviour — Desktop's current default — so the
 /// one-account-at-a-time repair path stays exactly as it was; passing one is
 /// what lets first-run setup walk the whole account list.
-fn requested_account_id(
-    state: &AppState,
-    account_id: Option<String>,
-) -> AppResult<String> {
+fn requested_account_id(state: &AppState, account_id: Option<String>) -> AppResult<String> {
     let requested = account_id
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty());
@@ -471,8 +532,7 @@ fn requested_account_id(
             .peek_accounts()
             .iter()
             .any(|(id, _, _)| *id == requested)
-            && super::desktop_control_account_id(state).as_deref()
-                != Some(requested.as_str())
+            && super::desktop_control_account_id(state).as_deref() != Some(requested.as_str())
         {
             return Err(crate::error::AppError::Message(
                 "desktopOfficialAccountUnknown".into(),
@@ -897,6 +957,25 @@ pub async fn remote_session_summary(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployment_control_refuses_wrong_host_kind_or_finished_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut progress = super::super::operation::RemoteOperationProgress::queued(
+            "control-test".into(),
+            "host".into(),
+            "oneClickBootstrap",
+        );
+        super::super::operation::save(temp.path(), &progress).unwrap();
+        assert!(super::validate_live_deployment(temp.path(), "host", "control-test").is_ok());
+        assert!(super::validate_live_deployment(temp.path(), "another", "control-test").is_err());
+        progress.state = "cancelled".into();
+        super::super::operation::save(temp.path(), &progress).unwrap();
+        assert!(super::validate_live_deployment(temp.path(), "host", "control-test").is_err());
+        progress.state = "running".into();
+        progress.kind = "restore".into();
+        super::super::operation::save(temp.path(), &progress).unwrap();
+        assert!(super::validate_live_deployment(temp.path(), "host", "control-test").is_err());
+    }
     #[test]
     fn sidebar_appears_only_for_managed_hosts_or_explicit_preference() {
         use crate::state::RemoteSidebarMode::{Auto, Hide, Show};

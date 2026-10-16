@@ -148,7 +148,7 @@ mutation 失敗及 Desktop apply 後續步驟失敗時恢復；native 驗證成�
 失敗注入涵蓋 service write/load、Docker restart、跨程序重試與 ownership 改變；
 支援資料排除私有快照。
 
-第三段（feb7787 邏輯與測試已驗收；既有 typecheck 錯誤由 b836c4d 修正，待複驗）：
+第三段（feb7787 與 b836c4d 已驗收）：
 apply 完成後，首次 verify 失敗時只做一次冪等 proxy.start，
 再 verify 一次；不重跑安裝、憑證同步、adopt 或 daemon restart。start 回覆遺失也會
 再讀狀態，以實際 readiness 決定結果。第二次仍失敗即回報 verification failure，
@@ -163,17 +163,30 @@ UI 提供重新部署。驗證必須維持 proxy ready、native daemon running�
 提供目前帳號的單次配對／啟用 remedy，完成後續部署，不走全部帳號佇列。
 暫缺憑證的選擇保存為 deferredCatalogIds，plan/apply 都保留，補憑證後再 converge
 即可納入；舊 desired state 與儲存的 plan 仍可讀。尚無可部署模型時回報已知碼
-noDeployableModels。preflight／autoFix／等待與取消／接手確認仍待後續分段；
+noDeployableModels。preflight／autoFix／等待與取消／接手確認見後續分段；
 模型／憑證的前置檢查已於下一段加入寫入關卡。
 
-第五段（待協調者驗證）：bootstrap 拆成 inspect／write，以共同關卡拒絕有 blockers
+第五段（d03ea3f 已驗收）：bootstrap 拆成 inspect／write，以共同關卡拒絕有 blockers
 的部署。先探測平台與 procps，再查 Desktop 模型憑證、signed bundle 的 agent／proxy／
 Codex 檔案與 digest、磁碟保留。已是 bundled Agent 時，於寫入前觀察 port、Official
 grant、config 與完整閒置狀態；Agent 需更新或尚未安裝時，先更新 Agent，再於 boundary／
 linger／Codex lifecycle 寫入前重查上述項目。回報 autoFix 清單，Codex 版本或相容性
 不符時自動安裝 pinned 版本；proxy／config／boundary 沿用既有收斂階段。fake transport
 涵蓋全新主機被拒時沒有本次部署寫入呼叫，既有 recovery hook 保持不變。
-active work／App-owned 目前仍擋下；等待與取消、接手確認在後續段完成。
+active work／App-owned 的等待與取消、接手確認見第六段。
+
+第六段（待協調者驗證）：一鍵部署遇到 active turn／工具／核准或觀察不完整時，
+維持 waitingForIdle 並每兩秒觀察，可取消；App-owned 閒置後進入 awaitingTakeover，
+使用者一次確認後沿用 stopAppOwned 的 ownership／觀察檢查。確認 token 綁定目前
+operation、host、PID、daemon identity 與 CODEX_HOME；程序或活動改變就撤銷確認。
+Agent 以 additive optional expectedDaemonPid／expectedDaemonIdentity 再核對一次，
+舊手動 stop RPC 仍相容；自動接手需 confirmedTakeoverIdentity feature flag。
+取消會在下一個檢查點停止，不中斷在途 RPC，也不刪除已完成的安裝；Vellum 重啟後
+舊確認失效，原 operation 轉為可重試的中斷狀態。同主機同時只允許一筆一鍵部署。
+補齊 inspect_bootstrap fake probe 的真實拒絕路徑測試；repair 改按 blocker 代碼對應，
+多 blocker 不再把平台說明當成 ps 指令。並修正 Codex 版本欄位為 codexVersion，
+避免已是 pinned 版本的主機每次都重裝。M3 程式碼範圍齊備，待本段建置測試驗收；
+實機 smoke 仍須 Joe 同意，由協調者執行。broker／Docker 死碼維持留到 M5。
 
 改寫 `one_click_bootstrap` 成一個狀態機（保留函式名以免破壞呼叫端）：
 

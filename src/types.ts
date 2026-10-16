@@ -1501,7 +1501,7 @@ export interface RemoteOperationProgress {
   kind: string;
   phase: string;
   percent: number;
-  state: "running" | "completed" | "failed";
+  state: "running" | "completed" | "failed" | "cancelled";
   message: string | null;
   result: unknown | null;
   updatedAt: string;

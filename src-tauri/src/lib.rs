@@ -368,6 +368,8 @@ pub fn run() {
             remote::commands::discover_remote_connections,
             remote::commands::inspect_remote_host,
             remote::commands::bootstrap_remote_host,
+            remote::commands::cancel_remote_deployment,
+            remote::commands::confirm_remote_deployment_takeover,
             remote::commands::plan_remote_deployment,
             remote::commands::reapply_remote_deployment,
             remote::commands::apply_remote_deployment,

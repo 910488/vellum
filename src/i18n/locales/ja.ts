@@ -508,6 +508,7 @@ const ja: ResourceTree = {
     },
     "act": {
       "bootstrap": "このホストをデプロイ",
+      "cancelDeployment": "デプロイをキャンセル",
       "reconverge": "再同期",
       "plan": "モデルを変更…",
       "replan": "プレビューを更新",
@@ -631,6 +632,10 @@ const ja: ResourceTree = {
       "noModelsSelected": "モデルが 1 つも選ばれていないため、同期するものがありません。",
       "noDeployableModels": "選択したモデルに、資格確認済みでデスクトップの認証情報も利用できるものがありません。モデルを有効化・検証し、認証情報を追加してから再デプロイしてください。",
       "bundledReleaseUnavailable": "同梱のデプロイファイルが不足しているか、検証に失敗しました。完全な Vellum リリースをインストールしてからデプロイしてください。",
+      "DeploymentAgentUpgradeRequired": "引き継ぎを確認する前にリモート Agent を更新してください。この Agent は確認を観測済みプロセスに結び付けられません。",
+      "DeploymentAlreadyRunning": "このホストではデプロイが実行中です。その操作を確認するか、キャンセルしてから開始してください。",
+      "DeploymentControlUnavailable": "このデプロイは現在の Vellum セッションで実行されていません。再デプロイして続行してください。",
+      "DeploymentConfirmationExpired": "観測済みプロセスまたは待機中の操作が変わりました。現在の引き継ぎ案内を確認し、再度承認してください。",
       "activeWorkInProgress": "Codex に実行中のターン、ツール、または承認待ちの操作があります。作業が終わってからデプロイしてください。",
       "unsupportedRemotePlatform": "このホストの OS またはアーキテクチャはデプロイのサポート対象外です。",
       "officialAccountStatusUnavailable": "現在デスクトップで選択したアカウントの、このホストでの認証状態を確認できません。接続を回復して再デプロイしてください。",
@@ -655,6 +660,9 @@ const ja: ResourceTree = {
       "cleanHostPreflight": "同梱物とクリーンなホスト基準を検証",
       "hostPreflight": "プラットフォーム・認証情報・デプロイファイルを確認",
       "autoFix": "デプロイに必要な修復を適用",
+      "waitingForIdle": "Codex のターン・ツール・承認待ち操作の終了を待機",
+      "awaitingTakeover": "Codex は待機中です。引き継ぎを確認するとデプロイを続行します",
+      "cancelled": "デプロイをキャンセルしました",
       "resolvingDesktopCodex": "Desktop と一致する Codex runtime を解決・検証",
       "installCodex": "同梱の pinned Codex CLI を導入",
       "nativeDaemon": "常駐型の Codex リモート制御を有効化",
@@ -673,6 +681,7 @@ const ja: ResourceTree = {
       "failed": "失敗"
     },
     "operation": {
+      "cancelled": "デプロイをキャンセルしました。完了済みのインストールは保持されます。再デプロイで続行できます。",
       "bootstrap": "デプロイ中",
       "apply": "同期中",
       "restore": "管理を解除中",

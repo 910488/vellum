@@ -539,6 +539,7 @@ const en: ResourceTree = {
     },
     "act": {
       "bootstrap": "Deploy this host",
+      "cancelDeployment": "Cancel deployment",
       "reconverge": "Reconverge",
       "plan": "Change models…",
       "replan": "Refresh preview",
@@ -662,6 +663,10 @@ const en: ResourceTree = {
       "noModelsSelected": "No model is selected, so there is nothing to sync.",
       "noDeployableModels": "No selected model has both current qualification and a usable Desktop credential. Enable and qualify a model, and add its credential, then deploy again.",
       "bundledReleaseUnavailable": "The bundled deployment files are missing or failed verification. Install a complete Vellum release before deploying.",
+      "DeploymentAgentUpgradeRequired": "Update the remote Agent before confirming takeover. This Agent cannot bind your confirmation to the observed process.",
+      "DeploymentAlreadyRunning": "A deployment is already running for this host. Follow that operation or cancel it before starting another.",
+      "DeploymentControlUnavailable": "This deployment is no longer active in this Vellum session. Start deployment again to continue.",
+      "DeploymentConfirmationExpired": "The observed process or waiting operation changed. Review the current takeover prompt and confirm again.",
       "activeWorkInProgress": "Codex still has an active turn, tool or approval. Wait for it to finish before deploying.",
       "unsupportedRemotePlatform": "This host's operating system or architecture is outside the supported deployment matrix.",
       "officialAccountStatusUnavailable": "The current Desktop account's authorization on this host could not be checked. Reconnect and deploy again.",
@@ -686,6 +691,9 @@ const en: ResourceTree = {
       "cleanHostPreflight": "Verifying bundled artifacts and a clean host baseline",
       "hostPreflight": "Checking platform, credentials and deployment files",
       "autoFix": "Applying deployment repairs",
+      "waitingForIdle": "Waiting for Codex turns, tools and approvals to finish",
+      "awaitingTakeover": "Codex is idle. Confirm takeover to continue deployment",
+      "cancelled": "Deployment cancelled",
       "resolvingDesktopCodex": "Resolving and qualifying the Desktop-matched Codex runtime",
       "installCodex": "Installing the bundled pinned Codex CLI",
       "nativeDaemon": "Enabling durable Codex remote control",
@@ -704,6 +712,7 @@ const en: ResourceTree = {
       "failed": "Failed"
     },
     "operation": {
+      "cancelled": "Deployment cancelled. Completed steps remain installed; deploy again to continue.",
       "bootstrap": "Deploying",
       "apply": "Syncing",
       "restore": "Withdrawing",

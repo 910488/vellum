@@ -9,6 +9,8 @@ pub struct DeploymentPreflight {
     pub auto_fix: Vec<String>,
     pub blockers: Vec<String>,
     pub repair_commands: Vec<String>,
+    #[serde(default)]
+    pub repairs: std::collections::BTreeMap<String, String>,
 }
 
 /// Do not enter the deployment write phase until inspection succeeds.
@@ -20,9 +22,10 @@ pub(crate) fn before_deployment<C, T>(
     let (report, context) = inspect()?;
     if !report.blockers.is_empty() {
         return Err(AppError::Message(format!(
-            "OneClickBootstrapBlocked: {}; repair: {}",
+            "OneClickBootstrapBlocked: {}; repairs: {}",
             report.blockers.join(", "),
-            report.repair_commands.join(" | ")
+            serde_json::to_string(&report.repairs)
+                .map_err(|error| AppError::Message(error.to_string()))?
         )));
     }
     write(report, context)
@@ -121,6 +124,40 @@ pub(crate) fn ps_start_time_preflight(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn multi_blocker_repairs_are_keyed_instead_of_associated_by_position() {
+        let report = DeploymentPreflight {
+            blockers: vec![
+                "unsupportedRemotePlatform".into(),
+                "psStartTimeUnavailable".into(),
+            ],
+            repair_commands: vec![
+                "not an executable command".into(),
+                "apk add procps-ng".into(),
+            ],
+            repairs: [
+                ("psStartTimeUnavailable".into(), "apk add procps-ng".into()),
+                (
+                    "unsupportedRemotePlatform".into(),
+                    "Choose another host".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let error = before_deployment(
+            || Ok((report, ())),
+            |_, _| -> AppResult<()> { panic!("blocked") },
+        )
+        .unwrap_err()
+        .to_string();
+        let (_, repairs) = error.split_once("; repairs: ").unwrap();
+        let repairs: serde_json::Value = serde_json::from_str(repairs).unwrap();
+        assert_eq!(repairs["psStartTimeUnavailable"], "apk add procps-ng");
+        assert_eq!(repairs["unsupportedRemotePlatform"], "Choose another host");
+    }
 
     #[test]
     fn fresh_host_preflight_refusal_makes_no_transport_write_calls() {

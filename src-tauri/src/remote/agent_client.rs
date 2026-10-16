@@ -615,6 +615,33 @@ impl RemoteAgentClient {
         }))
     }
 
+    pub(crate) fn codex_stop_app_owned_expected(
+        &self,
+        operation_id: &str,
+        native: &Value,
+    ) -> AppResult<Value> {
+        if self
+            .agent_version()?
+            .get("confirmedTakeoverIdentity")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(AppError::Message("DeploymentAgentUpgradeRequired".into()));
+        }
+        let pid = native
+            .get("daemonPid")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| AppError::Message("incompleteObservation".into()))?;
+        let identity = native
+            .get("daemonIdentity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Message("incompleteObservation".into()))?;
+        self.rpc(
+            json!({"method": "codex.stopAppOwned", "operationId": operation_id,
+            "expectedDaemonPid": pid, "expectedDaemonIdentity": identity}),
+        )
+    }
+
     pub fn codex_restore_native(&self, operation_id: &str) -> AppResult<Value> {
         self.rpc(json!({
             "method": "codex.restoreNative",

@@ -26,6 +26,7 @@ import {
   deploymentPreflightFailure,
   convergeCredentialFailure,
   convergePairingSuggested,
+  deploymentWaitControls,
   resumeConvergeAfterAccount,
   operationKindKey,
   phaseKey,
@@ -120,6 +121,7 @@ export function Remote({
   const pairQueueRestoreAccount = useRef<string | null>(null);
   const [pairQueueLength, setPairQueueLength] = useState(0);
   const [resumeBootstrapAfterPairing, setResumeBootstrapAfterPairing] = useState(false);
+  const [takeoverPrompt, setTakeoverPrompt] = useState<{ hostId: string; operationId: string; token: string } | null>(null);
   // Remote control identity A stays synchronized with Desktop. Official
   // execution identities B belong only to Vellum proxy authorization.
   const [executionAccounts, setExecutionAccounts] = useState<RemoteOfficialExecutionAccount[]>([]);
@@ -770,6 +772,10 @@ export function Remote({
   }[pending] : null;
 
   const runningPhaseKey = ownOperation ? phaseKey(ownOperation.phase) : null;
+  const waitControls = deploymentWaitControls(ownOperation, selectedHostId);
+  useEffect(() => {
+    setTakeoverPrompt((current) => current && (current.hostId !== selectedHostId || current.token !== waitControls.token) ? null : current);
+  }, [selectedHostId, waitControls.token]);
   const runningKindKey = ownOperation ? operationKindKey(ownOperation.kind) : null;
   const appOwnedFailure = Boolean(ownOperation?.state === "failed" && ownOperation.message?.includes("nativeDaemonAppOwned"));
   // The same reason can arrive on the action the user is standing in front of,
@@ -1012,7 +1018,19 @@ export function Remote({
                   <p className="worktop__where">
                     {runningPhaseKey ? t(runningPhaseKey) : ownOperation.phase}
                   </p>
+                  {waitControls.cancel ? <div className="worktop__acts">
+                    {waitControls.token ? <Btn disabled={busy !== null} onClick={() => {
+                      if (selectedHostId && waitControls.token) setTakeoverPrompt({ hostId: selectedHostId, operationId: ownOperation.operationId, token: waitControls.token });
+                    }}>{t("remote.act.takeoverNative")}</Btn> : null}
+                    <Btn soft disabled={busy !== null} onClick={() => {
+                      if (selectedHostId) void run("remote.act.cancelDeployment", () => api.cancelRemoteDeployment(selectedHostId, ownOperation.operationId));
+                    }}>{t("remote.act.cancelDeployment")}</Btn>
+                  </div> : null}
                 </div>
+              ) : ownOperation?.state === "cancelled" && !failure ? (
+                <Notice acts={<Btn mini soft disabled={busy !== null} onClick={() => setPending("bootstrap")}>{t("remote.act.retry")}</Btn>}>
+                  {t("remote.operation.cancelled")}
+                </Notice>
               ) : failure ? (
                 /* 剛按下去的動作失敗，排在背景作業失敗前面 —— 它比較新，
                    而且它是使用者正在等的那一件事。 */
@@ -1558,6 +1576,22 @@ export function Remote({
         </div>
       )}
 
+      {takeoverPrompt ? <Confirm
+        open
+        title={t("remote.act.takeoverNative")}
+        confirmLabel={t("remote.act.takeoverNative")}
+        facts={[
+          { key: t("remote.fact.changes"), value: t("remote.confirm.stopAppOwned.changes") },
+          { key: t("remote.fact.untouched"), value: t("remote.confirm.stopAppOwned.untouched") },
+          { key: t("remote.fact.turns"), value: t("remote.confirm.stopAppOwned.turns") },
+        ]}
+        onCancel={() => setTakeoverPrompt(null)}
+        onConfirm={() => {
+          const prompt = takeoverPrompt;
+          setTakeoverPrompt(null);
+          void run("remote.act.takeoverNative", () => api.confirmRemoteDeploymentTakeover(prompt.hostId, prompt.operationId, prompt.token));
+        }}
+      /> : null}
       {pending && confirmConfig ? (
         <Confirm
           open

@@ -508,6 +508,7 @@ const zhCN: ResourceTree = {
     },
     "act": {
       "bootstrap": "部署此主机",
+      "cancelDeployment": "取消部署",
       "reconverge": "重新同步",
       "plan": "变更模型…",
       "replan": "更新预览",
@@ -631,6 +632,10 @@ const zhCN: ResourceTree = {
       "noModelsSelected": "尚未选择任何模型，没有可同步的内容。",
       "noDeployableModels": "所选模型中，目前没有同时通过资格检查且具备桌面端可用凭证的模型。请启用并验证模型、补上凭证后再部署。",
       "bundledReleaseUnavailable": "内附部署文件缺少或未通过验证。请先安装完整的 Vellum 发行版本，再部署。",
+      "DeploymentAgentUpgradeRequired": "请先更新远端 Agent，再确认接手。当前 Agent 无法将确认绑定到已观察的进程。",
+      "DeploymentAlreadyRunning": "这台主机已有部署正在进行。请查看该操作，或取消后再开始。",
+      "DeploymentControlUnavailable": "这笔部署已不在当前 Vellum 会话执行。请重新部署以继续。",
+      "DeploymentConfirmationExpired": "已观察的进程或等待操作已改变。请查看当前接手提示，再确认一次。",
       "activeWorkInProgress": "Codex 仍有进行中的 turn、工具或待批准操作。请等当前工作结束后再部署。",
       "unsupportedRemotePlatform": "这台主机的操作系统或架构不在支持的部署范围内。",
       "officialAccountStatusUnavailable": "无法确认桌面端当前账号在这台主机上的授权状态。请恢复连接后重新部署。",
@@ -655,6 +660,9 @@ const zhCN: ResourceTree = {
       "cleanHostPreflight": "检查内置套件与干净主机基准",
       "hostPreflight": "检查平台、凭证与部署文件",
       "autoFix": "应用部署修复",
+      "waitingForIdle": "等待 Codex 当前这轮、工具与批准操作结束",
+      "awaitingTakeover": "Codex 已空闲，确认接手后会继续部署",
+      "cancelled": "已取消部署",
       "resolvingDesktopCodex": "解析并验证与 Desktop 相符的 Codex runtime",
       "installCodex": "安装内置的 pinned Codex CLI",
       "nativeDaemon": "开启可常驻的 Codex 远程控制",
@@ -673,6 +681,7 @@ const zhCN: ResourceTree = {
       "failed": "失败"
     },
     "operation": {
+      "cancelled": "已取消部署。已完成的安装会保留；重新部署即可继续。",
       "bootstrap": "正在部署",
       "apply": "正在同步",
       "restore": "正在解除管理",

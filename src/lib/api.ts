@@ -264,6 +264,14 @@ export const api = {
     return call<RemoteOperationProgress>("bootstrap_remote_host", { hostId });
   },
 
+  cancelRemoteDeployment(hostId: string, operationId: string): Promise<void> {
+    return call<void>("cancel_remote_deployment", { hostId, operationId });
+  },
+
+  confirmRemoteDeploymentTakeover(hostId: string, operationId: string, token: string): Promise<void> {
+    return call<void>("confirm_remote_deployment_takeover", { hostId, operationId, token });
+  },
+
   /** Resolves the host's SSH alias to an actual (host, port) and reports
    * whether that resolved target's key is already trusted in Vellum's own
    * known_hosts file. Never connects; safe to call speculatively. */

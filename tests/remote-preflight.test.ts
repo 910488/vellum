@@ -1,7 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { convergeCredentialFailure, convergePairingSuggested, describeBlocker, deploymentPreflightFailure, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, resumeConvergeAfterAccount, visibleBlockers } from "@/lib/remoteVocabulary";
+import { convergeCredentialFailure, convergePairingSuggested, deploymentWaitControls, describeBlocker, deploymentPreflightFailure, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, resumeConvergeAfterAccount, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("shows wait controls only for this host's live deployment and a valid confirmation token", () => {
+    const operation = { hostId: "host", kind: "oneClickBootstrap", state: "running", phase: "waitingForIdle", result: null as unknown };
+    expect(deploymentWaitControls(operation, "host")).toEqual({ cancel: true, token: null });
+    const token = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const confirm = { ...operation, phase: "awaitingTakeover", result: { takeoverToken: token } };
+    expect(deploymentWaitControls(confirm, "host")).toEqual({ cancel: true, token });
+    expect(deploymentWaitControls({ ...confirm, result: { takeoverToken: "invalid" } }, "host").token).toBeNull();
+    for (const next of [{ ...operation, state: "cancelled" }, { ...operation, state: "completed" }, { ...operation, kind: "restore" }, { ...operation, phase: "deploymentApply" }]) {
+      expect(deploymentWaitControls(next, "host")).toEqual({ cancel: false, token: null });
+    }
+    expect(deploymentWaitControls(confirm, "another")).toEqual({ cancel: false, token: null });
+    expect(deploymentWaitControls(null, "host")).toEqual({ cancel: false, token: null });
+    for (const phase of ["waitingForIdle", "awaitingTakeover", "cancelled"]) expect(phaseKey(phase)).toBe(`remote.phase.${phase}`);
+  });
+
+  it("extracts only the ps blocker repair from a multi-blocker reply", () => {
+    const message = 'OneClickBootstrapBlocked: unsupportedRemotePlatform, psStartTimeUnavailable; repairs: {"unsupportedRemotePlatform":"Unsupported architecture; select another host","psStartTimeUnavailable":"apk add procps-ng"}';
+    expect(psStartTimeFailure(message)).toEqual({ repair: "apk add procps-ng" });
+    expect(psStartTimeFailure('psStartTimeUnavailable; repairs: {"unsupportedRemotePlatform":"Select another host"}')).toEqual({ repair: null });
+    expect(psStartTimeFailure('psStartTimeUnavailable; repairs: invalid')).toEqual({ repair: null });
+    expect(psStartTimeFailure('unsupportedRemotePlatform, psStartTimeUnavailable; repair: Unsupported architecture | apk add procps-ng')).toEqual({ repair: null });
+  });
   it("explains deployment preflight refusals and the auto-fix phase", () => {
     for (const code of ["bundledReleaseUnavailable", "activeWorkInProgress", "unsupportedRemotePlatform", "insufficientDiskSpace", "proxyPortConflict", "proxyConfigurationSchemaTooNew"]) {
       expect(deploymentPreflightFailure(`OneClickBootstrapBlocked: ${code}`)).toBe(`remote.blocker.${code}`);

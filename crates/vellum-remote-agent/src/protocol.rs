@@ -421,7 +421,13 @@ pub enum AgentRequest {
     #[serde(rename = "codex.restartNative")]
     CodexRestartNative { operation_id: String },
     #[serde(rename = "codex.stopAppOwned")]
-    CodexStopAppOwned { operation_id: String },
+    CodexStopAppOwned {
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_identity: Option<String>,
+    },
     #[serde(rename = "codex.restoreNative")]
     CodexRestoreNative { operation_id: String },
     #[serde(rename = "codex.status")]
@@ -997,16 +1003,21 @@ mod tests {
 
         let stop = serde_json::to_value(AgentRequest::CodexStopAppOwned {
             operation_id: "op-stop-app-owned".into(),
+            expected_daemon_pid: None,
+            expected_daemon_identity: None,
         })
         .unwrap();
         assert_eq!(stop["method"], "codex.stopAppOwned");
+        assert!(stop.get("expectedDaemonPid").is_none());
         assert_eq!(stop["operationId"], "op-stop-app-owned");
         assert!(stop.get("operation_id").is_none());
         let round_tripped: AgentRequest = serde_json::from_value(stop).unwrap();
         assert_eq!(
             round_tripped,
             AgentRequest::CodexStopAppOwned {
-                operation_id: "op-stop-app-owned".into()
+                operation_id: "op-stop-app-owned".into(),
+                expected_daemon_pid: None,
+                expected_daemon_identity: None,
             }
         );
 
@@ -1016,5 +1027,25 @@ mod tests {
         .unwrap();
         assert_eq!(reconcile["method"], "services.reconcile");
         assert_eq!(reconcile["operationId"], "op-reconcile");
+    }
+
+    #[test]
+    fn confirmed_takeover_preserves_the_observed_process_identity() {
+        let request = serde_json::json!({"method": "codex.stopAppOwned", "operationId": "confirmed",
+            "expectedDaemonPid": 42, "expectedDaemonIdentity": "boot:start:42"});
+        let parsed: AgentRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        let legacy: AgentRequest = serde_json::from_value(
+            serde_json::json!({"method": "codex.stopAppOwned", "operationId": "old"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AgentRequest::CodexStopAppOwned {
+                expected_daemon_pid: None,
+                expected_daemon_identity: None,
+                ..
+            }
+        ));
     }
 }

@@ -87,7 +87,19 @@ pub struct OneClickBootstrapResult {
 pub async fn one_click_bootstrap<F>(
     state: &AppState,
     host_id: &str,
+    progress: F,
+) -> AppResult<OneClickBootstrapResult>
+where
+    F: FnMut(&str, u8, &str),
+{
+    one_click_bootstrap_controlled(state, host_id, progress, None).await
+}
+
+pub(crate) async fn one_click_bootstrap_controlled<F>(
+    state: &AppState,
+    host_id: &str,
     mut progress: F,
+    control: Option<&super::converge_control::DeploymentControl>,
 ) -> AppResult<OneClickBootstrapResult>
 where
     F: FnMut(&str, u8, &str),
@@ -97,9 +109,7 @@ where
         5,
         "Checking platform, credentials and bundled deployment artifacts",
     );
-    let mut prepared = bootstrap_with_progress(state, host_id, |_| {
-        progress("autoFix", 10, "Converging approved deployment repairs");
-    })?;
+    let mut prepared = prepare_with_control(state, host_id, &mut progress, control).await?;
 
     let native_unavailable = prepared
         .blocked_reasons
@@ -113,6 +123,7 @@ where
     });
     if (native_unavailable || codex_update) && crate::remote::pinned_install::release_status().ready
     {
+        check_cancelled(control)?;
         progress(
             "installCodex",
             20,
@@ -124,7 +135,7 @@ where
             &format!("{}-install-codex", prepared.operation_id),
         )?;
         progress("nativeDaemon", 35, "Enabling durable Codex remote control");
-        prepared = bootstrap(state, host_id)?;
+        prepared = prepare_with_control(state, host_id, &mut progress, control).await?;
     }
     if !prepared.blocked_reasons.is_empty() {
         return Err(AppError::Message(format!(
@@ -135,30 +146,12 @@ where
     }
 
     let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
-    let before = client.host_status()?;
-    let sessions = client.codex_session_status(None)?;
-    let active_session = sessions
-        .get("threads")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|thread| {
-            thread.get("active").and_then(serde_json::Value::as_bool) == Some(true)
-                || thread
-                    .get("activeTurnId")
-                    .is_some_and(|turn_id| !turn_id.is_null())
-        });
-    if before
-        .pointer("/nativeCodex/activeTurn")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || active_session
-    {
-        return Err(AppError::Message(
-            "OneClickBootstrapBlocked: activeTurnInProgress; wait for the current Codex turn to finish"
-                .into(),
-        ));
+    if let Some(control) = control {
+        if wait_for_idle(&client, control, &mut progress).await? {
+            prepared = prepare_with_control(state, host_id, &mut progress, Some(control)).await?;
+        }
     }
+    check_cancelled(control)?;
 
     progress(
         "deploymentPlan",
@@ -180,7 +173,9 @@ where
         60,
         "Installing proxy, credentials and native catalog",
     );
+    check_cancelled(control)?;
     let mut applied = crate::remote::deployment::apply(state, host_id, &plan.plan_id).await?;
+    check_cancelled(control)?;
 
     progress(
         "verification",
@@ -191,6 +186,7 @@ where
     let (verified, retried) = verify_with_retry(
         || RemoteHostManager::aggregate_status(state, host_id),
         || {
+            check_cancelled(control)?;
             client
                 .proxy_start(
                     &format!("{}-verify-start", applied.operation_id),
@@ -208,6 +204,7 @@ where
             )
         },
     )?;
+    check_cancelled(control)?;
     if retried {
         applied.completed_steps.push("verification.retried".into());
     }
@@ -364,21 +361,124 @@ where
 }
 
 pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> {
-    bootstrap_with_progress(state, host_id, |_| {})
+    bootstrap_with_progress(state, host_id, |_| Ok(()), None)
 }
 
 fn bootstrap_with_progress(
     state: &AppState,
     host_id: &str,
-    mut before_write: impl FnMut(&super::preflight::DeploymentPreflight),
+    mut before_write: impl FnMut(&super::preflight::DeploymentPreflight) -> AppResult<()>,
+    control: Option<&super::converge_control::DeploymentControl>,
 ) -> AppResult<BootstrapResult> {
     super::preflight::before_deployment(
         || inspect_bootstrap(state, host_id),
         |report, context| {
-            before_write(&report);
-            bootstrap_prepared(state, host_id, context, report)
+            before_write(&report)?;
+            bootstrap_prepared(state, host_id, context, report, control)
         },
     )
+}
+
+fn check_cancelled(control: Option<&super::converge_control::DeploymentControl>) -> AppResult<()> {
+    control.map_or(Ok(()), |control| control.check())
+}
+
+struct NativeWaitClient<'a> {
+    client: &'a RemoteAgentClient,
+}
+impl super::converge_control::WaitClient for NativeWaitClient<'_> {
+    fn observe(&self) -> AppResult<(serde_json::Value, Option<serde_json::Value>)> {
+        let status = self.client.host_status()?;
+        let sessions = if status
+            .pointer("/nativeCodex/daemonRunning")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            Some(self.client.codex_session_status(None)?)
+        } else {
+            None
+        };
+        Ok((status, sessions))
+    }
+    fn stop_app_owned(&self, native: &serde_json::Value) -> AppResult<()> {
+        self.client
+            .codex_stop_app_owned_expected(
+                &format!("converge-takeover-{}", ulid::Ulid::new()),
+                native,
+            )
+            .map(|_| ())
+    }
+}
+
+async fn wait_for_idle(
+    client: &RemoteAgentClient,
+    control: &super::converge_control::DeploymentControl,
+    progress: &mut impl FnMut(&str, u8, &str),
+) -> AppResult<bool> {
+    use super::converge_control::{step, WaitStep};
+    let client = NativeWaitClient { client };
+    loop {
+        match step(control, &client)? {
+            WaitStep::Ready => return Ok(false),
+            WaitStep::TookOver => return Ok(true),
+            WaitStep::WaitingForIdle => progress(
+                "waitingForIdle",
+                7,
+                "Waiting for Codex turns, tools and approvals to finish",
+            ),
+            WaitStep::AwaitingTakeover => progress(
+                "awaitingTakeover",
+                8,
+                "Confirm takeover of the idle Codex App server",
+            ),
+        }
+        control.wait().await;
+    }
+}
+
+async fn prepare_with_control(
+    state: &AppState,
+    host_id: &str,
+    progress: &mut impl FnMut(&str, u8, &str),
+    control: Option<&super::converge_control::DeploymentControl>,
+) -> AppResult<BootstrapResult> {
+    loop {
+        check_cancelled(control)?;
+        let result = bootstrap_with_progress(
+            state,
+            host_id,
+            |_| {
+                check_cancelled(control)?;
+                progress("autoFix", 10, "Converging approved deployment repairs");
+                Ok(())
+            },
+            control,
+        );
+        match result {
+            Err(error)
+                if control.is_some()
+                    && [
+                        "activeWorkInProgress",
+                        "activeTurnInProgress",
+                        "nativeDaemonAppOwned",
+                        "incompleteObservation",
+                    ]
+                    .iter()
+                    .any(|code| error.to_string().contains(code)) =>
+            {
+                let client =
+                    RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
+                wait_for_idle(
+                    &client,
+                    control
+                        .ok_or_else(|| AppError::Message("DeploymentControlUnavailable".into()))?,
+                    progress,
+                )
+                .await?;
+            }
+            result => return result,
+        }
+    }
 }
 
 struct BootstrapContext {
@@ -391,18 +491,47 @@ fn inspect_bootstrap(
     state: &AppState,
     host_id: &str,
 ) -> AppResult<(super::preflight::DeploymentPreflight, BootstrapContext)> {
+    inspect_bootstrap_with(state, host_id, &SshBootstrapProbe)
+}
+
+trait BootstrapProbeClient {
+    fn probe(&self, data_root: &Path, alias: &str) -> AppResult<BootstrapProbe>;
+    fn ps(&self, data_root: &Path, alias: &str) -> AppResult<super::preflight::PsProbeOutput>;
+}
+
+struct SshBootstrapProbe;
+impl BootstrapProbeClient for SshBootstrapProbe {
+    fn probe(&self, data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
+        probe(data_root, alias)
+    }
+    fn ps(&self, data_root: &Path, alias: &str) -> AppResult<super::preflight::PsProbeOutput> {
+        super::preflight::PsProcessClient::probe_start_time(&SshPsProcessClient {
+            data_root,
+            alias,
+        })
+    }
+}
+
+fn inspect_bootstrap_with(
+    state: &AppState,
+    host_id: &str,
+    transport: &dyn BootstrapProbeClient,
+) -> AppResult<(super::preflight::DeploymentPreflight, BootstrapContext)> {
     let target = RemoteHostManager::resolve_target(state, host_id)?;
     let alias = target
         .ssh_destination
         .as_deref()
         .ok_or_else(|| AppError::Message("bootstrap requires an SSH destination".into()))?;
     let data_root = state.data_root();
-    let probe = probe(&data_root, alias)?;
+    let probe = transport.probe(&data_root, alias)?;
     let mut report = super::preflight::DeploymentPreflight::default();
     let platform = match super::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch) {
         Ok(platform) => platform,
         Err(error) => {
             report.blockers.push(error.code.into());
+            report
+                .repairs
+                .insert(error.code.into(), error.message.clone());
             report.repair_commands.push(error.message);
             return Ok((
                 report,
@@ -414,14 +543,28 @@ fn inspect_bootstrap(
             ));
         }
     };
+    struct PsAdapter<'a> {
+        transport: &'a dyn BootstrapProbeClient,
+        root: &'a Path,
+        alias: &'a str,
+    }
+    impl super::preflight::PsProcessClient for PsAdapter<'_> {
+        fn probe_start_time(&self) -> AppResult<super::preflight::PsProbeOutput> {
+            self.transport.ps(self.root, self.alias)
+        }
+    }
     if let Some(blocker) = check_linux_prerequisites(
         &probe,
-        &SshPsProcessClient {
-            data_root: &data_root,
+        &PsAdapter {
+            transport,
+            root: &data_root,
             alias,
         },
     )? {
         report.blockers.push(blocker.code.into());
+        report
+            .repairs
+            .insert(blocker.code.into(), blocker.repair.into());
         report.repair_commands.push(blocker.repair.into());
         return Ok((
             report,
@@ -510,6 +653,7 @@ fn bootstrap_prepared(
     host_id: &str,
     context: BootstrapContext,
     preflight: super::preflight::DeploymentPreflight,
+    control: Option<&super::converge_control::DeploymentControl>,
 ) -> AppResult<BootstrapResult> {
     let BootstrapContext {
         probe,
@@ -570,6 +714,7 @@ fn bootstrap_prepared(
     } else {
         None
     };
+    check_cancelled(control)?;
     match install_managed_ssh_isolation(&data_root, host_id, &alias, &probe) {
         Ok(alias_name) => {
             result
@@ -588,6 +733,7 @@ fn bootstrap_prepared(
     }
 
     if let Some(artifact) = agent_artifact {
+        check_cancelled(control)?;
         install_artifact(
             &data_root,
             &alias,
@@ -638,6 +784,7 @@ fn bootstrap_prepared(
     }
 
     let client = RemoteAgentClient::new(target);
+    check_cancelled(control)?;
     client.agent_version()?;
     result.completed_steps.push("agent.compatible".into());
     // A fresh/updated Agent can now observe the real native state and port.
@@ -670,6 +817,7 @@ fn bootstrap_prepared(
             "依 Linux 發行版安裝 Docker，並將目前使用者加入可執行 docker 的群組後重新登入。".into(),
         );
     }
+    check_cancelled(control)?;
     if platform.service_manager() == crate::remote::platform::SERVICE_MANAGER_SYSTEMD_USER {
         let (scope, linger) =
             linux_persistence_scope(result.systemd_user_available, result.linger_enabled, || {
@@ -694,10 +842,12 @@ fn bootstrap_prepared(
                 .into(),
         );
     }
+    check_cancelled(control)?;
     crate::remote::provision_remote_boundary_key(&client, &data_root, host_id, &operation_id)?;
     result
         .completed_steps
         .push("credentials.boundaryReady".into());
+    check_cancelled(control)?;
     match client.codex_bootstrap_native(&format!("{operation_id}-codex")) {
         Ok(native) => {
             crate::remote::confirm_remote_boundary_key_consumers(
@@ -756,19 +906,6 @@ fn inspect_existing_agent(
 ) -> AppResult<()> {
     let desired = super::desired_state::load(&state.data_root(), host_id)?;
     client.proxy_select_port(desired.proxy_port)?;
-    if status
-        .pointer("/nativeCodex/compatible")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        super::deployment::select_for_converge(state, host_id, &desired)?;
-    } else {
-        // Account RPCs need a usable Codex install. Local credential eligibility
-        // was checked already; observe the remote grant after pinned install.
-        report
-            .auto_fix
-            .push("models.observeAfterCodexInstall".into());
-    }
     let sessions = if status
         .pointer("/nativeCodex/daemonRunning")
         .and_then(serde_json::Value::as_bool)
@@ -784,6 +921,22 @@ fn inspect_existing_agent(
         &manifest.codex.pinned_version,
         report,
     );
+    if !report.blockers.is_empty() {
+        return Ok(());
+    }
+    if status
+        .pointer("/nativeCodex/compatible")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        super::deployment::select_for_converge(state, host_id, &desired)?;
+    } else {
+        // Account RPCs need a usable Codex install. Local credential eligibility
+        // was checked already; observe the remote grant after pinned install.
+        report
+            .auto_fix
+            .push("models.observeAfterCodexInstall".into());
+    }
     Ok(())
 }
 
@@ -807,7 +960,7 @@ fn classify_existing_agent(
     }
     let native = status.get("nativeCodex");
     let version_matches = native
-        .and_then(|native| native.get("version"))
+        .and_then(|native| native.get("codexVersion").or_else(|| native.get("version")))
         .and_then(Value::as_str)
         .and_then(|version| version.split_whitespace().last())
         == Some(pinned_version);
@@ -1323,6 +1476,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn actual_bootstrap_inspection_on_fresh_unsupported_or_busybox_host_only_reads_transport() {
+        struct FakeTransport {
+            os: &'static str,
+            calls: std::cell::RefCell<Vec<&'static str>>,
+        }
+        impl BootstrapProbeClient for FakeTransport {
+            fn probe(&self, _: &Path, _: &str) -> AppResult<BootstrapProbe> {
+                self.calls.borrow_mut().push("read:probe");
+                Ok(BootstrapProbe {
+                    os: self.os.into(),
+                    arch: "aarch64".into(),
+                    ..Default::default()
+                })
+            }
+            fn ps(&self, _: &Path, _: &str) -> AppResult<super::super::preflight::PsProbeOutput> {
+                self.calls.borrow_mut().push("read:ps");
+                Ok(super::super::preflight::PsProbeOutput {
+                    success: false,
+                    stdout: "BusyBox ps".into(),
+                })
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state
+            .remote()
+            .import_discovered_host(&super::super::discovery::RemoteHostCandidate {
+                codex_host_id: None,
+                vellum_host_id: "fake-preflight".into(),
+                display_name: "fake".into(),
+                ssh_alias: "fake-only".into(),
+                hostname: None,
+                user: None,
+                port: None,
+                source: "test".into(),
+                validated: false,
+                validation_error: None,
+            })
+            .unwrap();
+        for (os, code, expected) in [
+            (
+                "unsupported",
+                "unsupportedRemotePlatform",
+                vec!["read:probe"],
+            ),
+            (
+                "linux",
+                "psStartTimeUnavailable",
+                vec!["read:probe", "read:ps"],
+            ),
+        ] {
+            let transport = FakeTransport {
+                os,
+                calls: Default::default(),
+            };
+            let result = super::super::preflight::before_deployment(
+                || inspect_bootstrap_with(&state, "fake-preflight", &transport),
+                |_, _| {
+                    transport.calls.borrow_mut().push("write:deployment");
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains(code));
+            assert_eq!(*transport.calls.borrow(), expected);
+        }
+    }
+
+    #[test]
     fn existing_preflight_classifies_repairs_without_replacing_incompatible_configuration() {
         for (state, fix, blocker) in [
             ("current", false, None),
@@ -1337,7 +1558,7 @@ mod tests {
         ] {
             let mut report = super::super::preflight::DeploymentPreflight::default();
             classify_existing_agent(
-                &serde_json::json!({"configuration": {"state": state}, "nativeCodex": {"version": "codex-cli pinned", "compatible": true, "daemonRunning": false}}),
+                &serde_json::json!({"configuration": {"state": state}, "nativeCodex": {"codexVersion": "codex-cli pinned", "compatible": true, "daemonRunning": false}}),
                 None,
                 "pinned",
                 &mut report,

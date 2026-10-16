@@ -292,7 +292,15 @@ pub fn restart_native(
 /// confirmation. This is intentionally narrower than `restart_native`: it
 /// never stops a daemon-managed process and never interrupts an active turn.
 pub fn stop_app_owned_native() -> Result<NativeCodexRuntimeStatus, String> {
+    stop_app_owned_native_expected(None, None)
+}
+
+pub fn stop_app_owned_native_expected(
+    expected_pid: Option<u32>,
+    expected_identity: Option<&str>,
+) -> Result<NativeCodexRuntimeStatus, String> {
     let before = discover_native()?;
+    validate_expected_stop_identity(&before, expected_pid, expected_identity)?;
     if !before.daemon_running {
         return Ok(before);
     }
@@ -323,6 +331,7 @@ pub fn stop_app_owned_native() -> Result<NativeCodexRuntimeStatus, String> {
         return Err("NativeAppOwnedStopIdentityChanged: PID or CODEX_HOME changed".into());
     }
     let current = discover_native()?;
+    validate_expected_stop_identity(&current, expected_pid, expected_identity)?;
     validate_app_owned_stop(&current)?;
     if current.daemon_pid != before.daemon_pid {
         return Err("NativeAppOwnedStopIdentityChanged: PID changed".into());
@@ -335,6 +344,24 @@ pub fn stop_app_owned_native() -> Result<NativeCodexRuntimeStatus, String> {
         return Err("NativeAppOwnedStopFailed: app-server is still running".into());
     }
     Ok(after)
+}
+
+fn validate_expected_stop_identity(
+    native: &NativeCodexRuntimeStatus,
+    expected_pid: Option<u32>,
+    expected_identity: Option<&str>,
+) -> Result<(), String> {
+    match (expected_pid, expected_identity) {
+        (None, None) => Ok(()),
+        (Some(pid), Some(identity))
+            if native.daemon_pid == Some(pid)
+                && !identity.is_empty()
+                && native.daemon_identity.as_deref() == Some(identity) =>
+        {
+            Ok(())
+        }
+        _ => Err("NativeAppOwnedStopIdentityChanged: confirmed process changed".into()),
+    }
 }
 
 fn validate_app_owned_stop(native: &NativeCodexRuntimeStatus) -> Result<(), String> {
@@ -1801,6 +1828,18 @@ mod tests {
             broker_enabled: false,
         };
         assert!(validate_app_owned_stop(&status).is_ok());
+        assert!(validate_expected_stop_identity(&status, Some(42), Some("pid-42")).is_ok());
+        assert!(validate_expected_stop_identity(&status, None, None).is_ok());
+        for (pid, identity) in [
+            (Some(43), Some("pid-42")),
+            (Some(42), Some("another-start")),
+            (Some(42), None),
+            (None, Some("pid-42")),
+        ] {
+            assert!(validate_expected_stop_identity(&status, pid, identity)
+                .unwrap_err()
+                .contains("NativeAppOwnedStopIdentityChanged"));
+        }
         status.daemon_owner = "codexCliDaemon".into();
         status.restart_safe = true;
         assert!(validate_app_owned_stop(&status)
