@@ -30,7 +30,7 @@ export function proxyMigrationFailure(message: string | null | undefined): strin
 /** A preflight refusal carries a fixed, distro-specific repair hint from the backend. */
 export function psStartTimeFailure(message: string | null | undefined): { repair: string | null } | null {
   if (!message?.includes("psStartTimeUnavailable")) return null;
-  const repair = message.split("; repair:")[1]?.split(/[\r\n]/, 1)[0].trim();
+  const repair = message.split("; repair:")[1]?.split(/[\r\n]/, 1)[0]?.trim();
   return { repair: repair || null };
 }
 
