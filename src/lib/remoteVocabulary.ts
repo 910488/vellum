@@ -15,6 +15,23 @@
 /** 主要動作。工作面上永遠只有一顆，這個型別就是「那一顆是什麼」。 */
 export type RemotePrimaryAction = "bootstrap" | "reconverge" | null;
 
+export function convergeCredentialFailure(message: string | null | undefined): { messageKey: string; remedy: RemoteRemedy | null } | null {
+  const code = ["noDeployableModels", "desktopOfficialAccountMissing", "officialAccountPairingRequired", "officialAccountActivationRequired", "officialAccountReauthenticationRequired", "officialAccountStatusUnavailable"]
+    .find((code) => message?.includes(code));
+  return code ? { messageKey: `remote.blocker.${code}`, remedy: BLOCKERS[code]?.remedy ?? null } : null;
+}
+
+export function convergePairingSuggested(result: unknown): boolean {
+  return typeof result === "object" && result !== null
+    && "chatgptPairingSuggested" in result && result.chatgptPairingSuggested === true;
+}
+
+export function resumeConvergeAfterAccount(operation: { hostId: string; kind: string; state: string; message: string | null } | null | undefined, hostId: string): boolean {
+  if (!operation || operation.hostId !== hostId) return false;
+  return operation.kind === "oneClickBootstrap"
+    && operation.state === "failed" && Boolean(operation.message?.includes("officialAccount"));
+}
+
 export function deploymentVerificationFailure(message: string | null | undefined): string | null {
   return message?.includes("OneClickBootstrapVerificationFailed")
     ? "remote.blocker.deploymentVerificationFailed" : null;
@@ -145,9 +162,12 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   nativeCodexVersionMismatch: { remedy: "installCodex", expectedBeforeBootstrap: false },
   nativeDaemonAppOwned: { remedy: "stopAppOwned", expectedBeforeBootstrap: false },
   noModelsSelected: { remedy: "plan", expectedBeforeBootstrap: false },
+  noDeployableModels: { remedy: null, expectedBeforeBootstrap: false },
   psStartTimeUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   officialAccountActivationRequired: { remedy: "activateChatGpt", expectedBeforeBootstrap: false },
   officialAccountPairingRequired: { remedy: "pairChatGpt", expectedBeforeBootstrap: false },
+  officialAccountReauthenticationRequired: { remedy: "pairChatGpt", expectedBeforeBootstrap: false },
+  officialAccountStatusUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   proxyConfigurationMissing: { remedy: "bootstrap", expectedBeforeBootstrap: true },
   // A newer schema than this build understands, or a config file that
   // couldn't be read at all -- both must block deployment outright rather

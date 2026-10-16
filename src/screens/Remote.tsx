@@ -23,6 +23,9 @@ import {
   psStartTimeFailure,
   proxyMigrationFailure,
   deploymentVerificationFailure,
+  convergeCredentialFailure,
+  convergePairingSuggested,
+  resumeConvergeAfterAccount,
   operationKindKey,
   phaseKey,
   visibleBlockers,
@@ -612,12 +615,16 @@ export function Remote({
 
   function pairChatGpt(accountId?: string, makeActive = true) {
     if (!selectedHostId) return;
+    if (!accountId) {
+      pairQueue.current = [];
+      setPairQueueLength(0);
+    }
     pairQueueRestoreAccount.current = makeActive
-      ? accountId ?? pairings.find((row) => row.isDesktopDefault)?.accountId ?? null
+      ? accountId ?? null
       : activeControlAccount?.accountId ?? null;
     void run("remote.act.chatgptPair", async () => {
       const login = await api.startRemoteCodexAccountLogin(selectedHostId, accountId);
-      setResumeBootstrapAfterPairing(Boolean(operation?.message?.includes("officialAccount")));
+      setResumeBootstrapAfterPairing(resumeConvergeAfterAccount(operation, selectedHostId));
       setChatgptLogin(login);
       window.open(login.verificationUrl, "_blank", "noopener,noreferrer");
     });
@@ -674,6 +681,9 @@ export function Remote({
       await api.activateRemoteCodexAccount(selectedHostId, accountId);
       await loadPairings(selectedHostId);
       await inspectHost(selectedHostId);
+      if (!accountId && resumeConvergeAfterAccount(operation, selectedHostId)) {
+        trackOperation(await api.bootstrapRemoteHost(selectedHostId));
+      }
     });
   }
 
@@ -771,6 +781,8 @@ export function Remote({
   const immediatePsFailure = psStartTimeFailure(failure?.raw);
   const immediateMigrationFailure = proxyMigrationFailure(failure?.raw);
   const immediateVerificationFailure = deploymentVerificationFailure(failure?.raw);
+  const immediateCredentialFailure = convergeCredentialFailure(failure?.raw);
+  const operationCredentialFailure = ownOperation?.state === "failed" ? convergeCredentialFailure(ownOperation.message) : null;
   const operationVerificationFailure = ownOperation?.state === "failed" ? deploymentVerificationFailure(ownOperation.message) : null;
   const operationMigrationFailure = ownOperation?.state === "failed" ? proxyMigrationFailure(ownOperation.message) : null;
   const operationPsFailure = ownOperation?.state === "failed" ? psStartTimeFailure(ownOperation.message) : null;
@@ -937,6 +949,15 @@ export function Remote({
               ) : null}
 
               {/* 進行中／失敗都原地取代按鈕。因與果同一格。 */}
+              {ownOperation?.state === "completed" && convergePairingSuggested(ownOperation.result) ? (
+                <Notice tone="info" acts={
+                  <Btn mini soft onClick={() => pairChatGpt()} disabled={busy !== null || Boolean(chatgptLogin) || !pairings.some((row) => row.isDesktopDefault)}>
+                    {t("remote.act.chatgptPair")}
+                  </Btn>
+                }>
+                  {t("remote.account.optionalAfterDeploy")}
+                </Notice>
+              ) : null}
               {proxyImageUpdateAvailable ? (
                 <Notice
                   tone="warn"
@@ -996,6 +1017,7 @@ export function Remote({
                   tone="error"
                   raw={failure.raw}
                   acts={<>
+                    {immediateCredentialFailure ? remedyButton(immediateCredentialFailure.remedy) : null}
                     {immediateAppOwnedFailure ? (
                       <Btn mini soft onClick={() => setPending("stopAppOwned")} disabled={busy !== null}>
                         {t("remote.act.stopAppOwned")}
@@ -1011,6 +1033,8 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : immediateAppOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : immediateCredentialFailure
+                      ? t(immediateCredentialFailure.messageKey)
                     : immediateVerificationFailure
                       ? t(immediateVerificationFailure)
                     : immediateMigrationFailure
@@ -1027,6 +1051,7 @@ export function Remote({
                   tone="error"
                   raw={ownOperation.message}
                   acts={<>
+                    {operationCredentialFailure ? remedyButton(operationCredentialFailure.remedy) : null}
                     {appOwnedFailure ? (
                       <Btn mini soft onClick={() => setPending("stopAppOwned")} disabled={busy !== null}>
                         {t("remote.act.stopAppOwned")}
@@ -1042,6 +1067,8 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : appOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : operationCredentialFailure
+                      ? t(operationCredentialFailure.messageKey)
                     : operationVerificationFailure
                       ? t(operationVerificationFailure)
                     : operationMigrationFailure

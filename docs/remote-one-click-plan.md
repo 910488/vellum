@@ -148,13 +148,23 @@ mutation 失敗及 Desktop apply 後續步驟失敗時恢復；native 驗證成�
 失敗注入涵蓋 service write/load、Docker restart、跨程序重試與 ownership 改變；
 支援資料排除私有快照。
 
-第三段（待協調者驗證）：apply 完成後，首次 verify 失敗時只做一次冪等 proxy.start，
+第三段（feb7787 邏輯與測試已驗收；既有 typecheck 錯誤由 b836c4d 修正，待複驗）：
+apply 完成後，首次 verify 失敗時只做一次冪等 proxy.start，
 再 verify 一次；不重跑安裝、憑證同步、adopt 或 daemon restart。start 回覆遺失也會
 再讀狀態，以實際 readiness 決定結果。第二次仍失敗即回報 verification failure，
 UI 提供重新部署。驗證必須維持 proxy ready、native daemon running、detachedReady
 及 apply 後的相同 proxy port；若 retry 期間 port 改變，不能宣稱 catalog 已同步，
-需重新 converge 收斂。preflight／autoFix／等待與取消／接手確認／模型憑證收斂
-仍待後續分段。
+需重新 converge 收斂。
+
+第四段（待協調者驗證）：一鍵 converge 使用獨立的可用模型範圍，預設選擇啟用且
+通過 qualification、Desktop 有可用憑證的模型；手動 plan 保留原本嚴格驗證。
+沿用主機的 policy overrides。Official 只使用 Desktop 目前帳號已啟用的遠端 grant；
+若其他模型可用，略過未就緒 Official 並在成功結果提示配對。只剩 Official 時，
+提供目前帳號的單次配對／啟用 remedy，完成後續部署，不走全部帳號佇列。
+暫缺憑證的選擇保存為 deferredCatalogIds，plan/apply 都保留，補憑證後再 converge
+即可納入；舊 desired state 與儲存的 plan 仍可讀。尚無可部署模型時回報已知碼
+noDeployableModels。preflight／autoFix／等待與取消／接手確認仍待後續分段；
+模型／憑證的前置檢查尚待移到所有遠端寫入之前。
 
 改寫 `one_click_bootstrap` 成一個狀態機（保留函式名以免破壞呼叫端）：
 

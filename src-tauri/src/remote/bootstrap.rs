@@ -72,6 +72,10 @@ pub struct OneClickBootstrapResult {
     pub proxy_ready: bool,
     pub native_daemon_running: bool,
     pub detached_ready: bool,
+    #[serde(default)]
+    pub chatgpt_pairing_suggested: bool,
+    #[serde(default)]
+    pub omitted_catalog_ids: Vec<String>,
 }
 
 /// Prepare an SSH host and converge it to its complete native Remote Manager
@@ -151,14 +155,8 @@ where
         "Resolving qualified models and credentials",
     );
     let desired = crate::remote::desired_state::load(&state.data_root(), host_id)?;
-    let plan = crate::remote::deployment::plan(
-        state,
-        host_id,
-        crate::remote::RemoteModelSelection {
-            catalog_ids: desired.selected_catalog_ids,
-            policy: crate::remote::deployment::RemotePolicyOverrides::default(),
-        },
-    )?;
+    let (plan, model_selection) =
+        crate::remote::deployment::plan_for_converge(state, host_id, &desired)?;
     if !plan.blocked_reasons.is_empty() {
         return Err(AppError::Message(format!(
             "OneClickBootstrapBlocked: {}",
@@ -231,6 +229,8 @@ where
         proxy_ready: true,
         native_daemon_running: true,
         detached_ready: true,
+        chatgpt_pairing_suggested: model_selection.chatgpt_pairing_suggested,
+        omitted_catalog_ids: model_selection.omitted_catalog_ids,
     })
 }
 

@@ -71,6 +71,26 @@ fn manager_snapshot_method_not_found(error: &AppError) -> bool {
         || message.contains("unknown variant 'host.managerSnapshot'")
 }
 
+fn official_account_required(agent: &Value) -> bool {
+    // Only a current, observed configuration can prove Official is optional.
+    // Preserve legacy behavior when configuration metadata is unavailable.
+    match (
+        agent
+            .pointer("/configuration/state")
+            .and_then(Value::as_str),
+        agent
+            .pointer("/configuration/credentialRefs")
+            .and_then(Value::as_array),
+    ) {
+        (Some("current"), Some(refs)) => refs.iter().any(|value| {
+            value
+                .as_str()
+                .is_none_or(|id| id == vellum_proxy_runtime::SELECTED_OFFICIAL_CREDENTIAL_ID)
+        }),
+        _ => true,
+    }
+}
+
 fn native_detached_ready(agent: &Value) -> bool {
     let daemon = agent
         .pointer("/nativeCodex/daemonRunning")
@@ -416,7 +436,10 @@ impl RemoteHostManager {
             available_actions.dedup();
             blocked_reasons.sort();
             blocked_reasons.dedup();
-            if let Some(account) = &chatgpt {
+            if let Some(account) = chatgpt
+                .as_ref()
+                .filter(|_| official_account_required(&agent))
+            {
                 match account.get("state").and_then(Value::as_str) {
                     Some("pairingRequired") => {
                         blocked_reasons.push("officialAccountPairingRequired".into())
@@ -720,6 +743,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn optional_chatgpt_does_not_block_a_current_non_official_deployment() {
+        let host = fixture_host();
+        let mut agent = json!({
+            "nativeCodex": {"compatible": true, "daemonRunning": true},
+            "proxy": {"running": true, "present": true, "ready": true},
+            "configuration": {"present": true, "state": "current", "credentialsReady": true, "credentialRefs": ["bearer"]},
+            "managedProfiles": [],
+        });
+        let account = json!({"state": "pairingRequired"});
+        let status = RemoteHostManager::compose_status(
+            host.clone(),
+            Some(host.clone()),
+            agent.clone(),
+            None,
+            Some(account.clone()),
+        );
+        assert!(!status
+            .blocked_reasons
+            .iter()
+            .any(|code| code.starts_with("officialAccount")));
+        assert!(
+            status.chatgpt.is_some(),
+            "optional account panel remains available"
+        );
+        agent["configuration"]["credentialRefs"] =
+            json!([vellum_proxy_runtime::SELECTED_OFFICIAL_CREDENTIAL_ID]);
+        let status =
+            RemoteHostManager::compose_status(host.clone(), Some(host), agent, None, Some(account));
+        assert!(status
+            .blocked_reasons
+            .contains(&"officialAccountPairingRequired".into()));
+        assert!(official_account_required(&json!({})));
+        assert!(official_account_required(
+            &json!({"configuration": {"state": "repairRequired", "credentialRefs": []}})
+        ));
+    }
 
     fn fixture_host() -> CachedHost {
         CachedHost {

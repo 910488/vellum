@@ -1,7 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { describeBlocker, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, visibleBlockers } from "@/lib/remoteVocabulary";
+import { convergeCredentialFailure, convergePairingSuggested, describeBlocker, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, resumeConvergeAfterAccount, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("resumes only the failed converge for this host after its account remedy", () => {
+    const operation = { hostId: "host", kind: "oneClickBootstrap", state: "failed", message: "officialAccountPairingRequired" };
+    expect(resumeConvergeAfterAccount(operation, "host")).toBe(true);
+    expect(resumeConvergeAfterAccount(operation, "another")).toBe(false);
+    expect(resumeConvergeAfterAccount({ ...operation, state: "completed" }, "host")).toBe(false);
+    expect(resumeConvergeAfterAccount({ ...operation, kind: "restore" }, "host")).toBe(false);
+    expect(resumeConvergeAfterAccount({ ...operation, message: "SSH failed" }, "host")).toBe(false);
+    expect(resumeConvergeAfterAccount(null, "host")).toBe(false);
+  });
+  it("offers one-account pairing only for a credential blocker and keeps optional pairing separate", () => {
+    expect(convergeCredentialFailure("officialAccountPairingRequired"))
+      .toEqual({ messageKey: "remote.blocker.officialAccountPairingRequired", remedy: "pairChatGpt" });
+    expect(convergeCredentialFailure("officialAccountActivationRequired")?.remedy).toBe("activateChatGpt");
+    expect(convergeCredentialFailure("officialAccountReauthenticationRequired")?.remedy).toBe("pairChatGpt");
+    expect(convergeCredentialFailure("noDeployableModels")?.remedy).toBeNull();
+    expect(convergeCredentialFailure("officialAccountStatusUnavailable")?.remedy).toBe("bootstrap");
+    expect(convergeCredentialFailure(null)).toBeNull();
+    expect(convergePairingSuggested({ chatgptPairingSuggested: true })).toBe(true);
+    for (const result of [null, undefined, "ready", {}, { chatgptPairingSuggested: "true" }, { chatgptPairingSuggested: false }]) {
+      expect(convergePairingSuggested(result)).toBe(false);
+    }
+  });
   it("explains verification retry exhaustion and offers reconvergence", () => {
     expect(deploymentVerificationFailure("OneClickBootstrapVerificationFailed: retryExhausted"))
       .toBe("remote.blocker.deploymentVerificationFailed");
@@ -57,6 +79,7 @@ describe("Linux process start-time prerequisites", () => {
     expect(psStartTimeFailure("DeploymentPreflightBlocked: psStartTimeUnavailable; repair: apt-get install procps"))
       .toEqual({ repair: "apt-get install procps" });
     expect(psStartTimeFailure("psStartTimeUnavailable")).toEqual({ repair: null });
+    expect(psStartTimeFailure("psStartTimeUnavailable; repair:")).toEqual({ repair: null });
     expect(psStartTimeFailure("SSH failed; repair: reconnect")).toBeNull();
     expect(psStartTimeFailure(null)).toBeNull();
   });

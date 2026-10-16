@@ -246,6 +246,8 @@ struct StoredDeploymentPlan {
     /// caller to resupply the original selection.
     #[serde(default)]
     policy_overrides: RemotePolicyOverrides,
+    #[serde(default)]
+    deferred_catalog_ids: Vec<String>,
 }
 
 fn bundled_proxy_image() -> AppResult<String> {
@@ -404,30 +406,157 @@ pub fn plan(
     host_id: &str,
     selection: RemoteModelSelection,
 ) -> AppResult<RemoteDeploymentPlan> {
-    RemoteHostManager::resolve_target(state, host_id)?;
-    let proxy_image = bundled_proxy_image()?;
+    plan_scoped(state, host_id, selection, None, &[])
+}
+
+/// One-click converge opts in to credential-aware selection. Explicit manual
+/// plans keep their existing strict validation and mandatory Official models.
+pub(crate) fn plan_for_converge(
+    state: &AppState,
+    host_id: &str,
+    desired: &super::desired_state::RemoteHostDesiredState,
+) -> AppResult<(RemoteDeploymentPlan, super::converge_models::Selection)> {
     let routes = state.routes();
-    let all_models = state.model_routes();
     let codex_paths = crate::codex::CodexPaths::discover(&state.data_root());
     let official_catalog = crate::catalog::read_official_catalog(&codex_paths.models_cache);
-    let hidden_official_models = hidden_official_model_ids(official_catalog.as_ref());
+    let hidden = hidden_official_model_ids(official_catalog.as_ref());
+    let available = qualified_remote_models(state, &routes, &hidden);
+    let account_id = super::desktop_control_account_id(state);
+    let requested = desired.converge_catalog_ids();
+    let wanted = |model: &crate::model::ModelRoute| {
+        requested.is_empty() || requested.contains(&model.catalog_id)
+    };
+    let account = if available.iter().any(|model| {
+        wanted(model)
+            && routes.iter().any(|route| {
+                route.id == model.route_id && route.provider_kind == ProviderKind::Official
+            })
+    }) {
+        account_id.as_ref().and_then(|id| {
+            RemoteHostManager::resolve_target(state, host_id)
+                .ok()
+                .and_then(|target| {
+                    RemoteAgentClient::new(target)
+                        .codex_account_status(Some(id))
+                        .ok()
+                })
+        })
+    } else {
+        None
+    };
+    let official_ready =
+        super::converge_models::official_account_ready(account_id.as_deref(), account.as_ref());
+    let official_blocker = if account_id.is_none() {
+        "desktopOfficialAccountMissing"
+    } else if account.is_none() {
+        "officialAccountStatusUnavailable"
+    } else {
+        match account
+            .as_ref()
+            .and_then(|status| status.get("state"))
+            .and_then(Value::as_str)
+        {
+            Some("activationRequired") => "officialAccountActivationRequired",
+            Some("reauthenticationRequired") => "officialAccountReauthenticationRequired",
+            _ => "officialAccountPairingRequired",
+        }
+    };
+    let mut ready_routes = BTreeSet::new();
+    for route in routes.iter().filter(|route| {
+        available
+            .iter()
+            .any(|model| wanted(model) && model.route_id == route.id)
+    }) {
+        let ready = if route.provider_kind == ProviderKind::Official {
+            official_ready
+        } else {
+            match route.auth_kind {
+                AuthKind::Bearer => crate::credentials::load(&state.data_root(), &route.id)?
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+                AuthKind::GrokSession => state
+                    .grok_accounts()
+                    .default_account_home()
+                    .ok()
+                    .and_then(|(_, home)| crate::grok_auth::read_credential(&home).ok().flatten())
+                    .is_some(),
+                AuthKind::None => true,
+                AuthKind::ChatGpt => false,
+            }
+        };
+        if ready {
+            ready_routes.insert(route.id.clone());
+        }
+    }
+    let candidates = available
+        .iter()
+        .map(|model| super::converge_models::Candidate {
+            catalog_id: model.catalog_id.clone(),
+            official: routes.iter().any(|route| {
+                route.id == model.route_id && route.provider_kind == ProviderKind::Official
+            }),
+            credential_available: ready_routes.contains(&model.route_id),
+        })
+        .collect::<Vec<_>>();
+    let selected = super::converge_models::select(&requested, &candidates, official_blocker)?;
+    let scope = selected
+        .catalog_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let plan = plan_scoped(
+        state,
+        host_id,
+        RemoteModelSelection {
+            catalog_ids: selected.catalog_ids.clone(),
+            policy: desired.policy_overrides.clone(),
+        },
+        Some(&scope),
+        &selected.omitted_catalog_ids,
+    )?;
+    Ok((plan, selected))
+}
+
+fn qualified_remote_models(
+    state: &AppState,
+    routes: &[crate::model::Route],
+    hidden_official: &BTreeSet<String>,
+) -> Vec<crate::model::ModelRoute> {
     let allowed = routes
         .iter()
         .filter(|route| route.enabled && !RETIRED_REMOTE_ROUTE_IDS.contains(&route.id.as_str()))
         .map(|route| route.id.as_str())
         .collect::<BTreeSet<_>>();
-    let available = all_models
-        .iter()
+    state
+        .model_routes()
+        .into_iter()
         .filter(|model| allowed.contains(model.route_id.as_str()))
         .filter(|model| {
             !routes.iter().any(|route| {
                 route.id == model.route_id
                     && route.provider_kind == ProviderKind::Official
-                    && hidden_official_models.contains(&model.catalog_id)
+                    && hidden_official.contains(&model.catalog_id)
             })
         })
         .filter(|model| remote_model_is_qualified(state, model))
-        .cloned()
+        .collect()
+}
+
+fn plan_scoped(
+    state: &AppState,
+    host_id: &str,
+    selection: RemoteModelSelection,
+    scope: Option<&BTreeSet<String>>,
+    deferred_catalog_ids: &[String],
+) -> AppResult<RemoteDeploymentPlan> {
+    RemoteHostManager::resolve_target(state, host_id)?;
+    let proxy_image = bundled_proxy_image()?;
+    let routes = state.routes();
+    let codex_paths = crate::codex::CodexPaths::discover(&state.data_root());
+    let official_catalog = crate::catalog::read_official_catalog(&codex_paths.models_cache);
+    let hidden_official_models = hidden_official_model_ids(official_catalog.as_ref());
+    let available = qualified_remote_models(state, &routes, &hidden_official_models)
+        .into_iter()
+        .filter(|model| scope.is_none_or(|ids| ids.contains(&model.catalog_id)))
         .collect::<Vec<_>>();
     let requested = selection
         .catalog_ids
@@ -938,6 +1067,7 @@ pub fn plan(
             observed_revision,
             last_plan_id: Some(plan_id.clone()),
             selected_catalog_ids: selected_ids.iter().cloned().collect(),
+            deferred_catalog_ids: deferred_catalog_ids.to_vec(),
             config_hash: Some(public.drift.desired_config_hash.clone()),
             catalog_hash: Some(public.drift.desired_catalog_hash.clone()),
             proxy_port: public.host_port,
@@ -954,6 +1084,7 @@ pub fn plan(
         image: proxy_image,
         route_ids: selected_route_ids.into_iter().collect(),
         policy_overrides: selection.policy,
+        deferred_catalog_ids: deferred_catalog_ids.to_vec(),
     };
     store_plan(&state.data_root(), &stored)?;
     Ok(public)
@@ -1578,6 +1709,7 @@ async fn apply_inner(
             observed_revision: stored.public.desired_revision,
             last_plan_id: Some(plan_id.into()),
             selected_catalog_ids: stored.public.selected_catalog_ids.clone(),
+            deferred_catalog_ids: stored.deferred_catalog_ids.clone(),
             config_hash: Some(
                 proxy
                     .get("configHash")

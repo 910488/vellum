@@ -21,6 +21,10 @@ pub struct RemoteHostDesiredState {
     pub observed_revision: u64,
     pub last_plan_id: Option<String>,
     pub selected_catalog_ids: Vec<String>,
+    /// Desired models temporarily omitted because their credential is not
+    /// ready. Retain intent so pairing/adding a key can re-include them.
+    #[serde(default)]
+    pub deferred_catalog_ids: Vec<String>,
     pub config_hash: Option<String>,
     pub catalog_hash: Option<String>,
     /// Last planned/applied host-local proxy port; absent in older records.
@@ -45,6 +49,18 @@ pub struct RemoteHostDesiredState {
     /// `None` until this host has been applied at least once.
     #[serde(default)]
     pub applied_review_policy_fingerprint: Option<String>,
+}
+
+impl RemoteHostDesiredState {
+    pub(crate) fn converge_catalog_ids(&self) -> Vec<String> {
+        self.selected_catalog_ids
+            .iter()
+            .chain(&self.deferred_catalog_ids)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 fn desired_state_dir(root: &Path) -> PathBuf {
@@ -95,6 +111,49 @@ mod tests {
         assert_eq!(state.desired_revision, 0);
         assert_eq!(state.observed_revision, 0);
         assert_eq!(next_revision(temp.path(), "h-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn deferred_models_survive_reload_and_rejoin_converge_after_credentials_arrive() {
+        let temp = tempfile::tempdir().unwrap();
+        let desired = RemoteHostDesiredState {
+            host_id: "pending".into(),
+            selected_catalog_ids: vec!["bearer".into()],
+            deferred_catalog_ids: vec!["official".into(), "bearer".into()],
+            policy_overrides: RemotePolicyOverrides {
+                auto_review_enabled: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        save(temp.path(), &desired).unwrap();
+        let restored = load(temp.path(), "pending").unwrap();
+        assert_eq!(restored.converge_catalog_ids(), vec!["bearer", "official"]);
+        assert_eq!(restored.policy_overrides.auto_review_enabled, Some(false));
+        let mut legacy = serde_json::to_value(&desired).unwrap();
+        legacy.as_object_mut().unwrap().remove("deferredCatalogIds");
+        let old: RemoteHostDesiredState = serde_json::from_value(legacy).unwrap();
+        assert!(old.deferred_catalog_ids.is_empty());
+        let candidates = [
+            super::super::converge_models::Candidate {
+                catalog_id: "bearer".into(),
+                official: false,
+                credential_available: true,
+            },
+            super::super::converge_models::Candidate {
+                catalog_id: "official".into(),
+                official: true,
+                credential_available: true,
+            },
+        ];
+        let selected = super::super::converge_models::select(
+            &restored.converge_catalog_ids(),
+            &candidates,
+            "unused",
+        )
+        .unwrap();
+        assert_eq!(selected.catalog_ids, vec!["bearer", "official"]);
+        assert!(selected.omitted_catalog_ids.is_empty());
     }
 
     #[test]
