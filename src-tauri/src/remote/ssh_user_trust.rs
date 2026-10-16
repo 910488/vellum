@@ -232,7 +232,16 @@ fn assess(config: &UserTrust, candidate: &PendingHostFingerprint) -> Decision {
             if marker.is_some() {
                 continue;
             } // CA trust cannot prove a scanned host key
-            let (Some(kind), Some(key)) = (fields.next(), fields.next()) else {
+            let Some(kind) = fields.next() else {
+                unreadable = true;
+                continue;
+            };
+            // Hosts commonly advertise several algorithms. Only another key
+            // of the scanned type is evidence that this particular key changed.
+            if kind != candidate.key_type {
+                continue;
+            }
+            let Some(key) = fields.next() else {
                 unreadable = true;
                 continue;
             };
@@ -240,7 +249,7 @@ fn assess(config: &UserTrust, candidate: &PendingHostFingerprint) -> Decision {
                 unreadable = true;
                 continue;
             };
-            if kind == candidate.key_type && key == scanned {
+            if key == scanned {
                 same = true;
             } else {
                 changed = true;
@@ -454,11 +463,54 @@ mod tests {
         fs::write(&config.files[0], format!("host.test ssh-ed25519 {KEY}\n")).unwrap();
         let mut rsa = candidate.clone();
         rsa.key_type = "ssh-rsa".into();
-        assert_eq!(assess(&config, &rsa), Decision::Changed);
+        assert_eq!(assess(&config, &rsa), Decision::Unknown);
         let root = temp.path().join("vellum");
         assert!(inherit(&root, &target, &config, vec![rsa, candidate]).unwrap());
         let contents = fs::read_to_string(known_hosts_path(&root)).unwrap();
         assert_eq!(contents.lines().count(), 1);
         assert!(!contents.contains("ssh-rsa"));
+    }
+
+    #[test]
+    fn multiple_key_types_allow_inheritance_and_confirmation_of_unchanged_keys() {
+        let (temp, target, config, _) = fixture(22);
+        let rsa = STANDARD.encode(b"rsa-key-a");
+        let ecdsa = STANDARD.encode(b"ecdsa-key-a");
+        let text = format!("host.test ssh-rsa {rsa}\nhost.test ecdsa-sha2-nistp256 {ecdsa}\nhost.test ssh-ed25519 {KEY}\n");
+        fs::write(&config.files[0], &text).unwrap();
+        let candidates = parse_keyscan_output(&target, text.as_bytes());
+        assert_eq!(candidates.len(), 3);
+        for candidate in &candidates {
+            assert_eq!(assess(&config, candidate), Decision::Same);
+        }
+        refuse_changed(&config, &candidates).unwrap();
+        let root = temp.path().join("vellum");
+        assert!(inherit(&root, &target, &config, candidates).unwrap());
+        assert_eq!(
+            fs::read_to_string(known_hosts_path(&root)).unwrap(),
+            format!("host.test ssh-ed25519 {KEY}\n")
+        );
+        assert_eq!(fs::read_to_string(&config.files[0]).unwrap(), text);
+    }
+
+    #[test]
+    fn changed_rsa_key_still_hard_fails_without_writing_trust() {
+        let (temp, target, config, _) = fixture(22);
+        let old = STANDARD.encode(b"rsa-key-a");
+        let new = STANDARD.encode(b"rsa-key-b");
+        fs::write(&config.files[0], format!("host.test ssh-rsa {old}\n")).unwrap();
+        let candidates =
+            parse_keyscan_output(&target, format!("host.test ssh-rsa {new}\n").as_bytes());
+        assert_eq!(assess(&config, &candidates[0]), Decision::Changed);
+        assert!(refuse_changed(&config, &candidates)
+            .unwrap_err()
+            .to_string()
+            .contains("SshHostKeyFingerprintMismatch"));
+        let root = temp.path().join("vellum");
+        assert!(inherit(&root, &target, &config, candidates)
+            .unwrap_err()
+            .to_string()
+            .contains("SshHostKeyFingerprintMismatch"));
+        assert!(!root.exists());
     }
 }

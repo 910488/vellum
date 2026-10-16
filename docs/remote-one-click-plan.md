@@ -383,8 +383,9 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   的有效 known_hosts，支援 hashed、非標準 port 與多個名字。同一 endpoint、key type、
   key bytes 完全一致，才把 scan 得到的優先 key（Ed25519 優先）寫入 Vellum 私有
   known_hosts；確認紀錄標明 `source: userKnownHosts`，UI 顯示沿用先前信任。
-  revoked、只有 cert-authority、檔案不存在或無法讀取時回到明確確認；同 host 的
-  另一把不同 key 維持 hard-fail。使用者檔案不寫回，也不整份匯入。
+  revoked、只有 cert-authority、檔案不存在或無法讀取時回到明確確認；同 host、
+  同 key type 的 key bytes 不同才 hard-fail，不同 key type 的行忽略。
+  使用者檔案不寫回，也不整份匯入。
 - 主機清單空的時候，提供「新增主機」：輸入 `user@host[:port]`，建立 Vellum 私有
   `<data_root>/remote-ssh/config` alias 與註冊紀錄，不改使用者的 SSH config。
   私有設定 Include 使用者 config，新增主機的連線以 `ssh -F` 使用此設定。

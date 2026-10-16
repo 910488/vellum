@@ -265,14 +265,14 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     const destination = await screen.findByLabelText(i18n.t("remoteAdd.destination"));
     fireEvent.change(destination, { target: { value: "operator@192.0.2.10" } });
-    fireEvent.click(screen.getByRole("button", { name: i18n.t("remoteAdd.add"), exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("remoteAdd.add") }));
     await waitFor(() => expect(apiMocks.addRemoteSshHost).toHaveBeenCalledWith("operator@192.0.2.10"));
     expect(await screen.findByText("SHA256:pending")).toBeTruthy();
     expect(screen.getByText(i18n.t("remoteAdd.loginHint"))).toBeTruthy();
     expect(apiMocks.inspectRemoteHost).not.toHaveBeenCalled();
     expect(apiMocks.fetchRemoteSshFingerprint).not.toHaveBeenCalled();
     apiMocks.getRemoteSshTrustStatus.mockResolvedValue({ host: "192.0.2.10", port: 22, confirmed: true });
-    fireEvent.click(screen.getByRole("button", { name: i18n.t("remote.trust.confirm"), exact: true }));
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("remote.trust.confirm") }));
     await waitFor(() => expect(apiMocks.inspectRemoteHost).toHaveBeenCalledWith("jetson"));
   });
 
@@ -281,7 +281,7 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     expect(await screen.findByText(i18n.t("remoteAdd.trustReused"))).toBeTruthy();
     await waitFor(() => expect(apiMocks.inspectRemoteHost).toHaveBeenCalledWith("jetson"));
-    expect(screen.queryByRole("button", { name: i18n.t("remote.trust.confirm"), exact: true })).toBeNull();
+    expect(screen.queryByRole("button", { name: i18n.t("remote.trust.confirm") })).toBeNull();
     expect(apiMocks.fetchRemoteSshFingerprint).not.toHaveBeenCalled();
     expect(apiMocks.confirmRemoteSshFingerprint).not.toHaveBeenCalled();
   });
