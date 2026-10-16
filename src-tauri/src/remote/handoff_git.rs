@@ -236,7 +236,9 @@ impl Git {
         let output = run_command_with_input(&mut command, Some(files.into_bytes()))?;
         let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
         if fields
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .any(|entry| entry[1] == b"filter" && entry[2] == b"lfs")
         {
             return Err(error("HandoffLfsUnsupported: LFS objects and filters are not transferred; use a repository without LFS for handoff"));
