@@ -152,7 +152,16 @@ impl ProxyManager {
         self.with_mutation_lock(|| {
             self.run_operation_locked(operation_id, "proxy.migrationCommit", &json!({}), |_| {
                 let Some(snapshot) = crate::migration::load(self.store.paths())? else {
-                    return Ok(json!({"migrationPending": false}));
+                    // Every converge reaches this commit, including apply.noop.
+                    // Older agents already discarded the snapshot but left Docker
+                    // containers behind. Cleanup is best effort and repeatable.
+                    let cleanup = self.cleanup_legacy_orphans();
+                    if cleanup.is_err() {
+                        eprintln!("ProxyMigrationContainerCleanupFailed");
+                    }
+                    return Ok(json!({"migrationPending": false,
+                        "orphanContainersRemoved": cleanup.as_ref().ok(),
+                        "cleanupWarning": cleanup.err().map(|_| "ProxyMigrationContainerCleanupFailed")}));
                 };
                 let state = self.store.load()?;
                 let install = state
@@ -197,6 +206,41 @@ impl ProxyManager {
                     cleanup.err().map(|_| "ProxyMigrationContainerCleanupFailed")}))
             })
         })
+    }
+
+    /// Caller holds the host mutation lock. A pending snapshot, even a rolled
+    /// back one, still owns its containers; never infer authority from names.
+    fn cleanup_legacy_orphans(&self) -> Result<usize, String> {
+        if crate::migration::load(self.store.paths())?.is_some() {
+            return Ok(0);
+        }
+        let state = self.store.load()?;
+        let Some(install) = state.install.as_ref().filter(|install| {
+            install.backend() == crate::platform::ProxyBackend::Native
+                && install.host_id == state.host_id
+        }) else {
+            return Ok(0);
+        };
+        let status = crate::native_proxy::observe_native(
+            &self.store,
+            self.launchd.as_ref(),
+            &self.launch_agents_dir,
+            &self.launchd_domain,
+            &self.boundary_key(),
+        )?;
+        if !status.ready {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for container in self
+            .require_docker_observable()?
+            .iter()
+            .filter(|container| !container.running && same_install_ownership(install, container))
+        {
+            self.docker.remove_container(&container.id)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub fn migration_rollback(&self, operation_id: &str) -> Result<OperationResult, String> {
@@ -1897,6 +1941,118 @@ mod tests {
         assert!(native.status().unwrap().ready);
         assert_eq!(docker.removed.lock().unwrap().len(), 1);
         assert_eq!(*docker.repo_digests.lock().unwrap(), images);
+    }
+
+    #[test]
+    fn converge_removes_old_committed_orphans_and_is_repeatable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (native, docker, _) = migration_fixture(&temp);
+        stage_migration(&native, &temp, "migrate").unwrap();
+        native
+            .start(ProxyStartRequest {
+                operation_id: "start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap();
+        // Simulate the old agent's successful commit: snapshot gone, containers retained.
+        crate::migration::clear(native.store.paths()).unwrap();
+        let images = docker.repo_digests.lock().unwrap().clone();
+        native.migration_commit("converge").unwrap();
+        assert_eq!(docker.removed.lock().unwrap().len(), 2);
+        assert_eq!(docker.containers.lock().unwrap()[0].id, "foreign");
+        native.migration_commit("converge-again").unwrap();
+        assert_eq!(docker.removed.lock().unwrap().len(), 2);
+        assert_eq!(*docker.repo_digests.lock().unwrap(), images);
+    }
+
+    #[test]
+    fn orphan_cleanup_refuses_pending_migrations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (native, docker, _) = migration_fixture(&temp);
+        stage_migration(&native, &temp, "migrate").unwrap();
+        native
+            .start(ProxyStartRequest {
+                operation_id: "start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap();
+        assert_eq!(
+            native
+                .with_mutation_lock(|| native.cleanup_legacy_orphans())
+                .unwrap(),
+            0
+        );
+        assert!(docker.removed.lock().unwrap().is_empty());
+        assert!(crate::migration::load(native.store.paths())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn orphan_cleanup_requires_exact_labels_stopped_container_and_ready_native() {
+        for condition in ["labels", "running", "unready", "backend"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (native, docker, service) = migration_fixture(&temp);
+            stage_migration(&native, &temp, "migrate").unwrap();
+            native
+                .start(ProxyStartRequest {
+                    operation_id: "start".into(),
+                    host_port: None,
+                    image: None,
+                })
+                .unwrap();
+            crate::migration::clear(native.store.paths()).unwrap();
+            match condition {
+                "labels" => {
+                    let mut containers = docker.containers.lock().unwrap();
+                    containers[0].labels.clear();
+                    containers[2]
+                        .labels
+                        .insert("io.vellum.install-id".into(), "another-install".into());
+                }
+                "running" => {
+                    for c in docker.containers.lock().unwrap().iter_mut() {
+                        c.running = true;
+                    }
+                }
+                "unready" => *service.ready.lock().unwrap() = false,
+                "backend" => {
+                    let mut state = native.store.load().unwrap();
+                    state.install.as_mut().unwrap().proxy_backend = Some("docker".into());
+                    native.store.save(&state).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            native.migration_commit("converge").unwrap();
+            assert!(docker.removed.lock().unwrap().is_empty(), "{condition}");
+        }
+    }
+
+    #[test]
+    fn orphan_cleanup_failure_does_not_fail_converge_and_next_converge_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let (native, docker, _) = migration_fixture(&temp);
+        stage_migration(&native, &temp, "migrate").unwrap();
+        native
+            .start(ProxyStartRequest {
+                operation_id: "start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap();
+        crate::migration::clear(native.store.paths()).unwrap();
+        *docker.fail_remove.lock().unwrap() = true;
+        let result = native.migration_commit("failed-cleanup").unwrap();
+        assert!(serde_json::to_value(result)
+            .unwrap()
+            .to_string()
+            .contains("ProxyMigrationContainerCleanupFailed"));
+        assert_eq!(docker.containers.lock().unwrap().len(), 3);
+        *docker.fail_remove.lock().unwrap() = false;
+        native.migration_commit("retry-cleanup").unwrap();
+        assert_eq!(docker.containers.lock().unwrap().len(), 1);
     }
 
     #[test]

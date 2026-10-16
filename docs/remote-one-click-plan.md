@@ -485,7 +485,8 @@ remedy，失敗期間主按鈕停用；原始錯誤位於工作面下方預設�
   UTC 時間、build 版本、平台 os／arch、persistenceScope、phase 的結果與耗時、
   最終結果、白名單失敗碼與 deploy／redeploy／models／restore trigger 都是結構化欄位。
   不記錄 secret、token、使用者名稱、IP、port、路徑、hostname 或錯誤原文；
-  尚未探測到的平台／常駐方式為 null，未識別的錯誤記作 DeploymentFailed。
+  尚未探測到的平台為 null；started 一律省略 persistenceScope，僅 finished 在已知時記錄。
+  成功率只統計 finished，不依賴 started 的常駐方式。未識別的錯誤記作 DeploymentFailed。
 - 每台主機以檔案鎖序列化 append、補記與裁剪，最多保留最近 500 次完整作業範圍；
   裁剪先寫同目錄暫存檔、sync 再 rename，避免截斷原檔。讀取時對照 live control
   與 operation 檔，只有 started 的已中止作業冪等補成 interrupted；存活的作業不補。

@@ -56,6 +56,11 @@ fn converge_outcomes_produce_two_lines_and_count_blocked_separately_from_failure
         assert_eq!(pair[0].event, "started");
         assert_eq!(pair[1].event, "finished");
         assert_eq!(pair[0].operation_id, pair[1].operation_id);
+        assert!(pair[0].metadata.persistence_scope.is_none());
+        assert!(serde_json::to_value(&pair[0])
+            .unwrap()
+            .get("persistenceScope")
+            .is_none());
         assert_eq!(pair[1].phases.len(), 3);
         assert_eq!(pair[1].metadata.os.as_deref(), Some("linux"));
         assert_eq!(pair[1].metadata.arch.as_deref(), Some("aarch64"));
@@ -83,6 +88,40 @@ fn converge_outcomes_produce_two_lines_and_count_blocked_separately_from_failure
         summary.last_failure_code.as_deref(),
         Some("psStartTimeUnavailable")
     );
+}
+
+#[test]
+fn started_omits_scope_with_or_without_cache_and_finished_observes_actual_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    for (id, cache) in [
+        ("fresh", None),
+        ("cached", Some(json!({"persistenceScope": "login"}))),
+    ] {
+        let mut p = progress(id);
+        let recorder = Recorder::begin(temp.path(), &p, Trigger::Deploy, cache).unwrap();
+        p.state = "completed".into();
+        p.result = Some(json!({"bootstrap": {"persistenceScope": "onDemand"}}));
+        recorder.finish(&p).unwrap();
+    }
+    let events = history(temp.path(), "host").unwrap();
+    let raw = fs::read_to_string(path(temp.path(), "host").unwrap()).unwrap();
+    for line in raw.lines() {
+        let value: Value = serde_json::from_str(line).unwrap();
+        if value["event"] == "started" {
+            assert!(value.get("persistenceScope").is_none(), "{line}");
+        } else {
+            assert_eq!(value["persistenceScope"], "onDemand");
+        }
+    }
+    for pair in events.as_chunks::<2>().0 {
+        let started = serde_json::to_value(&pair[0]).unwrap();
+        assert!(started.get("persistenceScope").is_none());
+        assert_eq!(
+            pair[1].metadata.persistence_scope.as_deref(),
+            Some("onDemand")
+        );
+    }
+    assert_eq!(summary(temp.path(), "host").unwrap().succeeded, 2);
 }
 
 #[test]

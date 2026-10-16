@@ -35,6 +35,7 @@ pub enum Trigger {
 pub struct Metadata {
     pub os: Option<String>,
     pub arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_scope: Option<String>,
 }
 impl Metadata {
@@ -333,7 +334,12 @@ impl Recorder {
             result: None,
             failure_code: None,
         };
-        locked(root, &progress.host_id, |path| append(path, &event))?;
+        // Scope is an outcome of convergence, not a promise made at start.
+        // Keep cached scope internally for a failed finish, but never publish
+        // it on started, regardless of whether this host was seen previously.
+        let mut started = event.clone();
+        started.metadata.persistence_scope = None;
+        locked(root, &progress.host_id, |path| append(path, &started))?;
         Ok(Self {
             root: root.into(),
             host: progress.host_id.clone(),
