@@ -62,6 +62,7 @@ pub struct HandoffStatus {
     pub handoff_id: String,
     pub source_thread_id: String,
     pub state: String,
+    pub phase: Phase,
     pub repo_path: String,
     pub worktree: String,
     pub snapshot_ref: String,
@@ -76,10 +77,11 @@ pub struct HandoffStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-enum Phase {
+pub enum Phase {
     Prepared,
     WorktreeReady,
     ThreadStarting,
+    ThreadAdopted,
     ThreadReady,
     TurnStarting,
     Running,
@@ -232,10 +234,11 @@ fn status(record: &Record, layout: &Layout) -> HandoffStatus {
         source_thread_id: record.request.source_thread_id.clone(),
         state: match record.phase {
             Phase::Prepared | Phase::WorktreeReady | Phase::ThreadReady => "prepared",
-            Phase::ThreadStarting | Phase::TurnStarting => "indeterminate",
+            Phase::ThreadStarting | Phase::ThreadAdopted | Phase::TurnStarting => "indeterminate",
             Phase::Running => "running",
         }
         .into(),
+        phase: record.phase,
         repo_path: layout.repo.to_string_lossy().into_owned(),
         worktree: layout.worktree.to_string_lossy().into_owned(),
         snapshot_ref: layout.snapshot_ref.clone(),
@@ -255,6 +258,75 @@ pub fn start(
     request: StartRequest,
 ) -> Result<HandoffStatus, String> {
     start_with(paths, request, &crate::handoff_git::NativeClient::new(home))
+}
+
+/// Fixed, read-only tool discovery for Desktop preflight. Only Git's version
+/// probe is executed; task commands and renderer-supplied names are forbidden.
+pub fn preflight(home: &Path) -> Result<Value, String> {
+    let client = crate::handoff_git::NativeClient::new(home);
+    client.preflight()?;
+    let output = std::process::Command::new("sh").args(["-c",
+        "for tool in git python python3 node pnpm cargo dotnet; do if command -v \"$tool\" >/dev/null 2>&1; then printf '%s\\n' \"$tool\"; fi; done"
+    ]).output().map_err(|e| format!("HandoffToolProbeFailed: {e}"))?;
+    if !output.status.success() {
+        return Err("HandoffToolProbeFailed".into());
+    }
+    let tools: Vec<_> = std::str::from_utf8(&output.stdout)
+        .map_err(|e| e.to_string())?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let git_ready = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && git_object_format_supported(&String::from_utf8_lossy(&output.stdout))
+        });
+    let mut report = preflight_metadata(home, tools)?;
+    report["gitObjectFormatSupported"] = json!(git_ready);
+    Ok(report)
+}
+
+fn git_object_format_supported(version: &str) -> bool {
+    let mut numbers = version
+        .strip_prefix("git version ")
+        .unwrap_or_default()
+        .split('.');
+    matches!((numbers.next().and_then(|v| v.parse::<u32>().ok()), numbers.next().and_then(|v| v.parse::<u32>().ok())),
+        (Some(major), Some(minor)) if major > 2 || major == 2 && minor >= 29)
+}
+
+fn preflight_metadata(home: &Path, tools: Vec<String>) -> Result<Value, String> {
+    let config: toml::Value = fs::read_to_string(home.join("config.toml"))
+        .map_err(|e| format!("HandoffConfigurationUnavailable: {e}"))?
+        .parse()
+        .map_err(|_| "HandoffConfigurationUnavailable: invalid TOML".to_string())?;
+    let mut providers = vec!["openai".to_string()];
+    if let Some(table) = config
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+    {
+        providers.extend(table.keys().cloned());
+    }
+    let models = match fs::read(home.join("vellum-model-catalog.json")) {
+        Ok(bytes) => {
+            let catalog: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("HandoffCatalogInvalid: {e}"))?;
+            catalog
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_owned))
+                .collect::<Vec<_>>()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("HandoffCatalogUnavailable: {e}")),
+    };
+    Ok(
+        json!({"runtimeReady": true, "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "tools": tools, "providers": providers, "models": models}),
+    )
 }
 
 pub(crate) fn start_with(
@@ -312,8 +384,34 @@ pub(crate) fn start_with(
         client.prepare_worktree(&layout, &record.request.snapshot_commit)?;
         record.phase = Phase::WorktreeReady;
         save(paths, &record)?;
-    } else if matches!(record.phase, Phase::WorktreeReady | Phase::ThreadReady) {
+    } else if matches!(
+        record.phase,
+        Phase::WorktreeReady | Phase::ThreadReady | Phase::ThreadAdopted
+    ) {
         client.prepare_worktree(&layout, &record.request.snapshot_commit)?;
+    }
+    if record.phase == Phase::ThreadAdopted {
+        // Never override the settings we are trying to qualify. A failed resume
+        // leaves the adopted identity intact and cannot create a new thread.
+        let response = client.call("thread/resume", json!({"threadId": record.thread_id}))?;
+        if response.pointer("/thread/id").and_then(Value::as_str) != record.thread_id.as_deref()
+            || response.get("cwd").and_then(Value::as_str) != layout.worktree.to_str()
+            || response.pointer("/thread/cwd").and_then(Value::as_str) != layout.worktree.to_str()
+        {
+            return Err("HandoffStartIndeterminate: resumed thread identity/cwd changed".into());
+        }
+        qualify_configuration(&record, &layout, &response)?;
+        // A dedicated recovered thread must still have no turn before we send
+        // the first one. An unexpected turn requires observation, not replay.
+        if !response
+            .pointer("/thread/turns")
+            .and_then(Value::as_array)
+            .is_some_and(|turns| turns.is_empty())
+        {
+            return Err("HandoffStartIndeterminate: adopted thread already contains turns".into());
+        }
+        record.phase = Phase::ThreadReady;
+        save(paths, &record)?;
     }
     if record.phase == Phase::WorktreeReady {
         record.phase = Phase::ThreadStarting;
@@ -336,37 +434,7 @@ pub(crate) fn start_with(
         record.thread_id = Some(id.into());
         // Save the identity even when qualification fails; never create a second thread.
         save(paths, &record)?;
-        if response.get("model").and_then(Value::as_str) != Some(record.request.model.as_str())
-            || response.get("modelProvider").and_then(Value::as_str)
-                != Some(record.request.model_provider.as_str())
-            || response.get("cwd").and_then(Value::as_str) != layout.worktree.to_str()
-            || response.pointer("/sandbox/type").and_then(Value::as_str) != Some("workspaceWrite")
-            || response.get("approvalPolicy").and_then(Value::as_str) != Some("never")
-            || response.get("reasoningEffort").and_then(Value::as_str)
-                != Some(record.request.effort.as_str())
-            || response
-                .pointer("/sandbox/excludeTmpdirEnvVar")
-                .and_then(Value::as_bool)
-                != Some(true)
-            || response
-                .pointer("/sandbox/excludeSlashTmp")
-                .and_then(Value::as_bool)
-                != Some(true)
-            || response
-                .pointer("/sandbox/networkAccess")
-                .and_then(Value::as_bool)
-                != Some(false)
-            || response
-                .pointer("/sandbox/writableRoots")
-                .and_then(Value::as_array)
-                .is_none_or(|roots| {
-                    roots
-                        .iter()
-                        .any(|path| path.as_str() != layout.worktree.to_str())
-                })
-        {
-            return Err("HandoffConfigurationMismatch: daemon did not preserve model, cwd or workspace-write policy".into());
-        }
+        qualify_configuration(&record, &layout, &response)?;
         record.phase = Phase::ThreadReady;
         save(paths, &record)?;
     }
@@ -394,6 +462,128 @@ pub(crate) fn start_with(
     Ok(status(&record, &layout))
 }
 
+fn qualify_configuration(record: &Record, layout: &Layout, response: &Value) -> Result<(), String> {
+    if response.get("model").and_then(Value::as_str) != Some(record.request.model.as_str())
+        || response.get("modelProvider").and_then(Value::as_str)
+            != Some(record.request.model_provider.as_str())
+        || response.get("cwd").and_then(Value::as_str) != layout.worktree.to_str()
+        || response.pointer("/sandbox/type").and_then(Value::as_str) != Some("workspaceWrite")
+        || response.get("approvalPolicy").and_then(Value::as_str) != Some("never")
+        || response.get("reasoningEffort").and_then(Value::as_str)
+            != Some(record.request.effort.as_str())
+        || response
+            .pointer("/sandbox/excludeTmpdirEnvVar")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || response
+            .pointer("/sandbox/excludeSlashTmp")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || response
+            .pointer("/sandbox/networkAccess")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || response
+            .pointer("/sandbox/writableRoots")
+            .and_then(Value::as_array)
+            .is_none_or(|roots| {
+                roots
+                    .iter()
+                    .any(|path| path.as_str() != layout.worktree.to_str())
+            })
+    {
+        return Err("HandoffConfigurationMismatch: daemon did not preserve model, cwd or workspace-write policy".into());
+    }
+    Ok(())
+}
+
+// Daemon calls here are observation only. The local record is advanced under
+// the mutation lock; no resume, thread/start or turn/start is allowed here.
+fn reconcile(
+    paths: &AgentPaths,
+    record: &mut Record,
+    layout: &Layout,
+    client: &dyn Client,
+) -> Result<(), String> {
+    if record.phase == Phase::ThreadStarting {
+        let mut cursor = Value::Null;
+        let mut candidates = BTreeMap::new();
+        // cwd is an exact filter in pinned v2. Bound paging and refuse adoption
+        // unless the entire result set has been observed.
+        for _ in 0..2 {
+            let page = client.call(
+                "thread/list",
+                json!({
+                    "cwd": layout.worktree, "cursor": cursor, "limit": 100,
+                    "modelProviders": [], "useStateDbOnly": true,
+                "sourceKinds": ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"],
+                }),
+            )?;
+            let threads = page
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or("HandoffResponseInvalid: thread/list missing data")?;
+            for thread in threads {
+                if thread.get("cwd").and_then(Value::as_str) == layout.worktree.to_str() {
+                    let id = thread
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| valid_id(id))
+                        .ok_or("HandoffResponseInvalid: thread/list invalid id")?;
+                    candidates.insert(id.to_string(), ());
+                }
+            }
+            if candidates.len() > 1 {
+                return Ok(());
+            }
+            match page.get("nextCursor") {
+                Some(Value::Null) => {
+                    if let Some((id, ())) = candidates.into_iter().next() {
+                        if record.thread_id.as_ref().is_none_or(|known| known == &id) {
+                            record.thread_id = Some(id);
+                            record.phase = Phase::ThreadAdopted;
+                            save(paths, record)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                Some(Value::String(next)) if cursor.as_str() != Some(next) => cursor = json!(next),
+                _ => return Err("HandoffResponseInvalid: thread/list invalid cursor".into()),
+            }
+        }
+    } else if record.phase == Phase::TurnStarting {
+        let response = client.call(
+            "thread/read",
+            json!({"threadId": record.thread_id, "includeTurns": true}),
+        )?;
+        let thread = response
+            .get("thread")
+            .ok_or("HandoffResponseInvalid: thread missing")?;
+        if thread.get("id").and_then(Value::as_str) != record.thread_id.as_deref()
+            || thread.get("cwd").and_then(Value::as_str) != layout.worktree.to_str()
+        {
+            return Err("HandoffStartIndeterminate: observed thread identity/cwd changed".into());
+        }
+        let turns = thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .ok_or("HandoffResponseInvalid: turns missing")?;
+        // Pinned 0.147 Turn has no clientUserMessageId. This is a new dedicated
+        // handoff thread, so exactly one turn is the only unambiguous match.
+        if turns.len() == 1 {
+            let id = turns[0]
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_id(id))
+                .ok_or("HandoffResponseInvalid: turn id missing")?;
+            record.turn_id = Some(id.into());
+            record.phase = Phase::Running;
+            save(paths, record)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn result(
     paths: &AgentPaths,
     home: &Path,
@@ -416,13 +606,17 @@ pub(crate) fn result_with(
     {
         return Err("HandoffRequestInvalid: capture requires an operation id".into());
     }
-    let _guard = if request.capture {
+    let initial = load(paths, &request.handoff_id)?;
+    let _guard = if request.capture
+        || matches!(initial.phase, Phase::ThreadStarting | Phase::TurnStarting)
+    {
         Some(HostMutationGuard::acquire(&paths.mutation_lock)?)
     } else {
         None
     };
     let mut record = load(paths, &request.handoff_id)?;
     let layout = Layout::new(paths, &record.request);
+    reconcile(paths, &mut record, &layout, client)?;
     let mut result = status(&record, &layout);
     if request.capture {
         if let Some(capture) = record
@@ -563,6 +757,8 @@ mod tests {
         other_active: Cell<bool>,
         captures: RefCell<Vec<bool>>,
         fail_capture: Cell<bool>,
+        list_candidates: Cell<usize>,
+        wrong_resume_cwd: Cell<bool>,
     }
     impl Fake {
         fn new() -> Self {
@@ -577,6 +773,8 @@ mod tests {
                 other_active: Cell::new(false),
                 captures: Default::default(),
                 fail_capture: Cell::new(false),
+                list_candidates: Cell::new(0),
+                wrong_resume_cwd: Cell::new(false),
             }
         }
     }
@@ -602,6 +800,29 @@ mod tests {
                 return Err("agent.transportTimeout".into());
             }
             match method {
+                "thread/list" => Ok(
+                    json!({"data": (0..self.list_candidates.get()).map(|i| json!({
+                    "id": if i == 0 { "remote-thread".into() } else { format!("remote-thread-{i}") },
+                    "cwd": params["cwd"], "modelProvider": "vellum",
+                })).collect::<Vec<_>>(), "nextCursor": null}),
+                ),
+                "thread/resume" => {
+                    let started = self
+                        .rpc
+                        .borrow()
+                        .iter()
+                        .find(|(name, _)| name == "thread/start")
+                        .unwrap()
+                        .1
+                        .clone();
+                    Ok(
+                        json!({"thread": {"id": if self.wrong_read_identity.get() { "wrong" } else { "remote-thread" }, "cwd": started["cwd"], "turns": []},
+                        "cwd": if self.wrong_resume_cwd.get() { json!("/outside") } else { started["cwd"].clone() }, "model": if self.wrong_model.get() { json!("wrong") } else { started["model"].clone() },
+                        "modelProvider": started["modelProvider"], "reasoningEffort": started["config"]["model_reasoning_effort"],
+                        "approvalPolicy": "never", "sandbox": {"type": "workspaceWrite", "networkAccess": false,
+                        "writableRoots": [], "excludeTmpdirEnvVar": true, "excludeSlashTmp": true}}),
+                    )
+                }
                 "thread/start" => Ok(
                     json!({"thread": {"id": "remote-thread"}, "cwd": params["cwd"],
                     "model": if self.wrong_model.get() { json!("another-model") } else { params["model"].clone() },
@@ -700,6 +921,42 @@ mod tests {
     }
 
     #[test]
+    fn preflight_metadata_returns_only_public_provider_names_and_model_slugs() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[model_providers.vellum]\nname='Vellum'\nexperimental_bearer_token='private-value'\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("vellum-model-catalog.json"),
+            r#"{"models":[{"slug":"selected","description":"private-description"}]}"#,
+        )
+        .unwrap();
+        let config_before = fs::read(temp.path().join("config.toml")).unwrap();
+        let status = preflight_metadata(temp.path(), vec!["git".into(), "python3".into()]).unwrap();
+        assert_eq!(status["providers"], json!(["openai", "vellum"]));
+        assert_eq!(status["models"], json!(["selected"]));
+        assert!(!status.to_string().contains("private"));
+        assert_eq!(
+            fs::read(temp.path().join("config.toml")).unwrap(),
+            config_before
+        );
+    }
+
+    #[test]
+    fn git_preflight_requires_object_format_support_including_vendor_versions() {
+        assert!(git_object_format_supported(
+            "git version 2.39.5 (Apple Git-154)\n"
+        ));
+        assert!(git_object_format_supported(
+            "git version 2.49.0.windows.1\n"
+        ));
+        assert!(!git_object_format_supported("git version 2.17.1\n"));
+        assert!(!git_object_format_supported("unknown"));
+    }
+
+    #[test]
     fn prepare_push_start_and_replay_create_one_thread_and_one_turn_with_original_settings() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentPaths::from_root(temp.path().join("state"));
@@ -755,9 +1012,23 @@ mod tests {
                 .unwrap_err()
                 .contains("HandoffStartIndeterminate"));
             let observed = result_with(&paths, result_request(false), &fake).unwrap();
-            assert_eq!(observed.state, "indeterminate");
+            assert_eq!(
+                observed.state,
+                if method == "turn/start" {
+                    "running"
+                } else {
+                    "indeterminate"
+                }
+            );
             assert_eq!(observed.thread_id.is_some(), method == "turn/start");
-            assert_eq!(fake.rpc.borrow().len(), calls);
+            assert_eq!(
+                fake.rpc
+                    .borrow()
+                    .iter()
+                    .filter(|(name, _)| matches!(name.as_str(), "thread/start" | "turn/start"))
+                    .count(),
+                calls
+            );
         }
     }
 
@@ -772,7 +1043,109 @@ mod tests {
             .contains("HandoffConfigurationMismatch"));
         let result = result_with(&paths, result_request(false), &fake).unwrap();
         assert_eq!(result.thread_id.as_deref(), Some("remote-thread"));
-        assert_eq!(fake.rpc.borrow().len(), 1);
+        assert_eq!(
+            fake.rpc
+                .borrow()
+                .iter()
+                .filter(|(name, _)| name == "thread/start")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lost_thread_reply_is_adopted_read_only_then_resumed_without_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        let fake = Fake::new();
+        *fake.fail_rpc.borrow_mut() = Some("thread/start".into());
+        assert!(start_with(&paths, request(), &fake).is_err());
+        *fake.fail_rpc.borrow_mut() = None;
+        fake.list_candidates.set(1);
+        let adopted = result_with(&paths, result_request(true), &fake).unwrap();
+        assert_eq!(adopted.phase, Phase::ThreadAdopted);
+        assert_eq!(adopted.thread_id.as_deref(), Some("remote-thread"));
+        assert!(adopted.capture.is_none());
+        let count = fake.rpc.borrow().len();
+        result_with(&paths, result_request(true), &fake).unwrap();
+        assert_eq!(fake.rpc.borrow().len(), count);
+        assert!(fake.captures.borrow().is_empty());
+        start_with(&paths, request(), &fake).unwrap();
+        let rpc = fake.rpc.borrow();
+        assert_eq!(
+            rpc.iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["thread/start", "thread/list", "thread/resume", "turn/start"]
+        );
+        assert_eq!(rpc[2].1, json!({"threadId": "remote-thread"}));
+    }
+
+    #[test]
+    fn adopted_resume_failure_mismatch_or_identity_change_never_starts_a_turn() {
+        for failure in ["transport", "model", "identity", "cwd"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AgentPaths::from_root(temp.path().join("state"));
+            let fake = Fake::new();
+            *fake.fail_rpc.borrow_mut() = Some("thread/start".into());
+            assert!(start_with(&paths, request(), &fake).is_err());
+            *fake.fail_rpc.borrow_mut() = None;
+            fake.list_candidates.set(1);
+            result_with(&paths, result_request(false), &fake).unwrap();
+            match failure {
+                "transport" => *fake.fail_rpc.borrow_mut() = Some("thread/resume".into()),
+                "model" => fake.wrong_model.set(true),
+                "cwd" => fake.wrong_resume_cwd.set(true),
+                _ => fake.wrong_read_identity.set(true),
+            }
+            let error = start_with(&paths, request(), &fake).unwrap_err();
+            if failure == "model" {
+                assert!(error.contains("HandoffConfigurationMismatch"));
+            }
+            let result = result_with(&paths, result_request(true), &fake).unwrap();
+            assert_eq!(result.phase, Phase::ThreadAdopted);
+            assert_eq!(result.thread_id.as_deref(), Some("remote-thread"));
+            assert!(!fake
+                .rpc
+                .borrow()
+                .iter()
+                .any(|(name, _)| name == "turn/start"));
+        }
+    }
+
+    #[test]
+    fn multiple_thread_or_turn_candidates_remain_indeterminate_without_mutations() {
+        for method in ["thread/start", "turn/start"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AgentPaths::from_root(temp.path().join("state"));
+            let fake = Fake::new();
+            *fake.fail_rpc.borrow_mut() = Some(method.into());
+            assert!(start_with(&paths, request(), &fake).is_err());
+            *fake.fail_rpc.borrow_mut() = None;
+            fake.list_candidates.set(2);
+            fake.other_active.set(true);
+            let before = fake
+                .rpc
+                .borrow()
+                .iter()
+                .filter(|(name, _)| matches!(name.as_str(), "thread/start" | "turn/start"))
+                .count();
+            assert_eq!(
+                result_with(&paths, result_request(true), &fake)
+                    .unwrap()
+                    .state,
+                "indeterminate"
+            );
+            assert_eq!(
+                fake.rpc
+                    .borrow()
+                    .iter()
+                    .filter(|(name, _)| matches!(name.as_str(), "thread/start" | "turn/start"))
+                    .count(),
+                before
+            );
+            assert!(fake.captures.borrow().is_empty());
+        }
     }
 
     #[test]

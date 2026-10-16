@@ -6,6 +6,7 @@
  * 呼叫端一行都不用改。
  */
 import { EMPTY_OBSERVATIONS, type RuntimeObservations } from "./enhanced";
+import type { RemoteHandoffThread, RemoteHandoffPreflight, RemoteHandoffRecord, RemoteHandoffRequirements } from "./remoteHandoff";
 import type {
   CompactionDetail,
   CompactionTranscript,
@@ -247,6 +248,36 @@ export const api = {
   inspectRemoteHost(hostId: string): Promise<RemoteHostStatus> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call<RemoteHostStatus>("inspect_remote_host", { hostId });
+  },
+
+  listRemoteHandoffThreads(): Promise<RemoteHandoffThread[]> {
+    if (!hasTauri()) return delay([]);
+    return call("list_remote_handoff_threads");
+  },
+
+  preflightRemoteHandoff(hostId: string, threadId: string, requirements: RemoteHandoffRequirements = {}): Promise<RemoteHandoffPreflight> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("preflight_remote_handoff", { hostId, threadId, requirements });
+  },
+
+  startRemoteHandoff(hostId: string, threadId: string, brief: string, requirements: RemoteHandoffRequirements = {}): Promise<RemoteHandoffRecord> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("start_remote_handoff", { hostId, threadId, brief, requirements });
+  },
+
+  resumeRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("resume_remote_handoff", { handoffId });
+  },
+
+  pollRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("poll_remote_handoff", { handoffId });
+  },
+
+  listRemoteHandoffs(): Promise<RemoteHandoffRecord[]> {
+    if (!hasTauri()) return delay([]);
+    return call("list_remote_handoffs");
   },
 
   getDesktopCodexCompatibility(hostId: string): Promise<DesktopCodexCompatibilityStatus> {

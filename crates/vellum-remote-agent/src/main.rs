@@ -157,6 +157,7 @@ fn dispatch(
             "confirmedTakeoverIdentity": true,
             "fullCodexRuntimePackage": true,
             "codexHandoff": true,
+            "codexHandoffPreflight": true,
         })),
         AgentRequest::HostCapabilities => {
             Ok(serde_json::to_value(probe_host()).map_err(|e| e.to_string())?)
@@ -475,6 +476,9 @@ fn dispatch(
                 )?)
                 .map_err(|error| error.to_string())?,
             )
+        }
+        AgentRequest::CodexHandoffPreflight => {
+            vellum_remote_agent::handoff::preflight(&resolve_codex_home()?)
         }
         AgentRequest::CodexHandoffStart(request) => {
             let home = resolve_codex_home()?;

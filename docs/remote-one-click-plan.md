@@ -271,7 +271,7 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   -p vellum-remote-agent --test codex_runtime_package -- --ignored`。
   兩個架構的 archive 分別跑一次；這項測試不執行目標 Codex，以 fake version／service
   client 驗證真實解包、完整性與相對 symlink，因此可在 x64 harness 檢查 arm64 package。
-- **Agent handoff 協定（第二段實作，待驗收）**：`agent.version` 的頂層
+- **Agent handoff 協定（第二段已驗收：d2cf954；對帳補強待驗收）**：`agent.version` 的頂層
   `codexHandoff=true` 表示支援。`codex.handoffStart` 收 operationId、repoId、
   snapshotCommit、sourceThreadId、brief、model、modelProvider、effort；先以
   prepareOnly=true 建立受管 bare repo，回傳 repoPath、snapshotRef、worktree。
@@ -279,12 +279,41 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   runtime 完整性與受管 daemon preflight 在寫入前執行；worktree 必須符合指定快照。
   新 thread／turn 沿用模型與 effort，限制 workspace-write、無網路與額外暫存目錄寫入。
   非冪等 RPC 前先持久化 intent；重試不重複建立。回覆遺失時回報
-  HandoffStartIndeterminate，保留已知 thread id，後續人工查明，不假裝成功。
+  HandoffStartIndeterminate，保留已知 thread id，不假裝成功。
+  `result` 對 ThreadStarting 以 pinned v2 `thread/list` 的 cwd 精確過濾、完整分頁
+  （最多兩頁）找唯一候選；useStateDbOnly=true，避免索引修復寫入。唯一候選採為
+  ThreadAdopted，仍回 indeterminate，只顯示身分，不讀進度或建快照。
+  0.147 的唯讀 Thread 不含 model／effort／sandbox，故下一次明確 `start` 才用
+  `thread/resume {threadId}`（無任何 override 或額外旗標）驗證完整設定，通過後送 turn。
+  resume 出錯／身分不符保留 adopted；設定不符回 HandoffConfigurationMismatch。
+  TurnStarting 以 thread/read 找唯一 turn；0.147 Turn 沒有 clientUserMessageId，
+  零個或多個均不採用。對帳不增加 thread/start 或 turn/start 的次數。
   `codex.handoffResult` 預設唯讀查詢 thread／turn、plan、最近輸出與摘要；
   capture=true 加 operationId 時，使用臨時 index 建立結果 commit 與 resultRef、diffstat，
   不更動原 index 或工作檔。執行中／失敗／中斷的快照標 partial；同一 capture operation
-  重試沿用既有快照，仍可用新的 operationId 拉取後續進度。Desktop 傳輸、UI、
-  本機衝突處理與通知留在後續段落。
+  重試沿用既有快照，仍可用新的 operationId 拉取後續進度。
+- **Desktop 傳輸（第三段實作，待驗收）**：Tauri 新增 list_remote_handoff_threads、
+  preflight_remote_handoff、start_remote_handoff、resume_remote_handoff、
+  poll_remote_handoff、list_remote_handoffs，均在 blocking pool 執行。
+  從最新本機 Codex state DB 唯讀列出最近 100 筆 git thread，從 sessions 下的
+  rollout 驗證身分並取最後的 model／provider／effort，沿用 conversation_key_matches。
+  不讀 auth；缺設定或仍有本機 turn 時擋下。已建立交接紀錄的 thread 標 handedOff，
+  後續 UI 據此避免重複交出，尚未處理回收後解除標記。
+  preflight 檢查受管 SSH alias、Agent 功能、主機／完整 runtime／版本／模型與憑證；
+  新增唯讀 codex.handoffPreflight，僅回傳固定工具清單、Git 2.29+ 能力、provider 名稱與 catalog slug。
+  明確 requiredOs 或根目錄 Windows 專用 csproj 與主機 OS 不符即擋下；缺工具的提醒
+  附加到交代尾端，例如 python 不存在但有 python3；也從常見根目錄 manifest 推導工具需求。
+  任務仍放在交代第一段。
+  快照／operation id／交代在任何遠端寫入前持久化；prepare → 受管 SSH push → start，
+  可重放既有紀錄，保留同一份快照。start 回覆不明先 poll 對帳；只有明確 resume
+  可以接續 adopted；poll 不發啟動 RPC，也不跳過未完成的 push。
+  Git 使用臨時 index、不改工作檔或使用者 index；push 另用臨時 bare Git 目錄借用
+  來源 objects，避免來源 repo 的 URL rewrite／remote helper 改送其他位置。
+  僅允許受管 SSH 與私有 known_hosts，無 force push；淺 clone 與 repo-local clean
+  filter 暫時拒絕，分別提示先補齊歷史／等待 filter 支援。Git fixture 需要 Git 2.29+。
+  UI（五個 mock 場景）、結果 fetch／套用／衝突分支與完成通知留待後續段落。
+  收尾仍需用真實 pinned daemon 對照 thread/start 回傳、dotted config override、
+  thread/list 與無 override 的 thread/resume；目前測試以 fake daemon／本機 Git fixture 為主。
 - 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、
   前置檢查擋下。
 

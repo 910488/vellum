@@ -160,6 +160,69 @@ pub async fn inspect_remote_host(
 }
 
 #[tauri::command]
+pub async fn list_remote_handoff_threads(
+    state: tauri::State<'_, AppState>,
+) -> AppResult<Vec<super::handoff::LocalThread>> {
+    off_main_thread(&state, |state| super::handoff::list_threads(&state)).await
+}
+
+#[tauri::command]
+pub async fn preflight_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    thread_id: String,
+    requirements: super::handoff::Requirements,
+) -> AppResult<super::handoff::Preflight> {
+    off_main_thread(&state, move |state| {
+        super::handoff::preflight(&state, &host_id, &thread_id, &requirements)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn start_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    thread_id: String,
+    brief: String,
+    requirements: super::handoff::Requirements,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::start(&state, &host_id, &thread_id, &brief, &requirements)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn resume_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::resume(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn poll_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::poll(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_remote_handoffs(
+    state: tauri::State<'_, AppState>,
+) -> AppResult<Vec<super::handoff::Record>> {
+    off_main_thread(&state, |state| super::handoff::list(&state)).await
+}
+
+#[tauri::command]
 pub async fn bootstrap_remote_host(
     state: tauri::State<'_, AppState>,
     host_id: String,

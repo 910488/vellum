@@ -374,6 +374,8 @@ pub enum AgentRequest {
     CodexSessionStatus { thread_id: Option<String> },
     #[serde(rename = "codex.handoffStart")]
     CodexHandoffStart(crate::handoff::StartRequest),
+    #[serde(rename = "codex.handoffPreflight")]
+    CodexHandoffPreflight,
     #[serde(rename = "codex.handoffResult")]
     CodexHandoffResult(crate::handoff::ResultRequest),
     #[serde(rename = "codex.accountStatus")]
