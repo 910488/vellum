@@ -273,6 +273,10 @@ pub enum AgentRequest {
     },
     #[serde(rename = "proxy.stop")]
     ProxyStop { operation_id: String },
+    #[serde(rename = "proxy.migrationCommit")]
+    ProxyMigrationCommit { operation_id: String },
+    #[serde(rename = "proxy.migrationRollback")]
+    ProxyMigrationRollback { operation_id: String },
     #[serde(rename = "proxy.restart")]
     ProxyRestart { operation_id: String },
     #[serde(rename = "proxy.configure")]

@@ -153,6 +153,7 @@ fn dispatch(
         AgentRequest::AgentVersion => Ok(json!({
             "agentVersion": AGENT_VERSION,
             "agentProtocol": AGENT_PROTOCOL_VERSION,
+            "proxyMigrationRecovery": true,
         })),
         AgentRequest::HostCapabilities => {
             Ok(serde_json::to_value(probe_host()).map_err(|e| e.to_string())?)
@@ -208,6 +209,12 @@ fn dispatch(
         })?),
         AgentRequest::ProxyStop { operation_id } => {
             operation_to_value(manager.stop(&operation_id)?)
+        }
+        AgentRequest::ProxyMigrationCommit { operation_id } => {
+            operation_to_value(manager.migration_commit(&operation_id)?)
+        }
+        AgentRequest::ProxyMigrationRollback { operation_id } => {
+            operation_to_value(manager.migration_rollback(&operation_id)?)
         }
         AgentRequest::ProxyRestart { operation_id } => {
             operation_to_value(manager.restart(&operation_id)?)
@@ -1065,6 +1072,11 @@ fn host_blockers(inventory: &HostInventoryV2) -> Vec<HostBlocker> {
         ));
     }
     match inventory.proxy.last_error.as_deref() {
+        Some("proxyMigrationRolledBack") => blockers.push(HostBlocker::new(
+            "proxyMigrationRolledBack",
+            "Native migration failed; the previous managed Docker proxy was restored",
+            true,
+        )),
         Some("proxyPortOccupied") => blockers.push(HostBlocker::new(
             "proxyPortOccupied",
             "The installed proxy port is occupied; converge can select a free port",
@@ -1179,7 +1191,11 @@ mod tests {
         inventory.system.os = "linux".into();
         inventory.system.arch = "aarch64".into();
         inventory.proxy.present = true;
-        for code in ["proxyPortOccupied", "proxyPortConflict"] {
+        for code in [
+            "proxyPortOccupied",
+            "proxyPortConflict",
+            "proxyMigrationRolledBack",
+        ] {
             inventory.proxy.last_error = Some(code.into());
             assert!(host_blockers(&inventory)
                 .iter()

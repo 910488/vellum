@@ -590,6 +590,8 @@ impl LaunchdClient for ProcessLaunchdClient {
 
 #[derive(Debug, Default)]
 pub struct MemoryLaunchd {
+    pub fail_write: Mutex<bool>,
+    pub fail_load: Mutex<bool>,
     pub systemd: bool,
     pub loaded: Mutex<bool>,
     pub running: Mutex<bool>,
@@ -620,6 +622,9 @@ impl LaunchdClient for MemoryLaunchd {
         }
     }
     fn write_service(&self, spec: &LaunchAgentSpec, directory: &Path) -> Result<PathBuf, String> {
+        if *self.fail_write.lock().unwrap() {
+            return Err("injected service write failure".into());
+        }
         if self.systemd {
             SystemdUserClient::default().write_service(spec, directory)
         } else {
@@ -634,6 +639,9 @@ impl LaunchdClient for MemoryLaunchd {
         }
     }
     fn load_agent(&self, _domain: &str, plist: &Path) -> Result<(), String> {
+        if *self.fail_load.lock().unwrap() {
+            return Err("injected service load failure".into());
+        }
         self.loads.lock().unwrap().push(plist.to_path_buf());
         *self.loaded.lock().unwrap() = true;
         *self.running.lock().unwrap() = true;

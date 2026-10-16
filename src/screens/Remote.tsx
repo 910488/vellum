@@ -21,6 +21,7 @@ import {
   elapsedLabel,
   hostVerdict,
   psStartTimeFailure,
+  proxyMigrationFailure,
   operationKindKey,
   phaseKey,
   visibleBlockers,
@@ -767,6 +768,8 @@ export function Remote({
   // buttons that both lead nowhere.
   const immediateAppOwnedFailure = Boolean(failure?.raw.includes("nativeDaemonAppOwned"));
   const immediatePsFailure = psStartTimeFailure(failure?.raw);
+  const immediateMigrationFailure = proxyMigrationFailure(failure?.raw);
+  const operationMigrationFailure = ownOperation?.state === "failed" ? proxyMigrationFailure(ownOperation.message) : null;
   const operationPsFailure = ownOperation?.state === "failed" ? psStartTimeFailure(ownOperation.message) : null;
   const immediateDesktopProtocolFailure = Boolean(failure?.raw.includes("CodexDesktopProtocolMismatch"));
   const operationDesktopProtocolFailure = Boolean(
@@ -1005,6 +1008,8 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : immediateAppOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : immediateMigrationFailure
+                      ? t(immediateMigrationFailure)
                     : immediatePsFailure
                       ? t("remote.blocker.psStartTimeUnavailable")
                     : immediateBoundaryKeyFailure
@@ -1032,6 +1037,8 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : appOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : operationMigrationFailure
+                      ? t(operationMigrationFailure)
                     : operationPsFailure
                       ? t("remote.blocker.psStartTimeUnavailable")
                     : operationBoundaryKeyFailure

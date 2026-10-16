@@ -88,6 +88,9 @@ pub trait DockerClient: Send + Sync {
     fn list_proxy_containers(&self) -> Result<Vec<ContainerSummary>, String>;
     fn run_proxy_container(&self, spec: &RunProxySpec) -> Result<ContainerSummary, String>;
     fn stop_container(&self, id: &str) -> Result<(), String>;
+    fn start_container(&self, _id: &str) -> Result<(), String> {
+        Err("docker container restart is unsupported".into())
+    }
     fn remove_container(&self, id: &str) -> Result<(), String>;
     fn inspect_readyz(&self, host_port: u16, boundary_key: &str) -> Result<bool, String>;
     /// Verify the Responses endpoint accepts a WebSocket upgrade. Codex may
@@ -187,6 +190,17 @@ impl ProcessDockerClient {
 }
 
 impl DockerClient for ProcessDockerClient {
+    fn start_container(&self, id: &str) -> Result<(), String> {
+        let output = Self::run(&["start", id])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "docker start failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
     fn list_proxy_containers(&self) -> Result<Vec<ContainerSummary>, String> {
         let output = Self::run(&[
             "ps",
@@ -604,6 +618,8 @@ fn parse_host_port(ports: &str) -> Option<u16> {
 
 #[derive(Debug, Default)]
 pub struct FakeDockerClient {
+    pub restarted: std::sync::Mutex<Vec<String>>,
+    pub fail_restart: std::sync::Mutex<bool>,
     pub containers: std::sync::Mutex<Vec<ContainerSummary>>,
     pub readyz: std::sync::Mutex<bool>,
     pub readyz_install_id: std::sync::Mutex<Option<String>>,
@@ -619,6 +635,19 @@ pub struct FakeDockerClient {
 }
 
 impl DockerClient for FakeDockerClient {
+    fn start_container(&self, id: &str) -> Result<(), String> {
+        if *self.fail_restart.lock().unwrap() {
+            return Err("injected Docker restart failure".into());
+        }
+        let mut containers = self.containers.lock().expect("poisoned");
+        let container = containers
+            .iter_mut()
+            .find(|container| container.id == id)
+            .ok_or_else(|| format!("container not found: {id}"))?;
+        container.running = true;
+        self.restarted.lock().unwrap().push(id.into());
+        Ok(())
+    }
     fn list_proxy_containers(&self) -> Result<Vec<ContainerSummary>, String> {
         Ok(self.containers.lock().expect("poisoned").clone())
     }

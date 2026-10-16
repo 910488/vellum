@@ -7,6 +7,7 @@ pub mod configuration;
 pub mod docker;
 pub mod grok;
 pub mod host_probe;
+mod migration;
 pub mod mobile_account;
 pub mod mutation_lock;
 pub mod native_account;

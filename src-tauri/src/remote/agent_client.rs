@@ -373,6 +373,14 @@ impl RemoteAgentClient {
         self.rpc(json!({"method": "proxy.status"}))
     }
 
+    pub fn proxy_migration_commit(&self, operation_id: &str) -> AppResult<Value> {
+        self.rpc(json!({"method": "proxy.migrationCommit", "operationId": operation_id}))
+    }
+
+    pub fn proxy_migration_rollback(&self, operation_id: &str) -> AppResult<Value> {
+        self.rpc(json!({"method": "proxy.migrationRollback", "operationId": operation_id}))
+    }
+
     pub fn proxy_select_port(&self, preferred_port: Option<u16>) -> AppResult<u16> {
         let value =
             self.rpc(json!({"method": "proxy.selectPort", "preferredPort": preferred_port}))?;

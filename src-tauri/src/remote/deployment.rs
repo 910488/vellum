@@ -1209,6 +1209,80 @@ fn remote_model_is_qualified(state: &AppState, model: &crate::model::ModelRoute)
 }
 
 pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<RemoteApplyResult> {
+    let mut recovery_needed = false;
+    let result = apply_inner(state, host_id, plan_id, &mut recovery_needed).await;
+    if !recovery_needed {
+        return result;
+    }
+    let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
+    let attempt = ulid::Ulid::new();
+    complete_migration(
+        result,
+        || client.proxy_migration_commit(&format!("migration-commit-{attempt}")),
+        || client.proxy_migration_rollback(&format!("migration-rollback-{attempt}")),
+    )
+}
+
+fn migration_recovery_available(version: &Value, status: &Value) -> AppResult<bool> {
+    let supported = version
+        .get("proxyMigrationRecovery")
+        .and_then(Value::as_bool)
+        == Some(true);
+    // Status observes the platform's preferred native backend even when the
+    // persisted install is still Docker. The install record is authoritative.
+    let legacy = match status.get("install").filter(|install| !install.is_null()) {
+        Some(install) => install.get("proxyBackend").and_then(Value::as_str) != Some("native"),
+        None => {
+            status
+                .pointer("/proxy/proxyBackend")
+                .and_then(Value::as_str)
+                == Some("docker")
+        }
+    };
+    if !supported && legacy {
+        return Err(AppError::Message(
+            "ProxyMigrationAgentUpgradeRequired".into(),
+        ));
+    }
+    Ok(supported)
+}
+
+fn complete_migration<T>(
+    result: AppResult<T>,
+    commit: impl FnOnce() -> AppResult<serde_json::Value>,
+    rollback: impl FnOnce() -> AppResult<serde_json::Value>,
+) -> AppResult<T> {
+    let error = match result {
+        Ok(value) => match commit() {
+            Ok(_) => return Ok(value),
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    match rollback() {
+        Ok(value)
+            if value
+                .pointer("/detail/migrationRestored")
+                .and_then(|value| value.as_bool())
+                == Some(true) =>
+        {
+            Err(AppError::Message(format!(
+                "ProxyMigrationRolledBack: {error}"
+            )))
+        }
+        Ok(_) => Err(error),
+        Err(recovery) => Err(AppError::Message(format!(
+            "ProxyMigrationRecoveryFailed: {recovery}; cause: {error}"
+        ))),
+    }
+}
+
+async fn apply_inner(
+    state: &AppState,
+    host_id: &str,
+    plan_id: &str,
+    recovery_needed: &mut bool,
+) -> AppResult<RemoteApplyResult> {
     let stored = load_plan(&state.data_root(), plan_id)?;
     if stored.public.host_id != host_id {
         return Err(AppError::Message("DeploymentPlanHostMismatch".into()));
@@ -1223,10 +1297,12 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         )));
     }
     let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
-    let operation_id = format!("native-{plan_id}");
+    // A compensated attempt has restored old config/credentials. Its completed
+    // per-phase RPCs must not replay into a new attempt after that rollback.
+    let operation_id = format!("native-{plan_id}-{}", ulid::Ulid::new());
     super::bootstrap::preflight_linux_host(state, host_id)?;
     let mut steps = Vec::new();
-    client.agent_version()?;
+    let version = client.agent_version()?;
     client.codex_discover_native()?;
     steps.push("compatibility.verified".into());
 
@@ -1290,6 +1366,7 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
     let needs_native_apply_preview = needs_proxy_mutation
         || stored.public.drift.catalog_changed
         || stored.public.restart_required;
+    *recovery_needed = migration_recovery_available(&version, &agent_status)?;
     if running && !needs_install && !needs_configure && !needs_native_apply_preview {
         steps.push("apply.noop".into());
         return Ok(RemoteApplyResult {
@@ -2914,5 +2991,91 @@ mod tests {
                 "boundary-key consumer confirmation must run after {label}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn older_native_agents_do_not_receive_new_rpcs_but_legacy_migration_requires_upgrade() {
+        let old = serde_json::json!({"agentProtocol": 5});
+        assert!(migration_recovery_available(
+            &old,
+            &serde_json::json!({
+                "proxy": {"proxyBackend": "native"}, "install": {"image": "legacy-proxy"}
+            })
+        )
+        .is_err());
+        assert!(!migration_recovery_available(
+            &old,
+            &serde_json::json!({"proxy": {"proxyBackend": "native"}})
+        )
+        .unwrap());
+        assert!(migration_recovery_available(
+            &old,
+            &serde_json::json!({"proxy": {"proxyBackend": "docker"}})
+        )
+        .is_err());
+        assert!(migration_recovery_available(
+            &serde_json::json!({"proxyMigrationRecovery": true}),
+            &serde_json::json!({})
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn success_commits_without_restarting_docker() {
+        let result = complete_migration(
+            Ok(42),
+            || Ok(serde_json::json!({})),
+            || panic!("unexpected rollback"),
+        );
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn later_phase_failure_rolls_back_without_committing() {
+        let result: AppResult<()> = complete_migration(
+            Err(AppError::Message("credential sync failed".into())),
+            || panic!("unexpected commit"),
+            || Ok(serde_json::json!({"detail": {"migrationRestored": true}})),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("ProxyMigrationRolledBack"));
+        assert!(error.contains("credential sync failed"));
+    }
+
+    #[test]
+    fn failed_final_verification_restores_old_proxy() {
+        let result = complete_migration(
+            Ok(()),
+            || Err(AppError::Message("native verification failed".into())),
+            || Ok(serde_json::json!({"detail": {"migrationRestored": true}})),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ProxyMigrationRolledBack"));
+    }
+
+    #[test]
+    fn failed_recovery_reports_both_causes_and_no_snapshot_preserves_error() {
+        let result: AppResult<()> = complete_migration(
+            Err(AppError::Message("configure failed".into())),
+            || panic!("unexpected commit"),
+            || Err(AppError::Message("container ownership changed".into())),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("ProxyMigrationRecoveryFailed"));
+        assert!(error.contains("configure failed"));
+        assert!(error.contains("container ownership changed"));
+        let result: AppResult<()> = complete_migration(
+            Err(AppError::Message("original".into())),
+            || panic!("unexpected commit"),
+            || Ok(serde_json::json!({"detail": {"migrationRestored": false}})),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "original");
     }
 }

@@ -15,6 +15,13 @@
 /** 主要動作。工作面上永遠只有一顆，這個型別就是「那一顆是什麼」。 */
 export type RemotePrimaryAction = "bootstrap" | "reconverge" | null;
 
+export function proxyMigrationFailure(message: string | null | undefined): string | null {
+  if (message?.includes("ProxyMigrationRecoveryFailed")) return "remote.blocker.proxyMigrationRecoveryFailed";
+  if (message?.includes("ProxyMigrationRolledBack")) return "remote.blocker.proxyMigrationRolledBack";
+  if (message?.includes("ProxyMigrationAgentUpgradeRequired")) return "remote.blocker.proxyMigrationAgentUpgradeRequired";
+  return null;
+}
+
 /** A preflight refusal carries a fixed, distro-specific repair hint from the backend. */
 export function psStartTimeFailure(message: string | null | undefined): { repair: string | null } | null {
   if (!message?.includes("psStartTimeUnavailable")) return null;
@@ -120,6 +127,9 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   // Only emitted after the Agent exhausts the automatic fallback range.
   proxyPortConflict: { remedy: null, expectedBeforeBootstrap: false },
   proxyPortOccupied: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  proxyMigrationRolledBack: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  proxyMigrationRecoveryFailed: { remedy: null, expectedBeforeBootstrap: false },
+  proxyMigrationAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
   insufficientDiskSpace: { remedy: null, expectedBeforeBootstrap: false },
   incompleteObservation: { remedy: null, expectedBeforeBootstrap: false },
   hostNotConfigured: { remedy: "bootstrap", expectedBeforeBootstrap: true },

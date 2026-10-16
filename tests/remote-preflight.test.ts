@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { describeBlocker, psStartTimeFailure, visibleBlockers } from "@/lib/remoteVocabulary";
+import { describeBlocker, psStartTimeFailure, proxyMigrationFailure, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("distinguishes recovered migrations, failed recovery, and missing agent support", () => {
+    expect(proxyMigrationFailure("ProxyMigrationRolledBack: start failed")).toBe("remote.blocker.proxyMigrationRolledBack");
+    expect(proxyMigrationFailure("ProxyMigrationRecoveryFailed: cause: ProxyMigrationRolledBack")).toBe("remote.blocker.proxyMigrationRecoveryFailed");
+    expect(proxyMigrationFailure("ProxyMigrationAgentUpgradeRequired")).toBe("remote.blocker.proxyMigrationAgentUpgradeRequired");
+    expect(proxyMigrationFailure(null)).toBeNull();
+    expect(describeBlocker("proxyMigrationRolledBack").remedy).toBe("bootstrap");
+    expect(describeBlocker("proxyMigrationRecoveryFailed").remedy).toBeNull();
+    expect(describeBlocker("proxyMigrationAgentUpgradeRequired").remedy).toBe("updateAgent");
+  });
   it("offers converge for an occupied saved port while preserving the exhausted-range blocker", () => {
     const occupied = describeBlocker("proxyPortOccupied");
     expect(occupied.messageKey).toBe("remote.blocker.proxyPortOccupied");
