@@ -300,7 +300,7 @@ fn artifact_for_arch<'a>(artifacts: &'a ArtifactSet, arch: &str) -> AppResult<&'
     artifact_for_os_arch(artifacts, "linux", arch)
 }
 
-fn artifact_for_os_arch<'a>(
+pub(crate) fn artifact_for_os_arch<'a>(
     artifacts: &'a ArtifactSet,
     os: &str,
     arch: &str,
@@ -392,6 +392,27 @@ fn bundled_artifact(relative: &str) -> AppResult<PathBuf> {
         .map(|root| root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)))
         .find(|path| path.is_file())
         .ok_or_else(|| AppError::Message(format!("ReleaseArtifactMissing: bundle://{relative}")))
+}
+
+/// Inspect a signed bundle asset without staging, downloading or remote writes.
+pub(crate) fn inspect_bundled_artifact(artifact: &CodexArtifact) -> AppResult<u64> {
+    let relative = artifact.url.strip_prefix("bundle://").ok_or_else(|| {
+        AppError::Message("bundledReleaseUnavailable: artifact is not bundled".into())
+    })?;
+    let path = bundled_artifact(relative)?;
+    inspect_artifact_file(&path, &artifact.sha256)
+}
+
+fn inspect_artifact_file(path: &Path, expected: &str) -> AppResult<u64> {
+    let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
+    if sha256_file(path)? != expected {
+        return Err(AppError::Message(
+            "ReleaseArtifactDigestMismatch: bundled artifact failed verification".into(),
+        ));
+    }
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| AppError::Message(error.to_string()))
 }
 
 /// Resolve a bundled artifact or download an explicitly HTTPS artifact, then
@@ -693,6 +714,27 @@ pub(crate) fn native_proxy_component_update_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_artifact_inspection_checks_digest_before_deployment_and_never_stages() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact");
+        std::fs::write(&artifact, b"signed bytes").unwrap();
+        let digest = sha256_file(&artifact).unwrap();
+        assert_eq!(inspect_artifact_file(&artifact, &digest).unwrap(), 12);
+        assert!(inspect_artifact_file(&artifact, "wrong")
+            .unwrap_err()
+            .to_string()
+            .contains("ReleaseArtifactDigestMismatch"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert!(inspect_bundled_artifact(&CodexArtifact {
+            url: "https://example.invalid/artifact".into(),
+            sha256: digest
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("bundledReleaseUnavailable"));
+    }
 
     #[test]
     fn schema5_native_linux_manifest_omits_broker_and_image_and_fails_closed_on_archives() {

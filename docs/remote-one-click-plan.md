@@ -156,7 +156,7 @@ UI 提供重新部署。驗證必須維持 proxy ready、native daemon running�
 及 apply 後的相同 proxy port；若 retry 期間 port 改變，不能宣稱 catalog 已同步，
 需重新 converge 收斂。
 
-第四段（待協調者驗證）：一鍵 converge 使用獨立的可用模型範圍，預設選擇啟用且
+第四段（af0771d 與 047066d 已驗收）：一鍵 converge 使用獨立的可用模型範圍，預設選擇啟用且
 通過 qualification、Desktop 有可用憑證的模型；手動 plan 保留原本嚴格驗證。
 沿用主機的 policy overrides。Official 只使用 Desktop 目前帳號已啟用的遠端 grant；
 若其他模型可用，略過未就緒 Official 並在成功結果提示配對。只剩 Official 時，
@@ -164,13 +164,24 @@ UI 提供重新部署。驗證必須維持 proxy ready、native daemon running�
 暫缺憑證的選擇保存為 deferredCatalogIds，plan/apply 都保留，補憑證後再 converge
 即可納入；舊 desired state 與儲存的 plan 仍可讀。尚無可部署模型時回報已知碼
 noDeployableModels。preflight／autoFix／等待與取消／接手確認仍待後續分段；
-模型／憑證的前置檢查尚待移到所有遠端寫入之前。
+模型／憑證的前置檢查已於下一段加入寫入關卡。
+
+第五段（待協調者驗證）：bootstrap 拆成 inspect／write，以共同關卡拒絕有 blockers
+的部署。先探測平台與 procps，再查 Desktop 模型憑證、signed bundle 的 agent／proxy／
+Codex 檔案與 digest、磁碟保留。已是 bundled Agent 時，於寫入前觀察 port、Official
+grant、config 與完整閒置狀態；Agent 需更新或尚未安裝時，先更新 Agent，再於 boundary／
+linger／Codex lifecycle 寫入前重查上述項目。回報 autoFix 清單，Codex 版本或相容性
+不符時自動安裝 pinned 版本；proxy／config／boundary 沿用既有收斂階段。fake transport
+涵蓋全新主機被拒時沒有本次部署寫入呼叫，既有 recovery hook 保持不變。
+active work／App-owned 目前仍擋下；等待與取消、接手確認在後續段完成。
 
 改寫 `one_click_bootstrap` 成一個狀態機（保留函式名以免破壞呼叫端）：
 
 1. `preflight`（純讀）：SSH 可達、host key 已信任、OS/arch、磁碟、glibc 不再相關、
    常駐能力、port、Codex daemon 擁有者、進行中 turn、Desktop 有沒有至少一個可用
    provider 憑證、bundled release ready。產出 `{autoFix[], blockers[]}`。
+   preflight 通過前，**本次部署不寫入任何東西**；既有受管安裝在 SSH 連入時觸發的
+   `ensure-services` 冪等恢復不在此限，保留原本 recovery hook，不另設跳過路徑。
 2. 自動修：Agent 版本不符 → 更新 Agent；Codex 版本／Desktop 協議不符 → 安裝／同步
    pinned Codex；proxy image／binary 過期 → 換；boundary key 缺 → provision；
    config `upgradeRequired`／`repairRequired` → 照現有邏輯收斂。

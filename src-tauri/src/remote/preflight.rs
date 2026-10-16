@@ -1,6 +1,32 @@
 //! Read-only prerequisites checked before remote deployment mutations.
 
 use crate::error::{AppError, AppResult};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentPreflight {
+    pub auto_fix: Vec<String>,
+    pub blockers: Vec<String>,
+    pub repair_commands: Vec<String>,
+}
+
+/// Do not enter the deployment write phase until inspection succeeds.
+/// An existing SSH wrapper's idempotent recovery is outside this deployment.
+pub(crate) fn before_deployment<C, T>(
+    inspect: impl FnOnce() -> AppResult<(DeploymentPreflight, C)>,
+    write: impl FnOnce(DeploymentPreflight, C) -> AppResult<T>,
+) -> AppResult<T> {
+    let (report, context) = inspect()?;
+    if !report.blockers.is_empty() {
+        return Err(AppError::Message(format!(
+            "OneClickBootstrapBlocked: {}; repair: {}",
+            report.blockers.join(", "),
+            report.repair_commands.join(" | ")
+        )));
+    }
+    write(report, context)
+}
 
 pub(crate) const PS_START_TIME_BLOCKER: &str = "psStartTimeUnavailable";
 
@@ -95,6 +121,83 @@ pub(crate) fn ps_start_time_preflight(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn fresh_host_preflight_refusal_makes_no_transport_write_calls() {
+        struct FakeTransport {
+            writes: std::cell::RefCell<Vec<&'static str>>,
+        }
+        let transport = FakeTransport {
+            writes: Default::default(),
+        };
+        for code in [
+            "unsupportedRemotePlatform",
+            "intelMacUnsupported",
+            "psStartTimeUnavailable",
+            "insufficientDiskSpace",
+            "noDeployableModels",
+            "bundledReleaseUnavailable",
+        ] {
+            let result = before_deployment(
+                || {
+                    Ok((
+                        DeploymentPreflight {
+                            blockers: vec![code.into()],
+                            ..Default::default()
+                        },
+                        false,
+                    ))
+                },
+                |_, managed_install| {
+                    assert!(!managed_install);
+                    transport.writes.borrow_mut().extend([
+                        "ssh.isolation",
+                        "ssh.upload",
+                        "credential.put",
+                        "codex.bootstrapNative",
+                    ]);
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains(code));
+            assert!(
+                transport.writes.borrow().is_empty(),
+                "{code} must precede every deployment write"
+            );
+        }
+        let result: AppResult<()> = before_deployment::<(), _>(
+            || Err(AppError::Message("SSH unavailable".into())),
+            |_, _| {
+                transport.writes.borrow_mut().push("ssh.upload");
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "SSH unavailable");
+        assert!(transport.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn allowed_preflight_passes_its_fix_list_to_the_write_phase_once() {
+        let writes = Cell::new(0);
+        before_deployment(
+            || {
+                Ok((
+                    DeploymentPreflight {
+                        auto_fix: vec!["agent.update".into()],
+                        ..Default::default()
+                    },
+                    (),
+                ))
+            },
+            |report, _| {
+                assert_eq!(report.auto_fix, vec!["agent.update"]);
+                writes.set(writes.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(writes.get(), 1);
+    }
 
     struct FakePs {
         output: PsProbeOutput,

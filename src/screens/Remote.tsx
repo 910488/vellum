@@ -23,6 +23,7 @@ import {
   psStartTimeFailure,
   proxyMigrationFailure,
   deploymentVerificationFailure,
+  deploymentPreflightFailure,
   convergeCredentialFailure,
   convergePairingSuggested,
   resumeConvergeAfterAccount,
@@ -781,6 +782,8 @@ export function Remote({
   const immediatePsFailure = psStartTimeFailure(failure?.raw);
   const immediateMigrationFailure = proxyMigrationFailure(failure?.raw);
   const immediateVerificationFailure = deploymentVerificationFailure(failure?.raw);
+  const immediatePreflightFailure = deploymentPreflightFailure(failure?.raw);
+  const operationPreflightFailure = ownOperation?.state === "failed" ? deploymentPreflightFailure(ownOperation.message) : null;
   const immediateCredentialFailure = convergeCredentialFailure(failure?.raw);
   const operationCredentialFailure = ownOperation?.state === "failed" ? convergeCredentialFailure(ownOperation.message) : null;
   const operationVerificationFailure = ownOperation?.state === "failed" ? deploymentVerificationFailure(ownOperation.message) : null;
@@ -1035,6 +1038,8 @@ export function Remote({
                       ? t("remote.blocker.nativeDaemonAppOwned")
                     : immediateCredentialFailure
                       ? t(immediateCredentialFailure.messageKey)
+                    : immediatePreflightFailure
+                      ? t(immediatePreflightFailure)
                     : immediateVerificationFailure
                       ? t(immediateVerificationFailure)
                     : immediateMigrationFailure
@@ -1069,6 +1074,8 @@ export function Remote({
                       ? t("remote.blocker.nativeDaemonAppOwned")
                     : operationCredentialFailure
                       ? t(operationCredentialFailure.messageKey)
+                    : operationPreflightFailure
+                      ? t(operationPreflightFailure)
                     : operationVerificationFailure
                       ? t(operationVerificationFailure)
                     : operationMigrationFailure

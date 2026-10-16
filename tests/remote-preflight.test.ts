@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { convergeCredentialFailure, convergePairingSuggested, describeBlocker, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, resumeConvergeAfterAccount, visibleBlockers } from "@/lib/remoteVocabulary";
+import { convergeCredentialFailure, convergePairingSuggested, describeBlocker, deploymentPreflightFailure, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, resumeConvergeAfterAccount, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("explains deployment preflight refusals and the auto-fix phase", () => {
+    for (const code of ["bundledReleaseUnavailable", "activeWorkInProgress", "unsupportedRemotePlatform", "insufficientDiskSpace", "proxyPortConflict", "proxyConfigurationSchemaTooNew"]) {
+      expect(deploymentPreflightFailure(`OneClickBootstrapBlocked: ${code}`)).toBe(`remote.blocker.${code}`);
+      expect(describeBlocker(code).messageKey).toBe(`remote.blocker.${code}`);
+    }
+    expect(deploymentPreflightFailure("SSH reply lost")).toBeNull();
+    expect(deploymentPreflightFailure(null)).toBeNull();
+    expect(phaseKey("autoFix")).toBe("remote.phase.autoFix");
+    expect(describeBlocker("bundledReleaseUnavailable").remedy).toBeNull();
+  });
   it("resumes only the failed converge for this host after its account remedy", () => {
     const operation = { hostId: "host", kind: "oneClickBootstrap", state: "failed", message: "officialAccountPairingRequired" };
     expect(resumeConvergeAfterAccount(operation, "host")).toBe(true);

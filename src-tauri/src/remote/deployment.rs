@@ -416,6 +416,30 @@ pub(crate) fn plan_for_converge(
     host_id: &str,
     desired: &super::desired_state::RemoteHostDesiredState,
 ) -> AppResult<(RemoteDeploymentPlan, super::converge_models::Selection)> {
+    let selected = select_for_converge(state, host_id, desired)?;
+    let scope = selected
+        .catalog_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let plan = plan_scoped(
+        state,
+        host_id,
+        RemoteModelSelection {
+            catalog_ids: selected.catalog_ids.clone(),
+            policy: desired.policy_overrides.clone(),
+        },
+        Some(&scope),
+        &selected.omitted_catalog_ids,
+    )?;
+    Ok((plan, selected))
+}
+
+pub(crate) fn select_for_converge(
+    state: &AppState,
+    host_id: &str,
+    desired: &super::desired_state::RemoteHostDesiredState,
+) -> AppResult<super::converge_models::Selection> {
     let routes = state.routes();
     let codex_paths = crate::codex::CodexPaths::discover(&state.data_root());
     let official_catalog = crate::catalog::read_official_catalog(&codex_paths.models_cache);
@@ -494,23 +518,7 @@ pub(crate) fn plan_for_converge(
             credential_available: ready_routes.contains(&model.route_id),
         })
         .collect::<Vec<_>>();
-    let selected = super::converge_models::select(&requested, &candidates, official_blocker)?;
-    let scope = selected
-        .catalog_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let plan = plan_scoped(
-        state,
-        host_id,
-        RemoteModelSelection {
-            catalog_ids: selected.catalog_ids.clone(),
-            policy: desired.policy_overrides.clone(),
-        },
-        Some(&scope),
-        &selected.omitted_catalog_ids,
-    )?;
-    Ok((plan, selected))
+    super::converge_models::select(&requested, &candidates, official_blocker)
 }
 
 fn qualified_remote_models(
@@ -536,6 +544,57 @@ fn qualified_remote_models(
         })
         .filter(|model| remote_model_is_qualified(state, model))
         .collect()
+}
+
+/// Local eligibility only: remote grants are observed after Agent availability
+/// is established. A current Desktop identity may pair later if Official is
+/// the only usable provider. Credential read failures remain errors.
+pub(crate) fn preflight_models(state: &AppState, host_id: &str) -> AppResult<()> {
+    let desired = super::desired_state::load(&state.data_root(), host_id)?;
+    let requested = desired.converge_catalog_ids();
+    let routes = state.routes();
+    let paths = crate::codex::CodexPaths::discover(&state.data_root());
+    let catalog = crate::catalog::read_official_catalog(&paths.models_cache);
+    let models =
+        qualified_remote_models(state, &routes, &hidden_official_model_ids(catalog.as_ref()));
+    let mut ready = false;
+    let mut official = false;
+    for route in routes.iter().filter(|route| {
+        models.iter().any(|model| {
+            model.route_id == route.id
+                && (requested.is_empty() || requested.contains(&model.catalog_id))
+        })
+    }) {
+        if route.provider_kind == ProviderKind::Official {
+            official = true;
+            ready |= super::desktop_control_account_id(state).is_some();
+        } else {
+            ready |= match route.auth_kind {
+                AuthKind::Bearer => crate::credentials::load(&state.data_root(), &route.id)?
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+                AuthKind::GrokSession => state
+                    .grok_accounts()
+                    .default_account_home()
+                    .ok()
+                    .and_then(|(_, home)| crate::grok_auth::read_credential(&home).ok().flatten())
+                    .is_some(),
+                AuthKind::None => true,
+                AuthKind::ChatGpt => false,
+            };
+        }
+    }
+    if ready {
+        Ok(())
+    } else {
+        Err(AppError::Message(
+            if official {
+                "desktopOfficialAccountMissing"
+            } else {
+                "noDeployableModels"
+            }
+            .into(),
+        ))
+    }
 }
 
 fn plan_scoped(

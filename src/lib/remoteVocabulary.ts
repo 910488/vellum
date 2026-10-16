@@ -37,6 +37,12 @@ export function deploymentVerificationFailure(message: string | null | undefined
     ? "remote.blocker.deploymentVerificationFailed" : null;
 }
 
+export function deploymentPreflightFailure(message: string | null | undefined): string | null {
+  const code = ["bundledReleaseUnavailable", "activeWorkInProgress", "incompleteObservation", "proxyConfigurationSchemaTooNew", "proxyConfigurationUnreadable", "insufficientDiskSpace", "proxyPortConflict", "intelMacUnsupported", "unsupportedRemotePlatform", "guiSessionUnavailable"]
+    .find((code) => message?.includes(code));
+  return code ? `remote.blocker.${code}` : null;
+}
+
 export function proxyMigrationFailure(message: string | null | undefined): string | null {
   if (message?.includes("ProxyMigrationRecoveryFailed")) return "remote.blocker.proxyMigrationRecoveryFailed";
   if (message?.includes("ProxyMigrationRolledBack")) return "remote.blocker.proxyMigrationRolledBack";
@@ -139,6 +145,9 @@ interface BlockerEntry {
 }
 
 const BLOCKERS: Record<string, BlockerEntry> = {
+  bundledReleaseUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  activeWorkInProgress: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  unsupportedRemotePlatform: { remedy: null, expectedBeforeBootstrap: false },
   agentUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: true },
   codexRestartRequired: { remedy: "repair", expectedBeforeBootstrap: false },
   credentialsMissing: { remedy: "bootstrap", expectedBeforeBootstrap: true },
@@ -268,6 +277,7 @@ const PHASES = new Set([
   "queued",
   "cleanHostPreflight",
   "hostPreflight",
+  "autoFix",
   "resolvingDesktopCodex",
   "installCodex",
   "nativeDaemon",
