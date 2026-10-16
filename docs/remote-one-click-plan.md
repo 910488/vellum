@@ -175,6 +175,45 @@ verify 重試仍待後續分段。
 錯誤輸出：每個失敗都要對到 `remoteVocabulary` 的已知碼＋人話＋remedy；
 找不到 remedy 的 blocker 要在 §5 的測試裡被列為「矩陣外，preflight 拒絕」。
 
+### M3b 遠端接手（handoff）：把本機做到一半的工作交給遠端 Codex
+
+Joe 於 2026-10-16 核准方向，排在 M3 之後、M4 之前。依據是 handoff POC
+（`E:\code_E\vellum-handoff-poc\REPORT.md`）：「交接單＋新 thread」在 Docker 遠端
+端對端跑通；transplant 整份 rollout 不冪等，**不做**。
+
+UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.html`
+（只是設計稿、不進 repo，已在 `info/exclude`）。五個狀態：準備交出、前置檢查擋下、
+遠端進行中、結果回來、本機在這段期間又改過。
+
+- **位置**：遠端總管的主機工作面底下一張「把本機的工作交給 <主機>」卡，主機由左欄
+  決定。主機清單的副標顯示「1 份工作進行中／1 份結果待拿回」。底下一張「交接紀錄」。
+- **選 thread**：列出本機最近、cwd 在 git repo 裡的 Codex thread（名稱、repo 路徑、
+  分支、時間）。不要用下拉選單。thread 的定位沿用現有對話身分邏輯。
+- **帶過去的東西**：顯示改過／已 staged／未追蹤的數量與檔名。快照用臨時 index
+  （`GIT_INDEX_FILE`＋`read-tree HEAD`＋`add -A`＋`write-tree`＋`commit-tree`），
+  不動使用者的 index 與工作區；經受管 SSH（`ssh_isolation`／`ssh_trust`）推到 agent
+  管理的 bare repo，**不經 GitHub**；`.gitignore` 生效。
+- **交代**：可編輯，第一段必須是明確的任務；原始需求與最後進度只當背景。原始需求裡
+  「先別做／留給別台」這類條款要明說指的就是這次交接（POC 第一輪就是被照字面遵守而
+  什麼都沒做）。
+- **前置檢查**（`host_probe`／`platform`）：主機就緒與 Codex 版本；工具鏈落差
+  （例如只有 `python3`）→ 警告並寫進交代；平台綁死的工作（例如 Windows 建置交給
+  Linux）→ 擋下。本機 thread 標成「已交出」，避免兩邊同時寫。
+- **遠端執行**：agent 新增 `codex.handoffStart`／`codex.handoffResult`。`handoffStart`
+  開 worktree，並透過 daemon 的 control socket 呼叫 `thread/start`＋`turn/start`
+  （**不要另起 stdio app-server**，以免搶 `thread-writer-locks`），關掉 Vellum 也會繼續跑。
+  sandbox 用 workspace-write，不用 danger-full-access。模型沿用本機 thread 的設定。
+- **進行中**：顯示遠端 thread id、plan 步驟、最近的指令輸出；可「在 Codex App 開啟遠端
+  thread」、「先拉回目前進度」。
+- **結果回來**：顯示相對交出時快照的 diffstat；動作是「套用到本機工作區」「開成分支」
+  「看完整 diff」。若本機在交出後又改過同一檔案，偵測到衝突時改以「開成分支」為主要
+  動作並警告。本機 thread 收到一則「遠端已完成」的摘要。
+- **先查清楚**：POC 發現 0.147 只裝單一執行檔時缺 `codex-code-mode-host`，所有 shell
+  指令都會失敗而模型只會說「執行主機不可用」；`desktop_codex.rs:478` 選的正是單一執行檔
+  archive。做 M3b 之前先確認並修正。
+- 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、
+  前置檢查擋下。
+
 ### M4 SSH 信任與加主機
 
 - 指紋確認：若使用者自己的 `~/.ssh/known_hosts` 已有**相同** Ed25519 key，
