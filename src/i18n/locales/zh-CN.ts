@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "remoteAdd": { "title": "新增 SSH 主机", "description": "输入现有 SSH 登录地址。Vellum 只保存私有 alias；你的 ssh config 与 known_hosts 保持原样。", "destination": "SSH 登录地址", "add": "新增主机", "adding": "新增中……", "saving": "正在保存私有 SSH alias……", "failed": "无法新增主机，请使用 user@host[:port] 格式并查看详细信息。", "saved": "主机已新增，确认信任后即可部署。", "loginHint": "首次安装需要你原有的 SSH key。如果目前只能用密码登录，请打开终端配置自己的公钥登录；Vellum 不会接收密码。", "keyHint": "终端有 ssh-copy-id 时（例如 Unix 终端），可运行此命令安装你自己的默认公钥；否则请用常用 SSH 工具配置密钥登录，然后刷新主机。isolation key 会在部署创建 wrapper 后安装。", "copyInstall": "复制密钥配置命令", "copyLogin": "复制登录命令", "copyFailed": "无法复制，请选中命令后手动复制。", "trustReused": "沿用你先前的信任", "trustReusedHint": "扫描到的主机 key 与你的 known_hosts 完全相同，仅此 key 已保存到 Vellum 私有文件，无需再次确认。" },
   "handoff": {
     "draftBackground": "所选对话的背景", "draftOriginal": "原始需求", "draftProgress": "最后的 Agent 进度", "draftCaution": "第一段是本次交接的任务。以下摘录仅供背景参考；发送前请确认旧有的暂缓指示本次是否仍适用。",
     "requiredOs": "任务需要的操作系统", "detectOs": "根据仓库判断",

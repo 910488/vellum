@@ -379,13 +379,25 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
 
 ### M4 SSH 信任與加主機
 
-- 指紋確認：若使用者自己的 `~/.ssh/known_hosts` 已有**相同** Ed25519 key，
-  視為使用者先前已信任，直接寫入 Vellum 私有 known_hosts，不再跳確認；
-  不一致或不存在時維持現行確認流程。（只讀 known_hosts，不寫回、不匯入其他 host。）
-- 主機清單空的時候，提供「新增主機」：輸入 `user@host[:port]`，Vellum 寫一筆受管
-  SSH alias（沿用 `ssh_isolation` 的 key）。需要密碼登入的情況，用一次互動式
-  `ssh-copy-id` 等價流程把 isolation key 放上去 —— 密碼由系統 ssh 的提示處理，
-  Vellum 不經手。這項若超出範圍可先做成提示文字，回報給協調者。
+- 指紋確認：透過 `ssh -G` 解析 `UserKnownHostsFile`／`HostKeyAlias`，只讀使用者
+  的有效 known_hosts，支援 hashed、非標準 port 與多個名字。同一 endpoint、key type、
+  key bytes 完全一致，才把 scan 得到的優先 key（Ed25519 優先）寫入 Vellum 私有
+  known_hosts；確認紀錄標明 `source: userKnownHosts`，UI 顯示沿用先前信任。
+  revoked、只有 cert-authority、檔案不存在或無法讀取時回到明確確認；同 host 的
+  另一把不同 key 維持 hard-fail。使用者檔案不寫回，也不整份匯入。
+- 主機清單空的時候，提供「新增主機」：輸入 `user@host[:port]`，建立 Vellum 私有
+  `<data_root>/remote-ssh/config` alias 與註冊紀錄，不改使用者的 SSH config。
+  私有設定 Include 使用者 config，新增主機的連線以 `ssh -F` 使用此設定。
+  註冊時先讀原始目的地的 `ssh -G`，保留 host 專屬的 identity、trust 與 proxy 設定；
+  isolation alias 延續 trust／proxy 設定，identity 則切換為受限 key。
+- 首次安裝必須先有使用者自己的 SSH key：isolation key 的 forced command 可以
+  轉送 bootstrap 指令，但全新主機尚無 wrapper，所以不能先放 isolation key 再安裝。
+  bootstrap 先用使用者 key，安裝好 wrapper／受限 authorized_keys 後才切換到另一個
+  isolation alias。兩個 alias 都在私有設定，失敗重試仍能使用原先登入方式。
+- 密碼登入改提供提示與可複製的 `ssh-copy-id -F <private-config> <alias>` 指令，
+  在支援 ssh-copy-id 的外部終端安裝使用者自己的公鑰，再回來重新整理。
+  Tauri 不提供 TTY 密碼流程；密碼由外部系統 ssh 接收，不進 Vellum，也不經 stdin pipe。
+- 四語 UI 與預覽台涵蓋空清單、新增中、沿用信任；新增後接既有指紋、preflight 與部署。
 
 ### M5 介面簡化（Remote.tsx）
 

@@ -35,12 +35,24 @@ pub struct RemoteHostCandidate {
 }
 
 pub fn discover(cached: &[CachedHost]) -> AppResult<Vec<RemoteHostCandidate>> {
-    discover_from_paths(
+    let mut found = discover_from_paths(
         codex_global_state_path().as_deref(),
         ssh_config_path().as_deref(),
         cached,
         resolve_ssh,
-    )
+    )?;
+    for mut host in super::ssh_added::list(&super::ssh_trust::runtime_data_root())? {
+        if let Some(known) = cached.iter().find(|c| c.id == host.vellum_host_id) {
+            host.ssh_alias = known.ssh_alias.clone();
+        }
+        if !found
+            .iter()
+            .any(|c| c.vellum_host_id == host.vellum_host_id)
+        {
+            found.push(host);
+        }
+    }
+    Ok(found)
 }
 
 fn codex_global_state_path() -> Option<PathBuf> {
@@ -412,7 +424,10 @@ Host after
             begin = crate::remote::ssh_isolation::SSH_BEGIN_PREFIX,
             end = crate::remote::ssh_isolation::SSH_END_PREFIX,
         );
-        assert_eq!(parse_ssh_aliases(&raw), vec!["after".to_string(), "jetson".to_string()]);
+        assert_eq!(
+            parse_ssh_aliases(&raw),
+            vec!["after".to_string(), "jetson".to_string()]
+        );
     }
 
     #[test]

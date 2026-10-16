@@ -46,6 +46,9 @@ const SCENES = {
   handoffRunning: "交接：遠端進行中",
   handoffBack: "交接：結果回來",
   handoffDrift: "交接：本機已變動",
+  emptyHosts: "SSH：空清單",
+  addingHost: "SSH：新增中",
+  inheritedTrust: "SSH：指紋沿用信任",
 } as const;
 type Scene = keyof typeof SCENES;
 
@@ -211,7 +214,12 @@ function installFixture(getScene: () => Scene) {
       case "get_remote_manager_feature_flags":
         return { nativeCodexRemoteManager: true, legacyBrokerHostsDropped: [] };
       case "remote_ssh_trust_status":
-        return { host: "192.0.2.10", port: 22, confirmed: true };
+        return { host: "192.0.2.10", port: 22, confirmed: true,
+          source: scene === "inheritedTrust" ? "userKnownHosts" : "explicitConfirmation",
+          fingerprint: scene === "inheritedTrust" ? {host: "192.0.2.10", port: 22, keyType: "ssh-ed25519", fingerprint: "SHA256:fWGOBFJCuLczHBhYs/jCgMIJ/NUUnYJmt5/owwnZAc4"} : null };
+      case "add_remote_ssh_host":
+        if (scene === "addingHost") return new Promise(() => undefined);
+        return { candidate: HOSTS[0], loginCommand: "ssh -F '/vellum/remote-ssh/config' -- vellum-added-preview", keyInstallCommand: "ssh-copy-id -F '/vellum/remote-ssh/config' vellum-added-preview" };
       case "remote_ssh_fetch_fingerprint":
         return {
           host: "192.0.2.10",
@@ -229,7 +237,7 @@ function installFixture(getScene: () => Scene) {
           proxyDigest: `sha256:${"a".repeat(64)}`, detail: "verified",
         };
       case "discover_remote_connections":
-        return HOSTS;
+        return scene === "emptyHosts" || scene === "addingHost" ? [] : HOSTS;
       case "inspect_remote_host":
         return statusFor(scene);
       case "get_remote_session_summary":
@@ -306,6 +314,22 @@ function Harness() {
     void refreshHandoffs();
     setNonce((current) => current + 1);
   }, [scene]);
+
+  useEffect(() => {
+    if (scene !== "addingHost") return;
+    // Drive the real form against a never-resolving fixture, with no network.
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      const input = document.querySelector<HTMLInputElement>("[data-remote-add-input]");
+      if (!input || input.disabled) { if (++attempts > 40) window.clearInterval(timer); return; }
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, "dev@example.test:2222");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      window.requestAnimationFrame(() => input.closest("form")?.requestSubmit());
+      window.clearInterval(timer);
+    }, 50);
+    return () => window.clearInterval(timer);
+  }, [scene, nonce]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;

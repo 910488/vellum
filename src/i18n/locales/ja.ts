@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
+  "remoteAdd": { "title": "SSH ホストを追加", "description": "既存の SSH 接続先を入力します。Vellum 専用の alias のみ保存し、ユーザーの ssh config と known_hosts は変更しません。", "destination": "SSH 接続先", "add": "ホストを追加", "adding": "追加中…", "saving": "専用の SSH alias を保存中…", "failed": "ホストを追加できませんでした。user@host[:port] の形式と詳細を確認してください。", "saved": "ホストを追加しました。信頼を確認してデプロイできます。", "loginHint": "初回インストールには既存の SSH 鍵が必要です。パスワードでしか接続できない場合は、ターミナルで自分の公開鍵を設定してください。Vellum はパスワードを受け取りません。", "keyHint": "ssh-copy-id が使えるターミナルでは、このコマンドで既定の公開鍵を登録できます。それ以外は SSH ツールで鍵認証を設定し、ホストを更新してください。分離用の鍵は、デプロイでラッパーを作成してから登録します。", "copyInstall": "鍵の設定コマンドをコピー", "copyLogin": "接続コマンドをコピー", "copyFailed": "コピーできませんでした。コマンドを選択して手動でコピーしてください。", "trustReused": "以前の信頼を引き継ぎました", "trustReusedHint": "取得したホスト鍵がユーザーの known_hosts と完全に一致しました。この鍵だけを Vellum 専用ファイルに保存したため、再確認は不要です。" },
   "handoff": {
     "draftBackground": "選択した会話の背景", "draftOriginal": "元の依頼", "draftProgress": "エージェントの最新の進捗", "draftCaution": "最初の段落が今回の引き継ぎ作業です。以下は背景情報です。以前の保留指示を今回も適用するか、送信前に確認してください。",
     "requiredOs": "作業に必要な OS", "detectOs": "リポジトリから判定",

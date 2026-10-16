@@ -325,6 +325,7 @@ impl Git {
             remote_ref,
             Some((&bare, &objects)),
         )?;
+        pin_transport_target(&mut cmd, &target)?;
         run_command(&mut cmd)?;
         Ok(())
     }
@@ -409,25 +410,8 @@ impl Git {
             "-o".into(),
             "ServerAliveCountMax=2".into(),
         ];
-        ssh_args.extend(
-            ssh_trust::strict_host_key_args(data_root)
-                .into_iter()
-                .map(|option| {
-                    if let Some(path) = option.strip_prefix("UserKnownHostsFile=") {
-                        let path = if cfg!(windows) {
-                            path.replace('\\', "/")
-                        } else {
-                            path.to_owned()
-                        };
-                        format!(
-                            "UserKnownHostsFile=\"{}\"",
-                            path.replace('\\', "\\\\").replace('"', "\\\"")
-                        )
-                    } else {
-                        option
-                    }
-                }),
-        );
+        ssh_args.extend(super::ssh_added::config_args(data_root, destination));
+        ssh_args.extend(ssh_trust::strict_host_key_args(data_root));
         let ssh = ssh_args
             .iter()
             .map(|arg| quote(arg))
@@ -513,6 +497,7 @@ impl Git {
             Some((&bare, &objects)),
             true,
         )?;
+        pin_transport_target(&mut cmd, &target)?;
         run_command(&mut cmd)?;
         let mut verify = self.command_with_config(false);
         verify
@@ -722,6 +707,25 @@ impl Git {
         )?;
         Ok(branch)
     }
+}
+
+fn pin_transport_target(command: &mut Command, target: &ssh_trust::SshTarget) -> AppResult<()> {
+    let ssh = command
+        .get_envs()
+        .find(|(name, _)| *name == "GIT_SSH_COMMAND")
+        .and_then(|(_, value)| value)
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| error("HandoffTransportTargetInvalid"))?;
+    let pattern = if target.port == 22 {
+        target.host.clone()
+    } else {
+        format!("[{}]:{}", target.host, target.port)
+    };
+    command.env(
+        "GIT_SSH_COMMAND",
+        format!("{ssh} -o {}", quote(&format!("HostKeyAlias={pattern}"))),
+    );
+    Ok(())
 }
 
 pub(crate) fn valid_commit(value: &str) -> bool {
@@ -1131,6 +1135,45 @@ mod tests {
                 true
             )
             .is_err());
+    }
+    #[test]
+    fn added_host_git_transport_uses_private_alias_and_pins_resolved_endpoint() {
+        let git = Git::new(Path::new("repo"), Path::new("data"));
+        let snapshot = Snapshot {
+            base: "a".repeat(40),
+            commit: "b".repeat(40),
+            local_ref: String::new(),
+            changes: vec![],
+        };
+        let mut cmd = git
+            .transport_command(
+                Path::new("data with spaces"),
+                "vellum-remote-added-123",
+                "/state/repo.git",
+                &snapshot,
+                "refs/vellum-handoff-results/handoff/capture",
+                None,
+                true,
+            )
+            .unwrap();
+        pin_transport_target(
+            &mut cmd,
+            &ssh_trust::SshTarget {
+                host: "host.test".into(),
+                port: 2222,
+            },
+        )
+        .unwrap();
+        let ssh = cmd
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_SSH_COMMAND")
+            .unwrap()
+            .1
+            .unwrap()
+            .to_string_lossy();
+        assert!(ssh.contains("'-F' 'data with spaces/remote-ssh/config'"));
+        assert!(ssh.contains("HostKeyAlias=[host.test]:2222"));
+        assert!(ssh.contains("StrictHostKeyChecking=yes"));
     }
     fn configured_fixture() -> (tempfile::TempDir, Git) {
         let temp = tempfile::tempdir().unwrap();

@@ -137,12 +137,15 @@ impl RemoteAgentClient {
         let data_root = ssh_trust::runtime_data_root();
         let trust_target = ssh_trust::resolve_ssh_target(destination)?;
         ssh_trust::require_trust_or_error(&data_root, &trust_target)?;
-        let mut cmd = background_command("ssh");
+        let mut cmd = super::ssh_added::command(&data_root, destination);
         cmd.arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-            .args(ssh_trust::strict_host_key_args(&data_root))
+            .args(ssh_trust::strict_host_key_args_for(
+                &data_root,
+                &trust_target,
+            ))
             .arg("-T")
             .arg(destination)
             .arg("cat")
@@ -180,11 +183,14 @@ impl RemoteAgentClient {
         if ssh_trust::require_trust_or_error(&data_root, &trust_target).is_err() {
             return;
         }
-        let mut cmd = background_command("ssh");
+        let mut cmd = super::ssh_added::command(&data_root, destination);
         cmd.args(["-o", "BatchMode=yes"])
             .arg("-o")
             .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-            .args(ssh_trust::strict_host_key_args(&data_root))
+            .args(ssh_trust::strict_host_key_args_for(
+                &data_root,
+                &trust_target,
+            ))
             .arg("-T")
             .arg(destination)
             .arg("rm")
@@ -821,12 +827,15 @@ fn invoke_ssh_stdin_rpc(
     let trust_target = ssh_trust::resolve_ssh_target(destination)?;
     ssh_trust::require_trust_or_error(&data_root, &trust_target)?;
 
-    let mut cmd = background_command("ssh");
+    let mut cmd = super::ssh_added::command(&data_root, destination);
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-        .args(ssh_trust::strict_host_key_args(&data_root))
+        .args(ssh_trust::strict_host_key_args_for(
+            &data_root,
+            &trust_target,
+        ))
         .arg("-T")
         .arg(destination)
         .arg(remote_command)

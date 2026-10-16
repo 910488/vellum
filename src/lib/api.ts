@@ -319,12 +319,16 @@ export const api = {
     return call<void>("confirm_remote_deployment_takeover", { hostId, operationId, token });
   },
 
-  /** Resolves the host's SSH alias to an actual (host, port) and reports
-   * whether that resolved target's key is already trusted in Vellum's own
-   * known_hosts file. Never connects; safe to call speculatively. */
+  /** Resolves effective SSH trust. May scan a host key and reuse matching
+   * user known_hosts trust into Vellum's private store. Never authenticates. */
   getRemoteSshTrustStatus(hostId: string): Promise<SshTrustStatus> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call<SshTrustStatus>("remote_ssh_trust_status", { hostId });
+  },
+
+  addRemoteSshHost(destination: string): Promise<import("@/types").AddedRemoteHost> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("add_remote_ssh_host", { destination });
   },
 
   /** Fetches (without trusting) the key the host is currently offering, via

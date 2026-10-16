@@ -366,6 +366,7 @@ pub fn run() {
             remote::commands::get_desktop_codex_compatibility,
             remote::commands::update_remote_codex_for_desktop,
             remote::commands::discover_remote_connections,
+            remote::commands::add_remote_ssh_host,
             remote::commands::inspect_remote_host,
             remote::commands::list_remote_handoff_threads,
             remote::commands::preflight_remote_handoff,

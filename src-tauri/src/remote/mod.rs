@@ -31,6 +31,7 @@ pub mod reducer;
 pub mod restore;
 pub mod session_summary;
 pub mod space;
+pub mod ssh_added;
 pub mod ssh_isolation;
 pub mod ssh_trust;
 

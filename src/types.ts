@@ -1142,6 +1142,14 @@ export interface SshTrustStatus {
   host: string;
   port: number;
   confirmed: boolean;
+  source?: "userKnownHosts" | "explicitConfirmation" | null;
+  fingerprint?: PendingHostFingerprint | null;
+}
+
+export interface AddedRemoteHost {
+  candidate: RemoteHostCandidate;
+  loginCommand: string;
+  keyInstallCommand: string;
 }
 
 /** A host key currently offered by a host, fetched via `ssh-keyscan` without

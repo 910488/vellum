@@ -8,9 +8,9 @@
 //! during that first connection is trusted silently and permanently.
 //!
 //! This module gives Vellum its own known_hosts file
-//! (`<data_root>/remote/known_hosts`) that nothing but an explicit user
-//! confirmation can write to, plus a small JSON side-store recording *that a
-//! human confirmed a fingerprint*, independent of whatever bytes happen to be
+//! (`<data_root>/remote/known_hosts`) populated by explicit confirmation or
+//! exact reuse of the user's effective known_hosts, plus a JSON side-store
+//! recording the source of that trust, independent of whatever bytes happen to be
 //! in the known_hosts file. Trust decisions are keyed by the SSH-resolved
 //! `(hostname, port)` pair, never by an SSH config alias: two aliases can
 //! point at the same host on different ports, and one alias can silently
@@ -19,13 +19,9 @@
 //! falls out for free from keying on the resolved target instead of the
 //! alias string.
 //!
-//! There is no code path in this module that can produce a "trusted but
-//! never confirmed" record: the only way an entry enters the confirmation
-//! store is [`confirm_and_trust`], which re-derives the fingerprint from the
-//! host itself and stamps `confirmed_at` at write time. A record's mere
-//! presence in the store *is* the confirmation; there is no separate
-//! defaultable/nullable flag that could be constructed as `false` and later
-//! misread as `true`.
+//! Reuse requires a fresh scan and exact endpoint/type/key bytes. Revocation,
+//! CA-only entries and unreadable files do not auto-trust; changed keys refuse.
+//! User files are read only. Existing records default to explicit confirmation.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -43,6 +39,9 @@ use sha2::{Digest, Sha256};
 use crate::error::{AppError, AppResult};
 use crate::remote::process::background_command;
 use crate::state::AppState;
+
+#[path = "ssh_user_trust.rs"]
+mod user_trust;
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const KEYSCAN_TIMEOUT_SECS: u64 = 10;
@@ -115,6 +114,8 @@ pub struct SshTrustStatus {
     pub host: String,
     pub port: u16,
     pub confirmed: bool,
+    pub source: Option<String>,
+    pub fingerprint: Option<PendingHostFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +126,11 @@ struct ConfirmedRecord {
     key_type: String,
     fingerprint: String,
     confirmed_at: DateTime<Utc>,
+    #[serde(default = "explicit_source")]
+    source: String,
+}
+fn explicit_source() -> String {
+    "explicitConfirmation".into()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -210,17 +216,30 @@ pub fn strict_host_key_args(data_root: &Path) -> Vec<String> {
         "StrictHostKeyChecking=yes".into(),
         "-o".into(),
         format!(
-            "UserKnownHostsFile={}",
-            known_hosts_path(data_root).display()
+            "UserKnownHostsFile=\"{}\"",
+            known_hosts_path(data_root)
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace('"', "\\\"")
         ),
     ]
+}
+/// User HostKeyAlias is respected when consulting their trust, but Vellum's
+/// private store always pins the resolved endpoint (including its port).
+pub fn strict_host_key_args_for(data_root: &Path, target: &SshTarget) -> Vec<String> {
+    let mut args = strict_host_key_args(data_root);
+    args.extend([
+        "-o".into(),
+        format!("HostKeyAlias={}", target.known_hosts_pattern()),
+    ]);
+    args
 }
 
 /// Resolve an SSH config alias (or a bare `user@host`/`user@host:port`
 /// destination, which `ssh -G` also accepts) to the actual hostname/IP and
 /// port `ssh` will contact. Never trusts anything; this only reads config.
 pub fn resolve_ssh_target(destination: &str) -> AppResult<SshTarget> {
-    let output = background_command("ssh")
+    let output = super::ssh_added::command(&runtime_data_root(), destination)
         .args(["-G", "--", destination])
         .output()
         .map_err(|error| AppError::Message(format!("ssh -G unavailable: {error}")))?;
@@ -453,8 +472,28 @@ fn confirm_matching_fingerprint(
                 target.host, target.port
             ))
         })?;
-    append_known_hosts_line(data_root, &matched.key_line)?;
+    persist_trust(data_root, target, matched, "explicitConfirmation")
+}
+fn persist_trust(
+    data_root: &Path,
+    target: &SshTarget,
+    matched: PendingHostFingerprint,
+    source: &str,
+) -> AppResult<()> {
+    if matched.host != target.host || matched.port != target.port {
+        return Err(AppError::Message(
+            "SshHostKeyFingerprintMismatch: scanned endpoint changed".into(),
+        ));
+    }
     let mut store = load_store(data_root)?;
+    if let Some(existing) = store.confirmed.get(&target.store_key()) {
+        if existing.key_type != matched.key_type || existing.fingerprint != matched.fingerprint {
+            return Err(AppError::Message(
+                "SshHostKeyFingerprintMismatch: previously trusted host key changed".into(),
+            ));
+        }
+    }
+    append_known_hosts_line(data_root, &matched.key_line)?;
     store.confirmed.insert(
         target.store_key(),
         ConfirmedRecord {
@@ -463,6 +502,7 @@ fn confirm_matching_fingerprint(
             key_type: matched.key_type,
             fingerprint: matched.fingerprint,
             confirmed_at: Utc::now(),
+            source: source.into(),
         },
     );
     save_store(data_root, &store)
@@ -503,9 +543,8 @@ fn resolved_target_for_host(state: &AppState, host_id: &str) -> AppResult<SshTar
     resolve_ssh_target(&destination)
 }
 
-/// Fetch (without trusting) the resolved host+port and confirmation state
-/// for a cached host, so the frontend can decide whether to show the
-/// confirmation prompt at all.
+/// Resolve trust for a cached host, reusing an exact user known_hosts match
+/// when possible. A fresh scan is required before any inherited trust write.
 #[tauri::command]
 pub async fn remote_ssh_trust_status(
     state: tauri::State<'_, AppState>,
@@ -513,12 +552,29 @@ pub async fn remote_ssh_trust_status(
 ) -> AppResult<SshTrustStatus> {
     let owned = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let target = resolved_target_for_host(&owned, &host_id)?;
-        let confirmed = is_confirmed(&owned.data_root(), &target)?;
+        let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
+            .ssh_destination
+            .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
+        let target = resolve_ssh_target(&destination)?;
+        let root = owned.data_root();
+        let mut fingerprint = None;
+        if !is_confirmed(&root, &target)? {
+            let config = user_trust::resolve(&destination, &target)?;
+            // No pre-auth scan when no readable user trust is available.
+            if config.has_trust_hint() {
+                let candidates = fetch_pending_fingerprints(&target)?;
+                fingerprint = preferred_fingerprint(candidates.clone());
+                user_trust::inherit(&root, &target, &config, candidates)?;
+            }
+        }
+        let store = load_store(&root)?;
+        let record = store.confirmed.get(&target.store_key());
         Ok(SshTrustStatus {
             host: target.host,
             port: target.port,
-            confirmed,
+            confirmed: record.is_some(),
+            source: record.map(|record| record.source.clone()),
+            fingerprint,
         })
     })
     .await
@@ -554,7 +610,13 @@ pub async fn remote_ssh_confirm_fingerprint(
     let owned = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let target = resolved_target_for_host(&owned, &host_id)?;
-        confirm_and_trust(&owned.data_root(), &target, &fingerprint)
+        let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
+            .ssh_destination
+            .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
+        let candidates = fetch_pending_fingerprints(&target)?;
+        let config = user_trust::resolve(&destination, &target)?;
+        user_trust::refuse_changed(&config, &candidates)?;
+        confirm_matching_fingerprint(&owned.data_root(), &target, &fingerprint, candidates)
     })
     .await
     .map_err(|error| AppError::Message(format!("SSH trust confirmation task failed: {error}")))?
@@ -777,6 +839,7 @@ mod tests {
                 key_type: "ssh-ed25519".into(),
                 fingerprint: GOLDEN_FINGERPRINT.into(),
                 confirmed_at: Utc::now(),
+                source: explicit_source(),
             },
         );
         save_store(temp.path(), &store).unwrap();
@@ -805,6 +868,12 @@ mod tests {
             .iter()
             .any(|arg| arg.starts_with("UserKnownHostsFile=")));
         assert!(!args.iter().any(|arg| arg.contains("accept-new")));
+        let target = SshTarget {
+            host: "host.test".into(),
+            port: 2222,
+        };
+        assert!(strict_host_key_args_for(temp.path(), &target)
+            .contains(&"HostKeyAlias=[host.test]:2222".into()));
     }
 
     #[test]

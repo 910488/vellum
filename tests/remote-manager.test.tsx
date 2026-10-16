@@ -15,6 +15,7 @@ const apiMocks = vi.hoisted(() => ({
   getRemoteManagerFeatureFlags: vi.fn(),
   getRemoteReleaseStatus: vi.fn(),
   discoverRemoteConnections: vi.fn(),
+  addRemoteSshHost: vi.fn(),
   inspectRemoteHost: vi.fn(),
   getDesktopCodexCompatibility: vi.fn(),
   updateRemoteCodexForDesktop: vi.fn(),
@@ -167,6 +168,7 @@ describe("Remote Manager operations UI", () => {
     apiMocks.listRemoteOfficialExecutionAccounts.mockResolvedValue([]);
     apiMocks.getRemoteReleaseStatus.mockResolvedValue(blockedRelease);
     apiMocks.discoverRemoteConnections.mockResolvedValue([host]);
+    apiMocks.addRemoteSshHost.mockResolvedValue({ candidate: host, loginCommand: "ssh -F private-config Jetson", keyInstallCommand: "ssh-copy-id -F private-config Jetson" });
     apiMocks.inspectRemoteHost.mockResolvedValue(status);
     apiMocks.getDesktopCodexCompatibility.mockResolvedValue({
       state: "current",
@@ -256,9 +258,39 @@ describe("Remote Manager operations UI", () => {
     vi.clearAllMocks();
   });
 
+  it("adds a host from the empty list and follows the normal fingerprint gate before probing", async () => {
+    apiMocks.discoverRemoteConnections.mockResolvedValue([]);
+    const fingerprint = { host: "192.0.2.10", port: 22, keyType: "ssh-ed25519", fingerprint: "SHA256:pending" };
+    apiMocks.getRemoteSshTrustStatus.mockResolvedValue({ host: "192.0.2.10", port: 22, confirmed: false, fingerprint });
+    renderRemote();
+    const destination = await screen.findByLabelText(i18n.t("remoteAdd.destination"));
+    fireEvent.change(destination, { target: { value: "operator@192.0.2.10" } });
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("remoteAdd.add"), exact: true }));
+    await waitFor(() => expect(apiMocks.addRemoteSshHost).toHaveBeenCalledWith("operator@192.0.2.10"));
+    expect(await screen.findByText("SHA256:pending")).toBeTruthy();
+    expect(screen.getByText(i18n.t("remoteAdd.loginHint"))).toBeTruthy();
+    expect(apiMocks.inspectRemoteHost).not.toHaveBeenCalled();
+    expect(apiMocks.fetchRemoteSshFingerprint).not.toHaveBeenCalled();
+    apiMocks.getRemoteSshTrustStatus.mockResolvedValue({ host: "192.0.2.10", port: 22, confirmed: true });
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("remote.trust.confirm"), exact: true }));
+    await waitFor(() => expect(apiMocks.inspectRemoteHost).toHaveBeenCalledWith("jetson"));
+  });
+
+  it("shows inherited trust and probes without asking for confirmation or rescanning", async () => {
+    apiMocks.getRemoteSshTrustStatus.mockResolvedValue({ host: "192.0.2.10", port: 22, confirmed: true, source: "userKnownHosts", fingerprint: { host: "192.0.2.10", port: 22, keyType: "ssh-ed25519", fingerprint: "SHA256:inherited" } });
+    renderRemote();
+    expect(await screen.findByText(i18n.t("remoteAdd.trustReused"))).toBeTruthy();
+    await waitFor(() => expect(apiMocks.inspectRemoteHost).toHaveBeenCalledWith("jetson"));
+    expect(screen.queryByRole("button", { name: i18n.t("remote.trust.confirm"), exact: true })).toBeNull();
+    expect(apiMocks.fetchRemoteSshFingerprint).not.toHaveBeenCalled();
+    expect(apiMocks.confirmRemoteSshFingerprint).not.toHaveBeenCalled();
+  });
+
   it("registers the bundled release readiness command used by the renderer", () => {
     expect(apiSource).toMatch(/getRemoteReleaseStatus[\s\S]*"get_remote_release_status"/);
     expect(rustSource).toMatch(/remote::commands::get_remote_release_status/);
+    expect(apiSource).toMatch(/addRemoteSshHost[\s\S]*"add_remote_ssh_host"/);
+    expect(rustSource).toMatch(/remote::commands::add_remote_ssh_host/);
     expect(apiSource).toMatch(/getDesktopCodexCompatibility[\s\S]*"get_desktop_codex_compatibility"/);
     expect(apiSource).toMatch(/updateRemoteCodexForDesktop[\s\S]*"update_remote_codex_for_desktop"/);
     expect(rustSource).toMatch(/remote::commands::get_desktop_codex_compatibility/);

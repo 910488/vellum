@@ -745,6 +745,11 @@ fn bootstrap_prepared(
     check_cancelled(control)?;
     match install_managed_ssh_isolation(&data_root, host_id, &alias, &probe) {
         Ok(alias_name) => {
+            if host_id.starts_with("added-") {
+                state
+                    .remote()
+                    .use_added_isolation_alias(host_id, &alias_name)?;
+            }
             result
                 .completed_steps
                 .push(format!("ssh.isolationInstalled:{alias_name}"));
@@ -1178,9 +1183,13 @@ fn install_managed_ssh_isolation(
     let identity_dir = data_root.join("remote-ssh").join(host_id);
     let identity = identity_dir.join("id_ed25519");
     let public_key = ensure_isolation_identity(&identity)?;
-    let ssh_config = dirs::home_dir()
-        .map(|home| home.join(".ssh").join("config"))
-        .ok_or_else(|| AppError::Message("SshConfigHomeMissing".into()))?;
+    let ssh_config = if host_id.starts_with("added-") {
+        super::ssh_added::config_path(data_root)
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join(".ssh").join("config"))
+            .ok_or_else(|| AppError::Message("SshConfigHomeMissing".into()))?
+    };
     let existing_keys = ssh_script(
         data_root,
         alias,
@@ -1440,13 +1449,16 @@ fn ssh_script(
         "-o".to_string(),
         "ConnectTimeout=10".to_string(),
     ];
-    args.extend(ssh_trust::strict_host_key_args(data_root));
+    args.extend(ssh_trust::strict_host_key_args_for(
+        data_root,
+        &trust_target,
+    ));
     args.push("-T".to_string());
     args.push("--".to_string());
     args.push(alias.to_string());
     args.push(remote_command.to_string());
 
-    let mut child = background_command("ssh")
+    let mut child = super::ssh_added::command(data_root, alias)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

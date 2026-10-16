@@ -17,6 +17,8 @@ import { api } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { RemoteHandoff } from "@/components/RemoteHandoff";
 import { useHandoffRecords } from "@/lib/handoffStore";
+import { RemoteHostAdd, RemoteHostLoginGuide } from "@/components/RemoteHostAdd";
+import type { AddedRemoteHost } from "@/types";
 import { handoffTerminal } from "@/lib/remoteHandoff";
 import { handoffReviewTarget } from "@/lib/handoffNavigation";
 import { Btn, Cap, Card, Confirm, Empty, Meter, Notice, Row, Rows, State, Tray } from "@/components/ui";
@@ -91,6 +93,7 @@ export function Remote({
   const { t } = useTranslation();
   const handoffs = useHandoffRecords();
   const [hosts, setHosts] = useState<RemoteHostCandidate[]>([]);
+  const [addedHost, setAddedHost] = useState<AddedRemoteHost | null>(null);
   const [statuses, setStatuses] = useState<Record<string, RemoteHostStatus>>({});
   const [selectedHostId, setSelectedHostId] = useState<string | null>(() => handoffReviewTarget()?.host ?? null);
   useEffect(() => {
@@ -150,6 +153,7 @@ export function Remote({
     checking: boolean;
     fingerprint: PendingHostFingerprint | null;
     fetchError: string | null;
+    source?: string | null;
   } | null>(null);
   // Discovery and a refresh can converge on the same host in one render.
   // Share their trust check so an unconfirmed host gets one keyscan rather
@@ -180,11 +184,11 @@ export function Remote({
       try {
         const status = await api.getRemoteSshTrustStatus(hostId);
         if (status.confirmed) {
-          setSshTrust({ hostId, confirmed: true, checking: false, fingerprint: null, fetchError: null });
+          setSshTrust({ hostId, confirmed: true, checking: false, fingerprint: status.fingerprint ?? null, fetchError: null, source: status.source });
           return true;
         }
         try {
-          const fingerprint = await api.fetchRemoteSshFingerprint(hostId);
+          const fingerprint = status.fingerprint ?? await api.fetchRemoteSshFingerprint(hostId);
           setSshTrust({ hostId, confirmed: false, checking: false, fingerprint, fetchError: null });
         } catch (cause) {
           setSshTrust({
@@ -874,6 +878,7 @@ export function Remote({
         </Notice>
       ) : null}
       {discoveryError ? <Notice tone="error" raw={discoveryError}>{t("remote.error.discovery")}</Notice> : null}
+      {addedHost && selectedHostId === addedHost.candidate.vellumHostId ? <RemoteHostLoginGuide host={addedHost} /> : null}
       {discovering ? <Notice>{t("remote.discovering")}</Notice> : null}
       {strayOperation ? (
         <Notice
@@ -888,7 +893,10 @@ export function Remote({
       {featureEnabled === false ? (
         <Card><Empty>{t("remote.featureDisabled")}</Empty></Card>
       ) : !hosts.length ? (
-        <Card><Empty>{t("remote.noHosts")}</Empty></Card>
+        discovering ? null : <RemoteHostAdd onAdded={(added) => {
+          setAddedHost(added); setHosts((rows) => [...rows.filter((r) => r.vellumHostId !== added.candidate.vellumHostId), added.candidate]);
+          setSelectedHostId(added.candidate.vellumHostId);
+        }} />
       ) : (
         <div className="remote-layout">
           <aside className="remote-hosts" aria-label={t("remote.hostsAria")}>
@@ -999,6 +1007,8 @@ export function Remote({
 
               {sshTrust?.hostId === selectedHostId && sshTrust.checking ? (
                 <Notice>{t("remote.trust.checking")}</Notice>
+              ) : sshTrust?.hostId === selectedHostId && sshTrust.confirmed && sshTrust.source === "userKnownHosts" ? (
+                <Notice><strong>{t("remoteAdd.trustReused")}</strong><p>{t("remoteAdd.trustReusedHint")}</p>{sshTrust.fingerprint ? <code>{sshTrust.fingerprint.fingerprint}</code> : null}</Notice>
               ) : sshTrust?.hostId === selectedHostId && !sshTrust.confirmed ? (
                 <div className="worktop__trust">
                   <p className="worktop__verdict">{t("remote.trust.title")}</p>

@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
+  "remoteAdd": { "title": "新增 SSH 主機", "description": "輸入既有 SSH 登入位置。Vellum 只儲存私有 alias；你的 ssh config 與 known_hosts 保持原樣。", "destination": "SSH 登入位置", "add": "新增主機", "adding": "新增中……", "saving": "正在儲存私有 SSH alias……", "failed": "無法新增主機，請使用 user@host[:port] 格式並查看詳細資訊。", "saved": "主機已新增，確認信任後即可部署。", "loginHint": "第一次安裝需要你原有的 SSH key。若目前只能用密碼登入，請開終端設定自己的公鑰登入；Vellum 不會接收密碼。", "keyHint": "終端有 ssh-copy-id 時（例如 Unix 終端），可執行這行安裝你自己的預設公鑰；否則請用慣用 SSH 工具設定金鑰登入，再重新整理主機。isolation key 會在部署建立 wrapper 後安裝。", "copyInstall": "複製金鑰設定指令", "copyLogin": "複製登入指令", "copyFailed": "無法複製，請選取指令後手動複製。", "trustReused": "沿用你先前的信任", "trustReusedHint": "掃描到的主機 key 與你的 known_hosts 完全相同，僅此 key 已儲存到 Vellum 私有檔案，不需再次確認。" },
   "handoff": {
     "draftBackground": "所選對話的背景", "draftOriginal": "原始需求", "draftProgress": "最後的 Agent 進度", "draftCaution": "第一段是這次交接的任務。以下摘錄僅供背景參考；送出前請確認舊有的暫緩指示這次是否仍適用。",
     "requiredOs": "任務需要的作業系統", "detectOs": "依儲存庫判斷",

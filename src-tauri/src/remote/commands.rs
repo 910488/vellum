@@ -145,6 +145,21 @@ pub async fn discover_remote_connections(
 }
 
 #[tauri::command]
+pub async fn add_remote_ssh_host(
+    state: tauri::State<'_, AppState>,
+    destination: String,
+) -> AppResult<super::ssh_added::AddedHost> {
+    off_main_thread(&state, move |state| {
+        let home = dirs::home_dir()
+            .ok_or_else(|| crate::error::AppError::Message("SshConfigHomeMissing".into()))?;
+        let added = super::ssh_added::add(&state.data_root(), &destination, &home)?;
+        state.remote().import_discovered_host(&added.candidate)?;
+        Ok(added)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn inspect_remote_host(
     state: tauri::State<'_, AppState>,
     host_id: String,
