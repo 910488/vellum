@@ -12,6 +12,7 @@ pub mod connection_manager;
 pub(crate) mod converge_control;
 pub(crate) mod converge_models;
 pub mod deployment;
+pub(crate) mod deploy_log;
 pub mod desired_state;
 pub mod desktop_codex;
 pub mod digest;

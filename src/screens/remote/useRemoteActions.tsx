@@ -20,7 +20,7 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
   } = context;
   async function run(actionKey: string, work: () => Promise<void>) {
     if (busyRef.current !== null) return;
-    if (selectedHostId && actionKey !== "remote.trust.confirm") {
+    if (selectedHostId && actionKey !== "remote.trust.confirm" && actionKey !== "remote.act.bundle") {
       const alreadyConfirmed = sshTrust?.hostId === selectedHostId && sshTrust.confirmed;
       const trusted = alreadyConfirmed || await ensureSshTrust(selectedHostId);
       if (!trusted) return;

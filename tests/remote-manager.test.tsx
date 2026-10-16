@@ -26,6 +26,8 @@ const apiMocks = vi.hoisted(() => ({
   listRemoteHostModels: vi.fn(),
   updateRemoteHostModels: vi.fn(),
   restoreRemoteHost: vi.fn(),
+  getRemoteDeploySummary: vi.fn(),
+  createRemoteSupportBundle: vi.fn(),
   getRemoteOperation: vi.fn(),
   stopRemoteAppOwnedCodex: vi.fn(),
   setActiveRemoteHost: vi.fn(),
@@ -159,6 +161,7 @@ describe("Remote Manager operations UI", () => {
   });
 
   beforeEach(() => {
+    apiMocks.getRemoteDeploySummary.mockResolvedValue({ total: 0, succeeded: 0, failed: 0, interrupted: 0, blocked: 0, lastFailureCode: null });
     apiMocks.listRemoteHostModels.mockResolvedValue([
       { catalogId: "gpt-5.6-luna", displayName: "5.6 Luna", routeId: "official", upstreamModel: "gpt-5.6-luna", selected: true, mandatory: true },
       { catalogId: "vlm-third-party", displayName: "DeepSeek V4 Flash", routeId: "cc", upstreamModel: "deepseek-v4-flash", selected: true, mandatory: false },
@@ -1036,6 +1039,19 @@ describe("Remote Manager operations UI", () => {
     fireEvent.click(confirm);
     await waitFor(() => expect(apiMocks.restoreRemoteHost).toHaveBeenCalledTimes(2));
     expect(apiMocks.bootstrapRemoteHost).not.toHaveBeenCalled();
+  });
+
+  it("exports local diagnostics without requiring an unreachable host to pass the trust gate", async () => {
+    apiMocks.getRemoteSshTrustStatus.mockResolvedValue({ confirmed: false });
+    apiMocks.fetchRemoteSshFingerprint.mockRejectedValue(new Error("ssh: connect timeout"));
+    apiMocks.createRemoteSupportBundle.mockResolvedValue({ remoteUnavailable: true });
+    renderRemote();
+    await screen.findByText(i18n.t("remote.trust.fetchFailed"));
+    openTray("進階");
+    fireEvent.click(screen.getByRole("button", { name: "匯出診斷包" }));
+    await waitFor(() => expect(apiMocks.createRemoteSupportBundle).toHaveBeenCalledWith("jetson"));
+    expect(apiMocks.confirmRemoteSshFingerprint).not.toHaveBeenCalled();
+    expect(apiMocks.inspectRemoteHost).not.toHaveBeenCalled();
   });
 
   it("asks the user to confirm the SSH fingerprint before inspect or bootstrap", async () => {

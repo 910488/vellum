@@ -1,6 +1,11 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "remoteHistory": {
+    "label": "部署记录", "counts": "最近 {{count}} 次部署：成功 {{succeeded}}／失败 {{failed}}／中断 {{interrupted}}",
+    "blocked": "另有 {{count}} 次在部署前阻止", "lastFailure": "最近一次未成功：{{reason}}（{{code}}）",
+    "interruptedReason": "Vellum 在操作完成前关闭", "unavailable": "无法读取本机部署记录，请导出诊断包查看。"
+  },
   "remoteModels": { "title": "这台主机可用的模型", "hint": "更改后会等待主机空闲并自动部署，沿用这台主机已有的策略设置。", "failed": "无法读取或更新模型。请查看详细信息；这次选择尚未确认。", "empty": "目前没有合格模型。请先在本机设置提供商，再重新部署。", "mandatory": "必要模型" },
   "remoteWork": {
     "advanced": "高级", "details": "详细信息",

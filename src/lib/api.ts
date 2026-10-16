@@ -392,6 +392,11 @@ export const api = {
     return call<RemoteOperationProgress>("get_remote_operation", { operationId });
   },
 
+  getRemoteDeploySummary(hostId: string): Promise<import("@/types").RemoteDeploySummary> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("get_remote_deploy_summary", { hostId });
+  },
+
   restartRemoteNativeCodex(hostId: string, operationId: string): Promise<unknown> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call("restart_remote_native_codex", { hostId, operationId });

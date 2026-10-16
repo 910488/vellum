@@ -1,6 +1,11 @@
 import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
+  "remoteHistory": {
+    "label": "デプロイ履歴", "counts": "直近 {{count}} 回のデプロイ：成功 {{succeeded}}／失敗 {{failed}}／中断 {{interrupted}}",
+    "blocked": "別途 {{count}} 回はデプロイ前に停止", "lastFailure": "直近の未完了の試行：{{reason}}（{{code}}）",
+    "interruptedReason": "処理の完了前に Vellum が終了しました", "unavailable": "ローカルのデプロイ履歴を読み取れません。診断バンドルをエクスポートして確認してください。"
+  },
   "remoteModels": { "title": "このホストで使えるモデル", "hint": "変更するとホストがアイドルになるのを待って自動デプロイします。既存のホスト設定は維持されます。", "failed": "モデルを取得または更新できませんでした。詳細を確認してください。選択はまだ確定していません。", "empty": "利用条件を満たすモデルがありません。ローカルでプロバイダーを設定してから再デプロイしてください。", "mandatory": "必須モデル" },
   "remoteWork": {
     "advanced": "詳細設定", "details": "詳細情報",

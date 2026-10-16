@@ -68,8 +68,10 @@ pub(crate) fn load_reconciled(
     operation_id: &str,
 ) -> AppResult<RemoteOperationProgress> {
     let mut progress = load(root, operation_id)?;
-    if progress.kind == "oneClickBootstrap"
-        && progress.state == "running"
+    if matches!(
+        progress.kind.as_str(),
+        "oneClickBootstrap" | "oneClickRestore" | "applyDeployment"
+    ) && progress.state == "running"
         && super::converge_control::resolve(operation_id, &progress.host_id).is_err()
     {
         progress.state = "failed".into();
@@ -84,6 +86,30 @@ pub(crate) fn load_reconciled(
 
 fn operation_dir(root: &Path) -> PathBuf {
     root.join("remote-operations")
+}
+
+pub(crate) fn for_host(root: &Path, host: &str) -> AppResult<Vec<RemoteOperationProgress>> {
+    let entries = match fs::read_dir(operation_dir(root)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(_) => return Err(AppError::Message("OperationHistoryUnavailable".into())),
+    };
+    let mut result = vec![];
+    for entry in entries.flatten() {
+        if entry.path().extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if let Some(progress) = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RemoteOperationProgress>(&bytes).ok())
+        {
+            if progress.host_id == host {
+                result.push(load_reconciled(root, &progress.operation_id)?);
+            }
+        }
+    }
+    result.sort_by_key(|p| p.updated_at);
+    Ok(result.into_iter().rev().take(500).collect())
 }
 
 #[cfg(test)]

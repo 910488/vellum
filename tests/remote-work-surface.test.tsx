@@ -97,6 +97,18 @@ describe("remote deployment presentation", () => {
 });
 
 describe("work surface in all four languages", () => {
+  it.each(["zh-TW", "zh-CN", "ja", "en"])("keeps failure details inside the margin after the remedy in %s", async (locale) => {
+    await i18n.changeLanguage(locale);
+    render(<RemoteWorkSurface model={remoteWorkSurface(states.failed)} disabled={false} remedyDisabled={false}
+      elapsed={undefined} onDeploy={() => {}} onRemedy={() => {}}
+      details={<details className="remote-work-details"><summary>{i18n.t("remoteWork.details")}</summary><pre>{"long/path/".repeat(100)}</pre></details>} />);
+    const region = screen.getByRole("region", { name: i18n.t("remoteWork.label") });
+    const details = screen.getByText(i18n.t("remoteWork.details")).closest("details");
+    expect(details?.parentElement).toBe(region);
+    expect(details?.previousElementSibling?.classList.contains("remote-work__remedy")).toBe(true);
+    expect(details?.open).toBe(false);
+  });
+
   it("keeps resource keys in parity", () => { expect(() => assertResourceParity()).not.toThrow(); });
 
   it("keeps manual repair as a single instruction and respects existing action gates", () => {

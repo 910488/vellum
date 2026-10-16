@@ -1615,3 +1615,12 @@ export interface UpdateOperation {
   phase: UpdatePhase;
   targetVersion: string | null;
 }
+
+export interface RemoteDeploySummary {
+  total: number;
+  succeeded: number;
+  failed: number;
+  interrupted: number;
+  blocked: number;
+  lastFailureCode: string | null;
+}

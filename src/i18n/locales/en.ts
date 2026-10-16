@@ -1,6 +1,11 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "remoteHistory": {
+    "label": "Deployment history", "counts": "Last {{count}} deployments: {{succeeded}} succeeded / {{failed}} failed / {{interrupted}} interrupted",
+    "blocked": "{{count}} blocked before deployment", "lastFailure": "Latest unsuccessful attempt: {{reason}} ({{code}})",
+    "interruptedReason": "Vellum closed before the operation finished", "unavailable": "Local deployment history could not be read. Export a diagnostic bundle to investigate."
+  },
   "remoteModels": { "title": "Models available on this host", "hint": "Changes deploy automatically when the host is idle. Existing host policies are preserved.", "failed": "Could not load or update models. Check the details; the selection has not been confirmed.", "empty": "No qualified models are available yet. Configure a provider locally, then redeploy.", "mandatory": "Required" },
   "remoteWork": {
     "advanced": "Advanced", "details": "Details",

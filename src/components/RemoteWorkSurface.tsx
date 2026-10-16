@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import type { ReactNode } from "react";
 import { Btn, Meter } from "./ui";
 import type { WorkRemedy, WorkSurfaceModel } from "@/lib/remoteWorkSurface";
 import "@/styles/remote-work-surface.css";
@@ -12,13 +13,14 @@ const REMEDY_LABELS: Record<WorkRemedy, string> = {
 };
 
 /** The work surface has one sentence, one primary action, progress and one remedy. */
-export function RemoteWorkSurface({ model, disabled, remedyDisabled, onDeploy, onRemedy, elapsed }: {
+export function RemoteWorkSurface({ model, disabled, remedyDisabled, onDeploy, onRemedy, elapsed, details }: {
   model: WorkSurfaceModel;
   disabled: boolean;
   remedyDisabled: boolean;
   onDeploy: () => void;
   onRemedy: (action: WorkRemedy) => void;
   elapsed: string | undefined;
+  details?: ReactNode;
 }) {
   const { t } = useTranslation();
   const remedy = model.remedy;
@@ -41,5 +43,6 @@ export function RemoteWorkSurface({ model, disabled, remedyDisabled, onDeploy, o
           {t("remoteWork.nextAction", { action: t(REMEDY_LABELS[remedy.action]) })}
         </Btn>}
     </div> : null}
+    {details}
   </section>;
 }

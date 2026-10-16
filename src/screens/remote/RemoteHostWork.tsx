@@ -54,7 +54,10 @@ export function RemoteHostWork({ model }: {
 
     <RemoteWorkSurface model={workSurface} disabled={!selectedHostId || busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed} remedyDisabled={workRemedyDisabled} onDeploy={() => setPending("bootstrap")} onRemedy={runWorkRemedy} elapsed={ownOperation?.state === "running" ? t("remote.operation.elapsed", {
       clock: elapsedLabel(operationStartedAt.current.get(ownOperation.operationId) ?? Date.now(), Date.now()),
-    }) : undefined} />
+    }) : undefined} details={failure || ownOperation?.state === "failed" || blockers.length ? <details className="remote-work-details">
+      <summary>{t("remoteWork.details")}</summary>
+      <pre>{failure?.raw ?? (ownOperation?.state === "failed" ? ownOperation.message : null) ?? blockers.map((blocker) => blocker.code).join("\n")}</pre>
+    </details> : null} />
 
     {/* 進行中／失敗都原地取代按鈕。因與果同一格。 */}
     {ownOperation?.state === "completed" && convergePairingSuggested(ownOperation.result) ? (<Notice tone="info" acts={<Btn mini soft onClick={() => pairChatGpt()} disabled={busy !== null || Boolean(chatgptLogin) || !pairings.some((row) => row.isDesktopDefault)}>
@@ -92,9 +95,5 @@ export function RemoteHostWork({ model }: {
 
   </div>
 
-    {failure || ownOperation?.state === "failed" || blockers.length ? <details className="remote-work-details">
-      <summary>{t("remoteWork.details")}</summary>
-      <pre>{failure?.raw ?? (ownOperation?.state === "failed" ? ownOperation.message : null) ?? blockers.map((blocker) => blocker.code).join("\n")}</pre>
-    </details> : null}
   </>;
 }

@@ -480,10 +480,21 @@ remedy，失敗期間主按鈕停用；原始錯誤位於工作面下方預設�
 
 ### M6 部署紀錄與成功率
 
-- Desktop 每次 converge 寫一行 JSONL 到 data root 下 `remote-deploy-log/<hostId>.jsonl`：
-  時間、build 版本、平台、persistenceScope、每個 phase 的結果與耗時、最終結果、
-  失敗碼。不含 secret、不含 hostname 以外的識別資訊。
-- support bundle 帶上最近 20 筆。
+- Desktop 每次 converge 各寫 started／finished 兩行至
+  `remote-deploy-log/<hostId>.jsonl`；hostId 使用既有 id 驗證。
+  UTC 時間、build 版本、平台 os／arch、persistenceScope、phase 的結果與耗時、
+  最終結果、白名單失敗碼與 deploy／redeploy／models／restore trigger 都是結構化欄位。
+  不記錄 secret、token、使用者名稱、IP、port、路徑、hostname 或錯誤原文；
+  尚未探測到的平台／常駐方式為 null，未識別的錯誤記作 DeploymentFailed。
+- 每台主機以檔案鎖序列化 append、補記與裁剪，最多保留最近 500 次完整作業範圍；
+  裁剪先寫同目錄暫存檔、sync 再 rename，避免截斷原檔。讀取時對照 live control
+  與 operation 檔，只有 started 的已中止作業冪等補成 interrupted；存活的作業不補。
+- support bundle 包含最近 20 組 started＋finished 與本機 operation 的安全欄位，
+  遠端失敗仍保存本機 JSON 診斷檔，標示 remoteUnavailable，不阻擋匯出。
+- 「進階」以一行顯示成功／失敗／中斷，取消不納入統計，blocked 另計且不當失敗；
+  最後一次未成功顯示白話原因與失敗碼。四語同步，預覽場景 deployHistory 展開進階。
+- 失敗「詳細資料」移入 RemoteWorkSurface 的 remedy 下方；原條件與錯誤內容不變，
+  僅移動 JSX，沿用工作面的左邊線縮排，無 callback／effect／closure 語意變更。
 
 ## 4. 不做／不改
 

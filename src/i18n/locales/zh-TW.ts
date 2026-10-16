@@ -1,6 +1,11 @@
 import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
+  "remoteHistory": {
+    "label": "部署紀錄", "counts": "最近 {{count}} 次部署：成功 {{succeeded}}／失敗 {{failed}}／中斷 {{interrupted}}",
+    "blocked": "另有 {{count}} 次在部署前擋下", "lastFailure": "最近一次未成功：{{reason}}（{{code}}）",
+    "interruptedReason": "Vellum 在作業完成前關閉", "unavailable": "無法讀取本機部署紀錄，請匯出診斷包查看。"
+  },
   "remoteModels": { "title": "這台可用的模型", "hint": "變更後會等待主機閒置並自動部署，沿用這台主機既有的政策設定。", "failed": "無法讀取或更新模型。請查看詳細資料；這次選擇尚未確認。", "empty": "目前沒有合格模型。請先在本機設定供應商，再重新部署。", "mandatory": "必要模型" },
   "remoteWork": {
     "advanced": "進階", "details": "詳細資料",

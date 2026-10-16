@@ -169,10 +169,11 @@ impl RemoteHostManager {
     }
 
     pub fn support_bundle(state: &AppState, host_id: &str) -> AppResult<Value> {
-        let target = Self::resolve_target(state, host_id)?;
-        let client = RemoteAgentClient::new(target);
-        client.agent_version()?;
-        client.support_bundle()
+        super::deploy_log::support_bundle(&state.data_root(), host_id, || {
+            let client = RemoteAgentClient::new(Self::resolve_target(state, host_id)?);
+            client.agent_version()?;
+            client.support_bundle()
+        })
     }
 
     pub fn aggregate_status(

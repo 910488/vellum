@@ -390,6 +390,7 @@ pub fn run() {
             remote::commands::reapply_remote_deployment,
             remote::commands::apply_remote_deployment,
             remote::commands::get_remote_operation,
+            remote::commands::get_remote_deploy_summary,
             remote::commands::restart_remote_native_codex,
             remote::commands::stop_remote_app_owned_codex,
             remote::commands::restore_remote_host,

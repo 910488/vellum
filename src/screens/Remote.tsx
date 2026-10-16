@@ -1,4 +1,5 @@
 import { RemoteModels } from "@/components/RemoteModels";
+import { RemoteDeployHistory } from "@/components/RemoteDeployHistory";
 import { RemoteHandoff } from "@/components/RemoteHandoff";
 import { RemoteHostAdd, RemoteHostLoginGuide } from "@/components/RemoteHostAdd";
 import { Btn, Card, Empty, Notice } from "@/components/ui";
@@ -88,6 +89,7 @@ export function Remote(props: RemoteProps) {
         <RemoteAccountCatalog model={model} />
         <details className="remote-advanced">
           <summary>{t("remoteWork.advanced")}</summary>
+          {selectedHostId ? <RemoteDeployHistory key={selectedHostId} hostId={selectedHostId} revision={probeVersion} /> : null}
           <RemoteAdvancedAccounts model={model} />
           <RemoteHostDetails model={model} />
           <RemoteThreadDetails model={model} />

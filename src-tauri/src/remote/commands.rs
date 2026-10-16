@@ -363,12 +363,25 @@ fn start_converge(
     let desired = catalog_ids
         .map(|ids| super::host_models::prepare_selection(state, &host_id, &ids))
         .transpose()?;
+    let trigger = if desired.is_some() {
+        super::deploy_log::Trigger::Models
+    } else if super::desired_state::load(&state.data_root(), &host_id)?.observed_revision > 0 {
+        super::deploy_log::Trigger::Redeploy
+    } else {
+        super::deploy_log::Trigger::Deploy
+    };
     let mut progress = crate::remote::RemoteOperationProgress::queued(
         operation_id.clone(),
         host_id.clone(),
         "oneClickBootstrap",
     );
     crate::remote::operation::save(&state.data_root(), &progress)?;
+    let mut evidence = super::deploy_log::Recorder::begin(
+        &state.data_root(),
+        &progress,
+        trigger,
+        state.remote().cached_snapshot(&host_id),
+    )?;
     let saved = desired.map_or(Ok(()), |desired| {
         super::desired_state::save(&state.data_root(), &desired)
     });
@@ -377,6 +390,7 @@ fn start_converge(
         progress.phase = "failed".into();
         progress.message = Some(error.to_string());
         let _ = super::operation::save(&state.data_root(), &progress);
+        let _ = evidence.finish(&progress);
         return Err(error);
     }
     let owned = state.clone();
@@ -388,6 +402,7 @@ fn start_converge(
             &owned,
             &host_id,
             |phase, percent, message| {
+                evidence.phase(phase);
                 running.phase = phase.into();
                 running.percent = percent;
                 running.message = Some(message.into());
@@ -421,6 +436,9 @@ fn start_converge(
             }
         }
         running.updated_at = chrono::Utc::now();
+        if evidence.finish(&running).is_err() {
+            log::warn!("DeploymentLogUnavailable");
+        }
         let _ = crate::remote::operation::save(&progress_root, &running);
     });
     crate::remote::operation::load(&state.data_root(), &operation_id)
@@ -523,11 +541,18 @@ pub async fn apply_remote_deployment(
             "applyDeployment",
         );
         crate::remote::operation::save(&state.data_root(), &progress)?;
+        let mut evidence = super::deploy_log::Recorder::begin(
+            &state.data_root(),
+            &progress,
+            super::deploy_log::Trigger::Redeploy,
+            state.remote().cached_snapshot(&host_id),
+        )?;
         let owned = state.clone();
         tauri::async_runtime::spawn(async move {
             let _registration = registration;
             let mut running = progress;
             running.phase = "applying".into();
+            evidence.phase("applying");
             running.percent = 10;
             running.updated_at = chrono::Utc::now();
             let _ = crate::remote::operation::save(&owned.data_root(), &running);
@@ -545,6 +570,9 @@ pub async fn apply_remote_deployment(
                 }
             }
             running.updated_at = chrono::Utc::now();
+            if evidence.finish(&running).is_err() {
+                log::warn!("DeploymentLogUnavailable");
+            }
             let _ = crate::remote::operation::save(&owned.data_root(), &running);
         });
         crate::remote::operation::load(&state.data_root(), &operation_id)
@@ -558,6 +586,17 @@ pub fn get_remote_operation(
     operation_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
     crate::remote::operation::load_reconciled(&state.data_root(), &operation_id)
+}
+
+#[tauri::command]
+pub async fn get_remote_deploy_summary(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> AppResult<super::deploy_log::Summary> {
+    off_main_thread(&state, move |state| {
+        super::deploy_log::summary(&state.data_root(), &host_id)
+    })
+    .await
 }
 
 fn restart_remote_native_codex_inner(
@@ -638,6 +677,12 @@ pub async fn restore_remote_host(
         "oneClickRestore",
     );
     crate::remote::operation::save(&state.data_root(), &progress)?;
+    let mut evidence = super::deploy_log::Recorder::begin(
+        &state.data_root(),
+        &progress,
+        super::deploy_log::Trigger::Restore,
+        state.remote().cached_snapshot(&host_id),
+    )?;
     let owned = state.inner().clone();
     let task_operation_id = operation_id.clone();
     tauri::async_runtime::spawn(async move {
@@ -649,6 +694,7 @@ pub async fn restore_remote_host(
             &host_id,
             &task_operation_id,
             |phase, percent, message| {
+                evidence.phase(phase);
                 running.phase = phase.into();
                 running.percent = percent;
                 running.message = Some(message.into());
@@ -671,6 +717,9 @@ pub async fn restore_remote_host(
             }
         }
         running.updated_at = chrono::Utc::now();
+        if evidence.finish(&running).is_err() {
+            log::warn!("DeploymentLogUnavailable");
+        }
         let _ = crate::remote::operation::save(&progress_root, &running);
     });
     crate::remote::operation::load(&state.data_root(), &operation_id)

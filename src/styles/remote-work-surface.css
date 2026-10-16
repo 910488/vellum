@@ -1,5 +1,5 @@
 /* A margin trace on the same page, with no separate hero or stepper. */
-.remote-work { border-inline-start: .15em solid var(--ink-faint); padding: .4em 0 .4em 1.15em; display: grid; gap: 1em; }
+.remote-work { border-inline-start: .15em solid var(--ink-faint); padding: .4em 0 .4em 1.15em; display: grid; gap: 1em; min-inline-size: 0; }
 .remote-work--ready { border-inline-start-color: var(--ink-soft); }
 .remote-work--failed { border-inline-start-color: var(--ink); }
 .remote-work__line { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .8em 1.5em; }
@@ -12,9 +12,10 @@
 .remote-work__remedy { display: grid; justify-items: start; gap: .6em; line-height: 1.7; }
 .remote-work__remedy p { margin: 0; }
 .remote-work__remedy code { overflow-wrap: anywhere; }
-.remote-work-details, .remote-advanced { padding-block: .8em; }
+.remote-work-details, .remote-advanced { padding-block: .8em; min-inline-size: 0; }
 .remote-work-details summary, .remote-advanced > summary { cursor: pointer; color: var(--ink-soft); padding-block: .5em; }
-.remote-work-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9em; }
+.remote-work-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9em; max-inline-size: 100%; }
+.remote-work-details summary, .remote-deploy-history { overflow-wrap: anywhere; line-height: 1.7; }
 .remote-advanced > .card { margin-block-start: 1em; }
 .remote-advanced .rows, .worktop__trust .rows { display: grid; grid-template-columns: fit-content(13em) minmax(0, 1fr); align-items: baseline; gap: .8em 1.2em; }
 .remote-advanced .rows__item { display: contents; }

@@ -41,6 +41,7 @@ const SCENES = {
   running: "進行中",
   failed: "失敗",
   readyOnDemand: "就緒（onDemand 常駐）",
+  deployHistory: "進階展開＋部署紀錄",
   appOwned: "被 Codex App 佔住",
   unreachable: "連不上",
   handoffCompose: "交接：準備交出",
@@ -210,6 +211,9 @@ function installFixture(getScene: () => Scene) {
   const invoke = async (cmd: string, args: Record<string, unknown> = {}): Promise<unknown> => {
     const scene = getScene();
     switch (cmd) {
+      case "get_remote_deploy_summary": return scene === "deployHistory"
+        ? { total: 12, succeeded: 9, failed: 2, interrupted: 1, blocked: 3, lastFailureCode: "proxyPortConflict" }
+        : { total: 0, succeeded: 0, failed: 0, interrupted: 0, blocked: 0, lastFailureCode: null };
       case "list_remote_handoff_threads": return [thread, { ...thread, threadId: "second", name: "修正 restart pill 反覆亮起", branch: "codex/restart-pill" }];
       case "list_remote_host_models": return [
         { catalogId: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", routeId: "official", upstreamModel: "gpt-5.6-luna", selected: true, mandatory: true },
@@ -350,6 +354,17 @@ function Harness() {
       if (!confirm || confirm.disabled) return;
       confirm.click();
       window.clearInterval(timer);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [scene, nonce]);
+
+  useEffect(() => {
+    if (scene !== "deployHistory") return;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      const advanced = document.querySelector<HTMLDetailsElement>(".remote-advanced");
+      if (advanced) advanced.open = true;
+      if (advanced || ++attempts > 80) window.clearInterval(timer);
     }, 100);
     return () => window.clearInterval(timer);
   }, [scene, nonce]);
