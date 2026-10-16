@@ -657,7 +657,7 @@ describe("Remote Manager operations UI", () => {
     const confirm = vi.spyOn(window, "confirm");
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
     const modal = dialog();
     expect(modal.getByText("會改")).toBeTruthy();
     expect(modal.getByText("不動")).toBeTruthy();
@@ -670,16 +670,16 @@ describe("Remote Manager operations UI", () => {
   it("starts one-click bootstrap as an in-place background operation", async () => {
     renderRemote();
 
-    const button = await screen.findByRole("button", { name: "重新同步" });
+    const button = await screen.findByRole("button", { name: "重新部署" });
     fireEvent.click(button);
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledWith("jetson"));
-    // 進度原地取代按鈕：階段、百分比與已經過的時間都在工作面上。
+    // 進度留在工作面，主要按鈕停用，避免重複部署。
     expect(await screen.findByText("正在部署")).toBeTruthy();
     expect(screen.getByText("排入佇列")).toBeTruthy();
     expect(screen.getByText(/0% · 已經過 0:0\d/)).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "重新同步" })).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
   });
 
   it("explains that on-demand services need a reconnect after reboot", async () => {
@@ -703,13 +703,13 @@ describe("Remote Manager operations UI", () => {
       });
     }
     renderRemote();
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     expect(await screen.findByText(
       "主機的 ps 無法查詢程序啟動時間，無法啟動 Codex daemon。請依修復指令安裝相容的 ps，再重新部署。",
       {}, { timeout: 2500 },
     )).toBeTruthy();
-    expect(screen.getByText("apk add procps-ng")).toBeTruthy();
+    expect(within(screen.getByRole("region", { name: i18n.t("remoteWork.label") })).getByText("apk add procps-ng")).toBeTruthy();
     expect(apiMocks.stopRemoteAppOwnedCodex).not.toHaveBeenCalled();
   });
 
@@ -738,8 +738,8 @@ describe("Remote Manager operations UI", () => {
       });
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     // 失敗原地顯示，說出停在哪一步，並附上補救動作。使用者沒按任何東西之前，
     // 不會有任何視窗自己跳出來。
@@ -770,8 +770,8 @@ describe("Remote Manager operations UI", () => {
     });
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     expect(await screen.findByText(
       "OneClickBootstrapBlocked: nativeDaemonAppOwned",
@@ -807,8 +807,8 @@ describe("Remote Manager operations UI", () => {
     });
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     const mismatch = await screen.findByText(
       "遠端 Codex runtime 與目前 Desktop 協定不相容。請先同步 Desktop Codex runtime，再重試一次。",
@@ -841,8 +841,8 @@ describe("Remote Manager operations UI", () => {
     });
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     const notice = await screen.findByText(
       "無法修復遠端 Proxy 驗證金鑰。請重試；若持續失敗，請匯出診斷包協助排查。",
@@ -874,8 +874,8 @@ describe("Remote Manager operations UI", () => {
     ));
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新同步" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新同步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     const notice = await screen.findByText(
       "Codex App 目前直接佔用此主機的 app-server，Vellum 無法接管。",
@@ -930,7 +930,8 @@ describe("Remote Manager operations UI", () => {
     expect(await screen.findByText(
       "此版本內含較新的 Proxy image，請按「重新同步」套用到這台主機。",
     )).toBeTruthy();
-    expect(screen.getAllByRole("button", { name: "重新同步" }).length).toBeGreaterThan(1);
+    expect(screen.getByRole("button", { name: "重新部署" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "重新同步" })).toBeTruthy();
   });
 
   it("offers an exact Desktop runtime sync when remote protocol qualification is stale", async () => {
@@ -1001,7 +1002,7 @@ describe("Remote Manager operations UI", () => {
     expect(screen.getByText("SHA256:fWGOBFJCuLczHBhYs/jCgMIJ/NUUnYJmt5/owwnZAc4")).toBeTruthy();
     expect(screen.getByText(/一個你已經信任的管道/)).toBeTruthy();
     expect(apiMocks.inspectRemoteHost).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "重新同步" })).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "部署此主機" }).disabled).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "信任並繼續" }));
     await waitFor(() => expect(apiMocks.confirmRemoteSshFingerprint).toHaveBeenCalledWith(

@@ -1,6 +1,14 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "remoteWork": {
+    "redeploy": "Redeploy",
+    "label": "Deployment work surface", "pending": "This host is waiting for deployment.",
+    "running": "Bringing this host to the desired state.", "failed": "Deployment needs your attention before continuing.",
+    "readyOnDemand": "Ready; services recover on SSH connection and are supervised on this host.",
+    "progress": "Deployment progress", "retryHint": "The operation did not finish; retry it using the same settings.",
+    "inspect": "Check the details below and resolve this condition before deploying again.", "nextAction": "Next: {{action}}"
+  },
   "remoteAdd": { "title": "Add an SSH host", "description": "Enter an existing SSH login. Vellum saves a private alias; your SSH config and known_hosts stay unchanged.", "destination": "SSH destination", "add": "Add host", "adding": "Adding…", "saving": "Saving the private SSH alias…", "failed": "The host could not be added. Use user@host[:port] and check the details.", "saved": "Host added. Confirm trust, then deploy.", "loginHint": "First installation needs your existing SSH key. If only password login works, open a terminal and set up your own public key there. Vellum never receives your password.", "keyHint": "With ssh-copy-id available (for example in a Unix terminal), run this to install your own default public key. Otherwise configure key login with your SSH tools. Refresh this host afterwards. The isolation key is installed by deployment once its wrapper exists.", "copyInstall": "Copy key setup command", "copyLogin": "Copy login command", "copyFailed": "Could not copy. Select the command and copy it manually.", "trustReused": "Using your previous trust", "trustReusedHint": "The scanned host key exactly matches your user known_hosts. Only this key was saved in Vellum's private store; no confirmation is needed." },
   "handoff": {
     "openCodexApp": "Open in Codex App", "addHostToCodex": "Add this host in Codex App first. You can still copy the remote thread ID.", "threadLinkFailed": "Could not check the Codex App connection. You can still copy the thread ID.", "openThreadFailed": "Could not open this thread. Check that the host is still in Codex App, then retry.", "copyFailed": "Could not copy. Select the text and copy it manually.", "copySummary": "Copy summary", "summaryStatus": "Result status", "summaryUnapplied": "Results have not been applied to local files", "summaryMissing": "No summary is available yet.", "summaryDiffstat": "File changes", "summaryDiffPending": "File changes have not been retrieved yet.",

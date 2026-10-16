@@ -2,8 +2,8 @@
  * 遠端總管。
  *
  * 版面的重點是「工作面」：一塊釘在頂端不捲走的區塊，永遠是
- * 「這台現在怎樣、我該按什麼」的答案。它有四個狀態 —— 待部署、就緒、
- * 進行中、失敗 —— 而且進行中與失敗都是**原地**取代按鈕。
+ * 「這台現在怎樣、我該按什麼」的答案。五種狀態交給 RemoteWorkSurface
+ * 與純函式推導；進度接在同一句狀態下，主要動作在執行期間停用。
  *
  * 上一版是資料在上、動作在中、結果在下：按下部署的當下，進度卡在
  * 十九行狀態與兩張卡以下，眼睛要跑三個地方才能把因果接起來。
@@ -16,12 +16,14 @@ import { operationalErrorKey } from "@/lib/operationalError";
 import { api } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 import { RemoteHandoff } from "@/components/RemoteHandoff";
+import { RemoteWorkSurface } from "@/components/RemoteWorkSurface";
+import { remoteWorkSurface, type WorkRemedy } from "@/lib/remoteWorkSurface";
 import { useHandoffRecords } from "@/lib/handoffStore";
 import { RemoteHostAdd, RemoteHostLoginGuide } from "@/components/RemoteHostAdd";
 import type { AddedRemoteHost } from "@/types";
 import { handoffTerminal } from "@/lib/remoteHandoff";
 import { handoffReviewTarget } from "@/lib/handoffNavigation";
-import { Btn, Cap, Card, Confirm, Empty, Meter, Notice, Row, Rows, State, Tray } from "@/components/ui";
+import { Btn, Cap, Card, Confirm, Empty, Notice, Row, Rows, State, Tray } from "@/components/ui";
 import {
   configurationStateKey,
   elapsedLabel,
@@ -478,9 +480,36 @@ export function Remote({
   const strayOperation = operation && operation.hostId !== selectedHostId && operationRunning
     ? operation
     : null;
-  const primaryActionKey = verdict.primary === "bootstrap"
-    ? "remote.act.bootstrap"
-    : "remote.act.reconverge";
+  const workSurface = remoteWorkSurface({
+    managerState: status?.managerState ?? "unmanaged",
+    agentReachable: Boolean(status?.agent),
+    persistenceScope: inventory?.persistenceScope ?? status?.agent?.capabilities.persistenceScope,
+    operation: ownOperation,
+    error: failure?.raw,
+    blockers: blockers.map((blocker) => blocker.code),
+    desktopCodexState: desktopCodex?.state,
+  });
+  const primaryActionKey = workSurface.primaryKey;
+  const workRemedy = workSurface.remedy?.action;
+  const workRemedyDisabled = busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed
+    || (workRemedy === "pairChatGpt" && Boolean(chatgptLogin))
+    || ((workRemedy === "installCodex" || workRemedy === "updateAgent") && !release?.ready);
+
+  function runWorkRemedy(action: WorkRemedy) {
+    switch (action) {
+      case "stopAppOwned": case "installCodex": case "updateAgent": case "bootstrap": case "syncDesktopCodex":
+        setPending(action); return;
+      case "pairChatGpt": pairChatGpt(); return;
+      case "activateChatGpt": activateChatGpt(); return;
+      case "repair": repair(); return;
+      case "plan": void run("remote.act.plan", () => createPlan([])); return;
+      case "retry":
+        if (failure) retry.current?.();
+        else retryOperation();
+        return;
+      case "inspect": return;
+    }
+  }
   // 只翻譯認得的狀態。後端多出一個新的值時顯示原碼，不假裝看得懂。
   const CHATGPT_STATES = ["ready", "synchronized", "pairingRequired", "pairingPending", "activationRequired", "reauthenticationRequired", "accountUnavailable", "desktopAccountUnavailable"];
   const chatgptStateLabel = !chatgpt
@@ -945,6 +974,7 @@ export function Remote({
                 <div>
                   <h3 className="worktop__name">{host?.displayName}</h3>
                   <p className="worktop__where">{host?.sshAlias}</p>
+                  {sessions?.threads.length ? <p className="worktop__where">{t("remote.summary.threads", { count: sessions.threads.length })}</p> : null}
                 </div>
                 <div className="worktop__head-status">
                   <State tone={verdict.tone} label={t(verdict.stateKey)} />
@@ -960,12 +990,16 @@ export function Remote({
                 </div>
               </div>
 
-              <p className="worktop__verdict">
-                {t(verdict.verdictKey)}
-                {sessions?.threads.length
-                  ? ` · ${t("remote.summary.threads", { count: sessions.threads.length })}`
-                  : ""}
-              </p>
+              <RemoteWorkSurface
+                model={workSurface}
+                disabled={!selectedHostId || busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed}
+                remedyDisabled={workRemedyDisabled}
+                onDeploy={() => setPending("bootstrap")}
+                onRemedy={runWorkRemedy}
+                elapsed={ownOperation?.state === "running" ? t("remote.operation.elapsed", {
+                  clock: elapsedLabel(operationStartedAt.current.get(ownOperation.operationId) ?? Date.now(), Date.now()),
+                }) : undefined}
+              />
 
               {blockers.length ? (
                 <div className="remote-blockers">
@@ -1030,21 +1064,6 @@ export function Remote({
                 </div>
               ) : ownOperation && ownOperation.state === "running" ? (
                 <div className="worktop__run">
-                  <div className="worktop__phase">
-                    <b>{runningKindKey ? t(runningKindKey) : ownOperation.kind}</b>
-                    <span className="worktop__tick">
-                      {ownOperation.percent}% · {t("remote.operation.elapsed", {
-                        clock: elapsedLabel(
-                          operationStartedAt.current.get(ownOperation.operationId) ?? Date.now(),
-                          Date.now(),
-                        ),
-                      })}
-                    </span>
-                  </div>
-                  <Meter percent={ownOperation.percent} />
-                  <p className="worktop__where">
-                    {runningPhaseKey ? t(runningPhaseKey) : ownOperation.phase}
-                  </p>
                   {waitControls.cancel ? <div className="worktop__acts">
                     {waitControls.token ? <Btn disabled={busy !== null} onClick={() => {
                       if (selectedHostId && waitControls.token) setTakeoverPrompt({ hostId: selectedHostId, operationId: ownOperation.operationId, token: waitControls.token });
@@ -1137,12 +1156,6 @@ export function Remote({
                 </Notice>
               ) : (
                 <div className="worktop__acts">
-                  <Btn
-                    onClick={() => setPending("bootstrap")}
-                    disabled={!selectedHostId || busy !== null || operationRunning}
-                  >
-                    {t(primaryActionKey)}
-                  </Btn>
                   {/* 規劃要讀主機上的 catalog，連不上就一定失敗。
                       讓它可按只是把一個必然的錯誤留給使用者去踩。 */}
                   <Btn

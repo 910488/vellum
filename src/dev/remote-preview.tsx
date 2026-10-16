@@ -33,12 +33,14 @@ import "@/styles/tokens.css";
 import "@/styles/base.css";
 import "@/styles/components.css";
 
-/** 工作面的四個狀態，加上兩個最會出事的變體。 */
+/** 工作面的五個狀態，加上交接與 SSH 信任的既有場景。 */
 const SCENES = {
   ready: "就緒",
   fresh: "未部署",
+  waitingForIdle: "等待閒置",
   running: "進行中",
   failed: "失敗",
+  readyOnDemand: "就緒（onDemand 常駐）",
   appOwned: "被 Codex App 佔住",
   unreachable: "連不上",
   handoffCompose: "交接：準備交出",
@@ -142,6 +144,12 @@ function baseStatus(): RemoteHostStatus {
 function statusFor(scene: Scene): RemoteHostStatus {
   const status = baseStatus();
   switch (scene) {
+    case "readyOnDemand":
+      return {
+        ...status,
+        agent: { ...status.agent!, capabilities: { ...status.agent!.capabilities, persistenceScope: "onDemand", serviceManager: "supervisor", userSystemdAvailable: false, lingerEnabled: false } },
+        inventory: { ...status.inventory!, persistenceScope: "onDemand", serviceManager: "supervisor" },
+      };
     case "fresh":
       return {
         ...status,
@@ -256,7 +264,9 @@ function installFixture(getScene: () => Scene) {
       case "restore_remote_host":
       case "apply_remote_deployment":
       case "get_remote_operation":
-        return scene === "failed" || scene === "appOwned" ? FAILED : RUNNING;
+        return scene === "failed" || scene === "appOwned" ? FAILED
+          : scene === "waitingForIdle" ? { ...RUNNING, phase: "waitingForIdle", percent: 15, message: "activeWorkInProgress" }
+          : RUNNING;
       case "plan_remote_deployment":
         return {
           planId: "plan-preview", hostId: "jetson", state: "readyToApply",
@@ -317,6 +327,27 @@ function Harness() {
     void refreshHandoffs();
     setNonce((current) => current + 1);
   }, [scene]);
+
+  useEffect(() => {
+    if (!["running", "failed", "waitingForIdle"].includes(scene)) return;
+    // Exercise the real deploy + confirmation path, only against the fixture.
+    let deployed = false;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      if (++attempts > 80) { window.clearInterval(timer); return; }
+      if (!deployed) {
+        const button = document.querySelector<HTMLButtonElement>(".remote-work__line button");
+        if (!button || button.disabled) return;
+        button.click();
+        deployed = true;
+      }
+      const confirm = document.querySelector<HTMLButtonElement>("dialog[open] .dialog__acts button:last-child");
+      if (!confirm || confirm.disabled) return;
+      confirm.click();
+      window.clearInterval(timer);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [scene, nonce]);
 
   useEffect(() => {
     if (scene !== "addingHost") return;

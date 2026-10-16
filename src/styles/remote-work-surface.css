@@ -1,0 +1,14 @@
+/* A margin trace on the same page, with no separate hero or stepper. */
+.remote-work { border-inline-start: .15em solid var(--ink-faint); padding: .4em 0 .4em 1.15em; display: grid; gap: 1em; }
+.remote-work--ready { border-inline-start-color: var(--ink-soft); }
+.remote-work--failed { border-inline-start-color: var(--ink); }
+.remote-work__line { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .8em 1.5em; }
+.remote-work__sentence { margin: 0; flex: 1 1 18em; font-size: 1.1em; line-height: 1.7; color: var(--ink); }
+.remote-work__progress { display: grid; gap: .6em; }
+.remote-work__phase { display: flex; justify-content: space-between; align-items: baseline; gap: 1em; color: var(--ink-soft); font-size: .9em; }
+.remote-work__phase span:last-child { font-variant-numeric: tabular-nums; }
+.remote-work__progress .meter { margin: 0; }
+.remote-work__progress p { margin: 0; font-size: .9em; color: var(--ink-soft); }
+.remote-work__remedy { display: grid; justify-items: start; gap: .6em; line-height: 1.7; }
+.remote-work__remedy p { margin: 0; }
+.remote-work__remedy code { overflow-wrap: anywhere; }
