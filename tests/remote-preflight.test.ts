@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { describeBlocker, psStartTimeFailure, proxyMigrationFailure, visibleBlockers } from "@/lib/remoteVocabulary";
+import { describeBlocker, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("explains verification retry exhaustion and offers reconvergence", () => {
+    expect(deploymentVerificationFailure("OneClickBootstrapVerificationFailed: retryExhausted"))
+      .toBe("remote.blocker.deploymentVerificationFailed");
+    expect(deploymentVerificationFailure("OneClickBootstrapVerificationFailed: proxyPortMatches=false"))
+      .toBe("remote.blocker.deploymentVerificationFailed");
+    expect(deploymentVerificationFailure("SSH failed")).toBeNull();
+    expect(deploymentVerificationFailure(null)).toBeNull();
+    expect(describeBlocker("deploymentVerificationFailed").remedy).toBe("bootstrap");
+    expect(phaseKey("verificationRetry")).toBe("remote.phase.verificationRetry");
+  });
   it("distinguishes recovered migrations, failed recovery, and missing agent support", () => {
     expect(proxyMigrationFailure("ProxyMigrationRolledBack: start failed")).toBe("remote.blocker.proxyMigrationRolledBack");
     expect(proxyMigrationFailure("ProxyMigrationRecoveryFailed: cause: ProxyMigrationRolledBack")).toBe("remote.blocker.proxyMigrationRecoveryFailed");

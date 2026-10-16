@@ -171,32 +171,50 @@ where
         60,
         "Installing proxy, credentials and native catalog",
     );
-    let applied = crate::remote::deployment::apply(state, host_id, &plan.plan_id).await?;
+    let mut applied = crate::remote::deployment::apply(state, host_id, &plan.plan_id).await?;
 
     progress(
         "verification",
         92,
         "Verifying proxy, native daemon and detach readiness",
     );
-    let verified = RemoteHostManager::aggregate_status(state, host_id)?;
-    let proxy_ready = verified
+    let expected_port = applied_proxy_port(&applied.proxy);
+    let (verified, retried) = verify_with_retry(
+        || RemoteHostManager::aggregate_status(state, host_id),
+        || {
+            client
+                .proxy_start(
+                    &format!("{}-verify-start", applied.operation_id),
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        },
+        |status| verify_deployment_status(status, expected_port),
+        || {
+            progress(
+                "verificationRetry",
+                96,
+                "Starting proxy and retrying verification once",
+            )
+        },
+    )?;
+    if retried {
+        applied.completed_steps.push("verification.retried".into());
+    }
+    // Return the observed service, rather than the possibly stale apply reply.
+    let observed_proxy = verified
         .agent
         .as_ref()
-        .and_then(|agent| agent.pointer("/proxy/ready"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let native_daemon_running = verified
-        .agent
-        .as_ref()
-        .and_then(|agent| agent.pointer("/nativeCodex/daemonRunning"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let detached_ready = verified.manager_state == "detachedReady" && native_daemon_running;
-    if !proxy_ready || !native_daemon_running || !detached_ready {
-        return Err(AppError::Message(format!(
-            "OneClickBootstrapVerificationFailed: managerState={}, proxyReady={proxy_ready}, nativeDaemonRunning={native_daemon_running}, detachedReady={detached_ready}",
-            verified.manager_state
-        )));
+        .and_then(|agent| agent.get("proxy"))
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Message("OneClickBootstrapVerificationFailed: proxy status missing".into())
+        })?;
+    if let Some(detail) = applied.proxy.get_mut("detail") {
+        *detail = observed_proxy;
+    } else {
+        applied.proxy = observed_proxy;
     }
     progress(
         "verified",
@@ -210,10 +228,70 @@ where
         selected_catalog_ids: plan.selected_catalog_ids,
         apply: applied,
         manager_state: verified.manager_state,
-        proxy_ready,
-        native_daemon_running,
-        detached_ready,
+        proxy_ready: true,
+        native_daemon_running: true,
+        detached_ready: true,
     })
+}
+
+fn applied_proxy_port(proxy: &serde_json::Value) -> Option<u64> {
+    // proxy.start returns an OperationResult; no-op apply returns raw status.
+    proxy
+        .get("detail")
+        .unwrap_or(proxy)
+        .get("hostPort")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// The retry boundary deliberately exposes only observation and idempotent
+/// start. Install, configure, credential sync and takeover cannot run again.
+fn verify_with_retry<T>(
+    mut observe: impl FnMut() -> AppResult<T>,
+    mut start: impl FnMut() -> AppResult<()>,
+    validate: impl Fn(&T) -> AppResult<()>,
+    mut retry_progress: impl FnMut(),
+) -> AppResult<(T, bool)> {
+    let mut read = || -> AppResult<T> {
+        let status = observe()?;
+        validate(&status)?;
+        Ok(status)
+    };
+    if let Ok(status) = read() {
+        return Ok((status, false));
+    }
+    retry_progress();
+    // An SSH reply may be lost after start succeeded. Always observe once
+    // more, even if start returned an error; readiness is the authority.
+    let start_failed = start().is_err();
+    read().map(|status| (status, true)).map_err(|error: AppError| AppError::Message(format!(
+        "OneClickBootstrapVerificationFailed: retryExhausted; retryStartFailed={start_failed}; {error}"
+    )))
+}
+
+fn verify_deployment_status(
+    status: &crate::remote::RemoteHostAggregateStatus,
+    expected_port: Option<u64>,
+) -> AppResult<()> {
+    let agent = status.agent.as_ref();
+    let proxy_ready = agent
+        .and_then(|agent| agent.pointer("/proxy/ready"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let native_running = agent
+        .and_then(|agent| agent.pointer("/nativeCodex/daemonRunning"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let actual_port = agent
+        .and_then(|agent| agent.pointer("/proxy/hostPort"))
+        .and_then(serde_json::Value::as_u64);
+    let port_matches = expected_port.is_some_and(|port| (1..=65535).contains(&port))
+        && actual_port == expected_port;
+    if !proxy_ready || !native_running || status.manager_state != "detachedReady" || !port_matches {
+        return Err(AppError::Message(format!(
+            "OneClickBootstrapVerificationFailed: managerState={}, proxyReady={proxy_ready}, nativeDaemonRunning={native_running}, proxyPortMatches={port_matches}", status.manager_state
+        )));
+    }
+    Ok(())
 }
 
 /// Qualification entry point for a genuinely new Vellum host. It proves the
@@ -1001,6 +1079,164 @@ fn blocked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_reads_the_port_from_start_replies_and_noop_status() {
+        assert_eq!(
+            applied_proxy_port(&serde_json::json!({"hostPort": 15730})),
+            Some(15730)
+        );
+        assert_eq!(
+            applied_proxy_port(&serde_json::json!({"detail": {"hostPort": 15731}})),
+            Some(15731)
+        );
+        assert_eq!(applied_proxy_port(&serde_json::json!({})), None);
+    }
+
+    fn verification_status(
+        manager: &str,
+        proxy_ready: bool,
+        daemon_running: bool,
+        port: u16,
+    ) -> crate::remote::RemoteHostAggregateStatus {
+        crate::remote::RemoteHostAggregateStatus {
+            host_id: "fake-host".into(),
+            manager_state: manager.into(),
+            cached_host: None,
+            agent: Some(serde_json::json!({
+                "proxy": {"ready": proxy_ready, "hostPort": port},
+                "nativeCodex": {"daemonRunning": daemon_running},
+            })),
+            agent_error: None,
+            available_actions: vec![],
+            blocked_reasons: vec![],
+            inventory: None,
+            chatgpt: None,
+        }
+    }
+
+    #[test]
+    fn verification_already_ready_does_not_start_or_retry() {
+        let calls = std::cell::Cell::new(0);
+        let (_, retried) = verify_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(verification_status("detachedReady", true, true, 15730))
+            },
+            || panic!("ready host must not start again"),
+            |status| verify_deployment_status(status, Some(15730)),
+            || panic!("ready host must not report retry"),
+        )
+        .unwrap();
+        assert!(!retried);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn verification_retries_only_observation_and_start_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut observations = std::collections::VecDeque::from([
+            verification_status("drifted", false, true, 15730),
+            verification_status("detachedReady", true, true, 15730),
+        ]);
+        let (_, retried) = verify_with_retry(
+            || {
+                calls.borrow_mut().push("verify");
+                Ok(observations.pop_front().expect("only two observations"))
+            },
+            || {
+                calls.borrow_mut().push("start");
+                Ok(())
+            },
+            |status| verify_deployment_status(status, Some(15730)),
+            || calls.borrow_mut().push("retry-progress"),
+        )
+        .unwrap();
+        assert!(retried);
+        assert_eq!(
+            *calls.borrow(),
+            vec!["verify", "retry-progress", "start", "verify"]
+        );
+    }
+
+    #[test]
+    fn verification_transport_failure_and_lost_start_reply_are_reobserved() {
+        let mut observations = std::collections::VecDeque::from([
+            Err(AppError::Message("SSH reply lost".into())),
+            Ok(verification_status("detachedReady", true, true, 15730)),
+        ]);
+        let starts = std::cell::Cell::new(0);
+        let (_, retried) = verify_with_retry(
+            || observations.pop_front().expect("only two observations"),
+            || {
+                starts.set(starts.get() + 1);
+                Err(AppError::Message("start reply lost".into()))
+            },
+            |status| verify_deployment_status(status, Some(15730)),
+            || {},
+        )
+        .unwrap();
+        assert!(retried);
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[test]
+    fn verification_exhaustion_is_bounded_and_preserves_final_read_failure() {
+        let reads = std::cell::Cell::new(0);
+        let starts = std::cell::Cell::new(0);
+        let result: AppResult<((), bool)> = verify_with_retry(
+            || {
+                reads.set(reads.get() + 1);
+                Err(AppError::Message("host still unreachable".into()))
+            },
+            || {
+                starts.set(starts.get() + 1);
+                Err(AppError::Message("start failed".into()))
+            },
+            |_| Ok(()),
+            || {},
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("OneClickBootstrapVerificationFailed: retryExhausted"));
+        assert!(error.contains("retryStartFailed=true"));
+        assert!(error.contains("host still unreachable"));
+        assert_eq!((reads.get(), starts.get()), (2, 1));
+    }
+
+    #[test]
+    fn verification_requires_detached_daemon_ready_proxy_and_original_port() {
+        for status in [
+            verification_status("nativeActive", true, true, 15730),
+            verification_status("detachedReady", false, true, 15730),
+            verification_status("detachedReady", true, false, 15730),
+            verification_status("detachedReady", true, true, 15731),
+        ] {
+            assert!(verify_deployment_status(&status, Some(15730)).is_err());
+        }
+        let ready = verification_status("detachedReady", true, true, 15730);
+        assert!(verify_deployment_status(&ready, None).is_err());
+        let mut missing = ready;
+        missing.agent = None;
+        assert!(verify_deployment_status(&missing, Some(15730)).is_err());
+    }
+
+    #[test]
+    fn verification_does_not_report_recovery_when_start_picks_a_different_port() {
+        let mut observations = std::collections::VecDeque::from([
+            verification_status("drifted", false, true, 15730),
+            verification_status("detachedReady", true, true, 15731),
+        ]);
+        let result = verify_with_retry(
+            || Ok(observations.pop_front().unwrap()),
+            || Ok(()),
+            |status| verify_deployment_status(status, Some(15730)),
+            || {},
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("proxyPortMatches=false"));
+    }
 
     #[test]
     fn persistence_falls_back_without_blocking_or_prompting_for_privileges() {

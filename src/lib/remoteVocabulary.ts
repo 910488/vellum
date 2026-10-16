@@ -15,6 +15,11 @@
 /** 主要動作。工作面上永遠只有一顆，這個型別就是「那一顆是什麼」。 */
 export type RemotePrimaryAction = "bootstrap" | "reconverge" | null;
 
+export function deploymentVerificationFailure(message: string | null | undefined): string | null {
+  return message?.includes("OneClickBootstrapVerificationFailed")
+    ? "remote.blocker.deploymentVerificationFailed" : null;
+}
+
 export function proxyMigrationFailure(message: string | null | undefined): string | null {
   if (message?.includes("ProxyMigrationRecoveryFailed")) return "remote.blocker.proxyMigrationRecoveryFailed";
   if (message?.includes("ProxyMigrationRolledBack")) return "remote.blocker.proxyMigrationRolledBack";
@@ -130,6 +135,7 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   proxyMigrationRolledBack: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   proxyMigrationRecoveryFailed: { remedy: null, expectedBeforeBootstrap: false },
   proxyMigrationAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
+  deploymentVerificationFailed: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   insufficientDiskSpace: { remedy: null, expectedBeforeBootstrap: false },
   incompleteObservation: { remedy: null, expectedBeforeBootstrap: false },
   hostNotConfigured: { remedy: "bootstrap", expectedBeforeBootstrap: true },
@@ -249,6 +255,7 @@ const PHASES = new Set([
   "deploymentApply",
   "applying",
   "verification",
+  "verificationRetry",
   "verified",
   "restorePreflight",
   "restoreLease",

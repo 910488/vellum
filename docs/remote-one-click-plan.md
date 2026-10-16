@@ -139,15 +139,22 @@ UI 提供重新部署 remedy。`proxyPortConflict` 仍僅代表整段候選範�
 fake 測試涵蓋舊埠被占用後重選、persisted listen/hash 與 Codex provider URL 一起更新。
 下列 converge 狀態機仍待後續分段完成；broker／Docker 死碼留 M5。
 
-第二段（待協調者驗證）：Docker → native 遷移在停止舊容器前，於 secrets 目錄保存
+第二段（26c2b29 已驗收）：Docker → native 遷移在停止舊容器前，於 secrets 目錄保存
 私有回滾紀錄（舊 install、config、credential bytes、這次停止的容器 ID）。Agent
 mutation 失敗及 Desktop apply 後續步驟失敗時恢復；native 驗證成功才清除紀錄。
 只恢復本次停止、且 Vellum label、host ID、install ID 仍一致的容器；不碰外來或
 原本已停止的容器。恢復失敗保留紀錄供重試，回報明確錯誤，不宣稱服務已恢復。
 舊 Agent 以 feature flag 相容；尚無補償能力的 Agent 必須先更新才能遷移 Docker。
 失敗注入涵蓋 service write/load、Docker restart、跨程序重試與 ownership 改變；
-支援資料排除私有快照。preflight／autoFix／等待與取消／接手確認／模型憑證收斂／
-verify 重試仍待後續分段。
+支援資料排除私有快照。
+
+第三段（待協調者驗證）：apply 完成後，首次 verify 失敗時只做一次冪等 proxy.start，
+再 verify 一次；不重跑安裝、憑證同步、adopt 或 daemon restart。start 回覆遺失也會
+再讀狀態，以實際 readiness 決定結果。第二次仍失敗即回報 verification failure，
+UI 提供重新部署。驗證必須維持 proxy ready、native daemon running、detachedReady
+及 apply 後的相同 proxy port；若 retry 期間 port 改變，不能宣稱 catalog 已同步，
+需重新 converge 收斂。preflight／autoFix／等待與取消／接手確認／模型憑證收斂
+仍待後續分段。
 
 改寫 `one_click_bootstrap` 成一個狀態機（保留函式名以免破壞呼叫端）：
 

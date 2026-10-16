@@ -22,6 +22,7 @@ import {
   hostVerdict,
   psStartTimeFailure,
   proxyMigrationFailure,
+  deploymentVerificationFailure,
   operationKindKey,
   phaseKey,
   visibleBlockers,
@@ -769,6 +770,8 @@ export function Remote({
   const immediateAppOwnedFailure = Boolean(failure?.raw.includes("nativeDaemonAppOwned"));
   const immediatePsFailure = psStartTimeFailure(failure?.raw);
   const immediateMigrationFailure = proxyMigrationFailure(failure?.raw);
+  const immediateVerificationFailure = deploymentVerificationFailure(failure?.raw);
+  const operationVerificationFailure = ownOperation?.state === "failed" ? deploymentVerificationFailure(ownOperation.message) : null;
   const operationMigrationFailure = ownOperation?.state === "failed" ? proxyMigrationFailure(ownOperation.message) : null;
   const operationPsFailure = ownOperation?.state === "failed" ? psStartTimeFailure(ownOperation.message) : null;
   const immediateDesktopProtocolFailure = Boolean(failure?.raw.includes("CodexDesktopProtocolMismatch"));
@@ -1008,6 +1011,8 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : immediateAppOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : immediateVerificationFailure
+                      ? t(immediateVerificationFailure)
                     : immediateMigrationFailure
                       ? t(immediateMigrationFailure)
                     : immediatePsFailure
@@ -1037,6 +1042,8 @@ export function Remote({
                     ? t("remote.error.desktopCodexMismatch")
                     : appOwnedFailure
                       ? t("remote.blocker.nativeDaemonAppOwned")
+                    : operationVerificationFailure
+                      ? t(operationVerificationFailure)
                     : operationMigrationFailure
                       ? t(operationMigrationFailure)
                     : operationPsFailure
