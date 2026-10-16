@@ -21,7 +21,7 @@ pub struct LocalThread {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub effort: Option<String>,
-    pub active: bool,
+    pub active: Option<bool>,
     pub handed_off: bool,
 }
 
@@ -30,6 +30,18 @@ fn error(message: impl Into<String>) -> AppError {
 }
 
 pub(crate) fn discover(home: &Path, data_root: &Path) -> AppResult<Vec<LocalThread>> {
+    discover_with(home, data_root, None)
+}
+
+pub(crate) fn select(home: &Path, data_root: &Path, id: &str) -> AppResult<Vec<LocalThread>> {
+    discover_with(home, data_root, Some(id))
+}
+
+fn discover_with(
+    home: &Path,
+    data_root: &Path,
+    selected: Option<&str>,
+) -> AppResult<Vec<LocalThread>> {
     if !home.exists() {
         return Ok(Vec::new());
     }
@@ -46,6 +58,7 @@ pub(crate) fn discover(home: &Path, data_root: &Path) -> AppResult<Vec<LocalThre
         .collect::<Vec<_>>();
     databases.sort_by_key(|path| fs::metadata(path).and_then(|m| m.modified()).ok());
     let mut threads = BTreeMap::new();
+    let mut repositories = BTreeMap::<PathBuf, Option<PathBuf>>::new();
     // The newest state DB is authoritative, including its archive decisions.
     // Do not resurrect an archived row from an older database version.
     for database in databases.into_iter().rev().take(1) {
@@ -57,11 +70,27 @@ pub(crate) fn discover(home: &Path, data_root: &Path) -> AppResult<Vec<LocalThre
         connection
             .busy_timeout(std::time::Duration::from_secs(1))
             .map_err(|e| error(e.to_string()))?;
-        let modern = "SELECT id, cwd, COALESCE(NULLIF(name, ''), title), rollout_path, model_provider, updated_at FROM threads WHERE archived=0 ORDER BY updated_at DESC LIMIT 100";
-        let legacy = "SELECT id, cwd, title, rollout_path, model_provider, updated_at FROM threads WHERE archived=0 ORDER BY updated_at DESC LIMIT 100";
+        let columns = "id, cwd, COALESCE(NULLIF(name, ''), title), rollout_path, model_provider, updated_at, git_branch";
+        let query = |columns: &str| {
+            format!(
+                "SELECT {columns} FROM threads WHERE archived=0 ORDER BY updated_at DESC LIMIT 100"
+            )
+        };
         let mut statement = connection
-            .prepare(modern)
-            .or_else(|_| connection.prepare(legacy))
+            .prepare(&query(columns))
+            .or_else(|_| connection.prepare(&query(&columns.replace("git_branch", "NULL"))))
+            .or_else(|_| {
+                connection.prepare(&query(
+                    &columns.replace("COALESCE(NULLIF(name, ''), title)", "title"),
+                ))
+            })
+            .or_else(|_| {
+                connection.prepare(&query(
+                    &columns
+                        .replace("COALESCE(NULLIF(name, ''), title)", "title")
+                        .replace("git_branch", "NULL"),
+                ))
+            })
             .map_err(|e| error(format!("HandoffThreadIndexUnsupported: {e}")))?;
         let rows = statement
             .query_map([], |row| {
@@ -72,44 +101,52 @@ pub(crate) fn discover(home: &Path, data_root: &Path) -> AppResult<Vec<LocalThre
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
+            .map_err(|e| error(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| error(e.to_string()))?;
+        // Release the SQLite reader before invoking Git or reading a rollout.
+        drop(statement);
+        drop(connection);
         for row in rows {
-            let (id, cwd, title, rollout, provider, updated) =
-                row.map_err(|e| error(e.to_string()))?;
+            let (id, cwd, title, rollout, provider, updated, branch) = row;
             if !super::handoff::valid_id(&id) {
+                continue;
+            }
+            if selected.is_some_and(|wanted| !crate::codex::conversation_key_matches(wanted, &id)) {
                 continue;
             }
             let cwd = PathBuf::from(cwd);
             if !cwd.is_dir() {
                 continue;
             }
-            let provisional = Git::new(&cwd, data_root);
-            let Ok(top) = provisional.run(&["rev-parse", "--show-toplevel"], None) else {
+            let repo = repositories.entry(cwd.clone()).or_insert_with(|| {
+                let top = Git::new(&cwd, data_root)
+                    .run(&["rev-parse", "--show-toplevel"], None)
+                    .ok()?;
+                fs::canonicalize(top.trim()).ok()
+            });
+            let Some(repo) = repo.clone() else {
                 continue;
             };
-            let repo = fs::canonicalize(top.trim()).map_err(|e| error(e.to_string()))?;
-            let git = Git::new(&repo, data_root);
-            let branch = git
-                .run(&["rev-parse", "--abbrev-ref", "HEAD"], None)
-                .unwrap_or_else(|_| "unborn".into())
-                .trim()
-                .to_owned();
             let mut thread = LocalThread {
                 thread_id: id,
                 name: title,
                 repo,
-                branch,
+                branch: branch.unwrap_or_default(),
                 updated_at: updated,
                 model: None,
                 model_provider: Some(provider),
                 effort: None,
-                active: true,
+                active: None,
                 handed_off: false,
             };
             // Missing/unreadable rollout remains visible but cannot pass preflight.
-            let _ = read_settings(home, Path::new(&rollout), &cwd, &mut thread);
+            if selected.is_some() {
+                let _ = read_settings(home, Path::new(&rollout), &cwd, &mut thread);
+            }
             threads.insert(thread.thread_id.clone(), thread);
         }
     }
@@ -191,7 +228,7 @@ fn read_settings(
     thread.model = model;
     thread.effort = effort;
     thread.model_provider = provider;
-    thread.active = active;
+    thread.active = Some(active);
     Ok(())
 }
 
@@ -260,11 +297,22 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].thread_id, "thread-1");
         assert_eq!(result[0].name, "My task");
-        assert_eq!(result[0].model.as_deref(), Some("model"));
-        assert!(!result[0].active);
+        assert!(result[0].model.is_none());
+        assert!(result[0].active.is_none());
+        let selected = select(&home, temp.path(), "thread-1").unwrap();
+        assert_eq!(selected[0].model.as_deref(), Some("model"));
+        assert_eq!(selected[0].active, Some(false));
         assert_eq!(fs::read(db).unwrap(), before_db);
         assert_eq!(fs::read(rollout).unwrap(), before_rollout);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), before_index);
+        // The picker must still work when a rollout is absent/unreadable.
+        fs::remove_file(home.join("sessions/rollout.jsonl")).unwrap();
+        let metadata_only = discover(&home, temp.path()).unwrap();
+        assert_eq!(metadata_only.len(), 1);
+        assert!(metadata_only[0].active.is_none());
+        assert!(select(&home, temp.path(), "thread-1").unwrap()[0]
+            .model
+            .is_none());
     }
     #[test]
     fn rollout_settings_follow_last_turn_and_refuse_foreign_identity() {
@@ -280,7 +328,7 @@ mod tests {
             model: None,
             model_provider: Some("old".into()),
             effort: None,
-            active: true,
+            active: None,
             handed_off: false,
         };
         let records = [
@@ -302,7 +350,7 @@ mod tests {
         assert_eq!(thread.model.as_deref(), Some("selected"));
         assert_eq!(thread.effort.as_deref(), Some("high"));
         assert_eq!(thread.model_provider.as_deref(), Some("vellum"));
-        assert!(!thread.active);
+        assert_eq!(thread.active, Some(false));
         thread.thread_id = "other-thread".into();
         assert!(read_settings(temp.path(), &rollout, temp.path(), &mut thread).is_err());
     }

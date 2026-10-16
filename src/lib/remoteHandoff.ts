@@ -13,7 +13,7 @@ export interface RemoteHandoffThread {
   model: string | null;
   modelProvider: string | null;
   effort: string | null;
-  active: boolean;
+  active: boolean | null;
   handedOff: boolean;
 }
 
@@ -29,6 +29,7 @@ export interface RemoteHandoffPreflight {
   blockers: string[];
   warnings: string[];
   remoteOs: string | null;
+  localRefNotice: string;
 }
 
 export interface RemoteHandoffRecord {

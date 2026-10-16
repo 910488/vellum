@@ -1,5 +1,5 @@
 //! Local Git plumbing for handoff. The real index and worktree are never written.
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -32,28 +32,60 @@ pub struct Snapshot {
 pub(crate) struct Git {
     pub repo: PathBuf,
     hooks: PathBuf,
+    #[cfg(test)]
+    system_config: Option<PathBuf>,
 }
 impl Git {
     pub fn new(repo: &Path, data_root: &Path) -> Self {
         Self {
             repo: repo.into(),
             hooks: data_root.join("remote-handoffs/empty-hooks"),
+            #[cfg(test)]
+            system_config: None,
         }
     }
     fn command(&self) -> Command {
+        self.command_with_config(true)
+    }
+    fn command_with_config(&self, inherit: bool) -> Command {
         let mut cmd = background_command("git");
-        for (name, _) in
-            std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("GIT_"))
-        {
-            cmd.env_remove(name);
+        for (name, _) in std::env::vars_os().filter(|(name, _)| {
+            name.to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+        }) {
+            // Staging must use the same normalization and clean filters as a
+            // user's git add. Clear routing overrides, preserving Git config.
+            if !inherit
+                || !name
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_CONFIG")
+            {
+                cmd.env_remove(name);
+            }
         }
-        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
-            .env("GIT_CONFIG_COUNT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0")
+        if !inherit {
+            cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env("GIT_CONFIG_COUNT", "0")
+                .args(["-c", "protocol.allow=never"]);
+        }
+        #[cfg(test)]
+        if inherit {
+            if let Some(path) = &self.system_config {
+                cmd.env_remove("GIT_CONFIG_NOSYSTEM")
+                    .env("GIT_CONFIG_SYSTEM", path)
+                    .env(
+                        "GIT_CONFIG_GLOBAL",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    );
+            }
+        }
+        cmd.env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_AUTHOR_NAME", "Vellum Handoff")
             .env("GIT_AUTHOR_EMAIL", "handoff@vellum.invalid")
@@ -65,8 +97,6 @@ impl Git {
                 "commit.gpgSign=false",
                 "-c",
                 "core.fsmonitor=false",
-                "-c",
-                "protocol.allow=never",
                 "-c",
             ])
             .arg(format!("core.hooksPath={}", self.hooks.display()))
@@ -118,15 +148,7 @@ impl Git {
         {
             return Err(error("HandoffShallowCloneUnsupported: fetch the complete repository history before handoff"));
         }
-        // An external clean filter can run arbitrary commands while staging.
-        // Refuse configured filters rather than executing them in preflight or
-        // silently changing what the temporary index captures.
-        let config = self.run(&["config", "--includes", "--list"], None)?;
-        if config.lines().any(|line| line.starts_with("filter.")) {
-            return Err(error(
-                "HandoffGitFiltersUnsupported: repository clean filters need explicit support",
-            ));
-        }
+        self.require_no_lfs(None)?;
         let status = self.run(&["status", "--porcelain=v1", "--no-renames", "-z"], None)?;
         let changes = status
             .split('\0')
@@ -145,6 +167,57 @@ impl Git {
             .collect::<AppResult<Vec<_>>>()?;
         Ok((base, changes))
     }
+    fn require_no_lfs(&self, index: Option<&Path>) -> AppResult<()> {
+        let files = self.run(
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            index,
+        )?;
+        // Also catch an LFS rule that currently matches no files. Other clean
+        // filters are the user's own Git configuration and remain enabled.
+        for path in files.split('\0').filter(|path| {
+            Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == ".gitattributes")
+        }) {
+            let path_on_disk = self.repo.join(path);
+            let attributes = match std::fs::read_to_string(&path_on_disk) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.run(&["show", &format!(":{path}")], index)?
+                }
+                Err(e) => return Err(error(format!("HandoffAttributesUnavailable: {e}"))),
+            };
+            if attributes
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .any(|line| line.split_whitespace().any(|field| field == "filter=lfs"))
+            {
+                return Err(error("HandoffLfsUnsupported: LFS objects and filters are not transferred; use a repository without LFS for handoff"));
+            }
+        }
+        // Git resolves nested rules, macros, info/attributes and global
+        // attributes. stdin avoids argv limits and preserves unusual names.
+        let mut command = self.command();
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        command.args(["check-attr", "-z", "--stdin", "filter"]);
+        let output = run_command_with_input(&mut command, Some(files.into_bytes()))?;
+        let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if fields
+            .chunks_exact(3)
+            .any(|entry| entry[1] == b"filter" && entry[2] == b"lfs")
+        {
+            return Err(error("HandoffLfsUnsupported: LFS objects and filters are not transferred; use a repository without LFS for handoff"));
+        }
+        Ok(())
+    }
     pub fn snapshot(&self, id: &str) -> AppResult<Snapshot> {
         if !super::handoff::valid_id(id) {
             return Err(error("HandoffIdInvalid"));
@@ -153,6 +226,7 @@ impl Git {
         let temporary = tempfile::tempdir().map_err(|e| error(e.to_string()))?;
         let index = temporary.path().join("index");
         self.run(&["read-tree", &base], Some(&index))?;
+        self.require_no_lfs(Some(&index))?;
         self.run(&["add", "-A", "--", "."], Some(&index))?;
         let tree = self.run(&["write-tree"], Some(&index))?;
         let commit = self
@@ -203,17 +277,16 @@ impl Git {
         } else {
             "sha1"
         };
-        self.run(
-            &[
-                "init",
-                "--bare",
-                "--template=",
-                &format!("--object-format={format}"),
-                bare.to_str()
-                    .ok_or_else(|| error("HandoffGitInvalidUtf8"))?,
-            ],
-            None,
-        )?;
+        let mut initialize = self.command_with_config(false);
+        initialize.args([
+            "init",
+            "--bare",
+            "--template=",
+            &format!("--object-format={format}"),
+            bare.to_str()
+                .ok_or_else(|| error("HandoffGitInvalidUtf8"))?,
+        ]);
+        run(initialize)?;
         let objects = self.run(&["rev-parse", "--git-path", "objects"], None)?;
         let objects = std::fs::canonicalize(self.repo.join(objects.trim()))
             .map_err(|e| error(e.to_string()))?;
@@ -226,6 +299,24 @@ impl Git {
             Some((&bare, &objects)),
         )?;
         run_command(&mut cmd)?;
+        Ok(())
+    }
+    /// Remove only the ref we created, and only while it still names the
+    /// recorded snapshot. Used on pre-transport journal failure and by the
+    /// later apply/discard lifecycle; never remove somebody else's update.
+    pub fn release_snapshot(&self, snapshot: &Snapshot) -> AppResult<()> {
+        if !snapshot
+            .local_ref
+            .strip_prefix("refs/vellum-handoff/")
+            .is_some_and(super::handoff::valid_id)
+            || !valid_commit(&snapshot.commit)
+        {
+            return Err(error("HandoffSnapshotRefInvalid"));
+        }
+        self.run(
+            &["update-ref", "-d", &snapshot.local_ref, &snapshot.commit],
+            None,
+        )?;
         Ok(())
     }
     fn push_command(
@@ -288,7 +379,7 @@ impl Git {
             .map(|arg| quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
-        let mut cmd = self.command();
+        let mut cmd = self.command_with_config(false);
         if let Some((directory, objects)) = isolation {
             cmd.arg("--git-dir")
                 .arg(directory)
@@ -322,8 +413,15 @@ fn run(mut command: Command) -> AppResult<Output> {
     run_command(&mut command)
 }
 fn run_command(command: &mut Command) -> AppResult<Output> {
+    run_command_with_input(command, None)
+}
+fn run_command_with_input(command: &mut Command, input: Option<Vec<u8>>) -> AppResult<Output> {
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -372,6 +470,19 @@ fn run_command(command: &mut Command) -> AppResult<Output> {
             .take()
             .ok_or_else(|| error("HandoffGitPipeMissing"))?,
     ));
+    let writer = if let Some(input) = input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| error("HandoffGitPipeMissing"))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(stdin.write_all(&input));
+        });
+        Some(rx)
+    } else {
+        None
+    };
     let deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| error(e.to_string()))? {
@@ -400,12 +511,168 @@ fn run_command(command: &mut Command) -> AppResult<Output> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
+    if let Some(writer) = writer {
+        writer
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| error(e.to_string()))?
+            .map_err(|e| error(e.to_string()))?;
+    }
     Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn configured_fixture() -> (tempfile::TempDir, Git) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let system = temp.path().join("system.gitconfig");
+        std::fs::write(&system, "[core]\n autocrlf = true\n[filter \"lfs\"]\n clean = git-lfs clean -- %f\n required = true\n[filter \"trim\"]\n clean = git stripspace\n").unwrap();
+        let mut git = Git::new(&repo, temp.path());
+        git.system_config = Some(system);
+        git.run(&["init"], None).unwrap();
+        (temp, git)
+    }
+    #[test]
+    fn crlf_checkout_keeps_system_normalization_and_snapshot_tree_matches_head() {
+        let (_temp, git) = configured_fixture();
+        std::fs::write(git.repo.join("t.txt"), "a\nb\n").unwrap();
+        git.run(&["add", "."], None).unwrap();
+        git.run(&["commit", "-m", "base"], None).unwrap();
+        std::fs::remove_file(git.repo.join("t.txt")).unwrap();
+        git.run(&["checkout", "--", "t.txt"], None).unwrap();
+        assert_eq!(
+            std::fs::read(git.repo.join("t.txt")).unwrap(),
+            b"a\r\nb\r\n"
+        );
+        let before_index = std::fs::read(git.repo.join(".git/index")).unwrap();
+        assert!(git.inspect().unwrap().1.is_empty());
+        let snapshot = git.snapshot("crlf-fixture").unwrap();
+        assert_eq!(
+            git.run(
+                &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)],
+                None
+            )
+            .unwrap(),
+            git.run(&["rev-parse", "HEAD^{tree}"], None).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(git.repo.join(".git/index")).unwrap(),
+            before_index
+        );
+        assert_eq!(
+            std::fs::read(git.repo.join("t.txt")).unwrap(),
+            b"a\r\nb\r\n"
+        );
+        let isolated = git.command_with_config(false);
+        assert!(isolated
+            .get_envs()
+            .any(|(key, value)| key == "GIT_CONFIG_NOSYSTEM"
+                && value.is_some_and(|value| value == "1")));
+    }
+    #[test]
+    fn non_lfs_clean_filter_uses_the_users_config() {
+        let (_temp, git) = configured_fixture();
+        std::fs::write(git.repo.join(".gitattributes"), "t.txt filter=trim\n").unwrap();
+        std::fs::write(git.repo.join("t.txt"), "base\n").unwrap();
+        git.run(&["add", "."], None).unwrap();
+        git.run(&["commit", "-m", "base"], None).unwrap();
+        std::fs::write(git.repo.join("t.txt"), "changed   \n\n\n").unwrap();
+        let snapshot = git.snapshot("filter-fixture").unwrap();
+        assert_eq!(
+            git.run(&["show", &format!("{}:t.txt", snapshot.commit)], None)
+                .unwrap(),
+            "changed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(git.repo.join("t.txt")).unwrap(),
+            "changed   \n\n\n"
+        );
+    }
+    #[test]
+    fn release_snapshot_ref_checks_the_expected_commit() {
+        let (_temp, git) = configured_fixture();
+        std::fs::write(git.repo.join("t.txt"), "base\n").unwrap();
+        git.run(&["add", "."], None).unwrap();
+        git.run(&["commit", "-m", "base"], None).unwrap();
+        let snapshot = git.snapshot("cleanup-fixture").unwrap();
+        git.run(&["update-ref", &snapshot.local_ref, &snapshot.base], None)
+            .unwrap();
+        assert!(git.release_snapshot(&snapshot).is_err());
+        assert_eq!(
+            git.run(&["rev-parse", &snapshot.local_ref], None)
+                .unwrap()
+                .trim(),
+            snapshot.base
+        );
+        git.run(
+            &[
+                "update-ref",
+                &snapshot.local_ref,
+                &snapshot.commit,
+                &snapshot.base,
+            ],
+            None,
+        )
+        .unwrap();
+        git.release_snapshot(&snapshot).unwrap();
+        assert!(git
+            .run(&["for-each-ref", &snapshot.local_ref], None)
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn lfs_attribute_refuses_even_without_matching_files() {
+        let (_temp, git) = configured_fixture();
+        std::fs::write(git.repo.join("t.txt"), "base\n").unwrap();
+        git.run(&["add", "."], None).unwrap();
+        git.run(&["commit", "-m", "base"], None).unwrap();
+        std::fs::write(git.repo.join(".gitattributes"), "# example filter=lfs\n").unwrap();
+        assert!(git.inspect().is_ok());
+        std::fs::write(
+            git.repo.join(".gitattributes"),
+            "*.bin filter=lfs diff=lfs\n",
+        )
+        .unwrap();
+        assert!(git
+            .inspect()
+            .unwrap_err()
+            .to_string()
+            .contains("HandoffLfsUnsupported"));
+        assert!(git
+            .snapshot("lfs-fixture")
+            .unwrap_err()
+            .to_string()
+            .contains("HandoffLfsUnsupported"));
+        assert!(git
+            .run(&["for-each-ref", "refs/vellum-handoff/"], None)
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn effective_lfs_attributes_from_user_config_refuse_before_clean_filters_run() {
+        let (temp, git) = configured_fixture();
+        std::fs::write(git.repo.join("t.bin"), "base\n").unwrap();
+        git.run(&["add", "."], None).unwrap();
+        git.run(&["commit", "-m", "base"], None).unwrap();
+        let attributes = temp.path().join("global.attributes");
+        std::fs::write(&attributes, "*.bin filter=lfs\n").unwrap();
+        git.run(
+            &[
+                "config",
+                "core.attributesFile",
+                attributes.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(git
+            .inspect()
+            .unwrap_err()
+            .to_string()
+            .contains("HandoffLfsUnsupported"));
+    }
     #[test]
     fn snapshot_keeps_real_index_worktree_and_ignored_files() {
         let temp = tempfile::tempdir().unwrap();

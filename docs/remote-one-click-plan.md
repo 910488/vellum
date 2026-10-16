@@ -295,8 +295,10 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
 - **Desktop 傳輸（第三段實作，待驗收）**：Tauri 新增 list_remote_handoff_threads、
   preflight_remote_handoff、start_remote_handoff、resume_remote_handoff、
   poll_remote_handoff、list_remote_handoffs，均在 blocking pool 執行。
-  從最新本機 Codex state DB 唯讀列出最近 100 筆 git thread，從 sessions 下的
-  rollout 驗證身分並取最後的 model／provider／effort，沿用 conversation_key_matches。
+  從最新本機 Codex state DB 唯讀列出最近 100 筆 git thread；清單只用 DB metadata，
+  每個不同 cwd 快取一次 rev-parse --show-toplevel，不掃 rollout、不另起 Git 查分支。
+  model／effort／active 在清單中為未知（null），選中一筆後才讀該筆 sessions rollout，
+  驗證身分並取最後的 model／provider／effort／active，沿用 conversation_key_matches。
   不讀 auth；缺設定或仍有本機 turn 時擋下。已建立交接紀錄的 thread 標 handedOff，
   後續 UI 據此避免重複交出，尚未處理回收後解除標記。
   preflight 檢查受管 SSH alias、Agent 功能、主機／完整 runtime／版本／模型與憑證；
@@ -309,8 +311,23 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   可以接續 adopted；poll 不發啟動 RPC，也不跳過未完成的 push。
   Git 使用臨時 index、不改工作檔或使用者 index；push 另用臨時 bare Git 目錄借用
   來源 objects，避免來源 repo 的 URL rewrite／remote helper 改送其他位置。
-  僅允許受管 SSH 與私有 known_hosts，無 force push；淺 clone 與 repo-local clean
-  filter 暫時拒絕，分別提示先補齊歷史／等待 filter 支援。Git fixture 需要 Git 2.29+。
+  本機 inspect／status／臨時 index staging 繼承使用者 system／global／repo config，
+  包含 core.autocrlf 與非 LFS clean filter，與使用者自己的 git add 保持一致；hooks 與
+  fsmonitor 仍強制關閉。執行這些使用者自行設定的 filter 是本輪明確核准的行為。
+  preflight 在 status／clean filter 前檢查 .gitattributes 與 Git 的有效 filter 屬性；
+  LFS 回 HandoffLfsUnsupported（不傳 LFS 物件或假裝遠端有 git-lfs）。臨時 index
+  read-tree 後再檢查一次，避免 index／工作樹屬性不同時漏過 LFS。
+  push 繼續隔離 system／global／來源 repo config，僅允許受管 SSH 與私有 known_hosts，
+  無 force push；淺 clone 仍拒絕並提示補齊歷史。Git fixture 需要 Git 2.29+。
+  本機 refs/vellum-handoff/<id> 在臨時 index 產生 commit 後、第一次遠端寫入前建立，
+  用來固定快照，會出現在 git log --all／GUI，並保持 objects 可達。
+  preflight 的 localRefNotice 告知此事；下一段 UI 必須顯示這段提醒。
+  若初次本機 journal／lock 寫入失敗且尚未進行遠端寫入，立即以 expected snapshot SHA
+  清除此 ref；若 ref 被其他動作改過則保留並回報，不刪別人的更新。
+  正常流程的清理時點是結果已安全套用到本機、已保存為本機分支，或使用者明確丟棄之後；
+  由下一段結果回收／discard 接上同一個 expected-SHA 清理 helper。running、傳輸失敗、
+  indeterminate 都保留 ref，避免重試換成另一份快照。現階段尚無 apply／discard 入口，
+  所以已寫入 journal 的 ref 會持續保留；不能用時間到了就自動刪除。
   UI（五個 mock 場景）、結果 fetch／套用／衝突分支與完成通知留待後續段落。
   收尾仍需用真實 pinned daemon 對照 thread/start 回傳、dotted config override、
   thread/list 與無 override 的 thread/resume；目前測試以 fake daemon／本機 Git fixture 為主。

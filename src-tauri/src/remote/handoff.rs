@@ -42,6 +42,7 @@ pub struct Preflight {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub remote_os: Option<String>,
+    pub local_ref_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,15 +127,24 @@ pub fn list_threads(state: &AppState) -> AppResult<Vec<LocalThread>> {
     Ok(threads)
 }
 fn selected_thread(state: &AppState, id: &str) -> AppResult<LocalThread> {
-    let mut matches = list_threads(state)?
+    let root = state.data_root();
+    let home = crate::codex::CodexPaths::discover(&root)
+        .config
+        .parent()
+        .ok_or_else(|| error("HandoffCodexHomeUnavailable"))?
+        .to_path_buf();
+    let mut matches = super::handoff_threads::select(&home, &root, id)?
         .into_iter()
         .filter(|thread| crate::codex::conversation_key_matches(id, &thread.thread_id));
-    let selected = matches
+    let mut selected = matches
         .next()
         .ok_or_else(|| error("HandoffThreadUnavailable"))?;
     if matches.next().is_some() {
         return Err(error("HandoffThreadIdentityAmbiguous"));
     }
+    selected.handed_off = list(state)?.iter().any(|record| {
+        crate::codex::conversation_key_matches(&selected.thread_id, &record.source.thread_id)
+    });
     Ok(selected)
 }
 
@@ -145,8 +155,34 @@ pub fn preflight(
     requirements: &Requirements,
 ) -> AppResult<Preflight> {
     let source = selected_thread(state, thread)?;
-    let (_, changes) = Git::new(&source.repo, &state.data_root()).inspect()?;
-    inspect(source, changes, requirements, &transport(state, host)?)
+    let local = local_preflight(&state.data_root(), source)?;
+    if !local.blockers.is_empty() {
+        return Ok(local);
+    }
+    inspect(
+        local.thread,
+        local.changes,
+        requirements,
+        &transport(state, host)?,
+    )
+}
+
+fn new_report(source: LocalThread, changes: Vec<Change>) -> Preflight {
+    Preflight {
+        thread: source, changes, blockers: Vec::new(), warnings: Vec::new(), remote_os: None,
+        local_ref_notice: "Handoff creates refs/vellum-handoff/<id> in this repository. The ref keeps the snapshot reachable until the result is safely applied or saved as a branch, or you discard the handoff.".into(),
+    }
+}
+fn local_preflight(root: &Path, source: LocalThread) -> AppResult<Preflight> {
+    let mut report = new_report(source, Vec::new());
+    match Git::new(&report.thread.repo, root).inspect() {
+        Ok((_, changes)) => report.changes = changes,
+        Err(e) if e.to_string().starts_with("HandoffLfsUnsupported") => {
+            report.blockers.push(e.to_string())
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(report)
 }
 
 fn inspect(
@@ -155,22 +191,21 @@ fn inspect(
     requirements: &Requirements,
     client: &dyn Transport,
 ) -> AppResult<Preflight> {
-    let mut report = Preflight {
-        thread: source,
-        changes,
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-        remote_os: None,
-    };
+    let mut report = new_report(source, changes);
     if report.thread.handed_off {
         report
             .blockers
             .push("HandoffThreadAlreadyHandedOff: inspect its existing handoff record".into());
     }
-    if report.thread.active {
+    if report.thread.active == Some(true) {
         report
             .blockers
             .push("activeWorkInProgress: finish or interrupt the local turn before handoff".into());
+    }
+    if report.thread.active.is_none() {
+        report
+            .blockers
+            .push("incompleteObservation: local turn activity could not be observed".into());
     }
     if [&report.thread.model, &report.thread.model_provider]
         .iter()
@@ -378,8 +413,14 @@ fn begin(
         ));
     }
     let git = Git::new(&source.repo, root);
-    let (_, changes) = git.inspect()?;
-    let report = inspect(source.clone(), changes, requirements, client)?;
+    let local = local_preflight(root, source.clone())?;
+    if !local.blockers.is_empty() {
+        return Err(error(format!(
+            "HandoffPreflightBlocked: {}",
+            local.blockers.join("; ")
+        )));
+    }
+    let report = inspect(source.clone(), local.changes, requirements, client)?;
     if !report.blockers.is_empty() {
         return Err(error(format!(
             "HandoffPreflightBlocked: {}",
@@ -407,8 +448,23 @@ fn begin(
         remote: None,
         error: None,
     };
-    let _handoff_guard = Lock::acquire(root, &record.id)?;
-    save(root, &record)?;
+    let saved = (|| -> AppResult<Lock> {
+        let guard = Lock::acquire(root, &record.id)?;
+        save(root, &record)?;
+        Ok(guard)
+    })();
+    let _handoff_guard = match saved {
+        Ok(guard) => guard,
+        Err(e) => {
+            if let Err(cleanup) = git.release_snapshot(&record.snapshot) {
+                return Err(error(format!(
+                    "{e}; snapshot ref {} retained: {cleanup}",
+                    record.snapshot.local_ref
+                )));
+            }
+            return Err(e);
+        }
+    };
     drive(root, &mut record, client)?;
     Ok(record)
 }
@@ -771,7 +827,7 @@ mod tests {
             model: Some("model".into()),
             model_provider: Some("vellum".into()),
             effort: Some("high".into()),
-            active: false,
+            active: Some(false),
             handed_off: false,
         };
         (temp, root, source)
@@ -826,6 +882,57 @@ mod tests {
             load(&root, &record.id).unwrap().snapshot.commit,
             record.snapshot.commit
         );
+    }
+
+    #[test]
+    fn lfs_preflight_returns_a_blocker_and_ref_notice_before_transport_or_snapshot() {
+        let (_temp, root, source) = fixture();
+        fs::write(source.repo.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        let report = local_preflight(&root, source.clone()).unwrap();
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("HandoffLfsUnsupported")));
+        assert!(report.local_ref_notice.contains("refs/vellum-handoff/<id>"));
+        assert!(report.local_ref_notice.contains("discard"));
+        let client = Fake::new();
+        assert!(begin(
+            &root,
+            "host",
+            source.clone(),
+            "Continue.",
+            &Requirements::default(),
+            &client
+        )
+        .is_err());
+        assert!(client.calls.borrow().is_empty());
+        assert!(Git::new(&source.repo, &root)
+            .run(&["for-each-ref", "refs/vellum-handoff/"], None)
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn initial_local_journal_failure_releases_snapshot_before_any_remote_write() {
+        let (_temp, root, source) = fixture();
+        fs::write(&root, "not a directory").unwrap();
+        let client = Fake::new();
+        assert!(begin(
+            &root,
+            "host",
+            source.clone(),
+            "Continue.",
+            &Requirements::default(),
+            &client
+        )
+        .is_err());
+        assert!(Git::new(&source.repo, &root)
+            .run(&["for-each-ref", "refs/vellum-handoff/"], None)
+            .unwrap()
+            .is_empty());
+        assert!(!client.calls.borrow().iter().any(|value| matches!(
+            value["method"].as_str(),
+            Some("push" | "codex.handoffStart")
+        )));
     }
     #[test]
     fn platform_or_incomplete_runtime_refusal_never_prepares_pushes_or_creates_a_snapshot() {
