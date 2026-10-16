@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import i18n from "i18next";
 // Remote 這一頁本身不 import i18n（App 進入點負責初始化），所以測試要自己接。
 import "@/i18n";
@@ -127,6 +127,13 @@ const blockedRelease: RemoteReleaseStatus = {
 
 function renderRemote() {
   return render(<Remote refreshVersion={0} onRefreshComplete={() => {}} />);
+}
+
+/** A loaded host has a redeploy action; unrelated tests need no verdict copy. */
+async function inspectedWorkSurface() {
+  const region = await screen.findByRole("region", { name: i18n.t("remoteWork.label") });
+  await within(region).findByRole("button", { name: i18n.t("remoteWork.redeploy") });
+  return within(region);
 }
 
 /** 維護動作收在 <details> 裡。測試要先把它打開，就跟使用者一樣。 */
@@ -332,7 +339,9 @@ describe("Remote Manager operations UI", () => {
   it("keeps the last-good status visible with a live indicator while re-probing an already-probed host", async () => {
     const view = renderRemote();
 
-    expect(await screen.findByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    const surface = await inspectedWorkSurface();
+    // The fixture has a credential blocker: retain that state during refresh.
+    expect(surface.getByRole("status").textContent).toBe(i18n.t("remoteWork.failed"));
     await waitFor(() => expect(apiMocks.inspectRemoteHost).toHaveBeenCalledTimes(1));
     expect(screen.queryByText(/更新中/)).toBeNull();
 
@@ -350,14 +359,14 @@ describe("Remote Manager operations UI", () => {
     // The refresh must never blank the page: the last-good verdict, and the
     // rest of the previously-rendered detail, stay on screen while the new
     // probe is in flight — only a small "updating" marker is added.
-    expect(screen.getByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    expect(surface.getByRole("status").textContent).toBe(i18n.t("remoteWork.failed"));
     expect(screen.getByText("credential cc is unavailable")).toBeTruthy();
     expect(screen.queryByText("偵測中…")).toBeNull();
     expect(await screen.findByText(/· 更新中/)).toBeTruthy();
 
     resolveSecondProbe(status);
     await waitFor(() => expect(screen.queryByText(/· 更新中/)).toBeNull());
-    expect(screen.getByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    expect(surface.getByRole("status").textContent).toBe(i18n.t("remoteWork.failed"));
   });
 
   it("keeps a failed probe on the host row instead of raising a page-level alert", async () => {
@@ -368,10 +377,30 @@ describe("Remote Manager operations UI", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("formats the last inspection time using the selected UI language and updates it on language changes", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(new Date(2026, 9, 16, 20, 43, 53).getTime());
+    try {
+      renderRemote();
+      await inspectedWorkSurface();
+      const updated = () => document.querySelector(".worktop__updated")?.textContent ?? "";
+      await waitFor(() => expect(updated()).toContain("下午"));
+      await act(async () => { await i18n.changeLanguage("en"); });
+      await waitFor(() => expect(updated()).toMatch(/Updated.*8:43:53\s*PM/));
+      expect(updated()).not.toMatch(/上午|下午/);
+      expect(apiMocks.inspectRemoteHost).toHaveBeenCalledTimes(1);
+    } finally {
+      clock.mockRestore();
+      await act(async () => { await i18n.changeLanguage("zh-TW"); });
+    }
+  });
+
   it("answers readiness in one line and hides the nineteen detail rows behind a tray", async () => {
+    apiMocks.inspectRemoteHost.mockResolvedValue({ ...status, managerState: "detachedReady", blockedReasons: [], inventory: status.inventory && { ...status.inventory, blockers: [] } });
     renderRemote();
 
-    expect(await screen.findByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    const surface = await inspectedWorkSurface();
+    expect(surface.getAllByRole("status")).toHaveLength(1);
+    expect(surface.getByRole("status").textContent).toBe(i18n.t("remote.verdict.detachedReady"));
     // 細節預設收起來。jsdom 不套 <details> 的預設樣式，所以節點還是查得到 ——
     // 要斷言的是「它在一個關著的托盤裡」，不是「它不在 DOM 裡」。
     const runtime = screen.getByText("CODEX_HOME").closest("details");
@@ -416,7 +445,7 @@ describe("Remote Manager operations UI", () => {
       },
     });
     renderRemote();
-    expect(await screen.findByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    await inspectedWorkSurface();
     openTray("主機");
     expect(screen.getByText("登入後常駐")).toBeTruthy();
     expect(screen.getAllByText("/Users/joshhuang/.vellum-remote/codex").length).toBeGreaterThan(0);
@@ -452,7 +481,7 @@ describe("Remote Manager operations UI", () => {
     });
     renderRemote();
 
-    expect(await screen.findByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    await inspectedWorkSurface();
     openTray("執行環境");
     expect(screen.getByText("設定")).toBeTruthy();
     expect(screen.getByText("遠端 Proxy 設定需要安全升級，重新部署即可自動修復。")).toBeTruthy();
@@ -461,7 +490,7 @@ describe("Remote Manager operations UI", () => {
   it("shows nothing extra for a current configuration -- the healthy case stays silent", async () => {
     renderRemote();
 
-    expect(await screen.findByText(/Codex App 目前使用此主機的 native daemon/)).toBeTruthy();
+    await inspectedWorkSurface();
     openTray("執行環境");
     expect(screen.queryByText("設定")).toBeNull();
   });
@@ -908,7 +937,7 @@ describe("Remote Manager operations UI", () => {
     });
     renderRemote();
 
-    await screen.findByText(/Codex App 目前使用此主機的 native daemon/);
+    await inspectedWorkSurface();
     openTray("維護");
     await waitFor(() => expect((screen.getByRole("button", { name: "安裝 pinned Codex CLI" }) as HTMLButtonElement).disabled).toBe(false));
     expect((screen.getByRole("button", { name: "更新遠端 Agent" }) as HTMLButtonElement).disabled).toBe(false);

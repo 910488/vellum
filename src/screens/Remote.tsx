@@ -12,6 +12,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocaleFormat } from "@/i18n/useLocaleFormat";
+import { formatDateTime } from "@/i18n/format";
 import { operationalErrorKey } from "@/lib/operationalError";
 import { api } from "@/lib/api";
 import { startVisiblePoll } from "@/lib/visiblePoll";
@@ -93,6 +95,7 @@ export function Remote({
   active?: boolean;
 }) {
   const { t } = useTranslation();
+  const { locale } = useLocaleFormat();
   const handoffs = useHandoffRecords();
   const [hosts, setHosts] = useState<RemoteHostCandidate[]>([]);
   const [addedHost, setAddedHost] = useState<AddedRemoteHost | null>(null);
@@ -983,7 +986,7 @@ export function Remote({
                   ) : selectedHostId && lastUpdated[selectedHostId] ? (
                     <p className="worktop__updated">
                       {t("remote.lastUpdated", {
-                        when: new Date(lastUpdated[selectedHostId]).toLocaleTimeString(),
+                        when: formatDateTime(new Date(lastUpdated[selectedHostId]), locale, { hour: "numeric", minute: "2-digit", second: "2-digit" }),
                       })}
                     </p>
                   ) : null}

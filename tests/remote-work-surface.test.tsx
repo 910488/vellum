@@ -70,7 +70,7 @@ describe("remote deployment presentation", () => {
   });
 
   it("uses the newest action failure, then operation failure, then the first blocker", () => {
-    const input = { ...pending, operation: { ...operation, state: "failed", message: "nativeDaemonAppOwned" }, blockers: ["noModelsSelected", "proxyPortConflict"] };
+    const input: WorkSurfaceInput = { ...pending, operation: { ...operation, state: "failed", message: "nativeDaemonAppOwned" }, blockers: ["noModelsSelected", "proxyPortConflict"] };
     expect(remoteWorkSurface(input).remedy?.action).toBe("stopAppOwned");
     expect(remoteWorkSurface({ ...input, error: "officialAccountPairingRequired" }).remedy?.action).toBe("pairChatGpt");
     expect(remoteWorkSurface({ ...input, operation: null }).remedy?.action).toBe("plan");
