@@ -1064,6 +1064,19 @@ fn host_blockers(inventory: &HostInventoryV2) -> Vec<HostBlocker> {
             true,
         ));
     }
+    match inventory.proxy.last_error.as_deref() {
+        Some("proxyPortOccupied") => blockers.push(HostBlocker::new(
+            "proxyPortOccupied",
+            "The installed proxy port is occupied; converge can select a free port",
+            true,
+        )),
+        Some("proxyPortConflict") => blockers.push(HostBlocker::new(
+            "proxyPortConflict",
+            "All proxy fallback ports are occupied",
+            true,
+        )),
+        _ => {}
+    }
     blockers
 }
 
@@ -1159,6 +1172,24 @@ fn print_ok(result: Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_proxy_port_failure_reaches_host_inventory() {
+        let mut inventory = HostInventoryV2::default();
+        inventory.system.os = "linux".into();
+        inventory.system.arch = "aarch64".into();
+        inventory.proxy.present = true;
+        for code in ["proxyPortOccupied", "proxyPortConflict"] {
+            inventory.proxy.last_error = Some(code.into());
+            assert!(host_blockers(&inventory)
+                .iter()
+                .any(|blocker| blocker.code == code));
+        }
+        inventory.proxy.last_error = None;
+        assert!(!host_blockers(&inventory)
+            .iter()
+            .any(|blocker| blocker.code.starts_with("proxyPort")));
+    }
 
     #[test]
     fn native_profile_runtime_uses_native_daemon_authority() {

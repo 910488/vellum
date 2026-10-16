@@ -750,26 +750,21 @@ pub fn observe_native(
         .map(|item| item.host_port)
         .unwrap_or_else(|| launchd.default_port());
     if !job.running {
-        if let Err(error) = select_native_port(launchd, port, None) {
-            if error.starts_with("proxyPortConflict:") {
-                return Ok(native_status_view(
-                    state.install.as_ref(),
-                    binary.is_file(),
-                    plist.is_file(),
-                    &job,
-                    false,
-                    Some("proxyPortConflict".into()),
-                ));
+        let last_error = match select_native_port(launchd, port, None) {
+            Ok(candidate) if candidate != port => Some("proxyPortOccupied".into()),
+            Ok(_) => None,
+            Err(error) if error.starts_with("proxyPortConflict:") => {
+                Some("proxyPortConflict".into())
             }
-            return Err(error);
-        }
+            Err(error) => return Err(error),
+        };
         return Ok(native_status_view(
             state.install.as_ref(),
             binary.is_file(),
             plist.is_file(),
             &job,
             false,
-            None,
+            last_error,
         ));
     }
     let ready = launchd.inspect_readyz(port, boundary_key).unwrap_or(false);
@@ -1019,6 +1014,43 @@ mod tests {
         assert_eq!(
             config.models[0].base_url, "http://127.0.0.1:1/v1",
             "upstream endpoints must remain unchanged"
+        );
+        manager.stop("simulate-reboot-stop").unwrap();
+        service.busy_ports.lock().unwrap().insert(15724);
+        let failed = manager.status().unwrap();
+        assert!(!failed.running);
+        assert_eq!(
+            failed.host_port,
+            Some(15724),
+            "status reports installed intent until converge changes it"
+        );
+        assert_eq!(failed.last_error.as_deref(), Some("proxyPortOccupied"));
+        let after_reboot = manager.select_port(Some(15724)).unwrap();
+        assert_eq!(after_reboot, 15725);
+        *service.ready.lock().unwrap() = true;
+        let recovered = manager
+            .start(crate::proxy::ProxyStartRequest {
+                operation_id: "converge-after-reboot".into(),
+                host_port: Some(after_reboot),
+                image: None,
+            })
+            .unwrap();
+        let recovered: ProxyStatusView = serde_json::from_value(recovered.detail).unwrap();
+        assert_eq!(recovered.host_port, Some(15725));
+        assert!(recovered.ready && recovered.last_error.is_none());
+        let config = vellum_proxy_runtime::ProxyRuntimeConfig::from_toml_str(
+            &std::fs::read_to_string(paths.proxy_config_dir.join("proxy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.listen.to_string(), "127.0.0.1:15725");
+        assert_eq!(
+            config.identity.config_hash,
+            store.load().unwrap().install.unwrap().config_hash
+        );
+        let providers = crate::profile::model_providers_table(&recovered).unwrap();
+        assert_eq!(
+            providers["vellum"]["base_url"].as_str(),
+            Some("http://127.0.0.1:15725/v1")
         );
     }
     use crate::state::AgentPaths;

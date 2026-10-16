@@ -615,6 +615,7 @@ const zhCN: ResourceTree = {
       "intelMacUnsupported": "Intel Mac 尚未支持。第一版 Remote Manager 只支持 Apple Silicon。",
       "guiSessionUnavailable": "没有可用的 macOS 登录会话。Proxy 是登录后常驻，不会改电源或自动登录。",
       "proxyPortConflict": "15721–15799 的 Proxy 备用端口全部被占用。请释放其中一个端口，再重新部署。",
+      "proxyPortOccupied": "Proxy 原来的端口已被其他进程占用。重新部署会自动选择空闲端口，并更新 Codex 的连接设置。",
       "insufficientDiskSpace": "可用空间不足以容纳下载、解压与回滚保留，替换操作已停止。不会自动删除用户数据。",
       "incompleteObservation": "无法完整观察受管理 runtime 的 turn、工具或批准，已阻止破坏性操作。",
       "hostNotConfigured": "此主机尚未写入 Vellum 的配置。",

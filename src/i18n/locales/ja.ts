@@ -615,6 +615,7 @@ const ja: ResourceTree = {
       "intelMacUnsupported": "Intel Mac は未対応です。Remote Manager の初版は Apple Silicon のみです。",
       "guiSessionUnavailable": "macOS のログインセッションがありません。Proxy はログイン後に常駐し、電源や自動ログインの設定は変更しません。",
       "proxyPortConflict": "Proxy の代替ポート 15721–15799 がすべて使用中です。いずれかのポートを空けてから、再度デプロイしてください。",
+      "proxyPortOccupied": "Proxy の以前のポートが別のプロセスに使われています。再デプロイすると空きポートを選び、Codex の接続設定を自動更新します。",
       "insufficientDiskSpace": "ダウンロード・展開・ロールバック用の空き容量が足りないため、置換を中止しました。ユーザーデータは自動削除しません。",
       "incompleteObservation": "管理対象 runtime の turn / ツール / 承認を完全に観測できないため、破壊的操作を遮断しました。",
       "hostNotConfigured": "このホストにはまだ Vellum の設定が書き込まれていません。",

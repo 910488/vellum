@@ -132,6 +132,13 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
 
 ### M3 一鍵 converge 吸收所有修復動作
 
+實作分段（第一段待協調者驗證，非 M3 全部完成）：重開機後 installed／desired port
+被外來程序占用時，Agent status 回 `proxyPortOccupied`，inventory 將該碼傳到 Desktop，
+UI 提供重新部署 remedy。`proxyPortConflict` 仍僅代表整段候選範圍全滿。每次 converge
+的 plan 都以 desired port 作為偏好重新探測，不能把已保存的 port 當作仍可用的證據；
+fake 測試涵蓋舊埠被占用後重選、persisted listen/hash 與 Codex provider URL 一起更新。
+Docker 遷移補償與下列 converge 狀態機仍待後續分段完成；broker／Docker 死碼留 M5。
+
 待辦（M1 審查延後處理）：Docker → native 遷移若已停止舊容器，而後續原生 proxy
 啟動失敗，converge 需補上恢復舊容器的補償流程與失敗說明。只允許恢復本次遷移
 實際停掉、且 Vellum label、host ID、install ID 仍一致的容器；維持現有安全邊界。

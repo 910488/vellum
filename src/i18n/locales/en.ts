@@ -646,6 +646,7 @@ const en: ResourceTree = {
       "intelMacUnsupported": "Intel Mac is not supported. The first release of Remote Manager targets Apple Silicon only.",
       "guiSessionUnavailable": "No macOS login session is available. The proxy stays resident after login and does not change power or auto-login settings.",
       "proxyPortConflict": "All proxy fallback ports in 15721–15799 are occupied. Free one port, then deploy again.",
+      "proxyPortOccupied": "Another process occupies the proxy's previous port. Redeploy to select a free port and update Codex's connection settings automatically.",
       "insufficientDiskSpace": "There is not enough free space for download, extract, and rollback reserve. The replace was stopped. User data is not deleted automatically.",
       "incompleteObservation": "Managed runtime turns, tools, or approvals could not be fully observed, so the destructive operation was blocked.",
       "hostNotConfigured": "Vellum's configuration has not been written to this host yet.",

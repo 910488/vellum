@@ -21,7 +21,7 @@ const LOCALES: Record<string, ResourceTree> = { "zh-TW": zhTW, "zh-CN": zhCN, en
 const BLOCKER_CODES = [
   "agentUnavailable", "codexRestartRequired", "credentialsMissing",
   "desktopOfficialAccountMissing", "dockerUnavailable", "intelMacUnsupported",
-  "guiSessionUnavailable", "proxyPortConflict", "insufficientDiskSpace",
+  "guiSessionUnavailable", "proxyPortConflict", "proxyPortOccupied", "insufficientDiskSpace",
   "incompleteObservation", "hostNotConfigured",
   "injectionRequiresReadyProxy", "invalidCompactionThreshold",
   "managedRuntimeRecoveryRequired", "nativeCodexVersionMismatch",

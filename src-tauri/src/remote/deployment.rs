@@ -594,21 +594,16 @@ pub fn plan(
     let agent_status = client.host_status();
     let previous_desired_state = super::desired_state::load(&state.data_root(), host_id)?;
     let mut identity = deployment_identity_from_status(agent_status.as_ref().ok(), &proxy_image);
-    if let Some(identity) = identity.as_mut() {
-        if identity.proxy_backend == crate::remote::platform::PROXY_BACKEND_NATIVE {
-            match client.proxy_select_port(
-                previous_desired_state
-                    .proxy_port
-                    .or(Some(identity.host_port)),
-            ) {
-                Ok(port) => identity.host_port = port,
-                Err(error) => blocked.push(if error.to_string().contains("proxyPortConflict:") {
-                    "proxyPortConflict".into()
-                } else {
-                    format!("proxyPortSelectionFailed:{error}")
-                }),
-            }
-        }
+    if let Err(error) = resolve_plan_proxy_port(
+        identity.as_mut(),
+        previous_desired_state.proxy_port,
+        |preferred| client.proxy_select_port(preferred),
+    ) {
+        blocked.push(if error.to_string().contains("proxyPortConflict:") {
+            "proxyPortConflict".into()
+        } else {
+            format!("proxyPortSelectionFailed:{error}")
+        });
     }
     let planned_port = identity
         .as_ref()
@@ -989,6 +984,25 @@ pub struct DeploymentIdentity {
     pub host_port: u16,
     pub managed_codex_home: String,
     pub artifact_id: String,
+}
+
+/// Recheck persisted intent against the live listener on every converge. A
+/// saved port is a preference, never evidence that the port is still free.
+fn resolve_plan_proxy_port(
+    identity: Option<&mut DeploymentIdentity>,
+    saved_port: Option<u16>,
+    select: impl FnOnce(Option<u16>) -> AppResult<u16>,
+) -> AppResult<()> {
+    if let Some(identity) = identity {
+        if identity.proxy_backend == crate::remote::platform::PROXY_BACKEND_NATIVE {
+            let port = select(saved_port.or(Some(identity.host_port)))?;
+            if port == 0 {
+                return Err(AppError::Message("NativeProxyPortSelectionInvalid".into()));
+            }
+            identity.host_port = port;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1590,6 +1604,58 @@ mod desktop_parity;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converge_rechecks_an_occupied_port_from_desired_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let desired = super::super::desired_state::RemoteHostDesiredState {
+            host_id: "rebooted".into(),
+            proxy_port: Some(15760),
+            ..Default::default()
+        };
+        super::super::desired_state::save(temp.path(), &desired).unwrap();
+        let desired = super::super::desired_state::load(temp.path(), "rebooted").unwrap();
+        let client = vellum_remote_agent::native_proxy::MemoryLaunchd::default();
+        client.busy_ports.lock().unwrap().insert(15760);
+        let mut identity = DeploymentIdentity {
+            platform: "linux-arm64".into(),
+            proxy_backend: "native".into(),
+            host_port: 15760,
+            managed_codex_home: "/home/remote/.vellum-remote/codex".into(),
+            artifact_id: "native-digest".into(),
+        };
+        resolve_plan_proxy_port(Some(&mut identity), desired.proxy_port, |preferred| {
+            assert_eq!(preferred, Some(15760));
+            vellum_remote_agent::native_proxy::select_native_port(&client, preferred.unwrap(), None)
+                .map_err(AppError::Message)
+        })
+        .unwrap();
+        assert_ne!(identity.host_port, 15760);
+        assert!(!client
+            .busy_ports
+            .lock()
+            .unwrap()
+            .contains(&identity.host_port));
+        *client.port_busy.lock().unwrap() = true;
+        let before = identity.clone();
+        assert!(
+            resolve_plan_proxy_port(Some(&mut identity), desired.proxy_port, |preferred| {
+                vellum_remote_agent::native_proxy::select_native_port(
+                    &client,
+                    preferred.unwrap(),
+                    None,
+                )
+                .map_err(AppError::Message)
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("proxyPortConflict:")
+        );
+        assert_eq!(
+            identity, before,
+            "failed probing must not replace the plan's port with a fabricated value"
+        );
+    }
 
     #[test]
     fn native_proxy_install_identity_uses_binary_digest_and_requires_migration() {

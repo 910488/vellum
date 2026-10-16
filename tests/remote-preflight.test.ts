@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { describeBlocker, psStartTimeFailure, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("offers converge for an occupied saved port while preserving the exhausted-range blocker", () => {
+    const occupied = describeBlocker("proxyPortOccupied");
+    expect(occupied.messageKey).toBe("remote.blocker.proxyPortOccupied");
+    expect(occupied.remedy).toBe("bootstrap");
+    expect(visibleBlockers(["proxyPortOccupied"], true)).toEqual([occupied]);
+    expect(describeBlocker("proxyPortConflict").remedy).toBeNull();
+  });
   it("keeps an exhausted proxy port range visible even before first deployment", () => {
     const blocker = describeBlocker("proxyPortConflict");
     expect(blocker.messageKey).toBe("remote.blocker.proxyPortConflict");

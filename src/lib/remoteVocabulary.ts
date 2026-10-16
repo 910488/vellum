@@ -119,6 +119,7 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   guiSessionUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   // Only emitted after the Agent exhausts the automatic fallback range.
   proxyPortConflict: { remedy: null, expectedBeforeBootstrap: false },
+  proxyPortOccupied: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   insufficientDiskSpace: { remedy: null, expectedBeforeBootstrap: false },
   incompleteObservation: { remedy: null, expectedBeforeBootstrap: false },
   hostNotConfigured: { remedy: "bootstrap", expectedBeforeBootstrap: true },
