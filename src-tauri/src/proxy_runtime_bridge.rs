@@ -155,6 +155,28 @@ struct DesktopOfficialAuth {
 }
 #[async_trait]
 impl OfficialAuthProvider for DesktopOfficialAuth {
+    async fn retry_after_quota(
+        &self,
+        _route_id: &str,
+        account_hash: &str,
+        reset_at: Option<u64>,
+        context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
+        allow_retry: bool,
+    ) -> Result<Option<OfficialAuthorization>, String> {
+        self.state
+            .codex_oauth()
+            .retry_pool_after_quota(account_hash, reset_at, context, allow_retry)
+            .await
+            .map(|auth| {
+                auth.map(|auth| OfficialAuthorization {
+                    access_token: auth.access_token,
+                    account_id: Some(auth.account_id),
+                    selection_revision: Some(auth.selection_revision),
+                    selection_verified: auth.selection_verified,
+                })
+            })
+            .map_err(|e| e.to_string())
+    }
     async fn authorize_with_context(
         &self,
         route_id: &str,

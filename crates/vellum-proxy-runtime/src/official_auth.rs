@@ -153,6 +153,19 @@ impl OfficialRoutingContext {
 
 #[async_trait]
 pub trait OfficialAuthProvider: Send + Sync {
+    /// Record an authoritative quota failure and select a different pooled
+    /// member only if its full replay budget fits. Non-pool hosts decline.
+    /// Reset is Unix milliseconds, never a credential or provider response body.
+    async fn retry_after_quota(
+        &self,
+        _route_id: &str,
+        _account_hash: &str,
+        _reset_at: Option<u64>,
+        _context: &OfficialRoutingContext,
+        _allow_retry: bool,
+    ) -> Result<Option<OfficialAuthorization>, String> {
+        Ok(None)
+    }
     async fn authorize(&self, route_id: &str) -> Result<OfficialAuthDecision, String>;
 
     /// Ordinary requests may use session-aware allocation. Explicit review
