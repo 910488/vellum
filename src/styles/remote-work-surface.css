@@ -12,3 +12,10 @@
 .remote-work__remedy { display: grid; justify-items: start; gap: .6em; line-height: 1.7; }
 .remote-work__remedy p { margin: 0; }
 .remote-work__remedy code { overflow-wrap: anywhere; }
+.remote-work-details, .remote-advanced { padding-block: .8em; }
+.remote-work-details summary, .remote-advanced > summary { cursor: pointer; color: var(--ink-soft); padding-block: .5em; }
+.remote-work-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9em; }
+.remote-advanced > .card { margin-block-start: 1em; }
+.remote-advanced .rows, .worktop__trust .rows { display: grid; grid-template-columns: fit-content(13em) minmax(0, 1fr); align-items: baseline; gap: .8em 1.2em; }
+.remote-advanced .rows__item { display: contents; }
+.worktop__trust .rows__item { display: contents; }

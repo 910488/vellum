@@ -211,6 +211,11 @@ function installFixture(getScene: () => Scene) {
     const scene = getScene();
     switch (cmd) {
       case "list_remote_handoff_threads": return [thread, { ...thread, threadId: "second", name: "修正 restart pill 反覆亮起", branch: "codex/restart-pill" }];
+      case "list_remote_host_models": return [
+        { catalogId: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", routeId: "official", upstreamModel: "gpt-5.6-luna", selected: true, mandatory: true },
+        { catalogId: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", routeId: "cc", upstreamModel: "deepseek-v4-flash", selected: true, mandatory: false },
+      ];
+      case "update_remote_host_models": return { ...RUNNING, phase: "waitingForIdle", percent: 15 };
       case "preflight_remote_handoff": return { thread, changes: [{ path: "wordcount.py", staged: true, untracked: false }, { path: "tests/test_wordcount.py", staged: false, untracked: false }, { path: "NOTES.local.md", staged: false, untracked: true }], blockers: scene === "handoffBlocked" || args.requirements && (args.requirements as {requiredOs?: string}).requiredOs === "windows" ? ["HandoffPlatformMismatch: task requires windows, remote is linux"] : [], warnings: ["Remote tool python is unavailable; use python3 instead."], remoteOs: "linux", localRefNotice: "Snapshot ref retained until apply/discard." };
       case "list_remote_handoffs": return handoff ? [handoff] : [];
       case "get_remote_handoff_thread_link": return scene === "handoffBackNoHost" ? null : "codex://threads/remote-thread?hostId=remote-ssh-discovered%3Ajetson-orin";

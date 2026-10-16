@@ -318,6 +318,14 @@ export const api = {
     return call<RemoteOperationProgress>("bootstrap_remote_host", { hostId });
   },
 
+  listRemoteHostModels(hostId: string): Promise<import("@/types").RemoteModelOption[]> {
+    return call<import("@/types").RemoteModelOption[]>("list_remote_host_models", { hostId });
+  },
+
+  updateRemoteHostModels(hostId: string, catalogIds: string[]): Promise<RemoteOperationProgress> {
+    return call<RemoteOperationProgress>("update_remote_host_models", { hostId, catalogIds });
+  },
+
   cancelRemoteDeployment(hostId: string, operationId: string): Promise<void> {
     return call<void>("cancel_remote_deployment", { hostId, operationId });
   },

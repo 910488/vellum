@@ -20,6 +20,7 @@ pub mod handoff;
 mod handoff_git;
 mod handoff_threads;
 pub mod host_manager;
+pub(crate) mod host_models;
 pub mod local_cache;
 pub mod observation;
 pub mod operation;

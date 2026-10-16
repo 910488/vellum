@@ -521,6 +521,35 @@ pub(crate) fn select_for_converge(
     super::converge_models::select(&requested, &candidates, official_blocker)
 }
 
+pub(crate) fn model_options(state: &AppState, host_id: &str) -> AppResult<Vec<RemoteModelOption>> {
+    RemoteHostManager::resolve_target(state, host_id)?;
+    let desired = super::desired_state::load(&state.data_root(), host_id)?;
+    let requested = desired.converge_catalog_ids();
+    let routes = state.routes();
+    let paths = crate::codex::CodexPaths::discover(&state.data_root());
+    let catalog = crate::catalog::read_official_catalog(&paths.models_cache);
+    Ok(
+        qualified_remote_models(state, &routes, &hidden_official_model_ids(catalog.as_ref()))
+            .into_iter()
+            .map(|model| {
+                let mandatory = routes.iter().any(|route| {
+                    route.id == model.route_id && route.provider_kind == ProviderKind::Official
+                });
+                RemoteModelOption {
+                    selected: mandatory
+                        || requested.is_empty()
+                        || requested.contains(&model.catalog_id),
+                    mandatory,
+                    catalog_id: model.catalog_id,
+                    display_name: model.display_name,
+                    route_id: model.route_id,
+                    upstream_model: model.upstream_model,
+                }
+            })
+            .collect(),
+    )
+}
+
 fn qualified_remote_models(
     state: &AppState,
     routes: &[crate::model::Route],

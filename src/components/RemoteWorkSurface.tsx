@@ -33,6 +33,7 @@ export function RemoteWorkSurface({ model, disabled, remedyDisabled, onDeploy, o
       {model.progress.phaseKey !== model.statusKey ? <p>{model.progress.phaseKey ? t(model.progress.phaseKey) : model.progress.phase}</p> : null}
     </div> : null}
     {remedy ? <div className="remote-work__remedy">
+      <p>{t(remedy.messageKey)}</p>
       {remedy.repair ? <code>{remedy.repair}</code> : null}
       {remedy.action === "inspect"
         ? <p>{t("remoteWork.inspect")}</p>

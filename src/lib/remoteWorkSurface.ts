@@ -1,7 +1,8 @@
 import type { RemoteOperationProgress } from "@/types";
+import { operationalErrorKey } from "./operationalError";
 import {
   describeBlocker, hostVerdict, operationKindKey, phaseKey,
-  proxyMigrationFailure, deploymentVerificationFailure, psStartTimeFailure,
+  proxyMigrationFailure, deploymentVerificationFailure, deploymentPreflightFailure, psStartTimeFailure,
   type RemoteRemedy,
 } from "./remoteVocabulary";
 
@@ -57,11 +58,17 @@ export function remoteWorkSurface(input: WorkSurfaceInput): WorkSurfaceModel {
     const protocolRemedy = input.desktopCodexState === "agentUpdateRequired" ? "updateAgent"
       : !input.desktopCodexState || ["desktopUnavailable", "unavailable"].includes(input.desktopCodexState) ? "inspect" : "syncDesktopCodex";
     return {
-      ...base, state: "failed", statusKey: "remoteWork.failed",
+      ...base, state: "failed", statusKey: "remoteWork.failed", primaryDisabled: true,
       remedy: {
-        action: desktopProtocol ? protocolRemedy : blocker ? blocker.remedy ?? "inspect"
+        action: desktopProtocol ? protocolRemedy : blocker
+          ? ["repair", "installCodex", "updateAgent"].includes(blocker.remedy ?? "") ? "bootstrap"
+            : blocker.remedy === "plan" ? "inspect" : blocker.remedy ?? "inspect"
           : input.error || operation?.state === "failed" ? "retry" : "inspect",
-        messageKey: desktopProtocol ? "remote.error.desktopCodexMismatch" : blocker?.messageKey ?? "remoteWork.retryHint",
+        messageKey: operationalErrorKey(failure) === "tabPolish.loginExpired" ? "tabPolish.loginExpired"
+          : desktopProtocol ? "remote.error.desktopCodexMismatch"
+          : failure.includes("RemoteBoundaryKeyProvisionFailed") ? "remote.error.boundaryKeyProvisionFailed"
+          : blocker?.messageKey ?? deploymentPreflightFailure(failure)
+            ?? (input.error || operation?.state === "failed" ? "remoteWork.retryHint" : "remote.blockerUnknown"),
         repair: ps?.repair ?? null,
       },
     };

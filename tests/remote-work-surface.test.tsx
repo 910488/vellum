@@ -50,11 +50,11 @@ describe("remote deployment presentation", () => {
     ["officialAccountPairingRequired", "pairChatGpt"],
     ["officialAccountActivationRequired", "activateChatGpt"],
     ["officialAccountReauthenticationRequired", "pairChatGpt"],
-    ["managedRuntimeRecoveryRequired", "repair"],
-    ["nativeCodexVersionMismatch", "installCodex"],
-    ["DeploymentAgentUpgradeRequired", "updateAgent"],
+    ["managedRuntimeRecoveryRequired", "bootstrap"],
+    ["nativeCodexVersionMismatch", "bootstrap"],
+    ["DeploymentAgentUpgradeRequired", "bootstrap"],
     ["codexRuntimeIncomplete", "bootstrap"],
-    ["noModelsSelected", "plan"],
+    ["noModelsSelected", "inspect"],
     ["proxyPortConflict", "inspect"],
     ["unsupportedRemotePlatform", "inspect"],
     ["CodexDesktopProtocolMismatch", "inspect"],
@@ -66,6 +66,7 @@ describe("remote deployment presentation", () => {
   ])("selects one remedy for %s", (code, action) => {
     const model = remoteWorkSurface({ ...pending, error: `OneClickBootstrapBlocked: ${code}` });
     expect(model).toMatchObject({ state: "failed", remedy: { action } });
+    expect(model.primaryDisabled).toBe(true);
     expect(model.progress).toBeNull();
   });
 
@@ -73,7 +74,7 @@ describe("remote deployment presentation", () => {
     const input: WorkSurfaceInput = { ...pending, operation: { ...operation, state: "failed", message: "nativeDaemonAppOwned" }, blockers: ["noModelsSelected", "proxyPortConflict"] };
     expect(remoteWorkSurface(input).remedy?.action).toBe("stopAppOwned");
     expect(remoteWorkSurface({ ...input, error: "officialAccountPairingRequired" }).remedy?.action).toBe("pairChatGpt");
-    expect(remoteWorkSurface({ ...input, operation: null }).remedy?.action).toBe("plan");
+    expect(remoteWorkSurface({ ...input, operation: null }).remedy?.action).toBe("inspect");
     expect(remoteWorkSurface({ ...pending, blockers: ["futureBlocker"] }).remedy?.action).toBe("inspect");
   });
 

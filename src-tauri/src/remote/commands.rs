@@ -325,16 +325,61 @@ pub async fn bootstrap_remote_host(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
+    off_main_thread(&state, move |state| start_converge(&state, &host_id, None)).await
+}
+
+#[tauri::command]
+pub async fn list_remote_host_models(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> AppResult<Vec<super::deployment::RemoteModelOption>> {
+    off_main_thread(&state, move |state| {
+        super::deployment::model_options(&state, &host_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_remote_host_models(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    catalog_ids: Vec<String>,
+) -> AppResult<crate::remote::RemoteOperationProgress> {
+    off_main_thread(&state, move |state| {
+        start_converge(&state, &host_id, Some(catalog_ids))
+    })
+    .await
+}
+
+fn start_converge(
+    state: &AppState,
+    host_id: &str,
+    catalog_ids: Option<Vec<String>>,
+) -> AppResult<crate::remote::RemoteOperationProgress> {
+    let host_id = host_id.to_owned();
     let operation_id = format!("one-click-bootstrap-{}", ulid::Ulid::new());
     let control = super::converge_control::register(&operation_id, &host_id)?;
     let registration = super::converge_control::Registration(operation_id.clone());
-    let progress = crate::remote::RemoteOperationProgress::queued(
+    let desired = catalog_ids
+        .map(|ids| super::host_models::prepare_selection(state, &host_id, &ids))
+        .transpose()?;
+    let mut progress = crate::remote::RemoteOperationProgress::queued(
         operation_id.clone(),
         host_id.clone(),
         "oneClickBootstrap",
     );
     crate::remote::operation::save(&state.data_root(), &progress)?;
-    let owned = state.inner().clone();
+    let saved = desired.map_or(Ok(()), |desired| {
+        super::desired_state::save(&state.data_root(), &desired)
+    });
+    if let Err(error) = saved {
+        progress.state = "failed".into();
+        progress.phase = "failed".into();
+        progress.message = Some(error.to_string());
+        let _ = super::operation::save(&state.data_root(), &progress);
+        return Err(error);
+    }
+    let owned = state.clone();
     tauri::async_runtime::spawn(async move {
         let _registration = registration;
         let mut running = progress;
@@ -470,6 +515,8 @@ pub async fn apply_remote_deployment(
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
     off_main_thread(&state, move |state| {
         let operation_id = ulid::Ulid::new().to_string();
+        let _control = super::converge_control::register(&operation_id, &host_id)?;
+        let registration = super::converge_control::Registration(operation_id.clone());
         let progress = crate::remote::RemoteOperationProgress::queued(
             operation_id.clone(),
             host_id.clone(),
@@ -478,6 +525,7 @@ pub async fn apply_remote_deployment(
         crate::remote::operation::save(&state.data_root(), &progress)?;
         let owned = state.clone();
         tauri::async_runtime::spawn(async move {
+            let _registration = registration;
             let mut running = progress;
             running.phase = "applying".into();
             running.percent = 10;
@@ -582,6 +630,8 @@ pub async fn restore_remote_host(
     host_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
     let operation_id = format!("one-click-restore-{}", ulid::Ulid::new());
+    let _control = super::converge_control::register(&operation_id, &host_id)?;
+    let registration = super::converge_control::Registration(operation_id.clone());
     let progress = crate::remote::RemoteOperationProgress::queued(
         operation_id.clone(),
         host_id.clone(),
@@ -591,6 +641,7 @@ pub async fn restore_remote_host(
     let owned = state.inner().clone();
     let task_operation_id = operation_id.clone();
     tauri::async_runtime::spawn(async move {
+        let _registration = registration;
         let mut running = progress;
         let progress_root = owned.data_root();
         let result = crate::remote::restore::one_click_restore(
@@ -1118,6 +1169,18 @@ pub async fn remote_session_summary(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_update_refuses_a_running_deployment_before_writing_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::with_data_dir(temp.path().to_path_buf());
+        let id = format!("models-busy-{}", ulid::Ulid::new());
+        let _control = super::super::converge_control::register(&id, &id).unwrap();
+        let _registration = super::super::converge_control::Registration(id.clone());
+        let result = super::start_converge(&state, &id, Some(vec!["official".into()]));
+        assert_eq!(result.unwrap_err().to_string(), "DeploymentAlreadyRunning");
+        assert!(!temp.path().join("remote-desired-state").exists());
+        assert!(!temp.path().join("remote-operations").exists());
+    }
     #[test]
     fn deployment_control_refuses_wrong_host_kind_or_finished_operation() {
         let temp = tempfile::tempdir().unwrap();

@@ -382,6 +382,8 @@ pub fn run() {
             remote::commands::discard_remote_handoff,
             remote::commands::acknowledge_remote_handoff,
             remote::commands::bootstrap_remote_host,
+            remote::commands::list_remote_host_models,
+            remote::commands::update_remote_host_models,
             remote::commands::cancel_remote_deployment,
             remote::commands::confirm_remote_deployment_takeover,
             remote::commands::plan_remote_deployment,

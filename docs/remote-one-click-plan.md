@@ -437,8 +437,16 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
 沿用「重寫本」的理由是每次部署都在修訂同一台主機，既有狀態與新進度應該接續可讀，
 不需要英雄區、等重卡片或流程方塊來重新包裝。
 
-第一段只替換工作面，舊的診斷、信任、維護與其他區塊暫時保留；待四語預覽確認後，
-第二段才收進進階並移除被 converge 吸收的維護入口。
+第一段只替換工作面並保留其他區塊，概念已經 Joe 確認。第二段將失敗收斂為一個
+remedy，失敗期間主按鈕停用；原始錯誤位於工作面下方預設關閉的「詳細資料」。
+遙控身分、執行帳號、Grok、主機與執行緒資料收進預設關閉的「進階」，只保留重新
+部署與診斷包作為進階維護入口，Restore 仍在危險區。
+
+模型 API 是本階段核准的後端擴充：`list_remote_host_models` 只讀本機可部署模型與
+主機既有意圖，不建立 plan、不寫 desired state；`update_remote_host_models` 先取得
+與部署／還原共用的主機作業註冊，忙碌就回 `DeploymentAlreadyRunning`，驗證 mandatory
+與合格模型後僅改模型意圖，保留原 policy overrides，再走既有 controlled converge
+（包括 preflight、等待閒置、接手確認與 verify）。前端不再組合 plan／apply 來部署。
 
 - 工作面只剩：狀態一句話、主要按鈕（部署／重新部署）、進度、失敗時的單一
   remedy。Plan 按鈕拿掉；模型選擇改成部署後「這台可用的模型」清單，可增減並自動

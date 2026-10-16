@@ -1,13 +1,15 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "remoteModels": { "title": "这台主机可用的模型", "hint": "更改后会等待主机空闲并自动部署，沿用这台主机已有的策略设置。", "failed": "无法读取或更新模型。请查看详细信息；这次选择尚未确认。", "empty": "目前没有合格模型。请先在本机设置提供商，再重新部署。", "mandatory": "必要模型" },
   "remoteWork": {
+    "advanced": "高级", "details": "详细信息",
     "redeploy": "重新部署",
     "label": "部署工作区", "pending": "这台主机正等待部署。",
     "running": "正在将这台主机收敛到期望状态。", "failed": "部署需要你处理一件事，才能继续。",
     "readyOnDemand": "已就绪；SSH 连接时会恢复服务，并由主机上的监督程序维持运行。",
     "progress": "部署进度", "retryHint": "这次操作未完成，请沿用相同设置重试。",
-    "inspect": "查看下方详细信息，处理这个条件后再部署。", "nextAction": "下一步：{{action}}"
+    "inspect": "查看下方详细信息并处理这个条件，再点击“重新扫描”后部署。", "nextAction": "下一步：{{action}}"
   },
   "remoteAdd": { "title": "新增 SSH 主机", "description": "输入现有 SSH 登录地址。Vellum 只保存私有 alias；你的 ssh config 与 known_hosts 保持原样。", "destination": "SSH 登录地址", "add": "新增主机", "adding": "新增中……", "saving": "正在保存私有 SSH alias……", "failed": "无法新增主机，请使用 user@host[:port] 格式并查看详细信息。", "saved": "主机已新增，确认信任后即可部署。", "loginHint": "首次安装需要你原有的 SSH key。如果目前只能用密码登录，请打开终端配置自己的公钥登录；Vellum 不会接收密码。", "keyHint": "终端有 ssh-copy-id 时（例如 Unix 终端），可运行此命令安装你自己的默认公钥；否则请用常用 SSH 工具配置密钥登录，然后刷新主机。isolation key 会在部署创建 wrapper 后安装。", "copyInstall": "复制密钥配置命令", "copyLogin": "复制登录命令", "copyFailed": "无法复制，请选中命令后手动复制。", "trustReused": "沿用你先前的信任", "trustReusedHint": "扫描到的主机 key 与你的 known_hosts 完全相同，仅此 key 已保存到 Vellum 私有文件，无需再次确认。" },
   "handoff": {

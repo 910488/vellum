@@ -1503,6 +1503,8 @@ export interface RemoteSessionSummary {
   }>;
 }
 
+export type RemoteModelOption = RemoteDeploymentPlan["selectedModels"][number];
+
 export interface RemoteOperationProgress {
   operationId: string;
   hostId: string;

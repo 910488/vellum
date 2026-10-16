@@ -1,13 +1,15 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "remoteModels": { "title": "Models available on this host", "hint": "Changes deploy automatically when the host is idle. Existing host policies are preserved.", "failed": "Could not load or update models. Check the details; the selection has not been confirmed.", "empty": "No qualified models are available yet. Configure a provider locally, then redeploy.", "mandatory": "Required" },
   "remoteWork": {
+    "advanced": "Advanced", "details": "Details",
     "redeploy": "Redeploy",
     "label": "Deployment work surface", "pending": "This host is waiting for deployment.",
     "running": "Bringing this host to the desired state.", "failed": "Deployment needs your attention before continuing.",
     "readyOnDemand": "Ready; services recover on SSH connection and are supervised on this host.",
     "progress": "Deployment progress", "retryHint": "The operation did not finish; retry it using the same settings.",
-    "inspect": "Check the details below and resolve this condition before deploying again.", "nextAction": "Next: {{action}}"
+    "inspect": "Check the details below, resolve this condition, then rescan before deploying again.", "nextAction": "Next: {{action}}"
   },
   "remoteAdd": { "title": "Add an SSH host", "description": "Enter an existing SSH login. Vellum saves a private alias; your SSH config and known_hosts stay unchanged.", "destination": "SSH destination", "add": "Add host", "adding": "Adding…", "saving": "Saving the private SSH alias…", "failed": "The host could not be added. Use user@host[:port] and check the details.", "saved": "Host added. Confirm trust, then deploy.", "loginHint": "First installation needs your existing SSH key. If only password login works, open a terminal and set up your own public key there. Vellum never receives your password.", "keyHint": "With ssh-copy-id available (for example in a Unix terminal), run this to install your own default public key. Otherwise configure key login with your SSH tools. Refresh this host afterwards. The isolation key is installed by deployment once its wrapper exists.", "copyInstall": "Copy key setup command", "copyLogin": "Copy login command", "copyFailed": "Could not copy. Select the command and copy it manually.", "trustReused": "Using your previous trust", "trustReusedHint": "The scanned host key exactly matches your user known_hosts. Only this key was saved in Vellum's private store; no confirmation is needed." },
   "handoff": {
