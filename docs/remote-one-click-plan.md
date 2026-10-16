@@ -175,8 +175,11 @@ linger／Codex lifecycle 寫入前重查上述項目。回報 autoFix 清單，C
 涵蓋全新主機被拒時沒有本次部署寫入呼叫，既有 recovery hook 保持不變。
 active work／App-owned 的等待與取消、接手確認見第六段。
 
-第六段（待協調者驗證）：一鍵部署遇到 active turn／工具／核准或觀察不完整時，
-維持 waitingForIdle 並每兩秒觀察，可取消；App-owned 閒置後進入 awaitingTakeover，
+第六段（67905d7 測試通過，審查修正待驗證）：一鍵部署遇到 active turn／工具／核准時，
+維持 waitingForIdle 並每兩秒觀察，可取消；缺少 native／session 觀察資料則進入 observing，
+連續 30 秒仍無法觀察時，以 incompleteObservation 附原因退出。bootstrap 與等待觀察結果
+不一致時，同一 blocker 重現就原樣退出；不同 blocker 最多重試三次，每次均先經過可取消
+的等待 tick，避免完整 SSH inspect 熱迴圈。App-owned 閒置後進入 awaitingTakeover，
 使用者一次確認後沿用 stopAppOwned 的 ownership／觀察檢查。確認 token 綁定目前
 operation、host、PID、daemon identity 與 CODEX_HOME；程序或活動改變就撤銷確認。
 Agent 以 additive optional expectedDaemonPid／expectedDaemonIdentity 再核對一次，

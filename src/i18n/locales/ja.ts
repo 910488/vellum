@@ -661,6 +661,7 @@ const ja: ResourceTree = {
       "hostPreflight": "プラットフォーム・認証情報・デプロイファイルを確認",
       "autoFix": "デプロイに必要な修復を適用",
       "waitingForIdle": "Codex のターン・ツール・承認待ち操作の終了を待機",
+      "observing": "Codex の状態を確認中。30 秒間取得できなければデプロイを停止します",
       "awaitingTakeover": "Codex は待機中です。引き継ぎを確認するとデプロイを続行します",
       "cancelled": "デプロイをキャンセルしました",
       "resolvingDesktopCodex": "Desktop と一致する Codex runtime を解決・検証",

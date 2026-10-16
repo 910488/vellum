@@ -28,7 +28,7 @@ export function convergePairingSuggested(result: unknown): boolean {
 
 export function deploymentWaitControls(operation: { hostId: string; kind: string; state: string; phase: string; result: unknown } | null | undefined, hostId: string | null): { cancel: boolean; token: string | null } {
   if (!operation || operation.hostId !== hostId || operation.kind !== "oneClickBootstrap" || operation.state !== "running"
-    || !["waitingForIdle", "awaitingTakeover"].includes(operation.phase)) return { cancel: false, token: null };
+    || !["observing", "waitingForIdle", "awaitingTakeover"].includes(operation.phase)) return { cancel: false, token: null };
   const result = operation.result;
   const token = operation.phase === "awaitingTakeover" && typeof result === "object" && result !== null && "takeoverToken" in result
     && typeof result.takeoverToken === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(result.takeoverToken) ? result.takeoverToken : null;
@@ -304,6 +304,7 @@ const PHASES = new Set([
   "hostPreflight",
   "autoFix",
   "waitingForIdle",
+  "observing",
   "awaitingTakeover",
   "cancelled",
   "resolvingDesktopCodex",

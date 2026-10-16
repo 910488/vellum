@@ -692,6 +692,7 @@ const en: ResourceTree = {
       "hostPreflight": "Checking platform, credentials and deployment files",
       "autoFix": "Applying deployment repairs",
       "waitingForIdle": "Waiting for Codex turns, tools and approvals to finish",
+      "observing": "Reading Codex status; deployment stops if it remains unavailable for 30 seconds",
       "awaitingTakeover": "Codex is idle. Confirm takeover to continue deployment",
       "cancelled": "Deployment cancelled",
       "resolvingDesktopCodex": "Resolving and qualifying the Desktop-matched Codex runtime",

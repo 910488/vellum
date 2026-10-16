@@ -5,6 +5,7 @@ describe("Linux process start-time prerequisites", () => {
   it("shows wait controls only for this host's live deployment and a valid confirmation token", () => {
     const operation = { hostId: "host", kind: "oneClickBootstrap", state: "running", phase: "waitingForIdle", result: null as unknown };
     expect(deploymentWaitControls(operation, "host")).toEqual({ cancel: true, token: null });
+    expect(deploymentWaitControls({ ...operation, phase: "observing" }, "host")).toEqual({ cancel: true, token: null });
     const token = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const confirm = { ...operation, phase: "awaitingTakeover", result: { takeoverToken: token } };
     expect(deploymentWaitControls(confirm, "host")).toEqual({ cancel: true, token });
@@ -14,7 +15,7 @@ describe("Linux process start-time prerequisites", () => {
     }
     expect(deploymentWaitControls(confirm, "another")).toEqual({ cancel: false, token: null });
     expect(deploymentWaitControls(null, "host")).toEqual({ cancel: false, token: null });
-    for (const phase of ["waitingForIdle", "awaitingTakeover", "cancelled"]) expect(phaseKey(phase)).toBe(`remote.phase.${phase}`);
+    for (const phase of ["observing", "waitingForIdle", "awaitingTakeover", "cancelled"]) expect(phaseKey(phase)).toBe(`remote.phase.${phase}`);
   });
 
   it("extracts only the ps blocker repair from a multi-blocker reply", () => {

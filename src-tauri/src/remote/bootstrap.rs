@@ -415,12 +415,21 @@ async fn wait_for_idle(
     control: &super::converge_control::DeploymentControl,
     progress: &mut impl FnMut(&str, u8, &str),
 ) -> AppResult<bool> {
-    use super::converge_control::{step, WaitStep};
+    use super::converge_control::{step, ObservationDeadline, WaitStep};
     let client = NativeWaitClient { client };
+    let started = std::time::Instant::now();
+    let mut deadline = ObservationDeadline::default();
     loop {
-        match step(control, &client)? {
+        let next = step(control, &client)?;
+        deadline.check(&next, started.elapsed())?;
+        match next {
             WaitStep::Ready => return Ok(false),
             WaitStep::TookOver => return Ok(true),
+            WaitStep::Observing => progress(
+                "observing",
+                7,
+                "Reading Codex daemon, turn, tool and approval status (up to 30 seconds)",
+            ),
             WaitStep::WaitingForIdle => progress(
                 "waitingForIdle",
                 7,
@@ -442,43 +451,55 @@ async fn prepare_with_control(
     progress: &mut impl FnMut(&str, u8, &str),
     control: Option<&super::converge_control::DeploymentControl>,
 ) -> AppResult<BootstrapResult> {
-    loop {
-        check_cancelled(control)?;
-        let result = bootstrap_with_progress(
-            state,
-            host_id,
-            |_| {
-                check_cancelled(control)?;
-                progress("autoFix", 10, "Converging approved deployment repairs");
-                Ok(())
-            },
-            control,
-        );
-        match result {
-            Err(error)
-                if control.is_some()
-                    && [
-                        "activeWorkInProgress",
-                        "activeTurnInProgress",
-                        "nativeDaemonAppOwned",
-                        "incompleteObservation",
-                    ]
-                    .iter()
-                    .any(|code| error.to_string().contains(code)) =>
-            {
-                let client =
-                    RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
-                wait_for_idle(
-                    &client,
-                    control
-                        .ok_or_else(|| AppError::Message("DeploymentControlUnavailable".into()))?,
-                    progress,
-                )
-                .await?;
-            }
-            result => return result,
+    struct Preparation<'a, P> {
+        state: &'a AppState,
+        host_id: &'a str,
+        progress: &'a mut P,
+        control: Option<&'a super::converge_control::DeploymentControl>,
+    }
+    impl<P: FnMut(&str, u8, &str)> super::converge_control::PreparationClient for Preparation<'_, P> {
+        type Output = BootstrapResult;
+        fn prepare(&mut self) -> AppResult<BootstrapResult> {
+            let control = self.control;
+            check_cancelled(control)?;
+            bootstrap_with_progress(
+                self.state,
+                self.host_id,
+                |_| {
+                    check_cancelled(control)?;
+                    (self.progress)("autoFix", 10, "Converging approved deployment repairs");
+                    Ok(())
+                },
+                control,
+            )
+        }
+        async fn wait_for_retry(&mut self) -> AppResult<()> {
+            let control = self
+                .control
+                .ok_or_else(|| AppError::Message("DeploymentControlUnavailable".into()))?;
+            control.check()?;
+            control.wait().await;
+            control.check()?;
+            let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(
+                self.state,
+                self.host_id,
+            )?);
+            wait_for_idle(&client, control, self.progress).await?;
+            Ok(())
         }
     }
+    // Non-interactive callers retain the original error without waiting.
+    let mut preparation = Preparation {
+        state,
+        host_id,
+        progress,
+        control,
+    };
+    if control.is_none() {
+        use super::converge_control::PreparationClient;
+        return preparation.prepare();
+    }
+    super::converge_control::prepare_bounded(&mut preparation).await
 }
 
 struct BootstrapContext {

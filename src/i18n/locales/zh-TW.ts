@@ -716,6 +716,7 @@ const zhTW: ResourceTree = {
       "hostPreflight": "檢查平台、憑證與部署檔案",
       "autoFix": "套用部署修復",
       "waitingForIdle": "等待 Codex 目前這輪、工具與核准操作結束",
+      "observing": "正在讀取 Codex 狀態；連續 30 秒無法讀取就會停止部署",
       "awaitingTakeover": "Codex 已閒置，確認接手後會繼續部署",
       "cancelled": "已取消部署",
       "resolvingDesktopCodex": "解析並驗證與 Desktop 相符的 Codex runtime",

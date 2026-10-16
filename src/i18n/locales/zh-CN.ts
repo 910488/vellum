@@ -661,6 +661,7 @@ const zhCN: ResourceTree = {
       "hostPreflight": "检查平台、凭证与部署文件",
       "autoFix": "应用部署修复",
       "waitingForIdle": "等待 Codex 当前这轮、工具与批准操作结束",
+      "observing": "正在读取 Codex 状态；连续 30 秒无法读取就会停止部署",
       "awaitingTakeover": "Codex 已空闲，确认接手后会继续部署",
       "cancelled": "已取消部署",
       "resolvingDesktopCodex": "解析并验证与 Desktop 相符的 Codex runtime",

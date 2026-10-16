@@ -122,9 +122,64 @@ pub(crate) trait WaitClient {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WaitStep {
     Ready,
+    Observing,
     WaitingForIdle,
     AwaitingTakeover,
     TookOver,
+}
+
+/// A missing observation is bounded separately from legitimately active work.
+#[derive(Default)]
+pub(crate) struct ObservationDeadline {
+    missing_since: Option<std::time::Duration>,
+}
+impl ObservationDeadline {
+    pub fn check(&mut self, step: &WaitStep, elapsed: std::time::Duration) -> AppResult<()> {
+        if *step != WaitStep::Observing {
+            self.missing_since = None;
+        } else {
+            let since = *self.missing_since.get_or_insert(elapsed);
+            if elapsed.saturating_sub(since) >= std::time::Duration::from_secs(30) {
+                return Err(AppError::Message(
+                    "incompleteObservation: unable to observe Codex daemon, turns, tools or approvals for 30 seconds".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) trait PreparationClient {
+    type Output;
+    fn prepare(&mut self) -> AppResult<Self::Output>;
+    /// Must include a cancellable tick even when the observation is already ready.
+    async fn wait_for_retry(&mut self) -> AppResult<()>;
+}
+
+pub(crate) async fn prepare_bounded<C: PreparationClient>(client: &mut C) -> AppResult<C::Output> {
+    let mut previous_blocker = None;
+    // At most three retries, even if inconsistent observers alternate blockers.
+    for attempt in 0..=3 {
+        let error = match client.prepare() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        let blocker = [
+            "activeWorkInProgress",
+            "activeTurnInProgress",
+            "nativeDaemonAppOwned",
+            "incompleteObservation",
+        ]
+        .into_iter()
+        .find(|code| message.contains(code));
+        if blocker.is_none() || blocker == previous_blocker || attempt == 3 {
+            return Err(error);
+        }
+        previous_blocker = blocker;
+        client.wait_for_retry().await?;
+    }
+    unreachable!("bounded preparation returns on its last attempt")
 }
 
 fn fingerprint(native: &Value) -> Option<String> {
@@ -147,7 +202,7 @@ pub(crate) fn step(control: &DeploymentControl, client: &dyn WaitClient) -> AppR
     let native = status.get("nativeCodex");
     if native.is_none_or(Value::is_null) {
         control.clear_consent();
-        return Ok(WaitStep::WaitingForIdle);
+        return Ok(WaitStep::Observing);
     }
     if native
         .and_then(|native| native.get("daemonRunning"))
@@ -157,9 +212,15 @@ pub(crate) fn step(control: &DeploymentControl, client: &dyn WaitClient) -> AppR
         control.clear_consent();
         return Ok(WaitStep::Ready);
     }
-    if super::observation::require_idle_for_destructive_op(sessions.as_ref(), native).is_err() {
+    if let Err(code) =
+        super::observation::require_idle_for_destructive_op(sessions.as_ref(), native)
+    {
         control.clear_consent();
-        return Ok(WaitStep::WaitingForIdle);
+        return Ok(if code == "incompleteObservation" {
+            WaitStep::Observing
+        } else {
+            WaitStep::WaitingForIdle
+        });
     }
     let native = native.ok_or_else(|| AppError::Message("incompleteObservation".into()))?;
     if native.get("restartSafe").and_then(Value::as_bool) == Some(true) {
@@ -197,6 +258,109 @@ pub(crate) fn step(control: &DeploymentControl, client: &dyn WaitClient) -> AppR
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[tokio::test]
+    async fn inconsistent_prepare_and_ready_observation_stop_after_one_waited_retry() {
+        struct FakePreparation {
+            attempts: usize,
+            ticks: usize,
+            alternating: bool,
+        }
+        impl PreparationClient for FakePreparation {
+            type Output = ();
+            fn prepare(&mut self) -> AppResult<()> {
+                self.attempts += 1;
+                let code = if self.alternating && self.attempts.is_multiple_of(2) {
+                    "incompleteObservation"
+                } else {
+                    "nativeDaemonAppOwned"
+                };
+                Err(AppError::Message(format!(
+                    "{code}: original prepare failure"
+                )))
+            }
+            async fn wait_for_retry(&mut self) -> AppResult<()> {
+                // Fake the cancellable tick without sleeping in unit tests.
+                self.ticks += 1;
+                let client = FakeClient::idle();
+                client.status.borrow_mut()["nativeCodex"]["restartSafe"] = true.into();
+                assert_eq!(
+                    step(&DeploymentControl::new("host"), &client)?,
+                    WaitStep::Ready
+                );
+                client.status.borrow_mut()["nativeCodex"]["daemonRunning"] = false.into();
+                assert_eq!(
+                    step(&DeploymentControl::new("host"), &client)?,
+                    WaitStep::Ready
+                );
+                Ok(())
+            }
+        }
+        let mut client = FakePreparation {
+            attempts: 0,
+            ticks: 0,
+            alternating: false,
+        };
+        assert_eq!(
+            prepare_bounded(&mut client).await.unwrap_err().to_string(),
+            "nativeDaemonAppOwned: original prepare failure"
+        );
+        assert_eq!((client.attempts, client.ticks), (2, 1));
+        client = FakePreparation {
+            attempts: 0,
+            ticks: 0,
+            alternating: true,
+        };
+        assert_eq!(
+            prepare_bounded(&mut client).await.unwrap_err().to_string(),
+            "incompleteObservation: original prepare failure"
+        );
+        assert_eq!((client.attempts, client.ticks), (4, 3));
+    }
+
+    #[test]
+    fn missing_native_state_times_out_and_recovered_observation_resets_deadline() {
+        use std::time::Duration;
+        for status in [
+            serde_json::json!({}),
+            serde_json::json!({"nativeCodex": null}),
+        ] {
+            let client = FakeClient::idle();
+            *client.status.borrow_mut() = status;
+            let control = DeploymentControl::new("host");
+            let mut deadline = ObservationDeadline::default();
+            for seconds in [0, 2, 28, 29] {
+                let next = step(&control, &client).unwrap();
+                assert_eq!(next, WaitStep::Observing);
+                deadline.check(&next, Duration::from_secs(seconds)).unwrap();
+            }
+            let error = deadline
+                .check(&step(&control, &client).unwrap(), Duration::from_secs(30))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("incompleteObservation"));
+            assert!(error.contains("unable to observe Codex"));
+            assert!(client.stops.borrow().is_empty());
+            assert!(control.token().is_none());
+            deadline
+                .check(&WaitStep::WaitingForIdle, Duration::from_secs(31))
+                .unwrap();
+            deadline
+                .check(&WaitStep::Observing, Duration::from_secs(60))
+                .unwrap();
+            deadline
+                .check(&WaitStep::Observing, Duration::from_secs(89))
+                .unwrap();
+            assert!(deadline
+                .check(&WaitStep::Observing, Duration::from_secs(90))
+                .is_err());
+            control.cancel();
+            assert_eq!(
+                step(&control, &client).unwrap_err().to_string(),
+                "DeploymentCancelled"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn cancel_wakes_the_wait_without_waiting_for_another_tick() {
@@ -259,10 +423,10 @@ mod tests {
         let client = FakeClient::idle();
         *client.sessions.borrow_mut() = None;
         let control = DeploymentControl::new("host");
-        assert_eq!(step(&control, &client).unwrap(), WaitStep::WaitingForIdle);
+        assert_eq!(step(&control, &client).unwrap(), WaitStep::Observing);
         assert!(client.stops.borrow().is_empty());
         *client.status.borrow_mut() = serde_json::json!({"nativeCodex": null});
-        assert_eq!(step(&control, &client).unwrap(), WaitStep::WaitingForIdle);
+        assert_eq!(step(&control, &client).unwrap(), WaitStep::Observing);
     }
     #[test]
     fn idle_takeover_needs_one_confirmation_and_passes_exact_identity_to_agent() {
