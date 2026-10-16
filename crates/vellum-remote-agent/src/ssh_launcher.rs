@@ -2,6 +2,11 @@
 //!
 //! The wrapper sets `CODEX_HOME` / `CODEX_INSTALL_DIR` for that key's sessions
 //! and leaves scp/sftp/rsync usable. It never rewrites `~/.codex`.
+//!
+//! Compatibility helper for agent library consumers. Production Desktop
+//! provisioning uses src-tauri/src/remote/ssh_isolation.rs instead. Keep the
+//! shell body in sync, and construct remote paths with POSIX separators on
+//! every Desktop/test OS.
 
 use std::path::Path;
 
@@ -28,7 +33,7 @@ case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
         home = shell_single_quote(&codex_home.to_string_lossy()),
         install = shell_single_quote(&install_dir.to_string_lossy()),
         extra = shell_single_quote(&extra_path.to_string_lossy()),
-        agent = shell_single_quote(&extra_path.join("vellum-remote-agent").to_string_lossy()),
+        agent = shell_single_quote(&format!("{}/vellum-remote-agent", extra_path.to_string_lossy().trim_end_matches('/'))),
     )
 }
 

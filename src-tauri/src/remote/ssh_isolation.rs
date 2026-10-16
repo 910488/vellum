@@ -25,6 +25,15 @@ pub struct AppliedIsolation {
     pub authorized_keys: String,
 }
 
+impl AppliedIsolation {
+    /// Converge always uploads the newly rendered wrapper, including when an
+    /// older managed version already exists. stdin is the wrapper payload.
+    pub fn wrapper_upload_command(&self) -> String {
+        let path = shell_single_quote(&self.wrapper_path);
+        format!("umask 077; mkdir -p \"$(dirname {path})\" && cat > {path} && chmod 0700 {path}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolationApplyRequest<'a> {
     pub ssh_config_path: &'a Path,
@@ -125,6 +134,9 @@ pub fn managed_ssh_wrapper_contents(
 export CODEX_HOME={home}\n\
 export CODEX_INSTALL_DIR={install}\n\
 export PATH={install}:{extra}:\"$PATH\"\n\
+if [ -x {agent} ]; then\n\
+  {agent} ensure-services </dev/null >/dev/null || printf '%s\\n' 'Vellum service recovery failed; inspect the remote supervisor logs.' >&2\n\
+fi\n\
 case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
   \"\") exec \"${{SHELL:-/bin/bash}}\" -l ;;\n\
   scp\\ *|scp|sftp*|rsync\\ *|/usr/libexec/sftp-server*) exec \"${{SHELL:-/bin/bash}}\" -c \"$SSH_ORIGINAL_COMMAND\" ;;\n\
@@ -132,6 +144,7 @@ case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
         home = shell_single_quote(codex_home),
         install = shell_single_quote(install_dir),
         extra = shell_single_quote(extra_path),
+        agent = shell_single_quote(&remote_posix_join(extra_path, "vellum-remote-agent")),
     )
 }
 
@@ -456,6 +469,52 @@ mod tests {
             parse_user_host_port("joshhuang@100.78.101.55").unwrap(),
             ("joshhuang".into(), "100.78.101.55".into(), 22)
         );
+    }
+
+    #[test]
+    fn reapply_refreshes_wrapper_payload_and_reuses_managed_key_and_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let identity = temp.path().join("identity");
+        let request = IsolationApplyRequest {
+            ssh_config_path: &config,
+            identity_file: &identity,
+            host_id: "linux-host",
+            hostname: "example.test",
+            user: "remote",
+            port: 22,
+            public_key: "ssh-ed25519 AAAAMANAGED vellum",
+            managed_codex_home: "/home/remote/.vellum-remote/codex",
+            install_dir: "/home/remote/.vellum-remote/codex/packages/standalone/current",
+            extra_path: "/home/remote/.local/bin/",
+            existing_authorized_keys: "ssh-ed25519 AAAAUSER mine\n",
+        };
+        let first = apply_managed_ssh_isolation(request.clone()).unwrap();
+        let ssh_config = fs::read_to_string(&config).unwrap();
+        // The existing key retains its wrapper path. Converge must still
+        // upload the complete new payload, including the recovery hook.
+        let next = apply_managed_ssh_isolation(IsolationApplyRequest {
+            existing_authorized_keys: &first.authorized_keys,
+            ..request
+        })
+        .unwrap();
+        assert_eq!(next.wrapper_path, first.wrapper_path);
+        assert_eq!(next.alias, first.alias);
+        assert_eq!(next.authorized_keys, first.authorized_keys);
+        assert_eq!(fs::read_to_string(&config).unwrap(), ssh_config);
+        assert!(next.wrapper_contents.contains(
+            "'/home/remote/.local/bin/vellum-remote-agent' ensure-services </dev/null >/dev/null"
+        ));
+        assert!(
+            next.wrapper_contents.find("ensure-services").unwrap()
+                < next.wrapper_contents.find("SSH_ORIGINAL_COMMAND").unwrap()
+        );
+        let upload = next.wrapper_upload_command();
+        assert!(upload.contains("&& cat > '/home/remote/.vellum-remote/ssh-wrapper' && chmod 0700"));
+        assert!(!upload.contains("if "));
+        let bootstrap = include_str!("bootstrap.rs");
+        assert!(bootstrap.contains("applied.wrapper_contents.as_bytes(),"));
+        assert!(bootstrap.contains("&applied.wrapper_upload_command(),"));
     }
 
     #[test]

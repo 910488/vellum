@@ -370,13 +370,20 @@ impl OnDemandClient {
 
     /// Called by the dedicated SSH wrapper. Does not enable a stopped install.
     pub fn ensure_enabled(&self) -> Result<(), String> {
-        let _guard = crate::mutation_lock::HostMutationGuard::acquire(&self.paths.mutation_lock)?;
+        let Some(_guard) =
+            crate::mutation_lock::HostMutationGuard::try_acquire(&self.paths.mutation_lock)?
+        else {
+            return Ok(());
+        };
         if !self.enabled_path().is_file() {
             return Ok(());
         }
-        let _launch = crate::mutation_lock::HostMutationGuard::acquire(
+        let Some(_launch) = crate::mutation_lock::HostMutationGuard::try_acquire(
             self.paths.agent_dir.join("on-demand-launch.lock"),
-        )?;
+        )?
+        else {
+            return Ok(());
+        };
         ensure_process(self.client.as_ref(), &self.proxy_spec()?, &self.pid_path())?;
         self.ensure_supervisor()
     }
@@ -575,6 +582,24 @@ mod tests {
         );
         service.write_service(&spec, temp.path()).unwrap();
         (temp, service, fake)
+    }
+
+    #[test]
+    fn reconnect_skips_busy_locks_without_spawning_or_waiting() {
+        let (temp, service, fake) = fixture();
+        service.load_agent("user", temp.path()).unwrap();
+        fake.live.lock().unwrap().clear();
+        let launch_lock = service.paths.agent_dir.join("on-demand-launch.lock");
+        for lock in [&service.paths.mutation_lock, &launch_lock] {
+            let guard = crate::mutation_lock::HostMutationGuard::acquire(lock).unwrap();
+            let started = std::time::Instant::now();
+            service.ensure_enabled().unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(fake.spawned.lock().unwrap().len(), 2);
+            drop(guard);
+        }
+        service.ensure_enabled().unwrap();
+        assert_eq!(fake.spawned.lock().unwrap().len(), 4);
     }
 
     #[test]

@@ -676,14 +676,11 @@ fn install_managed_ssh_isolation(
         },
     )
     .map_err(AppError::Message)?;
-    let wrapper_quoted = crate::remote::digest::shell_single_quote(&applied.wrapper_path);
     ssh_script(
         data_root,
         alias,
         applied.wrapper_contents.as_bytes(),
-        &format!(
-            "umask 077; mkdir -p \"$(dirname {wrapper_quoted})\" && cat > {wrapper_quoted} && chmod 0700 {wrapper_quoted}"
-        ),
+        &applied.wrapper_upload_command(),
     )?;
     ssh_script(
         data_root,
