@@ -215,14 +215,20 @@ pub fn strict_host_key_args(data_root: &Path) -> Vec<String> {
         "-o".into(),
         "StrictHostKeyChecking=yes".into(),
         "-o".into(),
-        format!(
-            "UserKnownHostsFile=\"{}\"",
-            known_hosts_path(data_root)
-                .to_string_lossy()
-                .replace('\\', "/")
-                .replace('"', "\\\"")
-        ),
+        known_hosts_option(&known_hosts_path(data_root)),
     ]
+}
+
+fn known_hosts_option(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    // ssh_config tokenization understands single quotes. They survive both
+    // Win32 and MSYS argv without Rust's Windows double-quote escaping.
+    let value = if value.chars().any(char::is_whitespace) || value.contains(['\'', '"']) {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        value
+    };
+    format!("UserKnownHostsFile={value}")
 }
 /// User HostKeyAlias is respected when consulting their trust, but Vellum's
 /// private store always pins the resolved endpoint (including its port).
@@ -389,38 +395,7 @@ fn keyscan_diagnostic(program: &Path, output: &Output) -> String {
 }
 
 fn keyscan_programs() -> Vec<PathBuf> {
-    #[cfg(windows)]
-    let mut programs = Vec::new();
-    #[cfg(not(windows))]
-    let programs = vec![PathBuf::from("ssh-keyscan")];
-    #[cfg(windows)]
-    {
-        // OpenSSH_for_Windows 9.5's ssh-keyscan aborts against otherwise
-        // compatible Ubuntu 22.04 servers that advertise
-        // sntrup761x25519-sha512@openssh.com, even though `ssh` itself
-        // correctly negotiates curve25519. Git for Windows' keyscan does not
-        // have that incompatibility, so prefer it when installed in one of
-        // Git's standard locations. The system tool is only a launch
-        // fallback; a completed Git keyscan is never repeated with it.
-        let mut roots = Vec::new();
-        if let Some(program_files) = std::env::var_os("ProgramFiles") {
-            roots.push(PathBuf::from(program_files).join("Git"));
-        }
-        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
-            roots.push(PathBuf::from(program_files_x86).join("Git"));
-        }
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            roots.push(PathBuf::from(local_app_data).join("Programs").join("Git"));
-        }
-        for root in roots {
-            let candidate = root.join("usr").join("bin").join("ssh-keyscan.exe");
-            if candidate.is_file() && !programs.contains(&candidate) {
-                programs.push(candidate);
-            }
-        }
-        programs.push(PathBuf::from("ssh-keyscan"));
-    }
-    programs
+    vec![crate::process::resolve_ssh_tool("ssh-keyscan")]
 }
 
 /// Pick the single fingerprint to show the user, preferring the strongest
@@ -624,6 +599,65 @@ pub async fn remote_ssh_confirm_fingerprint(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_hosts_options_quote_only_paths_that_need_config_tokenization() {
+        assert_eq!(
+            super::known_hosts_option(std::path::Path::new("E:/data/known_hosts")),
+            "UserKnownHostsFile=E:/data/known_hosts"
+        );
+        assert_eq!(
+            super::known_hosts_option(std::path::Path::new("E:/data with spaces/known_hosts")),
+            "UserKnownHostsFile='E:/data with spaces/known_hosts'"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn known_hosts_option_is_accepted_by_native_and_git_ssh_without_connecting() {
+        let native = crate::process::resolve_ssh_tool("ssh");
+        let git = std::path::PathBuf::from("C:/Program Files/Git/usr/bin/ssh.exe");
+        let mut tested = 0;
+        for program in [native, git].into_iter().filter(|p| p.is_file()) {
+            for path in [
+                "E:/data/known_hosts",
+                "E:/data with spaces/known_hosts",
+                "E:/O'Neil data/known_hosts",
+            ] {
+                let output = super::background_command(&program)
+                    .args([
+                        "-F",
+                        "none",
+                        "-G",
+                        "-o",
+                        "CanonicalizeHostname=no",
+                        "-o",
+                        &super::known_hosts_option(std::path::Path::new(path)),
+                        "host.invalid",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}: {}",
+                    program.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|l| l.starts_with("userknownhostsfile ") && l.contains(path)),
+                    "{}: {}",
+                    program.display(),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+            tested += 1;
+        }
+        assert!(
+            tested >= 1,
+            "install Windows OpenSSH Client to run argv qualification"
+        );
+    }
     use super::*;
 
     /// Cross-checked against a real, locally generated ed25519 key with
@@ -739,11 +773,10 @@ mod tests {
 
         assert!(parse_keyscan_output(&target, stdout).is_empty());
         let programs = keyscan_programs();
-        assert!(programs.contains(&PathBuf::from("ssh-keyscan")));
-        #[cfg(windows)]
-        if programs.iter().any(|program| program.is_absolute()) {
-            assert_ne!(programs[0], PathBuf::from("ssh-keyscan"));
-        }
+        assert_eq!(
+            programs,
+            vec![crate::process::resolve_ssh_tool("ssh-keyscan")]
+        );
     }
 
     #[test]

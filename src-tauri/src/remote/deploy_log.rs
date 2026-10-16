@@ -276,6 +276,9 @@ fn failure_code(message: &str) -> String {
         "proxyConfigurationSchemaTooNew",
         "proxyConfigurationUnreadable",
         "versionMismatch",
+        "windowsOpenSshUnavailable",
+        "NativeProxyRuntimeNotReady",
+        "NativeProxyServiceExited",
     ];
     message
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')

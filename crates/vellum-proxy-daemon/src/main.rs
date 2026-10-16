@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use vellum_proxy_runtime::runtime::bind_and_serve_static;
 use vellum_proxy_runtime::{serve_proxy, ProxyRuntimeConfig, ProxyRuntimeState, StaticProxyState};
+mod log_rotation;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,6 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { config, listen } => {
+            if let Some(root) = std::env::var_os("VELLUM_REMOTE_STATE_ROOT") {
+                log_rotation::start(root.into());
+            }
             let mut cfg = ProxyRuntimeConfig::load(&config)?;
             if let Some(root) = std::env::var_os("VELLUM_REMOTE_STATE_ROOT") {
                 resolve_native_paths(&mut cfg, &std::path::PathBuf::from(root));

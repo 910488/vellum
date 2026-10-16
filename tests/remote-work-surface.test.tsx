@@ -57,6 +57,7 @@ describe("remote deployment presentation", () => {
     ["noModelsSelected", "inspect"],
     ["proxyPortConflict", "inspect"],
     ["unsupportedRemotePlatform", "inspect"],
+    ["windowsOpenSshUnavailable", "inspect"],
     ["CodexDesktopProtocolMismatch", "inspect"],
     ["ProxyMigrationRecoveryFailed", "inspect"],
     ["ProxyMigrationRolledBack", "bootstrap"],

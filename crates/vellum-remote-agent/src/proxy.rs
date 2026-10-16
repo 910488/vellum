@@ -16,9 +16,9 @@ use crate::protocol::{OperationResult, ProxyLogsView, ProxyStatusView};
 use crate::state::{AgentStateStore, InstallRecord};
 
 #[cfg(not(test))]
-const PROXY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const PROXY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
-const PROXY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+pub(crate) const PROXY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ProxyStartRequest {
@@ -1907,6 +1907,26 @@ mod tests {
     }
 
     #[test]
+    fn migration_native_contract_timeout_restores_docker_and_never_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let (native, docker, service) = migration_fixture(&temp);
+        stage_migration(&native, &temp, "stage-timeout").unwrap();
+        *service.ready.lock().unwrap() = false;
+        let error = native
+            .start(ProxyStartRequest {
+                operation_id: "timeout-start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("ProxyMigrationRolledBack"), "{error}");
+        assert!(error.contains("NativeProxyRuntimeNotReady"), "{error}");
+        assert!(service.probes.load(std::sync::atomic::Ordering::Relaxed) > 1);
+        assert!(docker.containers.lock().unwrap()[0].running);
+        assert_eq!(docker.restarted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn migration_recovery_failure_keeps_snapshot_for_retry_after_process_restart() {
         let temp = tempfile::tempdir().unwrap();
         let (native, docker, service) = migration_fixture(&temp);
@@ -2738,6 +2758,8 @@ mod tests {
         assert_eq!(*launchd.log_reads.lock().unwrap(), 1);
 
         *launchd.ready.lock().unwrap() = false;
+        *launchd.ready_after.lock().unwrap() =
+            Some(launchd.probes.load(std::sync::atomic::Ordering::Relaxed) + 2);
         manager.repair("op-n-repair").unwrap();
         assert_eq!(launchd.unloads.lock().unwrap().len(), 1);
         assert_eq!(launchd.loads.lock().unwrap().len(), 2);

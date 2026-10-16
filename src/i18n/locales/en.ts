@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
+  "remoteSsh": { "nativeMissing": "Windows OpenSSH Client is missing. Enable the OpenSSH Client optional feature, then deploy again." },
   "remoteHistory": {
     "label": "Deployment history", "counts": "Last {{count}} deployments: {{succeeded}} succeeded / {{failed}} failed / {{interrupted}} interrupted",
     "blocked": "{{count}} blocked before deployment", "lastFailure": "Latest unsuccessful attempt: {{reason}} ({{code}})",

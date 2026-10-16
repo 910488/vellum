@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
+  "remoteSsh": { "nativeMissing": "Windows OpenSSH クライアントが見つかりません。オプション機能の OpenSSH クライアントを有効にして、再度デプロイしてください。" },
   "remoteHistory": {
     "label": "デプロイ履歴", "counts": "直近 {{count}} 回のデプロイ：成功 {{succeeded}}／失敗 {{failed}}／中断 {{interrupted}}",
     "blocked": "別途 {{count}} 回はデプロイ前に停止", "lastFailure": "直近の未完了の試行：{{reason}}（{{code}}）",

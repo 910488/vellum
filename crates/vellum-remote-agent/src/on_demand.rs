@@ -494,6 +494,7 @@ impl ProxyServiceClient for OnDemandClient {
             running: identity.is_some(),
             pid: identity.as_ref().map(|p| p.pid),
             program: identity.map(|p| p.executable.to_string_lossy().into_owned()),
+            failed: false,
         })
     }
     fn stop_before_replace(&self) -> bool {
@@ -501,6 +502,9 @@ impl ProxyServiceClient for OnDemandClient {
     }
     fn inspect_readyz(&self, port: u16, key: &str) -> Result<bool, String> {
         self.probes.inspect_readyz(port, key)
+    }
+    fn inspect_responses_websocket(&self, port: u16, key: &str) -> Result<bool, String> {
+        self.probes.inspect_responses_websocket(port, key)
     }
     fn port_in_use(&self, port: u16) -> Result<bool, String> {
         self.probes.port_in_use(port)
@@ -571,7 +575,10 @@ mod tests {
         let service = OnDemandClient {
             paths: paths.clone(),
             client: fake.clone(),
-            probes: Arc::new(crate::native_proxy::MemoryLaunchd::default()),
+            probes: Arc::new(crate::native_proxy::MemoryLaunchd {
+                ready: Mutex::new(true),
+                ..Default::default()
+            }),
         };
         let spec = LaunchAgentSpec::new(
             executable,

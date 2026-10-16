@@ -166,6 +166,7 @@ interface BlockerEntry {
 }
 
 const BLOCKERS: Record<string, BlockerEntry> = {
+  windowsOpenSshUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   codexRuntimeIncomplete: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   DeploymentAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
   DeploymentAlreadyRunning: { remedy: null, expectedBeforeBootstrap: false },
@@ -257,6 +258,7 @@ function blockerCode(reason: string): string {
 }
 
 export function describeBlocker(reason: string): RemoteBlocker {
+  if (blockerCode(reason) === "windowsOpenSshUnavailable") return { code: "windowsOpenSshUnavailable", messageKey: "remoteSsh.nativeMissing", remedy: null };
   const code = blockerCode(reason);
   const entry = BLOCKERS[code];
   return {

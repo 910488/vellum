@@ -512,6 +512,9 @@ fn inspect_bootstrap(
     state: &AppState,
     host_id: &str,
 ) -> AppResult<(super::preflight::DeploymentPreflight, BootstrapContext)> {
+    if let Some(code) = crate::process::native_ssh_blocker() {
+        return Err(AppError::Message(format!("OneClickBootstrapBlocked: {code}; repair: enable the Windows OpenSSH Client optional feature")));
+    }
     inspect_bootstrap_with(state, host_id, &SshBootstrapProbe)
 }
 

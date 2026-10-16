@@ -1,6 +1,7 @@
 import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
+  "remoteSsh": { "nativeMissing": "找不到 Windows OpenSSH 用戶端。請啟用「OpenSSH 用戶端」選用功能，再重新部署。" },
   "remoteHistory": {
     "label": "部署紀錄", "counts": "最近 {{count}} 次部署：成功 {{succeeded}}／失敗 {{failed}}／中斷 {{interrupted}}",
     "blocked": "另有 {{count}} 次在部署前擋下", "lastFailure": "最近一次未成功：{{reason}}（{{code}}）",

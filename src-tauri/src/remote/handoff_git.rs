@@ -399,7 +399,9 @@ impl Git {
             return Err(error("HandoffTransportTargetInvalid"));
         }
         let mut ssh_args = vec![
-            "ssh".to_string(),
+            crate::process::resolve_ssh_tool("ssh")
+                .to_string_lossy()
+                .replace('\\', "/"),
             "-T".into(),
             "-o".into(),
             "BatchMode=yes".into(),
