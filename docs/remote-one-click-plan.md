@@ -109,6 +109,14 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
   一次」之類的實際影響，不擋部署。
 - 先查清楚：Codex 自己的 `app-server daemon` 在沒有 systemd user 時怎麼常駐。
   若它本身做不到，`onDemand` 模式下的 durable 判定要跟著調整，不能謊報 detachedReady。
+- 實作分段：所有 Linux 的 `psStartTimeUnavailable` preflight 已於 `8a26b04` 修正。
+  常駐降級段落加入 Agent `supervise`／`ensure-services`：onDemand 的 proxy 與 supervisor
+  都有私有、原子寫入的 PID record，比對 UID、執行檔、argv、啟動時間與 boot ID；
+  SSH 重連只恢復已啟用的服務。停止與 supervisor tick 共用 host mutation lock，避免
+  明確停止後被復活。Codex 只在受管 lease 啟用且沒有執行中的 daemon 時，沿用既有
+  pinned daemon bootstrap／ownership 檢查恢復；不接管 App-owned 程序。
+  `detachedReady` 在 onDemand 下另外要求 `supervisorReady=true`。這段待協調者驗證，
+  不代表已完成 Linux 實機或全 M2 驗收；自動選埠仍接下一段。
 - Proxy port：預設 port 被非受管程序占用時，自動在 15721–15799 內挑一個空的，
   寫入 desired state，catalog／config 的 base_url 跟著走。`proxyPortConflict`
   只在整段範圍都被占時才出現。

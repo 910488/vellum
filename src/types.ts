@@ -1199,6 +1199,7 @@ export interface RemoteHostStatus {
       proxyBackend?: string | null;
       serviceManager?: string | null;
       persistenceScope?: string | null;
+      supervisorReady?: boolean | null;
       managedCodexHome?: string | null;
       guiSessionAvailable?: boolean | null;
     };

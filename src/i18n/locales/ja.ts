@@ -630,7 +630,7 @@ const ja: ResourceTree = {
       "proxyConfigurationMissing": "ホストにはまだ Proxy の設定がありません。",
       "proxyConfigurationSchemaTooNew": "ホスト上の Proxy 設定は、この Vellum が理解できるより新しい形式です。上書きを避けるためデプロイをブロックしています — 先に Vellum を更新してください。",
       "proxyConfigurationUnreadable": "ホスト上の Proxy 設定を読み取れません（権限または I/O の問題）。安全に置き換え可能とみなさず、デプロイをブロックしています。",
-      "systemdUserUnavailable": "ホストに使える user systemd がないため、daemon を常駐させられません。",
+      "systemdUserUnavailable": "user systemd が利用できないため、Agent supervisor を使います。ホスト再起動後に一度再接続してください。",
       "psStartTimeUnavailable": "ホストの ps ではプロセスの開始時刻を取得できないため、Codex daemon を起動できません。修復コマンドで互換性のある ps をインストールしてから、再度デプロイしてください。",
       "versionMismatch": "ホスト上の Agent のバージョンが、この Vellum と一致しません。"
     },
@@ -708,6 +708,7 @@ const ja: ResourceTree = {
       "persistence": "常駐範囲",
       "loginResident": "ログイン後常駐",
       "lingerResident": "systemd linger で常駐",
+      "onDemandResident": "Agent supervisor で常駐。ホスト再起動後に一度再接続が必要",
       "managedHome": "管理対象 CODEX_HOME",
       "isolationLabel": "分離",
       "isolation": "リモート設定は、ローカルの Vellum / Enhanced / ~/.codex と分離されたままです。"

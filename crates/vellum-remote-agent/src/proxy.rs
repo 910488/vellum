@@ -53,7 +53,11 @@ impl ProxyManager {
             crate::native_proxy::ProcessLaunchdClient::domain().unwrap_or_else(|_| "gui/0".into())
         };
         let service: Arc<dyn crate::native_proxy::ProxyServiceClient> = if linux {
-            Arc::new(crate::native_proxy::SystemdUserClient::default())
+            if crate::persistence::probe().systemd_user {
+                Arc::new(crate::native_proxy::SystemdUserClient::default())
+            } else {
+                Arc::new(crate::on_demand::OnDemandClient::new(store.paths().clone()))
+            }
         } else {
             Arc::new(crate::native_proxy::ProcessLaunchdClient)
         };
@@ -897,6 +901,14 @@ impl ProxyManager {
                     .into(),
             );
         }
+        let resume = self.launchd.stop_before_replace()
+            && self
+                .launchd
+                .inspect_agent(
+                    &self.launchd_domain,
+                    crate::native_proxy::LAUNCH_AGENT_LABEL,
+                )?
+                .running;
         let target = crate::native_proxy::native_proxy_bin(self.store.paths());
         std::fs::create_dir_all(target.parent().expect("native binary directory"))
             .map_err(|error| format!("NativeProxyBinaryDirectoryFailed: {error}"))?;
@@ -917,6 +929,25 @@ impl ProxyManager {
                 crate::space::free_bytes_for_path(self.store.paths().root.as_path()),
                 payload,
             )?;
+            if self.launchd.stop_before_replace() {
+                // Reject an invalid staged payload before interrupting a
+                // healthy detached process. install_binary verifies again.
+                crate::update::reject_symlink(Path::new(staged))?;
+                let actual = crate::update::sha256_file(Path::new(staged))?;
+                let expected = expected
+                    .trim()
+                    .strip_prefix("sha256:")
+                    .unwrap_or(expected.trim());
+                if actual != expected {
+                    return Err(format!(
+                        "AgentDigestMismatch: expected {expected}, resolved {actual}"
+                    ));
+                }
+                self.launchd.unload_agent(
+                    &self.launchd_domain,
+                    crate::native_proxy::LAUNCH_AGENT_LABEL,
+                )?;
+            }
             crate::update::install_binary(Path::new(staged), &target, &expected)?;
         }
         let digest = image_digest
@@ -924,6 +955,17 @@ impl ProxyManager {
             .filter(|value| !value.is_empty())
             .or_else(|| crate::native_proxy::digest_native_binary(&target).ok());
         self.install_native_inner(record, digest)?;
+        if resume {
+            let view = crate::native_proxy::start_native(
+                &self.store,
+                self.launchd.as_ref(),
+                &self.launch_agents_dir,
+                &self.launchd_domain,
+                None,
+                &self.boundary_key(),
+            )?;
+            return serde_json::to_value(&view).map_err(|error| error.to_string());
+        }
         let view = crate::native_proxy::reload_native_if_loaded(
             &self.store,
             self.launchd.as_ref(),
@@ -939,9 +981,41 @@ impl ProxyManager {
             return Err("NativeProxyInstallMissing: install the native proxy first".into());
         }
         let target = crate::native_proxy::native_proxy_bin(self.store.paths());
+        if self.launchd.stop_before_replace() {
+            let rollback = target.with_extension("vellum-rollback");
+            crate::update::reject_symlink(&rollback)?;
+            if !rollback.is_file() {
+                return Err("AgentRollbackUnavailable: no rollback binary exists".into());
+            }
+        }
+        let resume = self.launchd.stop_before_replace()
+            && self
+                .launchd
+                .inspect_agent(
+                    &self.launchd_domain,
+                    crate::native_proxy::LAUNCH_AGENT_LABEL,
+                )?
+                .running;
+        if self.launchd.stop_before_replace() {
+            self.launchd.unload_agent(
+                &self.launchd_domain,
+                crate::native_proxy::LAUNCH_AGENT_LABEL,
+            )?;
+        }
         crate::update::rollback_binary(&target)?;
         let digest = crate::native_proxy::digest_native_binary(&target)?;
         self.install_native_inner(record, Some(digest))?;
+        if resume {
+            let view = crate::native_proxy::start_native(
+                &self.store,
+                self.launchd.as_ref(),
+                &self.launch_agents_dir,
+                &self.launchd_domain,
+                None,
+                &self.boundary_key(),
+            )?;
+            return serde_json::to_value(&view).map_err(|error| error.to_string());
+        }
         let view = crate::native_proxy::reload_native_if_loaded(
             &self.store,
             self.launchd.as_ref(),

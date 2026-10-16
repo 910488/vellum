@@ -630,6 +630,15 @@ describe("Remote Manager operations UI", () => {
     expect(screen.queryByRole("button", { name: "重新同步" })).toBeNull();
   });
 
+  it("explains that on-demand services need a reconnect after reboot", async () => {
+    apiMocks.inspectRemoteHost.mockResolvedValue({
+      ...status,
+      inventory: { ...status.inventory, persistenceScope: "onDemand" },
+    });
+    renderRemote();
+    expect(await screen.findByText("Agent supervisor 常駐；主機重開機後需重新連線一次")).toBeTruthy();
+  });
+
   it.each(["immediate", "background"])("shows the ps prerequisite and repair command on %s failure", async (mode) => {
     const message = "OneClickBootstrapBlocked: psStartTimeUnavailable; repair: apk add procps-ng";
     if (mode === "immediate") {

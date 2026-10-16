@@ -1287,7 +1287,9 @@ export function Remote({
                       ? t("remote.detail.loginResident")
                       : (inventory?.persistenceScope ?? status?.agent?.capabilities.persistenceScope) === "linger"
                         ? t("remote.detail.lingerResident")
-                        : unknown
+                        : (inventory?.persistenceScope ?? status?.agent?.capabilities.persistenceScope) === "onDemand"
+                          ? t("remote.detail.onDemandResident")
+                          : unknown
                   }</Row>
                   <Row label={t("remote.detail.managedHome")}>{inventory?.managedCodexHome ?? status?.agent?.capabilities.managedCodexHome ?? native?.codexHome ?? unknown}</Row>
                   {(inventory?.platform === "darwin-arm64" || status?.agent?.capabilities.platform === "darwin-arm64") && (

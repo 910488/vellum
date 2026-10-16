@@ -97,6 +97,26 @@ fn native_detached_ready(agent: &Value) -> bool {
                 .and_then(Value::as_str)
                 == Some(crate::remote::platform::PERSISTENCE_LOGIN)
     } else {
+        let scope = agent
+            .pointer("/capabilities/persistenceScope")
+            .and_then(Value::as_str);
+        if matches!(scope, Some("login" | "onDemand")) {
+            return agent
+                .pointer("/nativeCodex/durable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && if scope == Some("login") {
+                    agent
+                        .pointer("/capabilities/userSystemdAvailable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                } else {
+                    agent
+                        .pointer("/capabilities/supervisorReady")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                };
+        }
         agent
             .pointer("/capabilities/lingerEnabled")
             .and_then(Value::as_bool)
@@ -165,9 +185,9 @@ impl RemoteHostManager {
         // `host.managerSnapshot` answer an unknown-method error here; fall
         // back to the original sequential RPCs so this keeps working
         // against an older/unpinned remote agent.
-        let snapshot = state.remote().host_manager_snapshot(host_id, || {
-            client.host_manager_snapshot(None, None)
-        });
+        let snapshot = state
+            .remote()
+            .host_manager_snapshot(host_id, || client.host_manager_snapshot(None, None));
         match snapshot {
             Ok((snapshot, _generation)) => {
                 let agent = snapshot.get("status").cloned().unwrap_or(Value::Null);
@@ -640,6 +660,23 @@ mod manager_state_tests {
         assert!(!native_detached_ready(&agent));
         agent["nativeCodex"]["cliLauncher"] = json!({"ready": true});
         assert!(native_detached_ready(&agent));
+    }
+
+    #[test]
+    fn login_and_on_demand_require_owned_daemon_and_actual_persistence() {
+        let mut agent = json!({
+            "nativeCodex": {"daemonRunning": true, "durable": true, "cliLauncher": {"ready": true}},
+            "capabilities": {"os": "linux", "persistenceScope": "login", "userSystemdAvailable": true, "lingerEnabled": false}
+        });
+        assert!(native_detached_ready(&agent));
+        agent["capabilities"]["userSystemdAvailable"] = json!(false);
+        assert!(!native_detached_ready(&agent));
+        agent["capabilities"]["persistenceScope"] = json!("onDemand");
+        assert!(!native_detached_ready(&agent));
+        agent["capabilities"]["supervisorReady"] = json!(true);
+        assert!(native_detached_ready(&agent));
+        agent["nativeCodex"]["durable"] = json!(false);
+        assert!(!native_detached_ready(&agent));
     }
 }
 

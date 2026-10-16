@@ -138,7 +138,7 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   // never filtered out by `visibleBlockers`'s `fresh` pass.
   proxyConfigurationSchemaTooNew: { remedy: null, expectedBeforeBootstrap: false },
   proxyConfigurationUnreadable: { remedy: null, expectedBeforeBootstrap: false },
-  systemdUserUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  systemdUserUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: true },
   versionMismatch: { remedy: "updateAgent", expectedBeforeBootstrap: false },
 };
 

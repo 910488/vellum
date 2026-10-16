@@ -55,6 +55,10 @@ enum Commands {
     Doctor,
     /// Refresh the detached Grok account (systemd timer entrypoint).
     RefreshGrok,
+    /// Restore enabled on-demand services on managed SSH reconnect.
+    EnsureServices,
+    /// Internal detached on-demand supervisor (no stdin/RPC transport).
+    Supervise,
 }
 
 fn main() {
@@ -104,6 +108,20 @@ fn run() -> Result<(), String> {
         Commands::RefreshGrok => {
             let status = vellum_remote_agent::grok::refresh(store.paths())?;
             print_ok(serde_json::to_value(status).map_err(|error| error.to_string())?)?;
+        }
+        Commands::EnsureServices => {
+            if cfg!(target_os = "linux") && !vellum_remote_agent::persistence::probe().systemd_user
+            {
+                vellum_remote_agent::on_demand::OnDemandClient::new(store.paths().clone())
+                    .ensure_enabled()?;
+            }
+        }
+        Commands::Supervise => {
+            if !cfg!(target_os = "linux") {
+                return Err("OnDemandLinuxOnly".into());
+            }
+            vellum_remote_agent::on_demand::OnDemandClient::new(store.paths().clone())
+                .supervise()?;
         }
         Commands::Rpc { request } => {
             let raw = match request {
@@ -830,11 +848,19 @@ fn host_status_with_native(
     let native_codex = native.and_then(|status| serde_json::to_value(status.clone()).ok());
     let mut managed_profiles = profiles.aggregate_statuses()?;
     reconcile_native_profile_runtime(&mut managed_profiles, native_codex.as_ref());
+    let mut capabilities = probe_host();
+    if capabilities.persistence_scope.as_deref() == Some("onDemand") {
+        capabilities.supervisor_ready = Some(
+            vellum_remote_agent::on_demand::OnDemandClient::new(store.paths().clone())
+                .supervisor_ready()
+                .unwrap_or(false),
+        );
+    }
     Ok(HostStatus {
         host_id: state.host_id,
         agent_version: AGENT_VERSION.to_string(),
         agent_protocol: AGENT_PROTOCOL_VERSION,
-        capabilities: probe_host(),
+        capabilities,
         proxy: manager.status()?,
         install: state.install,
         configuration: serde_json::to_value(vellum_remote_agent::configuration::public_status(
@@ -900,6 +926,17 @@ fn host_inventory_with_native(
         persistence_scope: platform.map(|item| item.persistence_scope().to_string()),
         managed_codex_home: managed_home,
     };
+    let persistence = vellum_remote_agent::persistence::probe();
+    inventory.service_manager = vellum_remote_agent::host_probe::observed_service_manager(
+        &inventory.system.os,
+        platform,
+        persistence,
+    );
+    inventory.persistence_scope = vellum_remote_agent::host_probe::observed_persistence_scope(
+        &inventory.system.os,
+        platform,
+        persistence,
+    );
     inventory.blockers = host_blockers(&inventory);
     inventory.available_actions = host_actions(&inventory);
     Ok(inventory)

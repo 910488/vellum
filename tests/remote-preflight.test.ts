@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { describeBlocker, psStartTimeFailure, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("lets bootstrap choose persistence when a legacy host reports no systemd", () => {
+    expect(describeBlocker("systemdUserUnavailable").remedy).toBe("bootstrap");
+    expect(visibleBlockers(["systemdUserUnavailable"], true)).toEqual([]);
+  });
   it("keeps a missing ps prerequisite visible on a fresh host", () => {
     const reason = "psStartTimeUnavailable";
     const blocker = describeBlocker(reason);

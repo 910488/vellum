@@ -424,7 +424,7 @@ fn validate_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], _mode: u32) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], _mode: u32) -> Result<(), String> {
     atomic_write_with(path, _mode, |file| file.write_all(bytes))
 }
 

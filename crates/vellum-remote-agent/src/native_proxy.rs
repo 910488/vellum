@@ -14,7 +14,7 @@ pub const LAUNCH_AGENT_LABEL: &str = "com.vellum.remote.proxy";
 pub const THROTTLE_INTERVAL_SECS: u32 = 10;
 pub const NATIVE_LISTEN_HOST: &str = "127.0.0.1";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchAgentSpec {
     pub label: String,
     pub executable: PathBuf,
@@ -189,6 +189,9 @@ pub fn port_conflict(listen: &str, in_use_by_managed: bool) -> Option<PortConfli
 }
 
 pub trait ProxyServiceClient: Send + Sync {
+    fn stop_before_replace(&self) -> bool {
+        false
+    }
     fn service_path(&self, directory: &Path) -> PathBuf {
         LaunchAgentSpec::plist_path(directory)
     }

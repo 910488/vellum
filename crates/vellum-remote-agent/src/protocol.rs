@@ -27,6 +27,8 @@ pub struct HostCapabilities {
     pub managed_codex_home: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_session_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_ready: Option<bool>,
 }
 
 /// Versioned host inventory (M30). A single-call superset of
@@ -659,6 +661,7 @@ mod tests {
                     persistence_scope: None,
                     managed_codex_home: None,
                     gui_session_available: None,
+                    supervisor_ready: None,
                 },
                 proxy: ProxyStatusView::default(),
                 install: None,
@@ -801,6 +804,7 @@ mod tests {
             persistence_scope: None,
             managed_codex_home: None,
             gui_session_available: None,
+            supervisor_ready: None,
         })
         .unwrap();
         let object = value.as_object().unwrap();

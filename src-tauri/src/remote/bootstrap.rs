@@ -412,28 +412,21 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
         );
     }
     if platform.service_manager() == crate::remote::platform::SERVICE_MANAGER_SYSTEMD_USER {
-        if !result.systemd_user_available {
-            result.blocked_reasons.push("systemdUserUnavailable".into());
-            result.repair_commands.push(
-                "確認 systemd user manager 可用，並由系統管理員執行：loginctl enable-linger $USER"
-                    .into(),
-            );
-        } else if !result.linger_enabled {
-            match ensure_linger(&data_root, &alias) {
-                Ok(()) => {
-                    result.linger_enabled = true;
-                    result.completed_steps.push("host.lingerEnabled".into());
-                }
-                Err(error) => {
-                    result
-                        .blocked_reasons
-                        .push(format!("lingerEnableFailed:{error}"));
-                    result.repair_commands.push(
-                        "Enable lingering for the SSH user (loginctl enable-linger $USER), then retry Bootstrap"
-                            .into(),
-                    );
-                }
-            }
+        let (scope, linger) =
+            linux_persistence_scope(result.systemd_user_available, result.linger_enabled, || {
+                ensure_linger(&data_root, &alias).is_ok()
+            });
+        result.persistence_scope = Some(scope.into());
+        result.linger_enabled = linger;
+        if scope == "onDemand" {
+            result.service_manager = Some("agent-supervisor".into());
+            result
+                .completed_steps
+                .push("host.onDemandPersistence".into());
+        } else if scope == "login" {
+            result.completed_steps.push("host.loginPersistence".into());
+        } else if !probe.linger_enabled {
+            result.completed_steps.push("host.lingerEnabled".into());
         }
     } else if !probe.gui_session_available {
         result.blocked_reasons.push("guiSessionUnavailable".into());
@@ -751,11 +744,26 @@ fn ensure_isolation_identity(path: &Path) -> AppResult<String> {
     fs::read_to_string(&pub_path).map_err(|error| AppError::Message(error.to_string()))
 }
 
+fn linux_persistence_scope(
+    systemd: bool,
+    linger: bool,
+    enable_linger: impl FnOnce() -> bool,
+) -> (&'static str, bool) {
+    if !systemd {
+        return ("onDemand", false);
+    }
+    if linger || enable_linger() {
+        ("linger", true)
+    } else {
+        ("login", false)
+    }
+}
+
 fn ensure_linger(data_root: &Path, alias: &str) -> AppResult<()> {
     let script = r#"set -eu
 user=$(id -un)
 if [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" != yes ]; then
-  loginctl enable-linger "$user"
+  loginctl --no-ask-password enable-linger "$user"
 fi
 [ "$(loginctl show-user "$user" -p Linger --value)" = yes ]
 "#;
@@ -996,6 +1004,26 @@ fn blocked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistence_falls_back_without_blocking_or_prompting_for_privileges() {
+        assert_eq!(
+            linux_persistence_scope(false, false, || panic!("no systemd: do not enable linger")),
+            ("onDemand", false)
+        );
+        assert_eq!(
+            linux_persistence_scope(true, true, || panic!("linger already enabled")),
+            ("linger", true)
+        );
+        assert_eq!(
+            linux_persistence_scope(true, false, || false),
+            ("login", false)
+        );
+        assert_eq!(
+            linux_persistence_scope(true, false, || true),
+            ("linger", true)
+        );
+    }
 
     #[test]
     fn linux_ps_preflight_is_independent_of_systemd() {

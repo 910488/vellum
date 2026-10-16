@@ -661,7 +661,7 @@ const en: ResourceTree = {
       "proxyConfigurationMissing": "The host has no proxy configuration yet.",
       "proxyConfigurationSchemaTooNew": "This host's proxy configuration is a newer format than this Vellum build understands. Deployment is blocked to avoid overwriting it — update Vellum first.",
       "proxyConfigurationUnreadable": "This host's proxy configuration could not be read (a permissions or I/O problem). Deployment is blocked rather than assumed safe to replace.",
-      "systemdUserUnavailable": "The host has no usable user systemd, so the daemon cannot stay resident.",
+      "systemdUserUnavailable": "User systemd is unavailable. The Agent supervisor will run services; reconnect once after the host reboots.",
       "psStartTimeUnavailable": "The host's ps cannot query process start times, which the Codex daemon requires. Install a compatible ps using the repair command, then deploy again.",
       "versionMismatch": "The Agent version on the host does not match this Vellum build."
     },
@@ -739,6 +739,7 @@ const en: ResourceTree = {
       "persistence": "Persistence",
       "loginResident": "Resident after login",
       "lingerResident": "Resident via systemd linger",
+      "onDemandResident": "Agent supervisor; reconnect once after the host reboots",
       "managedHome": "Managed CODEX_HOME",
       "isolationLabel": "Isolation",
       "isolation": "Remote settings stay isolated from local Vellum / Enhanced / ~/.codex."
