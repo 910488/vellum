@@ -371,8 +371,14 @@ pub fn rollback_catalog_version(
     crate::runtime::snapshot_catalog(&state.data_root(), &paths.catalog)?;
     crate::runtime::rollback_catalog(&state.data_root(), &version_id, &paths.catalog)?;
     state.set_active_catalog_version(Some(version_id));
-    state.mark_restart_required(crate::model::RuntimeNotice::new("catalogRestored"));
-    state.set_restart_process_identity(codex_process_identity());
+    let notice = crate::model::RuntimeNotice::new("catalogRestored");
+    match codex_process_identity() {
+        Some(identity) => state.mark_restart_required_for_process(notice, identity),
+        None => {
+            state.mark_restart_required(notice);
+            state.set_restart_process_identity(None);
+        }
+    }
     Ok(state.runtime_status())
 }
 

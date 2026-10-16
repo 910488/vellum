@@ -77,6 +77,38 @@ pub struct AppState {
     lifecycle_sink: Arc<Mutex<Option<LifecycleSink>>>,
 }
 
+/// Clears every restart reason once `current` is a different Codex from the
+/// one the reasons were recorded against.
+///
+/// A reason recorded while no Codex was running has no old instance to
+/// outlive: the first Codex seen afterwards started with the new
+/// configuration. Waiting for a PID change there kept the badge lit until a
+/// managed restart, whatever Codex actually loaded.
+fn settle_codex_restart(proxy: &mut ProxyControl, current: &str) {
+    if proxy.restart_reasons.is_empty() {
+        proxy.restart_process_identity = None;
+        return;
+    }
+    let restarted = proxy
+        .restart_process_identity
+        .as_deref()
+        .is_none_or(|previous| previous != current);
+    if !restarted {
+        return;
+    }
+    let cleared = proxy
+        .restart_reasons
+        .drain(..)
+        .map(|reason| reason.code)
+        .collect::<Vec<_>>();
+    log::info!("[Restart] Codex restart detected; cleared reasons={cleared:?}");
+    proxy.restart_process_identity = None;
+    let notice = RuntimeNotice::new("codexRestartDetected");
+    if !proxy.live_applied.contains(&notice) {
+        proxy.live_applied.push(notice);
+    }
+}
+
 struct ProxyControl {
     status: ProxyStatus,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1936,12 +1968,21 @@ impl AppState {
     /// has the previous configuration loaded. Keeping both writes under one
     /// lock prevents a status poll from observing an unreconcilable reason
     /// with no process identity.
+    ///
+    /// There is only one identity for all reasons, so rebinding it to a newer
+    /// Codex would also hand that Codex every older reason: one recorded
+    /// against the Codex that was running when the Proxy started would then
+    /// wait for the *next* restart, though the restart it asked for already
+    /// happened. Status is polled once a minute and only while the window is
+    /// visible, so a restart is routinely seen first here. Settle the older
+    /// reasons against this identity before taking it over.
     pub fn mark_restart_required_for_process(
         &self,
         reason: RuntimeNotice,
         process_identity: String,
     ) {
         let mut proxy = self.proxy.lock().expect("proxy state poisoned");
+        settle_codex_restart(&mut proxy, &process_identity);
         if !proxy.restart_reasons.contains(&reason) {
             log::info!("[Restart] reason added code={} process_bound=true", reason.code);
             proxy.restart_reasons.push(reason);
@@ -1985,22 +2026,7 @@ impl AppState {
             // Codex is between stop and start. Keep waiting for a new instance.
             return;
         };
-        // A reason recorded while no Codex was running has no old instance to
-        // outlive: the first Codex seen afterwards started with the new
-        // configuration. Waiting for a PID change there kept the badge lit
-        // until a managed restart, whatever Codex actually loaded.
-        let restarted = proxy
-            .restart_process_identity
-            .as_deref()
-            .is_none_or(|previous| previous != current);
-        if restarted {
-            proxy.restart_reasons.clear();
-            proxy.restart_process_identity = None;
-            let notice = RuntimeNotice::new("codexRestartDetected");
-            if !proxy.live_applied.contains(&notice) {
-                proxy.live_applied.push(notice);
-            }
-        }
+        settle_codex_restart(&mut proxy, current);
     }
 
     /// Takes the single automatic repair this session owes `launch_id`.
@@ -3330,6 +3356,44 @@ mod tests {
             .live_applied
             .iter()
             .any(|notice| notice.code == "codexRestartDetected"));
+    }
+
+    /// 2026-10-16 boot: Codex Desktop autostarted before Vellum, so the Proxy
+    /// start recorded `codexRunning` against it. The user restarted Codex, and
+    /// the Enhanced arming that followed recorded its own notice against the
+    /// new Codex before any status poll had seen the restart. That rebound
+    /// `codexRunning` to the new Codex too; adoption then cleared only the
+    /// Enhanced notice, and the badge asked for a restart that had happened.
+    #[test]
+    fn a_new_reason_does_not_rebind_reasons_an_earlier_restart_satisfied() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("codexRunning"),
+            "pid:31704".into(),
+        );
+        // Codex restarts; no poll runs before arming records its notice.
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+            "pid:13732".into(),
+        );
+        assert_eq!(
+            state.runtime_status().restart_reasons,
+            vec![RuntimeNotice::new("enhancedDesktopRuntimeChanged")]
+        );
+        state.reconcile_enhanced_adoption(true);
+        state.reconcile_codex_restart(Some("pid:13732".into()));
+        assert!(!state.runtime_status().restart_required);
+
+        // Reasons recorded against the same Codex still wait for its restart.
+        for code in ["codexRunning", "enhancedDesktopRuntimeChanged"] {
+            state.mark_restart_required_for_process(RuntimeNotice::new(code), "pid:1".into());
+        }
+        state.reconcile_enhanced_adoption(true);
+        assert_eq!(
+            state.runtime_status().restart_reasons,
+            vec![RuntimeNotice::new("codexRunning")]
+        );
     }
 
     /// Changing the catalog while Codex was closed recorded a reason with no
