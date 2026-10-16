@@ -178,6 +178,9 @@ fn dispatch(
         AgentRequest::ProxyStatus => {
             Ok(serde_json::to_value(manager.status()?).map_err(|e| e.to_string())?)
         }
+        AgentRequest::ProxySelectPort { preferred_port } => {
+            Ok(json!({"hostPort": manager.select_port(preferred_port)?}))
+        }
         AgentRequest::ProxyInstall {
             operation_id,
             image,

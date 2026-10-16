@@ -117,6 +117,7 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   dockerUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   intelMacUnsupported: { remedy: null, expectedBeforeBootstrap: false },
   guiSessionUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  // Only emitted after the Agent exhausts the automatic fallback range.
   proxyPortConflict: { remedy: null, expectedBeforeBootstrap: false },
   insufficientDiskSpace: { remedy: null, expectedBeforeBootstrap: false },
   incompleteObservation: { remedy: null, expectedBeforeBootstrap: false },

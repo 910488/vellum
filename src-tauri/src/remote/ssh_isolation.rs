@@ -30,7 +30,7 @@ impl AppliedIsolation {
     /// older managed version already exists. stdin is the wrapper payload.
     pub fn wrapper_upload_command(&self) -> String {
         let path = shell_single_quote(&self.wrapper_path);
-        format!("umask 077; mkdir -p \"$(dirname {path})\" && cat > {path} && chmod 0700 {path}")
+        format!("set -eu; umask 077; wrapper={path}; mkdir -p \"$(dirname \"$wrapper\")\"; tmp=$(mktemp \"${{wrapper}}.tmp.XXXXXX\"); trap 'rm -f \"$tmp\"' 0; trap 'exit 1' 1 2 15; cat > \"$tmp\"; chmod 0700 \"$tmp\"; mv -f \"$tmp\" \"$wrapper\"; trap - 0 1 2 15")
     }
 }
 
@@ -510,8 +510,10 @@ mod tests {
                 < next.wrapper_contents.find("SSH_ORIGINAL_COMMAND").unwrap()
         );
         let upload = next.wrapper_upload_command();
-        assert!(upload.contains("&& cat > '/home/remote/.vellum-remote/ssh-wrapper' && chmod 0700"));
-        assert!(!upload.contains("if "));
+        assert!(upload.contains("wrapper='/home/remote/.vellum-remote/ssh-wrapper'"));
+        assert!(upload.contains("mktemp \"${wrapper}.tmp.XXXXXX\""));
+        assert!(upload.contains("cat > \"$tmp\"; chmod 0700 \"$tmp\"; mv -f \"$tmp\" \"$wrapper\""));
+        assert!(!upload.contains("cat > \"$wrapper\""));
         let bootstrap = include_str!("bootstrap.rs");
         assert!(bootstrap.contains("applied.wrapper_contents.as_bytes(),"));
         assert!(bootstrap.contains("&applied.wrapper_upload_command(),"));

@@ -23,6 +23,9 @@ pub struct RemoteHostDesiredState {
     pub selected_catalog_ids: Vec<String>,
     pub config_hash: Option<String>,
     pub catalog_hash: Option<String>,
+    /// Last planned/applied host-local proxy port; absent in older records.
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
     /// Per-host policy overrides (`autoReviewEnabled`, compaction threshold,
     /// standalone web search) from the last plan for this host. Without
     /// this, `reapply_desired_state` would rebuild from
@@ -105,6 +108,7 @@ mod tests {
             selected_catalog_ids: vec!["a".into(), "b".into()],
             config_hash: Some("cfg".into()),
             catalog_hash: Some("cat".into()),
+            proxy_port: Some(15743),
             ..Default::default()
         };
         save(temp.path(), &state).unwrap();
@@ -127,5 +131,20 @@ mod tests {
         .unwrap();
         assert_eq!(next_revision(temp.path(), "h-1").unwrap(), 6);
         assert_eq!(next_revision(temp.path(), "h-2").unwrap(), 1);
+    }
+
+    #[test]
+    fn older_desired_state_without_proxy_port_remains_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = RemoteHostDesiredState {
+            host_id: "legacy".into(),
+            ..Default::default()
+        };
+        save(temp.path(), &state).unwrap();
+        let path = desired_state_dir(temp.path()).join("legacy.json");
+        let mut json = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("proxyPort");
+        std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(load(temp.path(), "legacy").unwrap().proxy_port, None);
     }
 }

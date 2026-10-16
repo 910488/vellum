@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { describeBlocker, psStartTimeFailure, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("keeps an exhausted proxy port range visible even before first deployment", () => {
+    const blocker = describeBlocker("proxyPortConflict");
+    expect(blocker.messageKey).toBe("remote.blocker.proxyPortConflict");
+    expect(blocker.remedy).toBeNull();
+    expect(visibleBlockers(["proxyPortConflict"], true)).toEqual([blocker]);
+  });
   it("lets bootstrap choose persistence when a legacy host reports no systemd", () => {
     expect(describeBlocker("systemdUserUnavailable").remedy).toBe("bootstrap");
     expect(visibleBlockers(["systemdUserUnavailable"], true)).toEqual([]);

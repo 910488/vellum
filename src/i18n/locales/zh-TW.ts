@@ -669,7 +669,7 @@ const zhTW: ResourceTree = {
       "dockerUnavailable": "主機上沒有可用的 Docker，Proxy 無法啟動。",
       "intelMacUnsupported": "Intel Mac 尚未支援。第一版 Remote Manager 只支援 Apple Silicon。",
       "guiSessionUnavailable": "沒有可用的 macOS 登入工作階段。Proxy 是登入後常駐，不會改電源或自動登入。",
-      "proxyPortConflict": "遠端 Proxy 預設埠被占用。請在部署計畫指定其他埠，或釋放 127.0.0.1:15722。",
+      "proxyPortConflict": "15721–15799 的 Proxy 備用連接埠全部被占用。請釋放其中一個連接埠，再重新部署。",
       "insufficientDiskSpace": "可用空間不足以容納下載、解壓與回滾保留，替換作業已停止。不會自動刪除使用者資料。",
       "incompleteObservation": "無法完整觀察受管理 runtime 的 turn、工具或核准，已擋下破壞性操作。",
       "hostNotConfigured": "此主機尚未寫入 Vellum 的設定。",

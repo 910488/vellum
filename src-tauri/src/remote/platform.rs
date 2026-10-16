@@ -13,8 +13,6 @@ pub const MACOS_ISOLATION_GATE_PASSED: bool = false;
 
 pub const LINUX_PROXY_PORT: u16 = 15721;
 pub const DARWIN_PROXY_PORT: u16 = 15722;
-pub const LINUX_PROXY_LISTEN: &str = "127.0.0.1:15721";
-pub const DARWIN_PROXY_LISTEN: &str = "127.0.0.1:15722";
 
 pub const PROXY_BACKEND_DOCKER: &str = "docker";
 pub const PROXY_BACKEND_NATIVE: &str = "native";
@@ -137,11 +135,8 @@ impl RemotePlatform {
         }
     }
 
-    pub fn default_proxy_listen(self) -> &'static str {
-        match self {
-            Self::LinuxAmd64 | Self::LinuxArm64 => LINUX_PROXY_LISTEN,
-            Self::DarwinArm64 => DARWIN_PROXY_LISTEN,
-        }
+    pub fn default_proxy_listen(self) -> String {
+        format!("127.0.0.1:{}", self.default_proxy_port())
     }
 
     /// Native Linux deployment requires protocol 5. macOS still requires the

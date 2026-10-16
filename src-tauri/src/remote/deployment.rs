@@ -589,8 +589,33 @@ pub fn plan(
     // disagree.
     let review_policy_fingerprint =
         review_policy_fingerprint_for(&review, selection.policy.auto_review_enabled);
+    let target = RemoteHostManager::resolve_target(state, host_id)?;
+    let client = RemoteAgentClient::new(target);
+    let agent_status = client.host_status();
+    let previous_desired_state = super::desired_state::load(&state.data_root(), host_id)?;
+    let mut identity = deployment_identity_from_status(agent_status.as_ref().ok(), &proxy_image);
+    if let Some(identity) = identity.as_mut() {
+        if identity.proxy_backend == crate::remote::platform::PROXY_BACKEND_NATIVE {
+            match client.proxy_select_port(
+                previous_desired_state
+                    .proxy_port
+                    .or(Some(identity.host_port)),
+            ) {
+                Ok(port) => identity.host_port = port,
+                Err(error) => blocked.push(if error.to_string().contains("proxyPortConflict:") {
+                    "proxyPortConflict".into()
+                } else {
+                    format!("proxyPortSelectionFailed:{error}")
+                }),
+            }
+        }
+    }
+    let planned_port = identity
+        .as_ref()
+        .map(|identity| identity.host_port)
+        .unwrap_or(crate::remote::platform::LINUX_PROXY_PORT);
     let mut config = ProxyRuntimeConfig {
-        listen: "0.0.0.0:15721".parse().expect("static address"),
+        listen: std::net::SocketAddr::from(([127, 0, 0, 1], planned_port)),
         data_dir: PathBuf::from("/var/lib/vellum/data"),
         history_dir: PathBuf::from("/var/lib/vellum/history"),
         log_dir: PathBuf::from("/var/log/vellum"),
@@ -617,8 +642,6 @@ pub fn plan(
     let config_toml = toml_edit::ser::to_string_pretty(&config)
         .map_err(|error| AppError::Message(format!("encode remote config failed: {error}")))?;
 
-    let target = RemoteHostManager::resolve_target(state, host_id)?;
-    let agent_status = RemoteAgentClient::new(target).host_status();
     let (remote_config_hash, remote_catalog_hash, lease_state, native) = match &agent_status {
         Ok(status) => (
             status
@@ -780,7 +803,6 @@ pub fn plan(
     let plan_id = ulid::Ulid::new().to_string();
     let expires_at = Utc::now() + Duration::minutes(PLAN_TTL_MINUTES);
     let desired_revision = super::desired_state::next_revision(&state.data_root(), host_id)?;
-    let previous_desired_state = super::desired_state::load(&state.data_root(), host_id)?;
     let observed_revision = previous_desired_state.observed_revision;
     // Gated on `observed_revision > 0`: a host that has never been applied
     // has nothing to "reapply" yet (the general blocked/needs-configure
@@ -835,7 +857,6 @@ pub fn plan(
             }
         })
         .collect::<Vec<_>>();
-    let identity = deployment_identity_from_status(agent_status.as_ref().ok(), &proxy_image);
     let plan_hash = plan_fingerprint_with_identity(
         &selected_ids,
         &desired_remote_config_hash,
@@ -924,6 +945,7 @@ pub fn plan(
             selected_catalog_ids: selected_ids.iter().cloned().collect(),
             config_hash: Some(public.drift.desired_config_hash.clone()),
             catalog_hash: Some(public.drift.desired_catalog_hash.clone()),
+            proxy_port: public.host_port,
             policy_overrides: selection.policy.clone(),
             review_policy_fingerprint: Some(review_policy_fingerprint),
             applied_review_policy_fingerprint: previous_desired_state
@@ -1246,12 +1268,15 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
     };
     // Reconfigure after component replacement so the Agent resolves the new
     // install identity and upgrades legacy configuration in the normal phase.
-    let needs_configure = stored.public.drift.config_changed || needs_install;
+    let port_changed = stored.public.host_port.is_some_and(|port| {
+        status.get("hostPort").and_then(Value::as_u64) != Some(u64::from(port))
+    });
+    let needs_configure = stored.public.drift.config_changed || needs_install || port_changed;
     let needs_proxy_mutation = needs_install || needs_configure;
     let needs_native_apply_preview = needs_proxy_mutation
         || stored.public.drift.catalog_changed
         || stored.public.restart_required;
-    if !needs_install && !needs_configure && !needs_native_apply_preview {
+    if running && !needs_install && !needs_configure && !needs_native_apply_preview {
         steps.push("apply.noop".into());
         return Ok(RemoteApplyResult {
             operation_id,
@@ -1388,7 +1413,10 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         steps.push("proxy.configured".into());
     }
     let proxy = if !running || needs_proxy_mutation {
-        let listen_port = stored.public.host_port.unwrap_or(15721);
+        let listen_port = stored
+            .public
+            .host_port
+            .unwrap_or_else(|| platform.default_proxy_port());
         let value =
             client.proxy_start(&format!("{operation_id}-start"), Some(listen_port), None)?;
         steps.push("proxy.ready".into());
@@ -1398,6 +1426,7 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         status
     };
     let needs_native_apply = needs_proxy_mutation
+        || !running
         || stored.public.drift.catalog_changed
         || stored.public.restart_required;
     let (native_adopt, native_runtime) = if needs_native_apply {
@@ -1458,8 +1487,18 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
             observed_revision: stored.public.desired_revision,
             last_plan_id: Some(plan_id.into()),
             selected_catalog_ids: stored.public.selected_catalog_ids.clone(),
-            config_hash: Some(stored.public.drift.desired_config_hash.clone()),
+            config_hash: Some(
+                proxy
+                    .get("configHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&stored.public.drift.desired_config_hash)
+                    .to_string(),
+            ),
             catalog_hash: Some(stored.public.drift.desired_catalog_hash.clone()),
+            proxy_port: proxy
+                .get("hostPort")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok()),
             policy_overrides: stored.policy_overrides.clone(),
             review_policy_fingerprint: Some(stored.public.drift.review_policy_fingerprint.clone()),
             // This apply just succeeded, so desired and applied agree.

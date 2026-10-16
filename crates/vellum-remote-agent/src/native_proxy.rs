@@ -13,6 +13,37 @@ use crate::state::{AgentPaths, AgentStateStore, InstallRecord};
 pub const LAUNCH_AGENT_LABEL: &str = "com.vellum.remote.proxy";
 pub const THROTTLE_INTERVAL_SECS: u32 = 10;
 pub const NATIVE_LISTEN_HOST: &str = "127.0.0.1";
+pub const AUTO_PROXY_PORT_END: u16 = 15799;
+
+/// Read-only candidate selection. A managed listener keeps its installed
+/// port; no probe ever stops, signals or adopts an unrelated listener.
+pub fn select_native_port(
+    client: &dyn ProxyServiceClient,
+    preferred: u16,
+    managed_port: Option<u16>,
+) -> Result<u16, String> {
+    if let Some(port) = managed_port {
+        if port == 0 {
+            return Err("NativeProxyPortInvalid: managed port must be nonzero".into());
+        }
+        return Ok(port);
+    }
+    if preferred == 0 {
+        return Err("NativeProxyPortInvalid: port must be nonzero".into());
+    }
+    if !client.port_in_use(preferred)? {
+        return Ok(preferred);
+    }
+    for port in crate::platform::LINUX_PROXY_PORT..=AUTO_PROXY_PORT_END {
+        if port != preferred && !client.port_in_use(port)? {
+            return Ok(port);
+        }
+    }
+    Err(format!(
+        "proxyPortConflict: no free loopback port in {}-{AUTO_PROXY_PORT_END}",
+        crate::platform::LINUX_PROXY_PORT
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchAgentSpec {
@@ -567,6 +598,7 @@ pub struct MemoryLaunchd {
     pub loads: Mutex<Vec<PathBuf>>,
     pub unloads: Mutex<Vec<String>>,
     pub port_busy: Mutex<bool>,
+    pub busy_ports: Mutex<std::collections::BTreeSet<u16>>,
     pub stdout_log: Mutex<String>,
     pub stderr_log: Mutex<String>,
     pub log_reads: Mutex<u32>,
@@ -633,8 +665,8 @@ impl LaunchdClient for MemoryLaunchd {
         Ok(*self.ready.lock().unwrap())
     }
 
-    fn port_in_use(&self, _host_port: u16) -> Result<bool, String> {
-        Ok(*self.port_busy.lock().unwrap())
+    fn port_in_use(&self, host_port: u16) -> Result<bool, String> {
+        Ok(*self.port_busy.lock().unwrap() || self.busy_ports.lock().unwrap().contains(&host_port))
     }
 
     fn read_logs(
@@ -717,19 +749,19 @@ pub fn observe_native(
         .as_ref()
         .map(|item| item.host_port)
         .unwrap_or_else(|| launchd.default_port());
-    let listen = native_listen(port);
     if !job.running {
-        if launchd.port_in_use(port)? {
-            if let Some(conflict) = port_conflict(&listen, false) {
+        if let Err(error) = select_native_port(launchd, port, None) {
+            if error.starts_with("proxyPortConflict:") {
                 return Ok(native_status_view(
                     state.install.as_ref(),
                     binary.is_file(),
                     plist.is_file(),
                     &job,
                     false,
-                    Some(conflict.code.into()),
+                    Some("proxyPortConflict".into()),
                 ));
             }
+            return Err(error);
         }
         return Ok(native_status_view(
             state.install.as_ref(),
@@ -764,14 +796,12 @@ pub fn start_native(
         .install
         .as_ref()
         .ok_or_else(|| "NativeProxyInstallMissing: install the native proxy first".to_string())?;
-    let port = host_port.unwrap_or(install.host_port);
-    let listen = native_listen(port);
     let job = launchd.inspect_agent(domain, LAUNCH_AGENT_LABEL)?;
-    if launchd.port_in_use(port)? && !job.running {
-        if let Some(conflict) = port_conflict(&listen, false) {
-            return Err(format!("{}: {listen} is already in use", conflict.code));
-        }
+    if job.running {
+        return observe_native(store, launchd, launch_agents_dir, domain, boundary_key);
     }
+    let port = select_native_port(launchd, host_port.unwrap_or(install.host_port), None)?;
+    let listen = native_listen(port);
     let paths = store.paths();
     let executable = native_proxy_bin(paths);
     if !executable.is_file() {
@@ -782,6 +812,11 @@ pub fn start_native(
     }
     if !executable.is_absolute() {
         return Err("NativeProxyBinaryMustBeAbsolute".into());
+    }
+    if let Some(config_hash) = crate::configuration::configure_native_listen(paths, port)? {
+        if let Some(install) = state.install.as_mut() {
+            install.config_hash = config_hash;
+        }
     }
     let spec = LaunchAgentSpec::new(
         executable,
@@ -883,6 +918,109 @@ pub fn reload_native_if_loaded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_port_selection_skips_busy_ports_and_only_conflicts_when_exhausted() {
+        let service = MemoryLaunchd::default();
+        assert_eq!(select_native_port(&service, 15721, None).unwrap(), 15721);
+        service
+            .busy_ports
+            .lock()
+            .unwrap()
+            .extend([15721, 15722, 15723]);
+        assert_eq!(select_native_port(&service, 15721, None).unwrap(), 15724);
+        assert_eq!(select_native_port(&service, 15780, None).unwrap(), 15780);
+        service.busy_ports.lock().unwrap().extend(15721..15799);
+        assert_eq!(select_native_port(&service, 15721, None).unwrap(), 15799);
+        *service.port_busy.lock().unwrap() = true;
+        assert_eq!(
+            select_native_port(&service, 15721, Some(15770)).unwrap(),
+            15770
+        );
+        assert!(select_native_port(&service, 15721, None)
+            .unwrap_err()
+            .starts_with("proxyPortConflict:"));
+        assert!(select_native_port(&service, 0, None)
+            .unwrap_err()
+            .starts_with("NativeProxyPortInvalid:"));
+    }
+
+    #[test]
+    fn plan_start_race_reselects_and_persists_the_actual_port_and_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        paths.ensure().unwrap();
+        let binary = native_proxy_bin(&paths);
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"fake-daemon").unwrap();
+        let store = AgentStateStore::new(paths.clone());
+        let service = std::sync::Arc::new(MemoryLaunchd {
+            systemd: true,
+            ready: Mutex::new(true),
+            ..Default::default()
+        });
+        let manager = crate::proxy::ProxyManager::with_native(
+            store.clone(),
+            service.clone(),
+            temp.path().join("units"),
+            "user",
+        );
+        manager.install("install", "", None).unwrap();
+        let before = std::fs::read(&paths.state_path).unwrap();
+        service.busy_ports.lock().unwrap().extend([15721, 15722]);
+        let planned = manager.select_port(None).unwrap();
+        assert_eq!(planned, 15723);
+        assert_eq!(
+            std::fs::read(&paths.state_path).unwrap(),
+            before,
+            "planning is read-only"
+        );
+        service.busy_ports.lock().unwrap().insert(planned);
+        let started = manager
+            .start(crate::proxy::ProxyStartRequest {
+                operation_id: "start".into(),
+                host_port: Some(planned),
+                image: None,
+            })
+            .unwrap();
+        let view: ProxyStatusView = serde_json::from_value(started.detail).unwrap();
+        assert_eq!(view.host_port, Some(15724));
+        let install = store.load().unwrap().install.unwrap();
+        assert_eq!(install.host_port, 15724);
+        let config = vellum_proxy_runtime::ProxyRuntimeConfig::from_toml_str(
+            &std::fs::read_to_string(paths.proxy_config_dir.join("proxy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.listen.to_string(), "127.0.0.1:15724");
+        assert_eq!(config.identity.config_hash, install.config_hash);
+        assert_eq!(
+            manager.select_port(Some(15721)).unwrap(),
+            15724,
+            "keep a running managed listener"
+        );
+        assert_eq!(
+            manager
+                .start(crate::proxy::ProxyStartRequest {
+                    operation_id: "start-again".into(),
+                    host_port: Some(15721),
+                    image: None
+                })
+                .unwrap()
+                .detail["hostPort"],
+            15724
+        );
+        // This is the exact provider table used for Codex catalog injection;
+        // test it without invoking host probes or a real service manager.
+        let providers = crate::profile::model_providers_table(&view).unwrap();
+        assert_eq!(
+            providers["vellum"]["base_url"].as_str(),
+            Some("http://127.0.0.1:15724/v1")
+        );
+        assert_eq!(
+            config.models[0].base_url, "http://127.0.0.1:1/v1",
+            "upstream endpoints must remain unchanged"
+        );
+    }
     use crate::state::AgentPaths;
     use chrono::Utc;
 

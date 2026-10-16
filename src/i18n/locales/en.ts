@@ -645,7 +645,7 @@ const en: ResourceTree = {
       "dockerUnavailable": "No usable Docker on the host, so the proxy cannot start.",
       "intelMacUnsupported": "Intel Mac is not supported. The first release of Remote Manager targets Apple Silicon only.",
       "guiSessionUnavailable": "No macOS login session is available. The proxy stays resident after login and does not change power or auto-login settings.",
-      "proxyPortConflict": "The remote proxy's default port is in use. Name another port in the deployment plan, or free 127.0.0.1:15722.",
+      "proxyPortConflict": "All proxy fallback ports in 15721–15799 are occupied. Free one port, then deploy again.",
       "insufficientDiskSpace": "There is not enough free space for download, extract, and rollback reserve. The replace was stopped. User data is not deleted automatically.",
       "incompleteObservation": "Managed runtime turns, tools, or approvals could not be fully observed, so the destructive operation was blocked.",
       "hostNotConfigured": "Vellum's configuration has not been written to this host yet.",

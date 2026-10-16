@@ -111,6 +111,42 @@ impl ProxyManager {
         crate::configuration::read_boundary_key(self.store.paths()).unwrap_or_default()
     }
 
+    /// Deployment planning uses the same read-only selection as native start.
+    pub fn select_port(&self, preferred: Option<u16>) -> Result<u16, String> {
+        if !self.native_backend_active() {
+            return Err("NativeProxyPortSelectionUnsupported".into());
+        }
+        let state = self.store.load()?;
+        let installed = state.install.as_ref().map(|install| install.host_port);
+        let job = self.launchd.inspect_agent(
+            &self.launchd_domain,
+            crate::native_proxy::LAUNCH_AGENT_LABEL,
+        )?;
+        let mut managed_port = if job.running { installed } else { None };
+        if let Some(old) = state
+            .install
+            .as_ref()
+            .filter(|install| install.backend() == crate::platform::ProxyBackend::Docker)
+        {
+            if self
+                .require_docker_observable()?
+                .iter()
+                .any(|container| container.running && same_install_ownership(old, container))
+            {
+                // Migration will stop this exact labelled container before
+                // native start. Its existing listener is not a foreign owner.
+                managed_port = Some(old.host_port);
+            }
+        }
+        crate::native_proxy::select_native_port(
+            self.launchd.as_ref(),
+            preferred
+                .or(installed)
+                .unwrap_or_else(|| self.launchd.default_port()),
+            managed_port,
+        )
+    }
+
     /// Read-only status may return diagnostics when Docker is unavailable.
     pub fn status(&self) -> Result<ProxyStatusView, String> {
         let state = self.store.load()?;
@@ -1469,6 +1505,22 @@ mod tests {
             "user",
         );
         native.docker = docker.clone();
+        *service.port_busy.lock().unwrap() = true;
+        assert_eq!(
+            native.select_port(None).unwrap(),
+            15721,
+            "labelled migration listener retains its port"
+        );
+        docker.containers.lock().unwrap()[0].running = false;
+        assert!(
+            native
+                .select_port(None)
+                .unwrap_err()
+                .starts_with("proxyPortConflict:"),
+            "foreign/unlabelled listeners must not count as managed"
+        );
+        docker.containers.lock().unwrap()[0].running = true;
+        *service.port_busy.lock().unwrap() = false;
         let staged = temp.path().join("proxy-stage");
         std::fs::write(&staged, b"native-linux").unwrap();
         let digest = crate::native_proxy::digest_native_binary(&staged).unwrap();

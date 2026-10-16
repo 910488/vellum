@@ -250,6 +250,8 @@ pub enum AgentRequest {
     },
     #[serde(rename = "proxy.status")]
     ProxyStatus,
+    #[serde(rename = "proxy.selectPort")]
+    ProxySelectPort { preferred_port: Option<u16> },
     #[serde(rename = "proxy.install")]
     ProxyInstall {
         operation_id: String,
@@ -564,6 +566,21 @@ mod tests {
                 host_port: Some(15721),
                 image: None,
             }
+        );
+    }
+
+    #[test]
+    fn proxy_port_selection_is_a_read_only_request_without_operation_id() {
+        let request = AgentRequest::ProxySelectPort {
+            preferred_port: Some(15745),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["method"], "proxy.selectPort");
+        assert_eq!(value["preferredPort"], 15745);
+        assert!(value.get("operationId").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentRequest>(value).unwrap(),
+            request
         );
     }
 

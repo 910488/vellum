@@ -373,6 +373,17 @@ impl RemoteAgentClient {
         self.rpc(json!({"method": "proxy.status"}))
     }
 
+    pub fn proxy_select_port(&self, preferred_port: Option<u16>) -> AppResult<u16> {
+        let value =
+            self.rpc(json!({"method": "proxy.selectPort", "preferredPort": preferred_port}))?;
+        value
+            .get("hostPort")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| AppError::Message("NativeProxyPortSelectionInvalid".into()))
+    }
+
     pub fn proxy_install(
         &self,
         operation_id: &str,

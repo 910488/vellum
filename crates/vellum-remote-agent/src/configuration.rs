@@ -313,6 +313,32 @@ pub fn configure(paths: &AgentPaths, raw: &str) -> Result<ConfigureResult, Strin
     })
 }
 
+/// Persist a port selected at start time (including a plan/start race), using
+/// the same canonical config hash as normal configure. Upstream URLs and
+/// credentials are preserved. A missing config remains the installer's job.
+pub(crate) fn configure_native_listen(
+    paths: &AgentPaths,
+    port: u16,
+) -> Result<Option<String>, String> {
+    let path = paths.proxy_config_dir.join("proxy.toml");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("NativeProxyConfigReadFailed: {error}")),
+    };
+    let mut config = ProxyRuntimeConfig::from_toml_str(&raw)
+        .map_err(|error| format!("InvalidProxyConfig: {error}"))?;
+    let listen = crate::native_proxy::native_listen(port)
+        .parse()
+        .map_err(|error| format!("NativeProxyListenInvalid: {error}"))?;
+    if config.listen == listen {
+        return Ok(None);
+    }
+    config.listen = listen;
+    let raw = toml::to_string_pretty(&config).map_err(|error| error.to_string())?;
+    configure(paths, &raw).map(|result| Some(result.config_hash))
+}
+
 pub fn put_credential(
     paths: &AgentPaths,
     credential_id: &str,

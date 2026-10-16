@@ -116,10 +116,19 @@ blocker 在 `remoteVocabulary.ts` 裡 `remedy: null`，使用者只能看到一�
   明確停止後被復活。Codex 只在受管 lease 啟用且沒有執行中的 daemon 時，沿用既有
   pinned daemon bootstrap／ownership 檢查恢復；不接管 App-owned 程序。
   `detachedReady` 在 onDemand 下另外要求 `supervisorReady=true`。這段待協調者驗證，
-  不代表已完成 Linux 實機或全 M2 驗收；自動選埠仍接下一段。
+  不代表已完成 Linux 實機驗收。`5edc38b` 已把恢復 hook 接到 Desktop 正式產生的
+  wrapper，修正 POSIX 路徑；SSH 重連的兩把鎖都用 try-lock，鎖忙立即跳過。
 - Proxy port：預設 port 被非受管程序占用時，自動在 15721–15799 內挑一個空的，
   寫入 desired state，catalog／config 的 base_url 跟著走。`proxyPortConflict`
   只在整段範圍都被占時才出現。
+- M2 最後段落（待協調者驗證）：Agent 新增唯讀 `proxy.selectPort`；已在執行的受管
+  proxy 保留埠，否則先試 desired／既有／平台預設埠，再掃描 15721–15799。
+  plan 記錄 `hostPort` 與 desired state 的 `proxyPort`，並用該埠產生 config.listen。
+  start 再探測一次，處理 plan 後埠被占用的情況；實際埠與 config hash 寫回 Agent，
+  Desktop 把實際埠／hash 保存為 observed desired state。Codex provider 的 base_url
+  沿用實際 ProxyStatus 產生；catalog 的上游網址不因 host-local 埠改變而重寫。
+  wrapper 上傳也改成同目錄 mktemp → chmod 0700 → mv -f，避免截斷執行中的腳本。
+  M2 的程式碼範圍已齊備；建置、測試與最後驗收由協調者執行，實機 smoke 仍待 Joe 同意。
 
 ### M3 一鍵 converge 吸收所有修復動作
 

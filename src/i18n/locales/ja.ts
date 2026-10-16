@@ -614,7 +614,7 @@ const ja: ResourceTree = {
       "dockerUnavailable": "ホストに使える Docker がなく、Proxy を起動できません。",
       "intelMacUnsupported": "Intel Mac は未対応です。Remote Manager の初版は Apple Silicon のみです。",
       "guiSessionUnavailable": "macOS のログインセッションがありません。Proxy はログイン後に常駐し、電源や自動ログインの設定は変更しません。",
-      "proxyPortConflict": "リモート Proxy の既定ポートが使用中です。デプロイ計画で別ポートを指定するか、127.0.0.1:15722 を空けてください。",
+      "proxyPortConflict": "Proxy の代替ポート 15721–15799 がすべて使用中です。いずれかのポートを空けてから、再度デプロイしてください。",
       "insufficientDiskSpace": "ダウンロード・展開・ロールバック用の空き容量が足りないため、置換を中止しました。ユーザーデータは自動削除しません。",
       "incompleteObservation": "管理対象 runtime の turn / ツール / 承認を完全に観測できないため、破壊的操作を遮断しました。",
       "hostNotConfigured": "このホストにはまだ Vellum の設定が書き込まれていません。",
