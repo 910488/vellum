@@ -189,7 +189,10 @@ impl ProxyManager {
                 crate::migration::clear(self.store.paths())?;
                 // The snapshot is no longer a rollback target. Re-observe labels
                 // before deleting; names alone never grant removal authority.
-                let cleanup = self.require_docker_observable().and_then(|containers| {
+                // Post-commit cleanup is optional: an unavailable Docker
+                // inventory is not a deletion failure or a native dependency.
+                let cleanup: Result<(), String> = (|| {
+                    let containers = self.docker.list_proxy_containers().unwrap_or_default();
                     for container in containers.iter().filter(|container| {
                         snapshot.stopped_ids.contains(&container.id)
                             && same_install_ownership(&snapshot.install, container)
@@ -198,7 +201,7 @@ impl ProxyManager {
                         self.docker.remove_container(&container.id)?;
                     }
                     Ok(())
-                });
+                })();
                 if cleanup.is_err() {
                     eprintln!("ProxyMigrationContainerCleanupFailed");
                 }
@@ -231,9 +234,14 @@ impl ProxyManager {
         if !status.ready {
             return Ok(0);
         }
+        // This is optional garbage collection, not migration/ownership
+        // validation. Without an inventory, skip it silently. Keep strict
+        // require_docker_observable checks on all deployment/rollback paths.
+        let Ok(containers) = self.docker.list_proxy_containers() else {
+            return Ok(0);
+        };
         let mut removed = 0;
-        for container in self
-            .require_docker_observable()?
+        for container in containers
             .iter()
             .filter(|container| !container.running && same_install_ownership(install, container))
         {
@@ -2053,6 +2061,46 @@ mod tests {
         *docker.fail_remove.lock().unwrap() = false;
         native.migration_commit("retry-cleanup").unwrap();
         assert_eq!(docker.containers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_docker_skips_cleanup_without_warning() {
+        for error in [
+            "docker executable not found: No such file or directory",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            "permission denied connecting to Docker",
+        ] {
+            for pending in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (native, docker, _) = migration_fixture(&temp);
+                stage_migration(&native, &temp, "migrate").unwrap();
+                native
+                    .start(ProxyStartRequest {
+                        operation_id: "start".into(),
+                        host_port: None,
+                        image: None,
+                    })
+                    .unwrap();
+                if !pending {
+                    crate::migration::clear(native.store.paths()).unwrap();
+                }
+                *docker.fail_list.lock().unwrap() = Some(error.into());
+                assert_eq!(
+                    native
+                        .with_mutation_lock(|| native.cleanup_legacy_orphans())
+                        .unwrap(),
+                    0
+                );
+                let result = native.migration_commit("commit").unwrap();
+                assert_eq!(result.status, "ok");
+                assert!(result.detail["cleanupWarning"].is_null(), "{error}");
+                if !pending {
+                    assert_eq!(result.detail["orphanContainersRemoved"], 0);
+                }
+                assert!(docker.removed.lock().unwrap().is_empty());
+                assert_eq!(docker.containers.lock().unwrap().len(), 3);
+            }
+        }
     }
 
     #[test]

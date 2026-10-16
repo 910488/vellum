@@ -618,6 +618,7 @@ fn parse_host_port(ports: &str) -> Option<u16> {
 
 #[derive(Debug, Default)]
 pub struct FakeDockerClient {
+    pub fail_list: std::sync::Mutex<Option<String>>,
     pub removed: std::sync::Mutex<Vec<String>>,
     pub fail_remove: std::sync::Mutex<bool>,
     pub restarted: std::sync::Mutex<Vec<String>>,
@@ -651,6 +652,9 @@ impl DockerClient for FakeDockerClient {
         Ok(())
     }
     fn list_proxy_containers(&self) -> Result<Vec<ContainerSummary>, String> {
+        if let Some(error) = self.fail_list.lock().unwrap().as_ref() {
+            return Err(error.clone());
+        }
         Ok(self.containers.lock().expect("poisoned").clone())
     }
 
