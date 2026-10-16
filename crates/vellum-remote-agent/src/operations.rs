@@ -192,7 +192,7 @@ fn validate_operation_id(operation_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp-{}", ulid::Ulid::new()));
     let write_result = (|| {
         let mut options = OpenOptions::new();

@@ -156,6 +156,7 @@ fn dispatch(
             "proxyMigrationRecovery": true,
             "confirmedTakeoverIdentity": true,
             "fullCodexRuntimePackage": true,
+            "codexHandoff": true,
         })),
         AgentRequest::HostCapabilities => {
             Ok(serde_json::to_value(probe_host()).map_err(|e| e.to_string())?)
@@ -474,6 +475,24 @@ fn dispatch(
                 )?)
                 .map_err(|error| error.to_string())?,
             )
+        }
+        AgentRequest::CodexHandoffStart(request) => {
+            let home = resolve_codex_home()?;
+            serde_json::to_value(vellum_remote_agent::handoff::start(
+                store.paths(),
+                &home,
+                request,
+            )?)
+            .map_err(|e| e.to_string())
+        }
+        AgentRequest::CodexHandoffResult(request) => {
+            let home = resolve_codex_home()?;
+            serde_json::to_value(vellum_remote_agent::handoff::result(
+                store.paths(),
+                &home,
+                request,
+            )?)
+            .map_err(|e| e.to_string())
         }
         AgentRequest::CodexSessionStatus { thread_id } => {
             let codex_home = resolve_codex_home()?;

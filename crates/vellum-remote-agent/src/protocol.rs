@@ -372,6 +372,10 @@ pub enum AgentRequest {
     CodexVerifyInstallation { compatible_range: Option<String> },
     #[serde(rename = "codex.sessionStatus")]
     CodexSessionStatus { thread_id: Option<String> },
+    #[serde(rename = "codex.handoffStart")]
+    CodexHandoffStart(crate::handoff::StartRequest),
+    #[serde(rename = "codex.handoffResult")]
+    CodexHandoffResult(crate::handoff::ResultRequest),
     #[serde(rename = "codex.accountStatus")]
     CodexAccountStatus { expected_account_id: Option<String> },
     /// Synchronize the remote daemon's control identity with Desktop. This is

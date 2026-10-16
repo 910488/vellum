@@ -252,7 +252,7 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
 - **結果回來**：顯示相對交出時快照的 diffstat；動作是「套用到本機工作區」「開成分支」
   「看完整 diff」。若本機在交出後又改過同一檔案，偵測到衝突時改以「開成分支」為主要
   動作並警告。本機 thread 收到一則「遠端已完成」的摘要。
-- **runtime package（調查完成，第一段實作待驗收）**：pinned 0.147.0-alpha.6.6 的
+- **runtime package（第一段已驗收：45d1444）**：pinned 0.147.0-alpha.6.6 的
   `code_mode_host` 預設開啟，host 延遲啟動；缺 helper 時 thread 仍可能建立成功，
   到工具呼叫才失敗。一般 Code Mode 可退回 direct tools，但 CodeModeOnly 或禁止
   fallback 時會失敗，不能把 POC 的「所有 shell 都失敗」推廣到所有設定。依據 pinned
@@ -271,6 +271,20 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   -p vellum-remote-agent --test codex_runtime_package -- --ignored`。
   兩個架構的 archive 分別跑一次；這項測試不執行目標 Codex，以 fake version／service
   client 驗證真實解包、完整性與相對 symlink，因此可在 x64 harness 檢查 arm64 package。
+- **Agent handoff 協定（第二段實作，待驗收）**：`agent.version` 的頂層
+  `codexHandoff=true` 表示支援。`codex.handoffStart` 收 operationId、repoId、
+  snapshotCommit、sourceThreadId、brief、model、modelProvider、effort；先以
+  prepareOnly=true 建立受管 bare repo，回傳 repoPath、snapshotRef、worktree。
+  Desktop 經受管 SSH 推入該 ref 後，以相同參數、prepareOnly=false 啟動。
+  runtime 完整性與受管 daemon preflight 在寫入前執行；worktree 必須符合指定快照。
+  新 thread／turn 沿用模型與 effort，限制 workspace-write、無網路與額外暫存目錄寫入。
+  非冪等 RPC 前先持久化 intent；重試不重複建立。回覆遺失時回報
+  HandoffStartIndeterminate，保留已知 thread id，後續人工查明，不假裝成功。
+  `codex.handoffResult` 預設唯讀查詢 thread／turn、plan、最近輸出與摘要；
+  capture=true 加 operationId 時，使用臨時 index 建立結果 commit 與 resultRef、diffstat，
+  不更動原 index 或工作檔。執行中／失敗／中斷的快照標 partial；同一 capture operation
+  重試沿用既有快照，仍可用新的 operationId 拉取後續進度。Desktop 傳輸、UI、
+  本機衝突處理與通知留在後續段落。
 - 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、
   前置檢查擋下。
 

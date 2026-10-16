@@ -204,14 +204,7 @@ impl RemoteAgentClient {
         expected_sha256: &str,
         expected_version: &str,
     ) -> AppResult<Value> {
-        if self
-            .agent_version()?
-            .pointer("/features/fullCodexRuntimePackage")
-            .and_then(Value::as_bool)
-            != Some(true)
-        {
-            return Err(AppError::Message("RemoteCodexAgentUpdateRequired: update the Agent before installing a runtime package".into()));
-        }
+        ensure_full_runtime_package(&self.agent_version()?)?;
         self.rpc(json!({
             "method": "codex.installPinned",
             "operationId": operation_id,
@@ -956,9 +949,42 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn ensure_full_runtime_package(version: &Value) -> AppResult<()> {
+    if version
+        .get("fullCodexRuntimePackage")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        Ok(())
+    } else {
+        Err(AppError::Message(
+            "RemoteCodexAgentUpdateRequired: update the Agent before installing a runtime package"
+                .into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_runtime_capability_uses_the_actual_top_level_agent_version_contract() {
+        assert!(ensure_full_runtime_package(
+            &json!({"agentProtocol": 5, "fullCodexRuntimePackage": true})
+        )
+        .is_ok());
+        for response in [
+            json!({}),
+            json!({"fullCodexRuntimePackage": false}),
+            json!({"features": {"fullCodexRuntimePackage": true}}),
+        ] {
+            assert!(ensure_full_runtime_package(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("RemoteCodexAgentUpdateRequired"));
+        }
+    }
 
     #[test]
     fn shell_quote_leaves_safe_tokens() {
