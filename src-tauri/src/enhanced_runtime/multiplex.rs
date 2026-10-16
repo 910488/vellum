@@ -470,6 +470,10 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     let mut clients = HashSet::from([0_u64]);
     let mut failed_sockets = HashSet::new();
     let mut ids = Ids::default();
+    let mut handoff_inbox = crate::enhanced_runtime::handoff_inject::Inbox::from_attestation(
+        &m.attestation_path,
+        &m.launch_id,
+    );
     let mut out = tokio::io::stdout();
     let mut observations = RuntimeObservations::new(m.launch_id.clone());
     observations.remote.owner_pid = relay.id();
@@ -480,9 +484,18 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
             event = rx.recv() => { let Some(event) = event else { break }; event }
             _ = heartbeat.tick() => {
                 for (plane,core) in std::iter::once((ExecutionPlane::OfficialCodex,&mut official)).chain(enhanced.as_mut().map(|core| (ExecutionPlane::EnhancedCodex,core))) {
-                    if core.process.try_wait()?.is_some() { state.mark_child_exited(plane,"core exited"); }
+                    if core.process.try_wait()?.is_some() {
+                        state.mark_child_exited(plane,"core exited");
+                        if let Some(inbox) = handoff_inbox.as_mut() { for client in &clients { inbox.disconnected(*client, Some(plane)); } }
+                    }
                 }
                 let _ = observations.write(&observation_path);
+                if let Some(inbox) = handoff_inbox.as_mut() {
+                    inbox.scan(&state.store, &m.enhanced_digest(), |client, value| {
+                        state.ensure_plane_available(ExecutionPlane::EnhancedCodex).is_ok()
+                            && sockets.get(&(client, ExecutionPlane::EnhancedCodex)).is_some_and(|socket| socket.try_send(value).is_ok())
+                    });
+                }
                 continue;
             }
         };
@@ -539,6 +552,11 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
             }
             other => other,
         };
+        let child_plane = match &event {
+            Event::Child(_, plane, _) => Some(*plane),
+            _ => None,
+        };
+        let mut scan_handoff = false;
         let (client, actions) = match event {
             Event::Client(client, mut value) => {
                 if !clients.contains(&client) {
@@ -584,6 +602,12 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                 }
             }
             Event::Child(client, plane, value) => {
+                if handoff_inbox
+                    .as_mut()
+                    .is_some_and(|inbox| inbox.response(client, plane, &value))
+                {
+                    continue;
+                }
                 if !clients.contains(&client) {
                     continue;
                 }
@@ -601,6 +625,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
             }
             Event::Close(0) => break,
             Event::Close(client) => {
+                if let Some(inbox) = handoff_inbox.as_mut() {
+                    inbox.disconnected(client, None);
+                }
                 clients.remove(&client);
                 sockets.retain(|(id, _), _| *id != client);
                 failed_sockets.retain(|(id, _)| *id != client);
@@ -609,6 +636,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                 continue;
             }
             Event::SocketClosed(client, plane) => {
+                if let Some(inbox) = handoff_inbox.as_mut() {
+                    inbox.disconnected(client, Some(plane));
+                }
                 if !clients.contains(&client) {
                     continue;
                 }
@@ -622,6 +652,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
             Event::RelayClosed => {
                 for client in clients.iter().copied().filter(|client| *client != 0) {
                     ids.disconnect(client);
+                    if let Some(inbox) = handoff_inbox.as_mut() {
+                        inbox.disconnected(client, None);
+                    }
                 }
                 clients.retain(|client| *client == 0);
                 sockets.retain(|(client, _), _| *client == 0);
@@ -670,6 +703,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                             }
                         }
                     }
+                    if let Some(inbox) = handoff_inbox.as_mut() {
+                        inbox.forwarded(client, plane, &value);
+                    }
                     if !matches!(
                         tokio::time::timeout(
                             std::time::Duration::from_secs(5),
@@ -681,6 +717,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                         sockets.remove(&(client, plane));
                         failed_sockets.insert((client, plane));
                         observations.remote.last_failure_stage = Some("backpressure".into());
+                        if let Some(inbox) = handoff_inbox.as_mut() {
+                            inbox.disconnected(client, Some(plane));
+                        }
                         deliver(client,json!({"method":"vellum/runtimeFailed","params":{"plane":plane.as_str(),"message":"Core transport stalled; outstanding operation results may be unknown"}}),&mut out,&mut relay_in).await?;
                     }
                 }
@@ -689,6 +728,10 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                     relay_in.write_all(bytes.as_bytes()).await?;
                 }
                 BridgeAction::ToClient(mut value) => {
+                    if let (Some(inbox), Some(plane)) = (handoff_inbox.as_mut(), child_plane) {
+                        inbox.observe(client, plane, &value, &state.store);
+                        scan_handoff |= value["method"] == "turn/completed";
+                    }
                     if let Ok(method) = ids.response(client, &mut value) {
                         let initialized = client == 0
                             && method.as_deref() == Some("initialize")
@@ -738,6 +781,21 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                 }
             }
         }
+        if scan_handoff {
+            if let Some(inbox) = handoff_inbox.as_mut() {
+                inbox.scan(&state.store, &m.enhanced_digest(), |client, value| {
+                    state
+                        .ensure_plane_available(ExecutionPlane::EnhancedCodex)
+                        .is_ok()
+                        && sockets
+                            .get(&(client, ExecutionPlane::EnhancedCodex))
+                            .is_some_and(|socket| socket.try_send(value).is_ok())
+                });
+            }
+        }
+    }
+    if let Some(inbox) = handoff_inbox.as_mut() {
+        inbox.shutdown();
     }
     let _ = relay.kill().await;
     let _ = official.process.kill().await;
@@ -754,6 +812,76 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn handoff_inject_response_never_consumes_desktop_or_relay_numeric_ids() {
+        use crate::enhanced_runtime::{
+            handoff_inject::{publish, Inbox},
+            ThreadRuntimeBinding,
+        };
+        for internal_first in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let bindings =
+                ThreadRuntimeBindingStore::open(temp.path().join("bindings.db")).unwrap();
+            bindings
+                .insert_immutable(&ThreadRuntimeBinding::new(
+                    "local",
+                    ExecutionPlane::EnhancedCodex,
+                    "digest",
+                    "provider",
+                    "model",
+                    "local",
+                    1,
+                ))
+                .unwrap();
+            let mut inbox = Inbox::new(temp.path().into(), "launch".into());
+            let resume =
+                json!({"id":"resume","method":"thread/resume","params":{"threadId":"local"}});
+            inbox.forwarded(0, ExecutionPlane::EnhancedCodex, &resume);
+            inbox.observe(
+                0,
+                ExecutionPlane::EnhancedCodex,
+                &json!({"id":"resume","result":{"thread":{"id":"local","status":{"type":"idle"}}}}),
+                &bindings,
+            );
+            std::fs::create_dir_all(temp.path().join("remote-handoffs/records")).unwrap();
+            std::fs::write(temp.path().join("remote-handoffs/records/handoff.json"), br#"{"id":"handoff","source":{"threadId":"local"},"remote":{"state":"completed","summary":"done"}}"#).unwrap();
+            publish(temp.path(), "handoff").unwrap();
+            let mut ids = Ids::default();
+            let mut desktop = json!({"id":0,"method":"thread/read"});
+            let mut relay = desktop.clone();
+            ids.request(0, &mut desktop).unwrap();
+            ids.request(7, &mut relay).unwrap();
+            let mut injected = None;
+            inbox.scan(&bindings, "digest", |_, value| {
+                injected = Some(value);
+                true
+            });
+            let internal = json!({"id":injected.unwrap()["id"],"result":{}});
+            assert!(internal["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("vellum:handoff-inject:"));
+            let mut desktop_reply = json!({"id":desktop["id"],"result":{"origin":"desktop"}});
+            let mut relay_reply = json!({"id":relay["id"],"result":{"origin":"relay"}});
+            if internal_first {
+                assert!(inbox.response(0, ExecutionPlane::EnhancedCodex, &internal));
+            }
+            assert!(!inbox.response(0, ExecutionPlane::EnhancedCodex, &desktop_reply));
+            assert!(!inbox.response(7, ExecutionPlane::EnhancedCodex, &relay_reply));
+            ids.response(0, &mut desktop_reply).unwrap();
+            ids.response(7, &mut relay_reply).unwrap();
+            if !internal_first {
+                assert!(inbox.response(0, ExecutionPlane::EnhancedCodex, &internal));
+            }
+            assert_eq!(desktop_reply, json!({"id":0,"result":{"origin":"desktop"}}));
+            assert_eq!(relay_reply, json!({"id":0,"result":{"origin":"relay"}}));
+            assert!(ids.requests.is_empty());
+            assert!(temp
+                .path()
+                .join("enhanced-runtime/handoff-inject/handoff.delivered")
+                .exists());
+        }
+    }
     #[test]
     fn same_request_ids_on_two_clients_never_collide() {
         let mut ids = Ids::default();

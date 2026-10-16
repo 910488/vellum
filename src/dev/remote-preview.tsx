@@ -374,7 +374,7 @@ function Harness() {
           會是一個永遠不捲的版面，也就驗不到這一版最主要的那個決定。 */}
       <div className="shell" style={{ gridTemplateColumns: "minmax(0, 1fr)", gridTemplateRows: "minmax(0, 1fr)" }}>
         <div className="canvas">
-          <HandoffNotifications onReview={requestHandoffReview} />
+          <HandoffNotifications key={`${scene}-${nonce}`} onReview={requestHandoffReview} />
           <Remote key={`${scene}-${nonce}`} refreshVersion={0} onRefreshComplete={() => {}} />
         </div>
       </div>

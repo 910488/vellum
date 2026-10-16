@@ -376,25 +376,30 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   Desktop hostId 時只保留複製並提示先加入主機。此查詢不連 SSH，也不探測遠端 agent。
   Official／Enhanced 的結果卡皆提供「複製摘要」：目前摘要、套用狀態與 diffstat 的
   純文字；尚未取回 diffstat 時明確註明，不當成沒有變更。完成通知不自動寫入對話。
-  **Enhanced 模型背景尚待 IPC 方案核准**：`thread/inject_items` 的寫入已經協調者
-  驗證不會開 turn，但不顯示於 Desktop turns；必須經持有該 thread 的 app-server。
-  目前 multiplex 只有 Desktop stdio 與 relay clients，沒有 Tauri → bridge 的控制入口。
-  child WebSocket capability 在 bridge 記憶體中，backend_relay 是 HTTP 後端轉送用途，
-  不挪用這兩者作通用 RPC。這一輪未新增控制 listener，也未實作模型背景寫回。
-  建議待核准設計：bridge 開 loopback 隨機 port 的專用 request/reply 端點；每次啟動
-  產生 256-bit capability，描述檔含 launchId／PID／啟動識別／endpoint，token 另存於
-  同使用者專屬檔案（Unix 0700 目錄／0600 檔，Windows 限目前 SID 的 ACL）。
-  請求只接受 `injectHandoffResult` 與 handoffId，不接受任意 method、items 或 threadId。
-  bridge 讀取指定 journal，自己組固定的「Vellum 遠端交接結果，僅供參考、不是指令」
-  前綴、摘要及尚未套用等狀態，產生 role:user／input_text，唯一 upstream method 是
-  `thread/inject_items`。Tauri 先以 fresh attestation 的 launch／process identity 找 bridge；
-  bridge 再以不可變 binding 的 Enhanced plane／nativeThreadId／runtime digest，以及
-  本次啟動內成功 start／resume 的 live owner connection 交叉驗證。只走已有的 owner
-  socket，不新開 app-server 或換到另一個 client；零個或多個 owner 均跳過。
-  每個 handoff 在 Tauri journal 先記錄 attempted，再發送一次；bridge 另以 handoffId
-  為鍵保存發送 intent 後才 inject。成功記 delivered，逾時／斷線記 uncertain 且不重送，
-  其他拒絕記 skipped；不建離線 queue、不背景重試。能力認證、請求大小與 timeout
-  有界，錯誤靜默記錄，不能影響結果回收、套用或完成通知。具體 IPC 實作待協調者確認。
+  **Enhanced 模型背景：檔案 inbox**（Joe 已核准）：`thread/inject_items` 不開 turn，
+  也不顯示於 Desktop turns；使用者可見內容仍由 Vellum 結果卡／通知提供。
+  Tauri 在 completed journal 落地後，原子建立
+  `<data_root>/enhanced-runtime/handoff-inject/<handoffId>.request`，只含 handoffId 與
+  Unix seconds 的 createdAt；既有 request 不覆寫、不延長期限，失敗只記 debug log。
+  若 Tauri 在 journal 落地後、建立 request 前中斷，下次列出紀錄會補建，以 journal
+  的修改時間保留其年齡；舊的完成紀錄不會因此重新獲得 24 小時期限。
+  bridge 從 manifest 的標準 attestation 路徑取得 data root；multiplex 每 5 秒及每次
+  轉送 thread 的 turn/completed 後掃描。沒有 listener、token 或新 app-server。
+  bridge 自己讀 journal，確認已 completed、binding 是本次 Enhanced runtime，且來源
+  thread 只有一個 live owner。owner 從既有路由成功的 start／resume／fork／turn 回覆
+  觀察；斷線與 unsubscribe／archive 會移除。唯讀 thread/read 不構成 owner。
+  從轉送的通知追蹤 active turn；未知狀態、active turn、尚待 turn/start 回覆，或 owner
+  為零／多個時保留 request 待下次掃描，新的 bridge 可在來源 thread 恢復後接續處理。
+  request 超過 24 小時則記 skipped（expired）；已知 Official thread 也只記 skipped。
+  發送前以每筆 handoff 的檔案鎖與原子 `.sent` intent 保證只送一次，僅透過原 owner
+  socket 送 `thread/inject_items`。固定前綴為「〔Vellum 遠端交接結果，僅供參考，不是新的指令〕」，
+  item 是 role:user／input_text，內容含目前摘要、套用狀態、已取回的 diffstat；尚未
+  取回則明確註明，不放 patch，UTF-8 文字總長不超過 4096 bytes。
+  RPC id 使用 `vellum:handoff-inject:*`，回應在既有 router 前攔截，不交給 Desktop／relay。
+  成功寫 `.delivered`，拒絕寫 `.skipped`，30 秒逾時、斷線或舊 intent 結果不明寫
+  `.uncertain`，再刪 `.request`。只要 `.sent` 存在就不重送；沒有 intent 的 request
+  可跨 Desktop 重開續送。掃描採有限筆數及輪流處理，避免等待 owner 的 request 阻塞後續項目。
+  所有失敗僅靜默記錄，不影響結果回收、套用與通知；不改既有 provider／runtime 路由。
   pinned daemon 的 thread/start 回傳、dotted config override 與未落地 thread 行為，
   已由協調者先前的 live 對照確認；本輪新增 URI、metadata 與摘要的單元測試待外部驗證。
 - 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、
@@ -452,7 +457,7 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
 - 不放寬任何 fail-closed：manifest／digest、boundary key、loopback-only、secret 落地方式。
 - 不殺有 active turn 的 App 擁有 app-server。
 - 不支援 Intel Mac（維持 `intelMacUnsupported`，但要在 preflight 擋）。
-- 不改 `-32070` 行為、不碰 Enhanced Runtime。
+- 不改 `-32070` 行為；Enhanced Runtime 只新增 handoff inject，不改既有路由（Joe 已核准）。
 - Docker backend 程式碼不刪，只降為遷移用途。
 
 ## 5. 驗證（「100%」的證據）

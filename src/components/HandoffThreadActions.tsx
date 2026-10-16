@@ -18,7 +18,7 @@ export function HandoffThreadActions({ record }: { record: RemoteHandoffRecord }
       if (live) setTarget({ id: record.id, thread: threadId, available: !!link });
     }).catch(() => { if (live) setFailure("handoff.threadLinkFailed"); });
     return () => { live = false; };
-  }, [record.id, record.hostId, threadId]);
+  }, [record, threadId]);
   const current = target?.id === record.id && target.thread === threadId ? target : null;
   if (!threadId) return null;
   async function open() {

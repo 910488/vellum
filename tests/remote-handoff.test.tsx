@@ -47,6 +47,16 @@ describe("remote handoff", () => {
     expect(screen.getByRole("button", { name: "Copy remote thread ID" })).toBeTruthy();
     expect(api.openRemoteHandoffThread).not.toHaveBeenCalled();
   });
+  it("refreshes completion actions when a new snapshot of the same handoff loses its Desktop host", async () => {
+    store.records = [record()];
+    const instance = render(<HandoffNotifications onReview={vi.fn()} />);
+    expect(await screen.findByRole("button", { name: "Open in Codex App" })).toBeTruthy();
+    vi.mocked(api.getRemoteHandoffThreadLink).mockResolvedValue(null);
+    store.records = [record()];
+    instance.rerender(<HandoffNotifications onReview={vi.fn()} />);
+    expect(await screen.findByText(i18n.t("handoff.addHostToCodex"))).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open in Codex App" })).toBeNull();
+  });
   it("contains link lookup and opener failures without blocking result actions", async () => {
     store.records = [record()];
     vi.mocked(api.openRemoteHandoffThread).mockRejectedValue(new Error("opener failed"));

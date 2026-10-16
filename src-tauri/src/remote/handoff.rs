@@ -692,7 +692,19 @@ fn list_at(root: &Path) -> AppResult<Vec<Record>> {
                 .and_then(|id| id.to_str())
                 .ok_or_else(|| error("HandoffRecordInvalid"))?
                 .to_owned();
-            records.push(load(root, &id)?);
+            let record = load(root, &id)?;
+            if record
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote["state"] == "completed")
+            {
+                if let Err(error) =
+                    crate::enhanced_runtime::handoff_inject::recover(root, &record.id)
+                {
+                    log::debug!("[HandoffInject] request recovery failed: {error}");
+                }
+            }
+            records.push(record);
         }
     }
     records.sort_by(|a, b| b.id.cmp(&a.id));
@@ -733,6 +745,15 @@ fn save(root: &Path, record: &Record) -> AppResult<()> {
     File::open(parent)
         .and_then(|file| file.sync_all())
         .map_err(|e| error(e.to_string()))?;
+    if record
+        .remote
+        .as_ref()
+        .is_some_and(|remote| remote["state"] == "completed")
+    {
+        if let Err(error) = crate::enhanced_runtime::handoff_inject::publish(root, &record.id) {
+            log::debug!("[HandoffInject] request could not be published: {error}");
+        }
+    }
     Ok(())
 }
 struct Lock(File);
@@ -872,6 +893,40 @@ mod tests {
         };
         (temp, root, source)
     }
+    #[test]
+    fn completed_journal_publishes_inbox_and_publish_failure_does_not_fail_save() {
+        let (_temp, root, source) = fixture();
+        let client = Fake::new();
+        let mut record = begin(
+            &root,
+            "host",
+            source,
+            "Finish task",
+            &Requirements::default(),
+            &client,
+        )
+        .unwrap();
+        let inbox = root.join("enhanced-runtime/handoff-inject");
+        assert!(!inbox.exists());
+        record.remote = Some(json!({"state":"completed", "summary":"Done"}));
+        save(&root, &record).unwrap();
+        assert!(inbox.join(format!("{}.request", record.id)).exists());
+        assert_eq!(
+            load(&root, &record.id).unwrap().remote.unwrap()["state"],
+            "completed"
+        );
+        fs::remove_file(inbox.join(format!("{}.request", record.id))).unwrap();
+        list_at(&root).unwrap();
+        assert!(inbox.join(format!("{}.request", record.id)).exists());
+        fs::remove_dir_all(&inbox).unwrap();
+        fs::write(&inbox, b"injected write failure").unwrap();
+        save(&root, &record).unwrap();
+        assert_eq!(
+            load(&root, &record.id).unwrap().remote.unwrap()["summary"],
+            "Done"
+        );
+    }
+
     #[test]
     fn prepare_push_start_preserves_settings_and_includes_toolchain_notes() {
         let (_temp, root, source) = fixture();
