@@ -278,7 +278,7 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   Desktop 經受管 SSH 推入該 ref 後，以相同參數、prepareOnly=false 啟動。
   runtime 完整性與受管 daemon preflight 在寫入前執行；worktree 必須符合指定快照。
   新 thread／turn 沿用模型與 effort，限制 workspace-write、無網路與額外暫存目錄寫入。
-  非冪等 RPC 前先持久化 intent；重試不重複建立。回覆遺失時回報
+  非冪等 RPC 前先持久化 intent；回覆遺失時回報
   HandoffStartIndeterminate，保留已知 thread id，不假裝成功。
   `result` 對 ThreadStarting 以 pinned v2 `thread/list` 的 cwd 精確過濾、完整分頁
   （最多兩頁）找唯一候選；useStateDbOnly=true，避免索引修復寫入。唯一候選採為
@@ -287,7 +287,17 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   `thread/resume {threadId}`（無任何 override 或額外旗標）驗證完整設定，通過後送 turn。
   resume 出錯／身分不符保留 adopted；設定不符回 HandoffConfigurationMismatch。
   TurnStarting 以 thread/read 找唯一 turn；0.147 Turn 沒有 clientUserMessageId，
-  零個或多個均不採用。對帳不增加 thread/start 或 turn/start 的次數。
+  零個或多個均不採用。背景對帳不增加 thread/start 或 turn/start 的次數。
+  pinned 0.147.0-alpha.6.6 的 live 對照確認：thread/start 回傳的 model、cwd、effort、
+  sandbox 形狀符合驗證，dotted config key 生效；但尚無 turn 的 thread 是記憶體中的
+  unmaterialized 空殼，不出現在 thread/list，thread/resume 回 no rollout。
+  因此 ThreadStarting 在下一次明確 start 時，先完整列出該 cwd；若候選為零且從未
+  收到 thread id（從而從未送出 turn），允許重送 thread/start。唯一候選仍走 adopted，
+  多個候選或分頁不完整則不重送；已知 id 的設定驗證失敗也不藉此另建 thread。
+  TurnStarting 的 thread/read(includeTurns=true) 僅在 JSON-RPC code=-32600 且
+  message 含 pinned 字串 not materialized 時，才允許明確 start 重送原 turn。
+  唯一已落地 turn 繼續採用；其他錯誤／候選維持不明，不把連線錯誤當成未執行。
+  result 只觀察，兩種安全重送均須使用者明確 resume，由 Agent 重新核對證據。
   `codex.handoffResult` 預設唯讀查詢 thread／turn、plan、最近輸出與摘要；
   capture=true 加 operationId 時，使用臨時 index 建立結果 commit 與 resultRef、diffstat，
   不更動原 index 或工作檔。執行中／失敗／中斷的快照標 partial；同一 capture operation
@@ -299,6 +309,9 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   每個不同 cwd 快取一次 rev-parse --show-toplevel，不掃 rollout、不另起 Git 查分支。
   model／effort／active 在清單中為未知（null），選中一筆後才讀該筆 sessions rollout，
   驗證身分並取最後的 model／provider／effort／active，沿用 conversation_key_matches。
+  同一次所選 rollout 掃描取最後使用者訊息作任務、第一則使用者訊息作原始需求、
+  最後 Agent 訊息作背景進度；分別最多 4000／4000／6000 Unicode 字元，截斷加省略號。
+  不讀未選中 thread 的 rollout，不使用工具輸出或隱藏推理作交代草稿；草稿可編輯。
   不讀 auth；缺設定或仍有本機 turn 時擋下。已建立交接紀錄的 thread 標 handedOff，
   UI 據此避免重複交出；安全套用、存成分支或明確捨棄後解除標記。
   preflight 檢查受管 SSH alias、Agent 功能、主機／完整 runtime／版本／模型與憑證；
@@ -314,6 +327,9 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   本機 inspect／status／臨時 index staging 繼承使用者 system／global／repo config，
   包含 core.autocrlf 與非 LFS clean filter，與使用者自己的 git add 保持一致；hooks 與
   fsmonitor 仍強制關閉。執行這些使用者自行設定的 filter 是本輪明確核准的行為。
+  Git diff 的 autoRefreshIndex 明確關閉，避免其 mandatory stat-refresh lock；status、
+  衝突檢查及 apply 使用真實 index 的臨時副本。保留真實 index byte 相等斷言，並在
+  真實 index.lock 已存在、system autocrlf=true 的 CRLF fixture 驗證套用維持 CRLF。
   preflight 在 status／clean filter 前檢查 .gitattributes 與 Git 的有效 filter 屬性；
   LFS 回 HandoffLfsUnsupported（不傳 LFS 物件或假裝遠端有 git-lfs）。臨時 index
   read-tree 後再檢查一次，避免 index／工作樹屬性不同時漏過 LFS。
@@ -341,9 +357,13 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   disposition 先持久化，再以 expected SHA 清理兩個 ref；清理失敗可離線重試，不能
   刪除別人改過的 ref。捨棄不取消遠端 turn；已觀察到終止、或確定尚未送出 turn/start 的
   紀錄可離線捨棄。running／indeterminate 必須先對帳並等原 turn 終止。
+  Codex package 驗證／解包已抽成 vellum-codex-package 小 crate，Desktop 正式依賴
+  此 crate，Agent 保留 codex_package 相容 re-export；Agent 只作 Desktop 測試相依。
+  digest、原子切換與回復邏輯保持；release 腳本已複製整個 crates，無需額外調整。
   compose／blocked／running／back／drift 使用真實元件，預覽台 /preview/remote.html
-  新增五個交接場景、四語切換。thread 用列表選擇，任務第一段由使用者編輯，不假稱已
-  自動整理完整對話；可選任務所需 OS。開始前重跑 preflight，不以舊畫面取代檢查。
+  新增五個交接場景、四語切換。thread 用列表選擇，交代以上述所選訊息摘錄預填，
+  第一段仍為可編輯的本次任務；手動編輯不受 OS／preflight 重查覆蓋。可選任務所需 OS。
+  交接 API 的同步拋錯及非同步失敗限制在交接區塊。開始前重跑 preflight，不以舊畫面取代檢查。
   結果卡顯示摘要、diffstat、完整 binary patch，遇 drift 只提供存成分支，不提供強制套用。
   App 共用一個輪詢器，避免工作面與通知重複輪詢；關閉 App 後工作仍由遠端 daemon
   執行，重開或視窗恢復可見時補查結果。完成／停止通知在 Vellum 內保留到明確確認，

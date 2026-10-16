@@ -577,7 +577,7 @@ async fn download_package(archive: &OfficialCodexArchive) -> AppResult<tempfile:
     output
         .flush()
         .map_err(|error| AppError::Message(format!("flush Codex binary: {error}")))?;
-    vellum_remote_agent::codex_package::verify_archive(output.path()).map_err(AppError::Message)?;
+    vellum_codex_package::verify_archive(output.path()).map_err(AppError::Message)?;
     Ok(output)
 }
 

@@ -2,6 +2,7 @@ import type { ResourceTree } from "../resources";
 
 const en: ResourceTree = {
   "handoff": {
+    "draftBackground": "Background from the selected conversation", "draftOriginal": "Original request", "draftProgress": "Latest agent progress", "draftCaution": "The first paragraph is the task for this handoff. Treat the excerpts below as background; review any older instructions to defer work before sending.",
     "requiredOs": "Required operating system", "detectOs": "Detect from the repository",
     "hostRepair": "Deploy or repair this host before handing off.", "gitRepair": "Install Git 2.29 or newer before handing off.", "pairRepair": "Pair and activate ChatGPT on this host first.", "copyThread": "Copy remote thread ID", "openThreadHint": "In Codex App, select this host and open the remote thread using this ID.",
     "title": "Hand local work to {{host}}", "lede": "Continue remotely from your current files, including uncommitted changes. Your local files stay in place.",

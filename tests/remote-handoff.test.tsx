@@ -5,7 +5,7 @@ import "@/i18n";
 import { api } from "@/lib/api";
 import { RemoteHandoff } from "@/components/RemoteHandoff";
 import { HandoffNotifications } from "@/components/HandoffNotifications";
-import { handoffState, type RemoteHandoffRecord, type RemoteHandoffThread } from "@/lib/remoteHandoff";
+import { handoffDraft, handoffState, type RemoteHandoffRecord, type RemoteHandoffThread } from "@/lib/remoteHandoff";
 import { assertResourceParity } from "@/i18n/resources";
 
 const store = vi.hoisted(() => ({ records: [] as RemoteHandoffRecord[] }));
@@ -26,6 +26,20 @@ beforeEach(async () => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const view = () => render(<RemoteHandoff hostId="host" hostName="Jetson" active />);
 describe("remote handoff", () => {
+  it("prefills only the selected thread's draft and preserves edits across OS rechecks", async () => {
+    const draft = { task: "Finish the CLI and tests.", originalRequest: "Create a word-count package.", lastProgress: "Parser is done." };
+    vi.mocked(api.preflightRemoteHandoff).mockResolvedValue({ thread: { ...thread, draft }, changes: [], blockers: [], warnings: [], remoteOs: "linux", localRefNotice: "ref" });
+    view();
+    const brief = await screen.findByRole("textbox") as HTMLTextAreaElement;
+    await waitFor(() => expect(brief.value).toBe(handoffDraft(draft, (key) => i18n.t(key))));
+    expect(brief.value.startsWith(draft.task)).toBe(true);
+    expect(brief.value).toContain(draft.originalRequest);
+    expect(brief.value).toContain(draft.lastProgress);
+    fireEvent.change(brief, { target: { value: "Edited task." } });
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "linux" } });
+    await waitFor(() => expect(api.preflightRemoteHandoff).toHaveBeenCalledWith("host", "local", { requiredOs: "linux" }));
+    expect((await screen.findByRole("textbox") as HTMLTextAreaElement).value).toBe("Edited task.");
+  });
   it("compose uses a thread list and requires an editable task before sending", async () => {
     const start = vi.spyOn(api, "startRemoteHandoff").mockResolvedValue(record("running"));
     view();

@@ -15,6 +15,17 @@ export interface RemoteHandoffThread {
   effort: string | null;
   active: boolean | null;
   handedOff: boolean;
+  draft?: { task: string; originalRequest: string; lastProgress: string } | null;
+}
+
+/** No model call: selected rollout excerpts only. The task is always first. */
+export function handoffDraft(draft: RemoteHandoffThread["draft"], t: (key: string) => string): string {
+  if (!draft?.task.trim()) return "";
+  const background = [
+    draft.originalRequest ? `${t("handoff.draftOriginal")}\n${draft.originalRequest}` : "",
+    draft.lastProgress ? `${t("handoff.draftProgress")}\n${draft.lastProgress}` : "",
+  ].filter(Boolean).join("\n\n");
+  return background ? `${draft.task}\n\n${t("handoff.draftBackground")}\n${t("handoff.draftCaution")}\n\n${background}` : draft.task;
 }
 
 export interface RemoteHandoffChange {

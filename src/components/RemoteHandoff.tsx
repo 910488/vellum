@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { api } from "@/lib/api";
 import { refreshHandoffs, useHandoffRecords } from "@/lib/handoffStore";
 import { handoffReviewTarget } from "@/lib/handoffNavigation";
-import { handoffState, handoffTerminal, type RemoteHandoffPreflight, type RemoteHandoffReview, type RemoteHandoffThread } from "@/lib/remoteHandoff";
+import { handoffDraft, handoffState, handoffTerminal, type RemoteHandoffPreflight, type RemoteHandoffRecord, type RemoteHandoffReview, type RemoteHandoffThread } from "@/lib/remoteHandoff";
 import { Btn, Cap, Card, Confirm, Notice, State } from "./ui";
 import "@/styles/handoff.css";
 
@@ -24,6 +24,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
   const [discardId, setDiscardId] = useState<string | null>(null);
   const generation = useRef(0);
   const inFlight = useRef(false);
+  const briefEdited = useRef(false);
   const autoCaptured = useRef(new Set<string>());
   const record = compose ? undefined : records.find((r) => r.id === recordId) ?? records.find((r) => !r.result.outcome);
   const terminal = record ? handoffTerminal(record) : false;
@@ -32,7 +33,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
   useEffect(() => {
     if (!active) return;
     let live = true;
-    void api.listRemoteHandoffThreads().then((rows) => {
+    void Promise.resolve().then(() => api.listRemoteHandoffThreads()).then((rows) => {
       if (live) { setThreads(rows); setSelected((current) => current || rows.find((row) => !row.handedOff)?.threadId || ""); }
     }).catch((e: unknown) => { if (live) setFailure(String(e)); });
     return () => { live = false; };
@@ -49,16 +50,19 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
     const current = ++generation.current;
     setReport(null); setFailure(null);
     if (!selected || !active) return;
-    void api.preflightRemoteHandoff(hostId, selected, requiredOs ? { requiredOs } : {}).then((value) => {
+    void Promise.resolve().then(() => api.preflightRemoteHandoff(hostId, selected, requiredOs ? { requiredOs } : {})).then((value) => {
       if (generation.current === current) setReport(value);
     }).catch((e: unknown) => { if (generation.current === current) setFailure(String(e)); });
     return () => { generation.current++; };
   }, [selected, hostId, active, requiredOs]);
   useEffect(() => {
+    if (report && !briefEdited.current) setBrief(handoffDraft(report.thread.draft, (key) => t(key)));
+  }, [report, t]);
+  useEffect(() => {
     let live = true;
     setReview(null); setShowDiff(false);
     if (!record?.result.fetched || record.result.outcome || !active) return;
-    void api.reviewRemoteHandoff(record.id).then((value) => { if (live) setReview(value); })
+    void Promise.resolve().then(() => api.reviewRemoteHandoff(record.id)).then((value) => { if (live) setReview(value); })
       .catch((e: unknown) => { if (live) setFailure(String(e)); });
     return () => { live = false; };
   }, [record?.id, record?.result.capture?.commit, record?.result.outcome, active]);
@@ -100,7 +104,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
       {!record ? <>
         <fieldset className="ho-threads" disabled={busy}><legend>{t("handoff.chooseThread")}</legend>
           {threads.length ? threads.map((thread) => <label key={thread.threadId} className={`ho-thread${selected === thread.threadId ? " ho-thread--on" : ""}`}>
-            <input type="radio" name={`handoff-${hostId}`} value={thread.threadId} checked={selected === thread.threadId} disabled={thread.handedOff} onChange={() => { setSelected(thread.threadId); setBrief(""); }} />
+            <input type="radio" name={`handoff-${hostId}`} value={thread.threadId} checked={selected === thread.threadId} disabled={thread.handedOff} onChange={() => { briefEdited.current = false; setSelected(thread.threadId); setBrief(""); }} />
             <span><strong>{thread.name}</strong><small>{thread.repo} · {thread.branch}</small></span>
             <small>{thread.handedOff ? t("handoff.handedOff") : date(thread.updatedAt)}</small>
           </label>) : <p className="note">{t("handoff.noThreads")}</p>}
@@ -114,7 +118,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
             <ul>{report.changes.map((change) => <li key={change.path}><code>{change.untracked ? "?" : change.staged ? "S" : "M"}</code> {change.path}</li>)}</ul>
           </div>
           <p className="note">{t("handoff.transferNote")}</p>
-          <label className="ho-brief">{t("handoff.brief")}<textarea className="input" rows={7} value={brief} onChange={(event) => setBrief(event.target.value)} disabled={busy} placeholder={t("handoff.briefPlaceholder")} /></label>
+          <label className="ho-brief">{t("handoff.brief")}<textarea className="input" rows={7} value={brief} onChange={(event) => { briefEdited.current = true; setBrief(event.target.value); }} disabled={busy} placeholder={t("handoff.briefPlaceholder")} /></label>
           <p className="note">{t("handoff.briefHint")}</p>
           <p className="note">{report.thread.model} · {report.thread.effort} · {report.remoteOs}</p>
           {report.blockers.map((blocker) => <Notice key={blocker} tone="warn" raw={blocker}>{message(blocker)}</Notice>)}
@@ -122,7 +126,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
           {!report.blockers.length ? <p className="ho-ok">✓ {t("handoff.preflightReady")}</p> : null}
           <p className="note">{t("handoff.refNotice")}</p>
           <div className="ho-acts"><Btn disabled={busy || !!report.blockers.length || !brief.trim()} onClick={() => void act(() => api.startRemoteHandoff(hostId, selected, brief, requiredOs ? { requiredOs } : {}))}>{t("handoff.start")}</Btn>
-            <Btn soft disabled={busy} onClick={() => { setReport(null); setSelected(""); }}>{t("handoff.reset")}</Btn></div>
+            <Btn soft disabled={busy} onClick={() => { briefEdited.current = false; setBrief(""); setReport(null); setSelected(""); }}>{t("handoff.reset")}</Btn></div>
         </> : selected && !failure ? <p role="status">{t("handoff.checking")}</p> : null}
       </> : <>
         <div className="ho-relay"><span>{t("handoff.local")}<strong>{t("handoff.handedOff")}</strong></span><i aria-hidden="true" /><span>{hostName}<strong>{t(`handoff.states.${handoffState(record)}`)}</strong></span></div>
@@ -153,7 +157,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
         </div>}
       </>}
     </Card>
-    <Card quiet><div className="ho-head"><Cap>{t("handoff.ledger")}</Cap><Btn mini soft disabled={busy} onClick={() => { setCompose(true); setRecordId(null); setSelected(""); setReport(null); }}>{t("handoff.new")}</Btn></div>
+    <Card quiet><div className="ho-head"><Cap>{t("handoff.ledger")}</Cap><Btn mini soft disabled={busy} onClick={() => { briefEdited.current = false; setBrief(""); setCompose(true); setRecordId(null); setSelected(""); setReport(null); }}>{t("handoff.new")}</Btn></div>
       {records.length ? records.map((row) => <button className="ho-ledger" key={row.id} onClick={() => { setCompose(false); setRecordId(row.id); setFailure(null); }}><span><strong>{row.source.name}</strong><small>{row.source.branch} · {row.id}</small></span><State tone={handoffTerminal(row) ? "ok" : "quiet"} label={t(`handoff.states.${handoffState(row)}`)} /></button>) : <p className="note">{t("handoff.noRecords")}</p>}
     </Card>
     {discardId ? <Confirm open title={t("handoff.discard")} confirmLabel={t("handoff.discard")} facts={[{ key: t("handoff.discard"), value: t("handoff.discardConfirm") }]} onCancel={() => setDiscardId(null)} onConfirm={() => { const id = discardId; setDiscardId(null); void act(() => api.discardRemoteHandoff(id)); }} /> : null}

@@ -541,7 +541,12 @@ fn drive(root: &Path, record: &mut Record, client: &dyn Transport) -> AppResult<
             record.stage = "snapshotPushed".into();
             save(root, record)?;
         }
-        if matches!(record.stage.as_str(), "snapshotPushed" | "adopted") {
+        // Only begin/explicit resume call drive. Poll remains observation-only.
+        // The Agent owns evidence-based replay of pinned unmaterialized RPCs.
+        if matches!(
+            record.stage.as_str(),
+            "snapshotPushed" | "adopted" | "startUncertain"
+        ) {
             record.stage = "startUncertain".into();
             save(root, record)?;
             let mut request = record.request.clone();
@@ -860,6 +865,7 @@ mod tests {
             effort: Some("high".into()),
             active: Some(false),
             handed_off: false,
+            draft: None,
         };
         (temp, root, source)
     }
@@ -1021,8 +1027,8 @@ mod tests {
         let commit = record.snapshot.commit.clone();
         fs::write(source.repo.join("file"), "local work after handoff\n").unwrap();
         let before = client.calls.borrow().len();
-        resume_with(&root, &mut record, &client).unwrap();
-        assert_eq!(client.calls.borrow().len(), before + 1);
+        assert!(resume_with(&root, &mut record, &client).is_err());
+        assert_eq!(client.calls.borrow().len(), before + 2);
         assert_eq!(record.stage, "startUncertain");
         *client.result.borrow_mut() = json!({"state": "indeterminate", "phase": "threadAdopted", "threadId": "remote-thread"});
         client.fail_start.set(false);

@@ -184,7 +184,8 @@ const FAILED: RemoteOperationProgress = {
  * 真的那條路徑（hasTauri() 為真、call() 真的走 invoke）。
  */
 function installFixture(getScene: () => Scene) {
-  const thread: RemoteHandoffThread = { threadId: "local-thread", name: "word-count CLI：加 top_words 與命令列介面", repo: "E:\\code_E\\demo-repo", branch: "main", updatedAt: Date.now() / 1000 - 720, model: "GPT-5.6 Sol", modelProvider: "vellum", effort: "high", active: false, handedOff: false };
+  const thread: RemoteHandoffThread = { threadId: "local-thread", name: "word-count CLI：加 top_words 與命令列介面", repo: "E:\\code_E\\demo-repo", branch: "main", updatedAt: Date.now() / 1000 - 720, model: "GPT-5.6 Sol", modelProvider: "vellum", effort: "high", active: false, handedOff: false,
+    draft: { task: "完成 top_words(text, n) 與命令列介面，並補測試。", originalRequest: "實作 word-count CLI，第 1 項先在本機完成，第 2 項交給遠端。", lastProgress: "第 1 項 parser 已完成，CLI 與 top_words 尚未實作。" } };
   let handoff: RemoteHandoffRecord | null = null;
   const makeRecord = (running: boolean): RemoteHandoffRecord => ({
     id: "01JPREVIEWHANDOFF", hostId: "jetson", source: thread,

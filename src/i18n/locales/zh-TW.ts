@@ -2,6 +2,7 @@ import type { ResourceTree } from "../resources";
 
 const zhTW: ResourceTree = {
   "handoff": {
+    "draftBackground": "所選對話的背景", "draftOriginal": "原始需求", "draftProgress": "最後的 Agent 進度", "draftCaution": "第一段是這次交接的任務。以下摘錄僅供背景參考；送出前請確認舊有的暫緩指示這次是否仍適用。",
     "requiredOs": "任務需要的作業系統", "detectOs": "依儲存庫判斷",
     "hostRepair": "請先部署或修復這台主機，再交出工作。", "gitRepair": "請先安裝 Git 2.29 以上版本，再交出工作。", "pairRepair": "請先在這台主機配對並啟用 ChatGPT。", "copyThread": "複製遠端 thread ID", "openThreadHint": "在 Codex App 選擇這台主機，再用此 ID 開啟遠端 thread。",
     "title": "把本機的工作交給 {{host}}", "lede": "遠端會從目前的進度接著做，包括還沒 commit 的改動。本機檔案保持原樣。",

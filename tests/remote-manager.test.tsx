@@ -9,6 +9,9 @@ import apiSource from "../src/lib/api.ts?raw";
 import rustSource from "../src-tauri/src/lib.rs?raw";
 
 const apiMocks = vi.hoisted(() => ({
+  listRemoteHandoffThreads: vi.fn(),
+  listRemoteHandoffs: vi.fn(),
+  pollRemoteHandoff: vi.fn(),
   getRemoteManagerFeatureFlags: vi.fn(),
   getRemoteReleaseStatus: vi.fn(),
   discoverRemoteConnections: vi.fn(),
@@ -141,6 +144,8 @@ describe("Remote Manager operations UI", () => {
   });
 
   beforeEach(() => {
+    apiMocks.listRemoteHandoffThreads.mockResolvedValue([]);
+    apiMocks.listRemoteHandoffs.mockResolvedValue([]);
     apiMocks.setActiveRemoteHost.mockResolvedValue(undefined);
     apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([]);
     apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({
@@ -258,6 +263,17 @@ describe("Remote Manager operations UI", () => {
     expect(apiSource).toMatch(/updateRemoteCodexForDesktop[\s\S]*"update_remote_codex_for_desktop"/);
     expect(rustSource).toMatch(/remote::commands::get_desktop_codex_compatibility/);
     expect(rustSource).toMatch(/remote::commands::update_remote_codex_for_desktop/);
+  });
+
+  it.each(["reject", "throw"])("keeps handoff API %s failures inside the handoff section", async (mode) => {
+    const failure = new Error("handoff thread discovery failed");
+    if (mode === "throw") apiMocks.listRemoteHandoffThreads.mockImplementationOnce(() => { throw failure; });
+    else apiMocks.listRemoteHandoffThreads.mockRejectedValueOnce(failure);
+    renderRemote();
+    expect(await screen.findByText(i18n.t("handoff.checkFailed"))).toBeTruthy();
+    expect(screen.getByText(i18n.t("handoff.title", { host: "Jetson" }))).toBeTruthy();
+    expect(screen.getByRole("button", { name: i18n.t("remote.rescan") })).toBeTruthy();
+    expect(apiMocks.inspectRemoteHost).toHaveBeenCalled();
   });
 
   it("paints discovered hosts while the selected SSH probe is still pending", async () => {

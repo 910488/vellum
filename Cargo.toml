@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 default-members = [
+  "crates/vellum-codex-package",
   "src-tauri",
   "crates/vellum-proxy-runtime",
   "crates/vellum-proxy-daemon",
@@ -14,6 +15,7 @@ default-members = [
   "crates/vellum-enhanced-codex",
 ]
 members = [
+  "crates/vellum-codex-package",
   "crates/vellum-quota-pool-replay",
   "src-tauri",
   "crates/vellum-codex-app-server",

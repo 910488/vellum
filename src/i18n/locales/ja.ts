@@ -2,6 +2,7 @@ import type { ResourceTree } from "../resources";
 
 const ja: ResourceTree = {
   "handoff": {
+    "draftBackground": "選択した会話の背景", "draftOriginal": "元の依頼", "draftProgress": "エージェントの最新の進捗", "draftCaution": "最初の段落が今回の引き継ぎ作業です。以下は背景情報です。以前の保留指示を今回も適用するか、送信前に確認してください。",
     "requiredOs": "作業に必要な OS", "detectOs": "リポジトリから判定",
     "hostRepair": "引き継ぎの前にホストをデプロイまたは修復してください。", "gitRepair": "引き継ぎの前に Git 2.29 以降をインストールしてください。", "pairRepair": "ホストで ChatGPT をペアリングして有効にしてください。", "copyThread": "リモートスレッド ID をコピー", "openThreadHint": "Codex App でこのホストを選択し、この ID でリモートスレッドを開いてください。",
     "title": "ローカルの作業を {{host}} に引き継ぐ", "lede": "未コミットの変更を含む現在の進捗からリモートで続行します。ローカルのファイルはそのままです。",

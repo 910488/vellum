@@ -1,6 +1,6 @@
 //! Durable handoff orchestration. Only the existing daemon executes turns.
-//! Persist intent before each non-idempotent RPC; an ambiguous reply never
-//! authorizes another thread/start or turn/start.
+//! Persist intent before each non-idempotent RPC. Replay requires an explicit
+//! start and pinned-daemon evidence that the original mutation never materialized.
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,22 @@ use serde_json::{json, Value};
 
 use crate::mutation_lock::HostMutationGuard;
 use crate::state::AgentPaths;
+
+// Pinned rust-v0.147.0-alpha.6.6: includeTurns on an unmaterialized thread
+// returns JSON-RPC -32600 with this message. Do not match transport failures,
+// "no rollout", or arbitrary errors merely mentioning a thread.
+const PINNED_0147_NOT_MATERIALIZED: &str = "not materialized";
+fn not_materialized(error: &str) -> bool {
+    error
+        .strip_prefix("HandoffDaemonRpcError: thread/read: ")
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .is_some_and(|body| {
+            body["code"].as_i64() == Some(-32600)
+                && body["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(PINNED_0147_NOT_MATERIALIZED))
+        })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -371,7 +387,14 @@ pub(crate) fn start_with(
         record
     };
     if matches!(record.phase, Phase::ThreadStarting | Phase::TurnStarting) {
-        return Err("HandoffStartIndeterminate: inspect the recorded remote thread; do not repeat thread/start or turn/start".into());
+        if !prepare_only {
+            reconcile(paths, &mut record, &layout, client, true)?;
+        }
+        if matches!(record.phase, Phase::ThreadStarting | Phase::TurnStarting) {
+            return Err(
+                "HandoffStartIndeterminate: daemon evidence does not authorize replay".into(),
+            );
+        }
     }
     if record.phase == Phase::Running {
         return Ok(status(&record, &layout));
@@ -504,6 +527,7 @@ fn reconcile(
     record: &mut Record,
     layout: &Layout,
     client: &dyn Client,
+    explicit_start: bool,
 ) -> Result<(), String> {
     if record.phase == Phase::ThreadStarting {
         let mut cursor = Value::Null;
@@ -544,6 +568,16 @@ fn reconcile(
                             record.phase = Phase::ThreadAdopted;
                             save(paths, record)?;
                         }
+                    } else if explicit_start && record.thread_id.is_none() {
+                        // Coordinator's live 0.147.0-alpha.6.6 observation
+                        // (remote-one-click-m3b-live-shape): thread/start creates
+                        // only an in-memory shell until turn/start materializes
+                        // it. No id was received, so we never sent a turn. A
+                        // complete empty cwd listing permits a new empty shell;
+                        // polling alone must not reset intent or send mutations.
+                        // Keep known ids (including configuration failures).
+                        record.phase = Phase::WorktreeReady;
+                        save(paths, record)?;
                     }
                     return Ok(());
                 }
@@ -552,10 +586,23 @@ fn reconcile(
             }
         }
     } else if record.phase == Phase::TurnStarting {
-        let response = client.call(
+        let response = match client.call(
             "thread/read",
             json!({"threadId": record.thread_id, "includeTurns": true}),
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(error) if not_materialized(&error) => {
+                if explicit_start {
+                    // Same pinned live observation: -32600 + this exact marker
+                    // means no first user message/turn was materialized. Only
+                    // the next explicit start may retry the original turn.
+                    record.phase = Phase::ThreadReady;
+                    save(paths, record)?;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let thread = response
             .get("thread")
             .ok_or("HandoffResponseInvalid: thread missing")?;
@@ -616,7 +663,7 @@ pub(crate) fn result_with(
     };
     let mut record = load(paths, &request.handoff_id)?;
     let layout = Layout::new(paths, &record.request);
-    reconcile(paths, &mut record, &layout, client)?;
+    reconcile(paths, &mut record, &layout, client, false)?;
     let mut result = status(&record, &layout);
     if request.capture {
         if let Some(capture) = record
@@ -759,6 +806,7 @@ mod tests {
         fail_capture: Cell<bool>,
         list_candidates: Cell<usize>,
         wrong_resume_cwd: Cell<bool>,
+        unmaterialized: Cell<bool>,
     }
     impl Fake {
         fn new() -> Self {
@@ -775,6 +823,7 @@ mod tests {
                 fail_capture: Cell::new(false),
                 list_candidates: Cell::new(0),
                 wrong_resume_cwd: Cell::new(false),
+                unmaterialized: Cell::new(false),
             }
         }
     }
@@ -800,6 +849,9 @@ mod tests {
                 return Err("agent.transportTimeout".into());
             }
             match method {
+                "thread/list" if self.unmaterialized.get() => {
+                    Ok(json!({"data": [], "nextCursor": null}))
+                }
                 "thread/list" => Ok(
                     json!({"data": (0..self.list_candidates.get()).map(|i| json!({
                     "id": if i == 0 { "remote-thread".into() } else { format!("remote-thread-{i}") },
@@ -807,6 +859,9 @@ mod tests {
                 })).collect::<Vec<_>>(), "nextCursor": null}),
                 ),
                 "thread/resume" => {
+                    if self.unmaterialized.get() {
+                        return Err("HandoffDaemonRpcError: thread/resume: {\"code\":-32600,\"message\":\"no rollout found for thread id remote-thread\"}".into());
+                    }
                     let started = self
                         .rpc
                         .borrow()
@@ -829,8 +884,17 @@ mod tests {
                     "modelProvider": params["modelProvider"], "approvalPolicy": "never", "reasoningEffort": params["config"]["model_reasoning_effort"],
                     "sandbox": {"type": "workspaceWrite", "networkAccess": false, "writableRoots": [], "excludeTmpdirEnvVar": true, "excludeSlashTmp": true}}),
                 ),
-                "turn/start" => Ok(json!({"turn": {"id": "remote-turn", "status": "inProgress"}})),
+                "turn/start" => {
+                    self.unmaterialized.set(false);
+                    Ok(json!({"turn": {"id": "remote-turn", "status": "inProgress"}}))
+                }
                 "thread/read" => {
+                    if self.unmaterialized.get() && params["includeTurns"] == true {
+                        return Err(format!(
+                            "HandoffDaemonRpcError: thread/read: {}",
+                            json!({"code":-32600, "message":"thread remote-thread is not materialized yet; includeTurns is unavailable before first user message"})
+                        ));
+                    }
                     let cwd = self
                         .rpc
                         .borrow()
@@ -997,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_thread_or_turn_reply_never_repeats_the_mutation() {
+    fn ambiguous_or_materialized_reply_never_repeats_the_mutation() {
         for method in ["thread/start", "turn/start"] {
             let temp = tempfile::tempdir().unwrap();
             let paths = AgentPaths::from_root(temp.path().join("state"));
@@ -1008,9 +1072,17 @@ mod tests {
                 "agent.transportTimeout"
             );
             let calls = fake.rpc.borrow().len();
-            assert!(start_with(&paths, request(), &fake)
-                .unwrap_err()
-                .contains("HandoffStartIndeterminate"));
+            if method == "thread/start" {
+                fake.list_candidates.set(2);
+                assert!(start_with(&paths, request(), &fake)
+                    .unwrap_err()
+                    .contains("HandoffStartIndeterminate"));
+            } else {
+                assert_eq!(
+                    start_with(&paths, request(), &fake).unwrap().phase,
+                    Phase::Running
+                );
+            }
             let observed = result_with(&paths, result_request(false), &fake).unwrap();
             assert_eq!(
                 observed.state,
@@ -1030,6 +1102,148 @@ mod tests {
                 calls
             );
         }
+    }
+
+    #[test]
+    fn lost_unmaterialized_thread_reply_can_replay_only_on_explicit_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        let fake = Fake::new();
+        fake.unmaterialized.set(true);
+        *fake.fail_rpc.borrow_mut() = Some("thread/start".into());
+        assert!(start_with(&paths, request(), &fake).is_err());
+        *fake.fail_rpc.borrow_mut() = None;
+        let before = fs::read(record_path(&paths, "handoff-1").unwrap()).unwrap();
+        assert_eq!(
+            result_with(&paths, result_request(false), &fake)
+                .unwrap()
+                .phase,
+            Phase::ThreadStarting
+        );
+        assert_eq!(
+            fs::read(record_path(&paths, "handoff-1").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            fake.rpc
+                .borrow()
+                .iter()
+                .filter(|(name, _)| name == "thread/start")
+                .count(),
+            1
+        );
+        let recovered = start_with(&paths, request(), &fake).unwrap();
+        assert_eq!(recovered.phase, Phase::Running);
+        let rpc = fake.rpc.borrow();
+        assert_eq!(
+            rpc.iter()
+                .filter(|(name, _)| name == "thread/start")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rpc.iter().filter(|(name, _)| name == "turn/start").count(),
+            1
+        );
+        assert!(!rpc.iter().any(|(name, _)| name == "thread/resume"));
+    }
+    #[test]
+    fn lost_unmaterialized_turn_reply_retries_same_thread_only_on_explicit_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        let fake = Fake::new();
+        fake.unmaterialized.set(true);
+        *fake.fail_rpc.borrow_mut() = Some("turn/start".into());
+        assert!(start_with(&paths, request(), &fake).is_err());
+        *fake.fail_rpc.borrow_mut() = None;
+        let before = fs::read(record_path(&paths, "handoff-1").unwrap()).unwrap();
+        assert_eq!(
+            result_with(&paths, result_request(false), &fake)
+                .unwrap()
+                .phase,
+            Phase::TurnStarting
+        );
+        assert_eq!(
+            fs::read(record_path(&paths, "handoff-1").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            fake.rpc
+                .borrow()
+                .iter()
+                .filter(|(name, _)| name == "turn/start")
+                .count(),
+            1
+        );
+        assert!(fake
+            .call("thread/resume", json!({"threadId":"remote-thread"}))
+            .unwrap_err()
+            .contains("no rollout"));
+        assert_eq!(
+            start_with(&paths, request(), &fake).unwrap().phase,
+            Phase::Running
+        );
+        let rpc = fake.rpc.borrow();
+        assert_eq!(
+            rpc.iter()
+                .filter(|(name, _)| name == "thread/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rpc.iter().filter(|(name, _)| name == "turn/start").count(),
+            2
+        );
+        assert!(rpc
+            .iter()
+            .filter(|(name, _)| name == "turn/start")
+            .all(|(_, params)| params["threadId"] == "remote-thread"));
+    }
+    #[test]
+    fn not_materialized_requires_pinned_rpc_code_and_message_and_not_transport_text() {
+        let rpc = |code, message| {
+            format!(
+                "HandoffDaemonRpcError: thread/read: {}",
+                json!({"code":code,"message":message})
+            )
+        };
+        assert!(not_materialized(&rpc(
+            -32600,
+            "thread is not materialized yet"
+        )));
+        assert!(!not_materialized(&rpc(
+            -32601,
+            "thread is not materialized yet"
+        )));
+        assert!(!not_materialized(&rpc(
+            -32600,
+            "no rollout found for thread"
+        )));
+        assert!(!not_materialized(
+            "transport failure -32600 not materialized"
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        let fake = Fake::new();
+        *fake.fail_rpc.borrow_mut() = Some("turn/start".into());
+        assert!(start_with(&paths, request(), &fake).is_err());
+        *fake.fail_rpc.borrow_mut() = Some("thread/read".into());
+        assert_eq!(
+            start_with(&paths, request(), &fake).unwrap_err(),
+            "agent.transportTimeout"
+        );
+        assert_eq!(
+            load(&paths, "handoff-1").unwrap().phase,
+            Phase::TurnStarting
+        );
+        assert_eq!(
+            fake.rpc
+                .borrow()
+                .iter()
+                .filter(|(name, _)| name == "turn/start")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1136,6 +1350,9 @@ mod tests {
                     .state,
                 "indeterminate"
             );
+            assert!(start_with(&paths, request(), &fake)
+                .unwrap_err()
+                .contains("HandoffStartIndeterminate"));
             assert_eq!(
                 fake.rpc
                     .borrow()

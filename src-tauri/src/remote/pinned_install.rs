@@ -409,7 +409,7 @@ pub(crate) fn inspect_bundled_codex_package(artifact: &CodexArtifact) -> AppResu
         AppError::Message("bundledReleaseUnavailable: Codex package is not bundled".into())
     })?;
     let path = bundled_artifact(relative)?;
-    vellum_remote_agent::codex_package::verify_archive(&path).map_err(AppError::Message)
+    vellum_codex_package::verify_archive(&path).map_err(AppError::Message)
 }
 
 fn inspect_artifact_file(path: &Path, expected: &str) -> AppResult<u64> {
@@ -499,8 +499,7 @@ pub fn install_pinned_codex(
     // Download + local digest verification.
     let local_staged = download_artifact(artifact)?;
     let result = (|| -> AppResult<serde_json::Value> {
-        vellum_remote_agent::codex_package::verify_archive(&local_staged)
-            .map_err(AppError::Message)?;
+        vellum_codex_package::verify_archive(&local_staged).map_err(AppError::Message)?;
         let bytes = std::fs::read(&local_staged)
             .map_err(|error| AppError::Message(format!("read staged artifact: {error}")))?;
         let remote_path = format!("/tmp/vellum-codex-stage-{}.bin", ulid::Ulid::new());

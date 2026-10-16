@@ -373,6 +373,7 @@ mod tests {
                 effort: Some("high".into()),
                 active: Some(false),
                 handed_off: true,
+                draft: None,
             },
             snapshot,
             request: json!({"repoId":"repo"}),

@@ -36,6 +36,7 @@ tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 ulid = { workspace = true }
 vellum-proxy-runtime = { path = "../vellum-proxy-runtime" }
+vellum-codex-package = { path = "../vellum-codex-package" }
 
 [features]
 default = []
@@ -45,5 +46,6 @@ default = []
 diagnostic-broker = []
 
 [dev-dependencies]
+vellum-codex-package = { path = "../vellum-codex-package", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }

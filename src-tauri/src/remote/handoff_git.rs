@@ -99,6 +99,13 @@ impl Git {
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
+                // builtin/diff.c::refresh_index_quietly takes a mandatory
+                // index lock (Git 2.39), despite --no-optional-locks:
+                // https://github.com/git/git/blob/v2.39.0/builtin/diff.c#L224-L236
+                // This
+                // disables its stat-only refresh, including in tree diffs.
+                "diff.autoRefreshIndex=false",
+                "-c",
             ])
             .arg(format!("core.hooksPath={}", self.hooks.display()))
             .arg("-C")
@@ -113,6 +120,19 @@ impl Git {
         }
         let output = run(cmd)?;
         String::from_utf8(output.stdout).map_err(|e| error(format!("HandoffGitInvalidUtf8: {e}")))
+    }
+    fn copied_index(&self) -> AppResult<(tempfile::TempDir, PathBuf)> {
+        let temporary = tempfile::tempdir().map_err(|e| error(e.to_string()))?;
+        let index = temporary.path().join("index");
+        let source = self.run(&["rev-parse", "--git-path", "index"], None)?;
+        match std::fs::copy(self.repo.join(source.trim()), &index) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.run(&["read-tree", "HEAD"], Some(&index))?;
+            }
+            Err(e) => return Err(error(format!("HandoffIndexUnavailable: {e}"))),
+        }
+        Ok((temporary, index))
     }
     pub fn inspect(&self) -> AppResult<(String, Vec<Change>)> {
         let version = self.run(&["version"], None)?;
@@ -149,8 +169,12 @@ impl Git {
         {
             return Err(error("HandoffShallowCloneUnsupported: fetch the complete repository history before handoff"));
         }
-        self.require_no_lfs(None)?;
-        let status = self.run(&["status", "--porcelain=v1", "--no-renames", "-z"], None)?;
+        let (_temporary, index) = self.copied_index()?;
+        self.require_no_lfs(Some(&index))?;
+        let status = self.run(
+            &["status", "--porcelain=v1", "--no-renames", "-z"],
+            Some(&index),
+        )?;
         let changes = status
             .split('\0')
             .filter(|s| !s.is_empty())
@@ -553,7 +577,9 @@ impl Git {
     }
     pub fn patch(&self, snapshot: &Snapshot, commit: &str) -> AppResult<Vec<u8>> {
         self.verify_result(snapshot, commit)?;
+        let (_temporary, index) = self.copied_index()?;
         let mut cmd = self.command();
+        cmd.env("GIT_INDEX_FILE", index);
         cmd.args([
             "diff",
             "--binary",
@@ -590,10 +616,11 @@ impl Git {
         if head != snapshot.base {
             return Ok(false);
         }
+        let (_temporary, index) = self.copied_index()?;
         if !self
             .run(
                 &["diff", "--name-only", "--diff-filter=U", "-z", "--"],
-                None,
+                Some(&index),
             )?
             .is_empty()
         {
@@ -657,6 +684,7 @@ impl Git {
             return Ok(true);
         }
         let mut cmd = self.command();
+        cmd.env("GIT_INDEX_FILE", &index);
         cmd.args(["apply", "--check", "--binary", "--whitespace=nowarn", "-"]);
         Ok(run_command_with_input(&mut cmd, Some(patch)).is_ok())
     }
@@ -666,7 +694,9 @@ impl Git {
         }
         let patch = self.patch(snapshot, commit)?;
         if !patch.is_empty() {
+            let (_temporary, index) = self.copied_index()?;
             let mut cmd = self.command();
+            cmd.env("GIT_INDEX_FILE", index);
             cmd.args(["apply", "--binary", "--whitespace=nowarn", "-"]);
             run_command_with_input(&mut cmd, Some(patch))?;
         }
@@ -813,6 +843,85 @@ fn run_command_with_input(command: &mut Command, input: Option<Vec<u8>>) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crlf_apply_inherits_system_config_and_never_touches_real_index_even_when_locked() {
+        let (temp, git) = configured_fixture();
+        std::fs::write(git.repo.join("t.txt"), "a\nb\n").unwrap();
+        git.run(&["add", "."], None).unwrap();
+        git.run(&["commit", "-m", "base"], None).unwrap();
+        std::fs::remove_file(git.repo.join("t.txt")).unwrap();
+        git.run(&["checkout", "--", "t.txt"], None).unwrap();
+        assert_eq!(
+            std::fs::read(git.repo.join("t.txt")).unwrap(),
+            b"a\r\nb\r\n"
+        );
+        let snapshot = git.snapshot("crlf-apply").unwrap();
+        let content = temp.path().join("remote-content");
+        std::fs::write(&content, "a\nb\nc\n").unwrap();
+        let blob = git
+            .run(&["hash-object", "-w", content.to_str().unwrap()], None)
+            .unwrap();
+        let index = temp.path().join("remote-index");
+        git.run(&["read-tree", &snapshot.commit], Some(&index))
+            .unwrap();
+        git.run(
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{},t.txt", blob.trim()),
+            ],
+            Some(&index),
+        )
+        .unwrap();
+        let tree = git.run(&["write-tree"], Some(&index)).unwrap();
+        let commit = git
+            .run(
+                &[
+                    "commit-tree",
+                    tree.trim(),
+                    "-p",
+                    &snapshot.commit,
+                    "-m",
+                    "remote result",
+                ],
+                None,
+            )
+            .unwrap();
+        let before = std::fs::read(git.repo.join(".git/index")).unwrap();
+        // Deliberately invalidate only the entry's cached stat information.
+        std::fs::File::options()
+            .write(true)
+            .open(git.repo.join("t.txt"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        // Exercise the formerly mandatory diff auto-refresh independently.
+        git.run(
+            &["diff", "--name-only", "--diff-filter=U", "-z", "--"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(git.repo.join(".git/index")).unwrap(), before);
+        let lock = git.repo.join(".git/index.lock");
+        let _guard = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert!(git.inspect().unwrap().1.is_empty());
+        assert_eq!(std::fs::read(git.repo.join(".git/index")).unwrap(), before);
+        assert!(git.can_apply(&snapshot, commit.trim()).unwrap());
+        assert_eq!(std::fs::read(git.repo.join(".git/index")).unwrap(), before);
+        git.apply_result(&snapshot, commit.trim()).unwrap();
+        assert_eq!(std::fs::read(git.repo.join(".git/index")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(git.repo.join("t.txt")).unwrap(),
+            b"a\r\nb\r\nc\r\n"
+        );
+        assert!(lock.exists());
+    }
 
     fn result_fixture() -> (tempfile::TempDir, Git, Snapshot, String) {
         let (temp, git) = configured_fixture();

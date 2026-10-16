@@ -5653,6 +5653,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "url",
+ "vellum-codex-package",
  "vellum-enhanced-codex",
  "vellum-proxy-runtime",
  "vellum-proxy-testkit",
@@ -5705,6 +5706,17 @@ name = "vellum-codex-gate-child"
 version = "0.2.4"
 dependencies = [
  "vellum",
+]
+
+[[package]]
+name = "vellum-codex-package"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
 ]
 
 [[package]]
@@ -5871,6 +5883,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "toml 0.8.23",
  "ulid",
+ "vellum-codex-package",
  "vellum-proxy-runtime",
 ]
 

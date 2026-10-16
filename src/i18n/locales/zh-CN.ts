@@ -2,6 +2,7 @@ import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
   "handoff": {
+    "draftBackground": "所选对话的背景", "draftOriginal": "原始需求", "draftProgress": "最后的 Agent 进度", "draftCaution": "第一段是本次交接的任务。以下摘录仅供背景参考；发送前请确认旧有的暂缓指示本次是否仍适用。",
     "requiredOs": "任务需要的操作系统", "detectOs": "根据仓库判断",
     "hostRepair": "请先部署或修复此主机，再交出工作。", "gitRepair": "请先安装 Git 2.29 或更高版本，再交出工作。", "pairRepair": "请先在此主机配对并启用 ChatGPT。", "copyThread": "复制远端 thread ID", "openThreadHint": "在 Codex App 选择此主机，再用此 ID 打开远端 thread。",
     "title": "把本机的工作交给 {{host}}", "lede": "远端会从目前的进度接着做，包括尚未 commit 的改动。本机文件保持原样。",

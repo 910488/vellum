@@ -23,6 +23,49 @@ pub struct LocalThread {
     pub effort: Option<String>,
     pub active: Option<bool>,
     pub handed_off: bool,
+    /// Populated only when this thread is selected, never for the picker.
+    #[serde(default)]
+    pub draft: Option<BriefDraft>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefDraft {
+    pub task: String,
+    pub original_request: String,
+    pub last_progress: String,
+}
+
+fn bounded_text(text: &str, limit: usize) -> String {
+    let mut chars = text.trim().chars();
+    let mut result: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
+fn message_text(payload: &Value, limit: usize) -> String {
+    // response_item text blocks, not tool outputs or hidden reasoning.
+    let mut text = String::new();
+    for block in payload["content"].as_array().into_iter().flatten() {
+        if matches!(
+            block["type"].as_str(),
+            Some("input_text" | "output_text" | "text")
+        ) {
+            if let Some(part) = block["text"].as_str() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                let remaining = limit.saturating_sub(text.chars().count()) + 1;
+                text.extend(part.chars().take(remaining));
+                if text.chars().count() > limit {
+                    break;
+                }
+            }
+        }
+    }
+    bounded_text(&text, limit)
 }
 
 fn error(message: impl Into<String>) -> AppError {
@@ -142,6 +185,7 @@ fn discover_with(
                 effort: None,
                 active: None,
                 handed_off: false,
+                draft: None,
             };
             // Missing/unreadable rollout remains visible but cannot pass preflight.
             if selected.is_some() {
@@ -177,12 +221,45 @@ fn read_settings(
     let mut effort = None;
     let mut provider = thread.model_provider.clone();
     let mut active = true;
+    let mut first_user = String::new();
+    let mut last_user = String::new();
+    let mut last_agent = String::new();
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|e| error(e.to_string()))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let payload = &value["payload"];
+        let (role, text) = match value["type"].as_str() {
+            Some("response_item") if payload["type"] == "message" => {
+                let role = payload["role"].as_str().unwrap_or_default();
+                (
+                    role,
+                    message_text(payload, if role == "assistant" { 6000 } else { 4000 }),
+                )
+            }
+            Some("event_msg") if payload["type"] == "user_message" => (
+                "user",
+                bounded_text(payload["message"].as_str().unwrap_or_default(), 4000),
+            ),
+            Some("event_msg") if payload["type"] == "agent_message" => (
+                "assistant",
+                bounded_text(payload["message"].as_str().unwrap_or_default(), 6000),
+            ),
+            _ => ("", String::new()),
+        };
+        if !text.is_empty() {
+            match role {
+                "user" => {
+                    if first_user.is_empty() {
+                        first_user = text.clone();
+                    }
+                    last_user = text;
+                }
+                "assistant" => last_agent = text,
+                _ => {}
+            }
+        }
         match value["type"].as_str() {
             Some("session_meta") => {
                 identity = payload["id"].as_str() == Some(thread.thread_id.as_str());
@@ -229,6 +306,11 @@ fn read_settings(
     thread.effort = effort;
     thread.model_provider = provider;
     thread.active = Some(active);
+    thread.draft = (!last_user.is_empty()).then_some(BriefDraft {
+        task: last_user,
+        original_request: first_user,
+        last_progress: last_agent,
+    });
     Ok(())
 }
 
@@ -250,6 +332,9 @@ mod tests {
         let rollout = home.join("sessions/rollout.jsonl");
         let events = [
             serde_json::json!({"type": "session_meta", "payload": {"id": "thread-1", "cwd": repo, "model_provider": "vellum"}}),
+            serde_json::json!({"type": "event_msg", "payload": {"type": "user_message", "message": "Original request"}}),
+            serde_json::json!({"type": "event_msg", "payload": {"type": "user_message", "message": "Finish the CLI and tests"}}),
+            serde_json::json!({"type": "event_msg", "payload": {"type": "agent_message", "message": "Parser complete; CLI remains"}}),
             serde_json::json!({"type": "turn_context", "payload": {"model": "model", "effort": "high"}}),
             serde_json::json!({"type": "event_msg", "payload": {"type": "task_complete"}}),
         ];
@@ -299,9 +384,14 @@ mod tests {
         assert_eq!(result[0].name, "My task");
         assert!(result[0].model.is_none());
         assert!(result[0].active.is_none());
+        assert!(result[0].draft.is_none());
         let selected = select(&home, temp.path(), "thread-1").unwrap();
         assert_eq!(selected[0].model.as_deref(), Some("model"));
         assert_eq!(selected[0].active, Some(false));
+        let draft = selected[0].draft.as_ref().unwrap();
+        assert_eq!(draft.task, "Finish the CLI and tests");
+        assert_eq!(draft.original_request, "Original request");
+        assert_eq!(draft.last_progress, "Parser complete; CLI remains");
         assert_eq!(fs::read(db).unwrap(), before_db);
         assert_eq!(fs::read(rollout).unwrap(), before_rollout);
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), before_index);
@@ -330,6 +420,7 @@ mod tests {
             effort: None,
             active: None,
             handed_off: false,
+            draft: None,
         };
         let records = [
             serde_json::json!({"type": "session_meta", "payload": {"id": "thread-1", "cwd": temp.path(), "model_provider": "vellum"}}),
@@ -353,5 +444,48 @@ mod tests {
         assert_eq!(thread.active, Some(false));
         thread.thread_id = "other-thread".into();
         assert!(read_settings(temp.path(), &rollout, temp.path(), &mut thread).is_err());
+    }
+    #[test]
+    fn draft_extracts_response_messages_and_bounds_unicode_excerpts() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("sessions")).unwrap();
+        let rollout = temp.path().join("sessions/selected.jsonl");
+        let mut thread = LocalThread {
+            thread_id: "selected".into(),
+            name: "Task".into(),
+            repo: temp.path().into(),
+            branch: "main".into(),
+            updated_at: 1,
+            model: None,
+            model_provider: None,
+            effort: None,
+            active: None,
+            handed_off: false,
+            draft: None,
+        };
+        let events = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"selected","cwd":temp.path()}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"First request"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"任務".repeat(4000)}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"進度".repeat(5000)}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","output":"Not an agent message"}}),
+        ];
+        fs::write(
+            &rollout,
+            events
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        read_settings(temp.path(), &rollout, temp.path(), &mut thread).unwrap();
+        let draft = thread.draft.as_ref().unwrap();
+        assert_eq!(draft.original_request, "First request");
+        assert_eq!(draft.task.chars().count(), 4001);
+        assert_eq!(draft.last_progress.chars().count(), 6001);
+        assert!(draft.task.ends_with('…'));
+        assert!(draft.last_progress.ends_with('…'));
+        assert!(!draft.last_progress.contains("Not an agent"));
     }
 }
