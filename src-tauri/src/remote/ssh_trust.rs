@@ -40,6 +40,8 @@ use crate::error::{AppError, AppResult};
 use crate::remote::process::background_command;
 use crate::state::AppState;
 
+#[path = "ssh_key_probe.rs"]
+mod key_probe;
 #[path = "ssh_user_trust.rs"]
 mod user_trust;
 
@@ -88,8 +90,7 @@ impl SshTarget {
     }
 }
 
-/// A host key a host is currently offering, captured via `ssh-keyscan`
-/// without connecting or authenticating and without trusting anything yet.
+/// A host key collected before authentication, without trusting it yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingHostFingerprint {
@@ -287,38 +288,21 @@ fn fingerprint_of(key_base64: &str) -> AppResult<String> {
     Ok(format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)))
 }
 
-/// Fetch every host key `target` currently offers via `ssh-keyscan`. This
-/// never connects/authenticates as a client and never writes anything --
-/// it only asks the host "what keys do you have", the same thing
-/// `ssh-keyscan` is designed to do without trusting the answer.
+/// Collect untrusted keys for a literal endpoint. Production callers retain
+/// their original SSH alias through key_probe::fetch. Windows uses SSH KEX,
+/// with authentication disabled and only disposable known_hosts writes.
 pub fn fetch_pending_fingerprints(target: &SshTarget) -> AppResult<Vec<PendingHostFingerprint>> {
-    let mut diagnostics = Vec::new();
-    for program in keyscan_programs() {
-        match run_keyscan(&program, target) {
-            Ok(output) => {
-                let results = parse_keyscan_output(target, &output.stdout);
-                if !results.is_empty() {
-                    return Ok(results);
-                }
-                diagnostics.push(keyscan_diagnostic(&program, &output));
-                // A keyscan process that started has already contacted the
-                // host. Do not immediately repeat the same network probe with
-                // another implementation: that used to double the pre-auth
-                // burst on Windows and could trigger fail2ban. The fallback
-                // below is only for a scanner that could not be launched.
-                break;
-            }
-            Err(error) => {
-                diagnostics.push(format!("{} could not start: {error}", program.display()))
-            }
-        }
-    }
-    Err(AppError::Message(format!(
-        "SSH host key scan failed for {}:{}; {}",
-        target.host,
-        target.port,
-        diagnostics.join("; ")
-    )))
+    let host = if target.host.contains(':') {
+        format!("[{}]", target.host)
+    } else {
+        target.host.clone()
+    };
+    key_probe::fetch(
+        &runtime_data_root(),
+        &format!("ssh://{host}:{}", target.port),
+        target,
+        cfg!(windows),
+    )
 }
 
 fn run_keyscan(program: &Path, target: &SshTarget) -> std::io::Result<Output> {
@@ -394,10 +378,6 @@ fn keyscan_diagnostic(program: &Path, output: &Output) -> String {
     }
 }
 
-fn keyscan_programs() -> Vec<PathBuf> {
-    vec![crate::process::resolve_ssh_tool("ssh-keyscan")]
-}
-
 /// Pick the single fingerprint to show the user, preferring the strongest
 /// key type a host offered. Deterministic so the same host always surfaces
 /// the same fingerprint for confirmation.
@@ -415,7 +395,7 @@ pub fn preferred_fingerprint(
 
 /// Record the user's explicit confirmation of `expected_fingerprint` for
 /// `target`, and only then append its key to Vellum's own known_hosts file.
-/// The fingerprint is re-derived from a fresh `ssh-keyscan` rather than
+/// The fingerprint is re-derived from a fresh pre-auth probe rather than
 /// trusting the caller's claim, so a host that changed keys between "fetch"
 /// and "confirm" (or a caller passing an arbitrary string) cannot get a
 /// stale/wrong key written as trusted.
@@ -537,7 +517,7 @@ pub async fn remote_ssh_trust_status(
             let config = user_trust::resolve(&destination, &target)?;
             // No pre-auth scan when no readable user trust is available.
             if config.has_trust_hint() {
-                let candidates = fetch_pending_fingerprints(&target)?;
+                let candidates = key_probe::fetch(&root, &destination, &target, cfg!(windows))?;
                 fingerprint = preferred_fingerprint(candidates.clone());
                 user_trust::inherit(&root, &target, &config, candidates)?;
             }
@@ -565,7 +545,11 @@ pub async fn remote_ssh_fetch_fingerprint(
     let owned = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let target = resolved_target_for_host(&owned, &host_id)?;
-        let candidates = fetch_pending_fingerprints(&target)?;
+        let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
+            .ssh_destination
+            .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
+        let candidates =
+            key_probe::fetch(&owned.data_root(), &destination, &target, cfg!(windows))?;
         preferred_fingerprint(candidates)
             .ok_or_else(|| AppError::Message("no SSH host key offered".into()))
     })
@@ -588,7 +572,8 @@ pub async fn remote_ssh_confirm_fingerprint(
         let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
             .ssh_destination
             .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
-        let candidates = fetch_pending_fingerprints(&target)?;
+        let candidates =
+            key_probe::fetch(&owned.data_root(), &destination, &target, cfg!(windows))?;
         let config = user_trust::resolve(&destination, &target)?;
         user_trust::refuse_changed(&config, &candidates)?;
         confirm_matching_fingerprint(&owned.data_root(), &target, &fingerprint, candidates)
@@ -772,11 +757,6 @@ mod tests {
         let stdout = b"# choose_kex: unsupported KEX method\nnot-a-host-key\n";
 
         assert!(parse_keyscan_output(&target, stdout).is_empty());
-        let programs = keyscan_programs();
-        assert_eq!(
-            programs,
-            vec![crate::process::resolve_ssh_tool("ssh-keyscan")]
-        );
     }
 
     #[test]

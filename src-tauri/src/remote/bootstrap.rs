@@ -2087,34 +2087,88 @@ mod tests {
             .expect("configured Codex/OpenSSH host");
         state.remote().import_discovered_host(&candidate).unwrap();
 
-        let first = one_click_bootstrap(
-            &state,
-            &candidate.vellum_host_id,
-            |phase, percent, message| println!("{percent:3}% {phase}: {message}"),
-        )
-        .await
-        .expect("first one-click bootstrap");
+        let (first_operation, run) =
+            crate::remote::commands::prepare_converge(&state, &candidate.vellum_host_id, None)
+                .unwrap();
+        let first_progress = run.await;
+        assert_eq!(
+            first_progress.state, "completed",
+            "{:?}",
+            first_progress.message
+        );
+        let first: OneClickBootstrapResult =
+            serde_json::from_value(first_progress.result.unwrap()).unwrap();
         assert_eq!(first.state, "detachedReady");
         assert!(first.proxy_ready && first.native_daemon_running && first.detached_ready);
 
-        let second = one_click_bootstrap(
-            &state,
-            &candidate.vellum_host_id,
-            |phase, percent, message| println!("{percent:3}% {phase}: {message}"),
-        )
-        .await
-        .expect("idempotent one-click bootstrap");
+        let (second_operation, run) =
+            crate::remote::commands::prepare_converge(&state, &candidate.vellum_host_id, None)
+                .unwrap();
+        let second_progress = run.await;
+        assert_eq!(
+            second_progress.state, "completed",
+            "{:?}",
+            second_progress.message
+        );
+        let second: OneClickBootstrapResult =
+            serde_json::from_value(second_progress.result.unwrap()).unwrap();
         assert_eq!(second.state, "detachedReady");
-        assert!(second
-            .apply
-            .completed_steps
-            .iter()
-            .any(|step| step == "proxy.alreadyReady"));
-        assert!(second
-            .apply
-            .completed_steps
-            .iter()
-            .any(|step| step == "nativeAdopt.alreadyActive"));
+        assert!(second.proxy_ready && second.native_daemon_running && second.detached_ready);
+        let steps = &second.apply.completed_steps;
+        let has = |name| steps.iter().any(|step| step == name);
+        assert!(
+            has("apply.noop") || (has("proxy.alreadyReady") && has("nativeAdopt.alreadyActive")),
+            "{steps:?}"
+        );
+        for mutation in [
+            "proxy.ready",
+            "proxy.configured",
+            "nativeAdopt.applied",
+            "nativeDaemon.restarted",
+            "proxy.stoppedForConfiguration",
+        ] {
+            assert!(!has(mutation), "unexpected mutation: {mutation}");
+        }
+        let log = fs::read_to_string(
+            state
+                .data_root()
+                .join("remote-deploy-log")
+                .join(format!("{}.jsonl", candidate.vellum_host_id)),
+        )
+        .unwrap();
+        let events: Vec<crate::remote::deploy_log::Event> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for operation in [first_operation, second_operation] {
+            let pair: Vec<_> = events
+                .iter()
+                .filter(|e| e.operation_id == operation.operation_id)
+                .collect();
+            assert_eq!(pair.len(), 2);
+            assert_eq!(pair[0].event, "started");
+            assert_eq!(pair[1].event, "finished");
+            assert_eq!(
+                pair[1].result,
+                Some(crate::remote::deploy_log::Outcome::Succeeded)
+            );
+        }
+        for private in [
+            candidate.hostname.as_deref(),
+            candidate.user.as_deref(),
+            first.bootstrap.managed_codex_home.as_deref(),
+            Some("/home/"),
+            Some("/Users/"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        {
+            assert!(
+                !log.contains(private),
+                "deployment log contains private host data"
+            );
+        }
     }
 
     #[test]

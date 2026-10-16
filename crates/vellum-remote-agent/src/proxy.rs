@@ -178,7 +178,23 @@ impl ProxyManager {
                     return Err("ProxyMigrationNativeNotReady".into());
                 }
                 crate::migration::clear(self.store.paths())?;
-                Ok(json!({"migrationCommitted": true}))
+                // The snapshot is no longer a rollback target. Re-observe labels
+                // before deleting; names alone never grant removal authority.
+                let cleanup = self.require_docker_observable().and_then(|containers| {
+                    for container in containers.iter().filter(|container| {
+                        snapshot.stopped_ids.contains(&container.id)
+                            && same_install_ownership(&snapshot.install, container)
+                            && !container.running
+                    }) {
+                        self.docker.remove_container(&container.id)?;
+                    }
+                    Ok(())
+                });
+                if cleanup.is_err() {
+                    eprintln!("ProxyMigrationContainerCleanupFailed");
+                }
+                Ok(json!({"migrationCommitted": true, "cleanupWarning":
+                    cleanup.err().map(|_| "ProxyMigrationContainerCleanupFailed")}))
             })
         })
     }
@@ -1742,6 +1758,12 @@ mod tests {
         assert_eq!(service.loads.lock().unwrap().len(), 1);
         native.migration_commit("migration-commit").unwrap();
         assert!(crate::migration::load(&paths).unwrap().is_none());
+        let containers = docker.containers.lock().unwrap();
+        assert_eq!(containers.len(), 3);
+        assert!(containers
+            .iter()
+            .all(|c| c.id == "unlabeled" || c.id == "foreign" || c.id == "foreign-install"));
+        drop(containers);
         native.migration_rollback("after-commit").unwrap();
         assert!(docker.restarted.lock().unwrap().is_empty());
     }
@@ -1818,6 +1840,10 @@ mod tests {
             *docker.restarted.lock().unwrap(),
             vec![containers[0].id.clone()]
         );
+        assert!(
+            docker.removed.lock().unwrap().is_empty(),
+            "rollback must retain the Docker fallback"
+        );
         drop(containers);
         assert!(native.status().unwrap().ready);
         assert_eq!(
@@ -1838,7 +1864,39 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(native.status().unwrap().ready);
-        assert!(!docker.containers.lock().unwrap()[0].running);
+        assert!(docker
+            .containers
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.id == "foreign" || c.id == "already-stopped"));
+    }
+
+    #[test]
+    fn migration_commit_cleanup_failure_is_nonfatal_and_preserves_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let (native, docker, _) = migration_fixture(&temp);
+        stage_migration(&native, &temp, "migrate").unwrap();
+        native
+            .start(ProxyStartRequest {
+                operation_id: "native-start".into(),
+                host_port: None,
+                image: None,
+            })
+            .unwrap();
+        let images = docker.repo_digests.lock().unwrap().clone();
+        *docker.fail_remove.lock().unwrap() = true;
+        let result = native.migration_commit("commit").unwrap();
+        assert!(serde_json::to_value(result)
+            .unwrap()
+            .to_string()
+            .contains("ProxyMigrationContainerCleanupFailed"));
+        assert!(crate::migration::load(native.store.paths())
+            .unwrap()
+            .is_none());
+        assert!(native.status().unwrap().ready);
+        assert_eq!(docker.removed.lock().unwrap().len(), 1);
+        assert_eq!(*docker.repo_digests.lock().unwrap(), images);
     }
 
     #[test]

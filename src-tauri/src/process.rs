@@ -54,7 +54,7 @@ pub(crate) fn resolve_ssh_tool(program: impl AsRef<OsStr>) -> PathBuf {
 
 pub(crate) fn native_ssh_blocker() -> Option<&'static str> {
     if cfg!(windows)
-        && ["ssh", "scp", "ssh-keyscan", "ssh-keygen"]
+        && ["ssh", "scp", "ssh-keygen"]
             .iter()
             .any(|tool| !resolve_ssh_tool(tool).is_absolute())
     {

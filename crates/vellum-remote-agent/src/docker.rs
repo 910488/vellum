@@ -618,6 +618,8 @@ fn parse_host_port(ports: &str) -> Option<u16> {
 
 #[derive(Debug, Default)]
 pub struct FakeDockerClient {
+    pub removed: std::sync::Mutex<Vec<String>>,
+    pub fail_remove: std::sync::Mutex<bool>,
     pub restarted: std::sync::Mutex<Vec<String>>,
     pub fail_restart: std::sync::Mutex<bool>,
     pub containers: std::sync::Mutex<Vec<ContainerSummary>>,
@@ -681,6 +683,10 @@ impl DockerClient for FakeDockerClient {
     }
 
     fn remove_container(&self, id: &str) -> Result<(), String> {
+        self.removed.lock().unwrap().push(id.into());
+        if *self.fail_remove.lock().unwrap() {
+            return Err("injected Docker removal failure".into());
+        }
         let mut guard = self.containers.lock().expect("poisoned");
         let before = guard.len();
         guard.retain(|c| c.id != id);

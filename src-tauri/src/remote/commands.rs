@@ -356,6 +356,21 @@ fn start_converge(
     host_id: &str,
     catalog_ids: Option<Vec<String>>,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
+    let (queued, run) = prepare_converge(state, host_id, catalog_ids)?;
+    tauri::async_runtime::spawn(run);
+    crate::remote::operation::load(&state.data_root(), &queued.operation_id)
+}
+
+/// UI and live qualification share registration, journaling and execution.
+/// The caller chooses its executor; no Tauri runtime is required by the core.
+pub(crate) fn prepare_converge(
+    state: &AppState,
+    host_id: &str,
+    catalog_ids: Option<Vec<String>>,
+) -> AppResult<(
+    crate::remote::RemoteOperationProgress,
+    impl std::future::Future<Output = crate::remote::RemoteOperationProgress> + Send + 'static,
+)> {
     let host_id = host_id.to_owned();
     let operation_id = format!("one-click-bootstrap-{}", ulid::Ulid::new());
     let control = super::converge_control::register(&operation_id, &host_id)?;
@@ -394,7 +409,8 @@ fn start_converge(
         return Err(error);
     }
     let owned = state.clone();
-    tauri::async_runtime::spawn(async move {
+    let queued = progress.clone();
+    Ok((queued, async move {
         let _registration = registration;
         let mut running = progress;
         let progress_root = owned.data_root();
@@ -440,8 +456,8 @@ fn start_converge(
             log::warn!("DeploymentLogUnavailable");
         }
         let _ = crate::remote::operation::save(&progress_root, &running);
-    });
-    crate::remote::operation::load(&state.data_root(), &operation_id)
+        running
+    }))
 }
 
 #[tauri::command]
@@ -1218,6 +1234,25 @@ pub async fn remote_session_summary(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shared_converge_core_records_start_and_finish_without_tauri_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::with_data_dir(temp.path().to_path_buf());
+        let host = format!("missing-{}", ulid::Ulid::new());
+        let (queued, run) = super::prepare_converge(&state, &host, None).unwrap();
+        let finished = run.await;
+        assert_eq!(finished.state, "failed");
+        let events = crate::remote::deploy_log::recent(temp.path(), &host).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation_id, queued.operation_id);
+        assert_eq!(events[0].event, "started");
+        assert_eq!(events[1].event, "finished");
+        assert_eq!(
+            events[1].result,
+            Some(crate::remote::deploy_log::Outcome::Failed)
+        );
+    }
+
     #[test]
     fn model_update_refuses_a_running_deployment_before_writing_intent() {
         let temp = tempfile::tempdir().unwrap();
