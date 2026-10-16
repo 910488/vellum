@@ -3,7 +3,8 @@ import { useTranslation } from "react-i18next";
 import { api } from "@/lib/api";
 import { refreshHandoffs, useHandoffRecords } from "@/lib/handoffStore";
 import { handoffReviewTarget } from "@/lib/handoffNavigation";
-import { handoffDraft, handoffState, handoffTerminal, type RemoteHandoffPreflight, type RemoteHandoffRecord, type RemoteHandoffReview, type RemoteHandoffThread } from "@/lib/remoteHandoff";
+import { handoffDraft, handoffState, handoffSummary, handoffTerminal, type RemoteHandoffPreflight, type RemoteHandoffRecord, type RemoteHandoffReview, type RemoteHandoffThread } from "@/lib/remoteHandoff";
+import { HandoffThreadActions } from "./HandoffThreadActions";
 import { Btn, Cap, Card, Confirm, Notice, State } from "./ui";
 import "@/styles/handoff.css";
 
@@ -131,11 +132,11 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
       </> : <>
         <div className="ho-relay"><span>{t("handoff.local")}<strong>{t("handoff.handedOff")}</strong></span><i aria-hidden="true" /><span>{hostName}<strong>{t(`handoff.states.${handoffState(record)}`)}</strong></span></div>
         {record.remote?.threadId ? <div><p className="note">{t("handoff.remoteThread")} <code>{record.remote.threadId}</code></p>
-          <Btn mini soft onClick={() => void (async () => { try { await navigator.clipboard.writeText(record.remote?.threadId ?? ""); } catch (e) { setFailure(String(e)); } })()}>{t("handoff.copyThread")}</Btn>
-          <p className="note">{t("handoff.openThreadHint")}</p>
+          <HandoffThreadActions key={record.id} record={record} />
         </div> : null}
         {record.error ? <Notice tone="warn" raw={record.error}>{message(record.error)}</Notice> : null}
         {record.remote?.summary ? <p>{record.remote.summary}</p> : null}
+        <Btn mini soft onClick={() => void (async () => { try { await navigator.clipboard.writeText(handoffSummary(record, (key) => t(key))); } catch (e) { setFailure(String(e)); } })()}>{t("handoff.copySummary")}</Btn>
         {record.remote?.plan.length ? <ol className="ho-plan">{record.remote.plan.map((line, index) => <li key={index}>{line}</li>)}</ol> : null}
         {record.remote?.recentOutput ? <pre className="ho-log">{record.remote.recentOutput}</pre> : null}
         {captured && record.result.fetched ? <>

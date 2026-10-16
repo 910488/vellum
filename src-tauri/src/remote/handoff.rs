@@ -18,6 +18,9 @@ use crate::state::AppState;
 #[path = "handoff_result.rs"]
 mod result;
 pub use result::{acknowledge, capture, discard, review, settle, ResultState, Review};
+#[path = "handoff_desktop.rs"]
+mod desktop;
+pub use desktop::thread_link;
 
 fn error(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())

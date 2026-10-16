@@ -80,6 +80,17 @@ export interface RemoteHandoffRecord {
 
 export interface RemoteHandoffReview { canApply: boolean; patch: string }
 
+/** User-visible plain text, with an explicit application status and no model call. */
+export function handoffSummary(record: RemoteHandoffRecord, t: (key: string) => string): string {
+  const capture = record.result.fetched ? record.result.capture : null;
+  const status = record.result.outcome ? t(`handoff.states.${record.result.outcome}`) : t("handoff.summaryUnapplied");
+  const files = capture ? capture.diffstat.map((file) => file.added == null || file.deleted == null
+    ? `${file.path}\t${t("handoff.binary")}` : `${file.path}\t+${file.added}\t−${file.deleted}`).join("\n") || t("handoff.noChanges") : t("handoff.summaryDiffPending");
+  return [record.source.name, record.remote?.summary.trim() || t("handoff.summaryMissing"),
+    `${t("handoff.summaryStatus")}: ${status}`, capture?.partial ? t("handoff.partialCapture") : "",
+    `${t("handoff.summaryDiffstat")}\n${files}`].filter(Boolean).join("\n\n");
+}
+
 export function handoffTerminal(record: RemoteHandoffRecord): boolean {
   return ["completed", "failed", "interrupted"].includes(record.remote?.state ?? "");
 }

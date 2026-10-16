@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { refreshHandoffs, useHandoffRecords } from "@/lib/handoffStore";
 import { handoffTerminal } from "@/lib/remoteHandoff";
 import { Btn, Notice } from "./ui";
+import { HandoffThreadActions } from "./HandoffThreadActions";
 
 /** Durable completion inbox. Reopening Vellum discovers missed completions. */
 export function HandoffNotifications({ onReview }: { onReview: (host: string, id: string) => void }) {
@@ -15,5 +16,6 @@ export function HandoffNotifications({ onReview }: { onReview: (host: string, id
   </>}>
     {t(record.remote?.state === "completed" ? "handoff.completedNotice" : "handoff.partialNotice", { name: record.source.name })}
     {record.remote?.summary ? <p>{record.remote.summary}</p> : null}
+    <HandoffThreadActions record={record} />
   </Notice>)}</div>;
 }

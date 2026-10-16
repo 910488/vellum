@@ -280,6 +280,13 @@ export const api = {
     return call("list_remote_handoffs");
   },
 
+  getRemoteHandoffThreadLink(handoffId: string): Promise<string | null> {
+    return call("get_remote_handoff_thread_link", { handoffId });
+  },
+  openRemoteHandoffThread(handoffId: string): Promise<void> {
+    return call("open_remote_handoff_thread", { handoffId });
+  },
+
   captureRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
     return call("capture_remote_handoff", { handoffId });
   },

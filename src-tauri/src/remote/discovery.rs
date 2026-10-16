@@ -63,6 +63,47 @@ fn codex_global_state_path() -> Option<PathBuf> {
     )
 }
 
+/// Local metadata only: opening a thread must not inspect SSH or a remote agent.
+pub(crate) fn desktop_host_id(host_id: &str, cached: &[CachedHost]) -> Option<String> {
+    let raw = read_stable_snapshot(&codex_global_state_path()?).ok()?;
+    desktop_host_id_from_snapshot(&raw, host_id, cached)
+}
+
+fn desktop_host_id_from_snapshot(
+    raw: &str,
+    host_id: &str,
+    cached: &[CachedHost],
+) -> Option<String> {
+    let cached_by_alias = cached_ids_by_alias(cached);
+    let mut matches = parse_codex_connections(raw)
+        .ok()?
+        .into_iter()
+        .filter_map(|seed| {
+            let id = cached_by_alias
+                .get(&seed.ssh_alias.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| stable_host_id(seed.codex_host_id.as_deref(), &seed.ssh_alias));
+            if id == host_id {
+                seed.codex_host_id
+            } else {
+                None
+            }
+        });
+    let found = matches.next()?;
+    // Ambiguous Desktop identities must never open an arbitrary host.
+    if matches.any(|id| id != found) {
+        return None;
+    }
+    Some(found)
+}
+
+fn cached_ids_by_alias(cached: &[CachedHost]) -> BTreeMap<String, String> {
+    cached
+        .iter()
+        .map(|host| (host.ssh_alias.to_ascii_lowercase(), host.id.clone()))
+        .collect()
+}
+
 fn ssh_config_path() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".ssh").join("config"))
 }
@@ -107,10 +148,7 @@ where
         }
     }
 
-    let cached_by_alias = cached
-        .iter()
-        .map(|host| (host.ssh_alias.to_ascii_lowercase(), host.id.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let cached_by_alias = cached_ids_by_alias(cached);
     let mut output = Vec::with_capacity(seeds.len());
     for seed in seeds {
         let vellum_host_id = cached_by_alias
@@ -340,6 +378,52 @@ fn stable_host_id(codex_host_id: Option<&str>, alias: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_thread_links_use_exact_local_metadata_and_fall_back_without_a_host_id() {
+        let raw = r#"{"codex-managed-remote-connections":[{"hostId":"remote-ssh-discovered:jetson-orin","alias":"jetson"}]}"#;
+        let id = stable_host_id(Some("remote-ssh-discovered:jetson-orin"), "jetson");
+        assert_eq!(
+            desktop_host_id_from_snapshot(raw, &id, &[]).as_deref(),
+            Some("remote-ssh-discovered:jetson-orin")
+        );
+        assert_eq!(desktop_host_id_from_snapshot(raw, "unrelated", &[]), None);
+        let missing = r#"{"codex-managed-remote-connections":[{"alias":"jetson"}]}"#;
+        assert_eq!(
+            desktop_host_id_from_snapshot(missing, &stable_host_id(None, "jetson"), &[]),
+            None
+        );
+        assert_eq!(
+            desktop_host_id_from_snapshot("invalid json", &id, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn desktop_thread_link_mapping_matches_the_cached_discovery_identity() {
+        let raw = r#"{"codex-managed-remote-connections":[{"hostId":"remote-ssh-discovered:jetson-orin","alias":"jetson"}]}"#;
+        let cached = CachedHost {
+            id: "existing-host".into(),
+            name: "Jetson".into(),
+            ssh_alias: "Jetson".into(),
+            broker_url: "ws://127.0.0.1:45100/ws".into(),
+            device_id: "native-existing-host".into(),
+            device_token: None,
+            last_thread_id: None,
+            last_ack_seq: 0,
+            cursor_scheme: vellum_remote_protocol::CURSOR_SCHEME.into(),
+        };
+        assert_eq!(
+            desktop_host_id_from_snapshot(raw, "existing-host", std::slice::from_ref(&cached))
+                .as_deref(),
+            Some("remote-ssh-discovered:jetson-orin")
+        );
+        let ambiguous = r#"{"codex-managed-remote-connections":[{"hostId":"one","alias":"jetson"},{"hostId":"two","alias":"jetson"}]}"#;
+        assert_eq!(
+            desktop_host_id_from_snapshot(ambiguous, "existing-host", &[cached]),
+            None
+        );
+    }
 
     #[test]
     fn parses_codex_connections_without_private_or_secret_fields() {

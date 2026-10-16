@@ -369,6 +369,8 @@ pub fn run() {
             remote::commands::add_remote_ssh_host,
             remote::commands::inspect_remote_host,
             remote::commands::list_remote_handoff_threads,
+            remote::commands::get_remote_handoff_thread_link,
+            remote::commands::open_remote_handoff_thread,
             remote::commands::preflight_remote_handoff,
             remote::commands::start_remote_handoff,
             remote::commands::resume_remote_handoff,

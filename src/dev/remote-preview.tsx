@@ -45,6 +45,7 @@ const SCENES = {
   handoffBlocked: "交接：平台阻擋",
   handoffRunning: "交接：遠端進行中",
   handoffBack: "交接：結果回來",
+  handoffBackNoHost: "交接：結果回來（未加入 Codex App）",
   handoffDrift: "交接：本機已變動",
   emptyHosts: "SSH：空清單",
   addingHost: "SSH：新增中",
@@ -54,7 +55,7 @@ type Scene = keyof typeof SCENES;
 
 const HOSTS: RemoteHostCandidate[] = [
   {
-    codexHostId: "jetson", vellumHostId: "jetson", displayName: "Jetson Orin",
+    codexHostId: "remote-ssh-discovered:jetson-orin", vellumHostId: "jetson", displayName: "Jetson Orin",
     sshAlias: "example-host", hostname: "192.0.2.10", user: "operator", port: 22,
     source: "codexApp", validated: true, validationError: null,
   },
@@ -197,13 +198,15 @@ function installFixture(getScene: () => Scene) {
     remote: { handoffId: "01JPREVIEWHANDOFF", phase: "running", state: running ? "running" : "completed", threadId: "remote-thread", turnId: "remote-turn", turnStatus: running ? "inProgress" : "completed", plan: ["補上 top_words", "實作命令列介面", "執行測試"], recentOutput: "$ python3 -m unittest -v\ntest_top_words_basic ... ok\ntest_top_words_empty ... ok", summary: running ? "正在補測試。" : "已完成 top_words 與 CLI；6 個測試通過。", capture: null },
     result: { captureOperation: null, capture: running ? null : { resultRef: "refs/vellum-handoff-results/01JPREVIEWHANDOFF/capture", commit: "c".repeat(40), snapshotCommit: "b".repeat(40), partial: false, diffstat: [{ path: "wordcount.py", added: 46, deleted: 1 }, { path: "wordcount/__main__.py", added: 19, deleted: 0 }, { path: "tests/test_wordcount.py", added: 16, deleted: 0 }] }, fetched: !running, outcome: null, branch: null, applyIntent: false, cleaned: false, acknowledged: false },
   });
-  if (["handoffRunning", "handoffBack", "handoffDrift"].includes(getScene())) handoff = makeRecord(getScene() === "handoffRunning");
+  if (["handoffRunning", "handoffBack", "handoffBackNoHost", "handoffDrift"].includes(getScene())) handoff = makeRecord(getScene() === "handoffRunning");
   const invoke = async (cmd: string, args: Record<string, unknown> = {}): Promise<unknown> => {
     const scene = getScene();
     switch (cmd) {
       case "list_remote_handoff_threads": return [thread, { ...thread, threadId: "second", name: "修正 restart pill 反覆亮起", branch: "codex/restart-pill" }];
       case "preflight_remote_handoff": return { thread, changes: [{ path: "wordcount.py", staged: true, untracked: false }, { path: "tests/test_wordcount.py", staged: false, untracked: false }, { path: "NOTES.local.md", staged: false, untracked: true }], blockers: scene === "handoffBlocked" || args.requirements && (args.requirements as {requiredOs?: string}).requiredOs === "windows" ? ["HandoffPlatformMismatch: task requires windows, remote is linux"] : [], warnings: ["Remote tool python is unavailable; use python3 instead."], remoteOs: "linux", localRefNotice: "Snapshot ref retained until apply/discard." };
       case "list_remote_handoffs": return handoff ? [handoff] : [];
+      case "get_remote_handoff_thread_link": return scene === "handoffBackNoHost" ? null : "codex://threads/remote-thread?hostId=remote-ssh-discovered%3Ajetson-orin";
+      case "open_remote_handoff_thread": return null;
       case "start_remote_handoff": handoff = makeRecord(true); return handoff;
       case "poll_remote_handoff": case "resume_remote_handoff": return handoff;
       case "capture_remote_handoff": if (handoff) { const partial = handoff.remote?.state === "running"; handoff.result = makeRecord(false).result; if (handoff.result.capture) handoff.result.capture.partial = partial; } return handoff;
@@ -237,7 +240,7 @@ function installFixture(getScene: () => Scene) {
           proxyDigest: `sha256:${"a".repeat(64)}`, detail: "verified",
         };
       case "discover_remote_connections":
-        return scene === "emptyHosts" || scene === "addingHost" ? [] : HOSTS;
+        return scene === "emptyHosts" || scene === "addingHost" ? [] : scene === "handoffBackNoHost" ? HOSTS.map((host) => ({ ...host, codexHostId: null, source: "openSsh" })) : HOSTS;
       case "inspect_remote_host":
         return statusFor(scene);
       case "get_remote_session_summary":

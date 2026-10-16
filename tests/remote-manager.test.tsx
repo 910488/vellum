@@ -11,6 +11,8 @@ import rustSource from "../src-tauri/src/lib.rs?raw";
 const apiMocks = vi.hoisted(() => ({
   listRemoteHandoffThreads: vi.fn(),
   listRemoteHandoffs: vi.fn(),
+  getRemoteHandoffThreadLink: vi.fn(),
+  openRemoteHandoffThread: vi.fn(),
   pollRemoteHandoff: vi.fn(),
   getRemoteManagerFeatureFlags: vi.fn(),
   getRemoteReleaseStatus: vi.fn(),
@@ -147,6 +149,8 @@ describe("Remote Manager operations UI", () => {
   beforeEach(() => {
     apiMocks.listRemoteHandoffThreads.mockResolvedValue([]);
     apiMocks.listRemoteHandoffs.mockResolvedValue([]);
+    apiMocks.getRemoteHandoffThreadLink.mockResolvedValue(null);
+    apiMocks.openRemoteHandoffThread.mockResolvedValue(undefined);
     apiMocks.setActiveRemoteHost.mockResolvedValue(undefined);
     apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([]);
     apiMocks.getRemoteManagerFeatureFlags.mockResolvedValue({

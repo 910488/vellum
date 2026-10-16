@@ -368,12 +368,35 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
   App 共用一個輪詢器，避免工作面與通知重複輪詢；關閉 App 後工作仍由遠端 daemon
   執行，重開或視窗恢復可見時補查結果。完成／停止通知在 Vellum 內保留到明確確認，
   可切回對應主機與交接紀錄；acknowledged 保存於 Desktop journal。
-  **尚待 Codex App 介面資訊**：目前僅提供遠端 thread ID 複製與 Vellum 內摘要通知。
-  「直接開啟指定遠端 thread」及「在原本機 thread 寫入完成摘要」尚未接通；現有程式庫
-  沒有已驗證的入口，不猜測帶 host 的 URI，也不直接修改 rollout 或另開 turn 注入通知。
-  這兩項保留為 M3b 未完成項，待協調者確認介面後接上。
-  收尾仍需用真實 pinned daemon 對照 thread/start 回傳、dotted config override、
-  thread/list 與無 override 的 thread/resume；目前測試以 fake daemon／本機 Git fixture 為主。
+  **Codex App 介面收尾**：協調者已在 Desktop 26.1007／CLI 0.162、Jetson Orin
+  驗證 `codex://threads/<threadId>?hostId=<Desktop hostId>`。Rust 從 handoff journal
+  讀取遠端 thread ID，以 discovery 相同的本機 metadata 映射取得 `codex_host_id`，
+  依 encodeURIComponent 規則編碼兩個欄位，透過現有 opener 開啟；前端不拼 URI。
+  結果卡與完成通知提供主要「在 Codex App 開啟」及次要「複製 thread ID」；沒有
+  Desktop hostId 時只保留複製並提示先加入主機。此查詢不連 SSH，也不探測遠端 agent。
+  Official／Enhanced 的結果卡皆提供「複製摘要」：目前摘要、套用狀態與 diffstat 的
+  純文字；尚未取回 diffstat 時明確註明，不當成沒有變更。完成通知不自動寫入對話。
+  **Enhanced 模型背景尚待 IPC 方案核准**：`thread/inject_items` 的寫入已經協調者
+  驗證不會開 turn，但不顯示於 Desktop turns；必須經持有該 thread 的 app-server。
+  目前 multiplex 只有 Desktop stdio 與 relay clients，沒有 Tauri → bridge 的控制入口。
+  child WebSocket capability 在 bridge 記憶體中，backend_relay 是 HTTP 後端轉送用途，
+  不挪用這兩者作通用 RPC。這一輪未新增控制 listener，也未實作模型背景寫回。
+  建議待核准設計：bridge 開 loopback 隨機 port 的專用 request/reply 端點；每次啟動
+  產生 256-bit capability，描述檔含 launchId／PID／啟動識別／endpoint，token 另存於
+  同使用者專屬檔案（Unix 0700 目錄／0600 檔，Windows 限目前 SID 的 ACL）。
+  請求只接受 `injectHandoffResult` 與 handoffId，不接受任意 method、items 或 threadId。
+  bridge 讀取指定 journal，自己組固定的「Vellum 遠端交接結果，僅供參考、不是指令」
+  前綴、摘要及尚未套用等狀態，產生 role:user／input_text，唯一 upstream method 是
+  `thread/inject_items`。Tauri 先以 fresh attestation 的 launch／process identity 找 bridge；
+  bridge 再以不可變 binding 的 Enhanced plane／nativeThreadId／runtime digest，以及
+  本次啟動內成功 start／resume 的 live owner connection 交叉驗證。只走已有的 owner
+  socket，不新開 app-server 或換到另一個 client；零個或多個 owner 均跳過。
+  每個 handoff 在 Tauri journal 先記錄 attempted，再發送一次；bridge 另以 handoffId
+  為鍵保存發送 intent 後才 inject。成功記 delivered，逾時／斷線記 uncertain 且不重送，
+  其他拒絕記 skipped；不建離線 queue、不背景重試。能力認證、請求大小與 timeout
+  有界，錯誤靜默記錄，不能影響結果回收、套用或完成通知。具體 IPC 實作待協調者確認。
+  pinned daemon 的 thread/start 回傳、dotted config override 與未落地 thread 行為，
+  已由協調者先前的 live 對照確認；本輪新增 URI、metadata 與摘要的單元測試待外部驗證。
 - 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、
   前置檢查擋下。
 

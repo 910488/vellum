@@ -5,7 +5,7 @@ import "@/i18n";
 import { api } from "@/lib/api";
 import { RemoteHandoff } from "@/components/RemoteHandoff";
 import { HandoffNotifications } from "@/components/HandoffNotifications";
-import { handoffDraft, handoffState, type RemoteHandoffRecord, type RemoteHandoffThread } from "@/lib/remoteHandoff";
+import { handoffDraft, handoffState, handoffSummary, type RemoteHandoffRecord, type RemoteHandoffThread } from "@/lib/remoteHandoff";
 import { assertResourceParity } from "@/i18n/resources";
 
 const store = vi.hoisted(() => ({ records: [] as RemoteHandoffRecord[] }));
@@ -22,10 +22,80 @@ beforeEach(async () => {
   vi.spyOn(api, "listRemoteHandoffThreads").mockResolvedValue([thread]);
   vi.spyOn(api, "preflightRemoteHandoff").mockResolvedValue({ thread, changes: [{ path: "wordcount.py", staged: true, untracked: false }], blockers: [], warnings: [], remoteOs: "linux", localRefNotice: "ref notice" });
   vi.spyOn(api, "reviewRemoteHandoff").mockResolvedValue({ canApply: true, patch: "+ remote result" });
+  vi.spyOn(api, "getRemoteHandoffThreadLink").mockResolvedValue("codex://threads/remote-thread?hostId=remote-ssh-discovered%3Ajetson-orin");
+  vi.spyOn(api, "openRemoteHandoffThread").mockResolvedValue(undefined);
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 const view = () => render(<RemoteHandoff hostId="host" hostName="Jetson" active />);
 describe("remote handoff", () => {
+  it("opens through Rust by handoff ID and keeps thread-ID copying secondary", async () => {
+    store.records = [record()];
+    const copy = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText: copy } });
+    view();
+    fireEvent.click(await screen.findByRole("button", { name: "Open in Codex App" }));
+    await waitFor(() => expect(api.openRemoteHandoffThread).toHaveBeenCalledWith("handoff"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy remote thread ID" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith("remote-thread"));
+  });
+  it("offers only ID copying and a host setup hint without a Desktop host ID", async () => {
+    store.records = [record()];
+    vi.mocked(api.getRemoteHandoffThreadLink).mockResolvedValue(null);
+    view();
+    expect(await screen.findByText(i18n.t("handoff.addHostToCodex"))).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open in Codex App" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Copy remote thread ID" })).toBeTruthy();
+    expect(api.openRemoteHandoffThread).not.toHaveBeenCalled();
+  });
+  it("contains link lookup and opener failures without blocking result actions", async () => {
+    store.records = [record()];
+    vi.mocked(api.openRemoteHandoffThread).mockRejectedValue(new Error("opener failed"));
+    const instance = view();
+    fireEvent.click(await screen.findByRole("button", { name: "Open in Codex App" }));
+    expect(await screen.findByText(i18n.t("handoff.openThreadFailed"))).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy summary" })).toBeTruthy();
+    instance.unmount();
+    vi.mocked(api.getRemoteHandoffThreadLink).mockRejectedValue(new Error("metadata unavailable"));
+    view();
+    expect(await screen.findByText(i18n.t("handoff.threadLinkFailed"))).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy remote thread ID" })).toBeTruthy();
+  });
+  it("copies the current summary, diffstat and unapplied status as plain text", async () => {
+    store.records = [record()];
+    const copy = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText: copy } });
+    view();
+    fireEvent.click(screen.getByRole("button", { name: "Copy summary" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(handoffSummary(store.records[0]!, (key) => i18n.t(key))));
+    const text = handoffSummary(store.records[0]!, (key) => i18n.t(key));
+    expect(text).toContain("Ready for review");
+    expect(text).toContain("wordcount.py\t+46\t−1");
+    expect(text).toContain("Results have not been applied to local files");
+  });
+  it("keeps summary status accurate after apply or when no diff has been fetched", () => {
+    const row = record();
+    row.result.outcome = "applied";
+    expect(handoffSummary(row, (key) => i18n.t(key))).toContain("Result status: Applied");
+    row.result.outcome = null;
+    row.result.fetched = false;
+    const pending = handoffSummary(row, (key) => i18n.t(key));
+    expect(pending).toContain("File changes have not been retrieved yet.");
+    expect(pending).not.toContain("wordcount.py");
+    row.result.fetched = true;
+    row.result.capture!.partial = true;
+    row.result.capture!.diffstat = [{ path: "asset.dat", added: null, deleted: null }];
+    const partial = handoffSummary(row, (key) => i18n.t(key));
+    expect(partial).toContain(i18n.t("handoff.partialCapture"));
+    expect(partial).toContain("asset.dat\tBinary");
+  });
+  it("provides the same remote-open action in completion notifications", async () => {
+    store.records = [record()];
+    render(<HandoffNotifications onReview={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open in Codex App" }));
+    await waitFor(() => expect(api.openRemoteHandoffThread).toHaveBeenCalledWith("handoff"));
+    expect(screen.getByRole("button", { name: "Copy remote thread ID" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Copy summary" })).toBeNull();
+  });
   it("prefills only the selected thread's draft and preserves edits across OS rechecks", async () => {
     const draft = { task: "Finish the CLI and tests.", originalRequest: "Create a word-count package.", lastProgress: "Parser is done." };
     vi.mocked(api.preflightRemoteHandoff).mockResolvedValue({ thread: { ...thread, draft }, changes: [], blockers: [], warnings: [], remoteOs: "linux", localRefNotice: "ref" });

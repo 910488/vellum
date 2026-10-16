@@ -3,6 +3,7 @@
 use crate::error::AppResult;
 use crate::state::{AppState, RemoteSidebarMode};
 use sha2::{Digest, Sha256};
+use tauri_plugin_opener::OpenerExt;
 
 /// Remote commands talk to the host over `ssh` and wait for it. A synchronous
 /// Tauri command runs on the main thread, so each call froze the window for a
@@ -179,6 +180,36 @@ pub async fn list_remote_handoff_threads(
     state: tauri::State<'_, AppState>,
 ) -> AppResult<Vec<super::handoff::LocalThread>> {
     off_main_thread(&state, |state| super::handoff::list_threads(&state)).await
+}
+
+#[tauri::command]
+pub async fn get_remote_handoff_thread_link(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<Option<String>> {
+    off_main_thread(&state, move |state| {
+        super::handoff::thread_link(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_remote_handoff_thread(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<()> {
+    // Resolve again on click; neither URI nor Desktop host ID comes from the renderer.
+    let uri = off_main_thread(&state, move |state| {
+        super::handoff::thread_link(&state, &handoff_id)
+    })
+    .await?
+    .ok_or_else(|| crate::error::AppError::Message("HandoffCodexHostUnavailable".into()))?;
+    app.opener()
+        .open_url(&uri, None::<String>)
+        .map_err(|error| {
+            crate::error::AppError::Message(format!("HandoffCodexOpenFailed: {error}"))
+        })
 }
 
 #[tauri::command]
