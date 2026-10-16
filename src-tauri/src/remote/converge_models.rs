@@ -19,6 +19,35 @@ pub(crate) struct Selection {
     pub chatgpt_pairing_suggested: bool,
 }
 
+pub(crate) fn observe_official_account<T>(
+    needed: bool,
+    expected: Option<&str>,
+    resolve: impl FnOnce() -> AppResult<T>,
+    query: impl FnOnce(T, &str) -> AppResult<Value>,
+) -> AppResult<Option<Value>> {
+    let Some(expected) = expected.filter(|_| needed) else {
+        return Ok(None);
+    };
+    let status = query(resolve()?, expected)?;
+    if !matches!(
+        status.get("state").and_then(Value::as_str),
+        Some(
+            "ready"
+                | "synchronized"
+                | "pairingRequired"
+                | "pairingPending"
+                | "accountUnavailable"
+                | "activationRequired"
+                | "reauthenticationRequired"
+        )
+    ) {
+        return Err(AppError::Message(
+            "officialAccountStatusUnavailable: invalid account status".into(),
+        ));
+    }
+    Ok(Some(status))
+}
+
 pub(crate) fn official_account_ready(expected: Option<&str>, status: Option<&Value>) -> bool {
     let Some(expected) = expected else {
         return false;
@@ -80,6 +109,70 @@ pub(crate) fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transport_failures_abort_before_model_selection_with_or_without_alternatives() {
+        for alternatives in [true, false] {
+            let selection_reached = std::cell::Cell::new(false);
+            let result = (|| {
+                let _status = observe_official_account(
+                    true,
+                    Some("current"),
+                    || Ok(()),
+                    |_, account| {
+                        assert_eq!(account, "current");
+                        Err(AppError::Message(
+                            "agent.transportTimeout: SSH reply lost".into(),
+                        ))
+                    },
+                )?;
+                selection_reached.set(true);
+                select(
+                    &[],
+                    &[
+                        candidate("other", false, alternatives),
+                        candidate("official", true, false),
+                    ],
+                    "officialAccountPairingRequired",
+                )
+            })();
+            let error = result.unwrap_err().to_string();
+            assert_eq!(error, "agent.transportTimeout: SSH reply lost");
+            assert!(!error.contains("PairingRequired"));
+            assert!(!selection_reached.get());
+        }
+    }
+    #[test]
+    fn target_resolution_errors_are_preserved_and_irrelevant_accounts_are_not_queried() {
+        let result = observe_official_account::<()>(
+            true,
+            Some("current"),
+            || Err(AppError::Message("unknown remote host: missing".into())),
+            |_, _| panic!("no target"),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "unknown remote host: missing"
+        );
+        for (needed, account) in [(false, Some("current")), (true, None)] {
+            assert!(observe_official_account::<()>(
+                needed,
+                account,
+                || panic!("not needed"),
+                |_, _| panic!("not needed")
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert!(observe_official_account(
+            true,
+            Some("current"),
+            || Ok(()),
+            |_, _| Ok(serde_json::json!({}))
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("officialAccountStatusUnavailable"));
+    }
     fn candidate(id: &str, official: bool, credential: bool) -> Candidate {
         Candidate {
             catalog_id: id.into(),

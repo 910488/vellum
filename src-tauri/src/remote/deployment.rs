@@ -426,24 +426,18 @@ pub(crate) fn plan_for_converge(
     let wanted = |model: &crate::model::ModelRoute| {
         requested.is_empty() || requested.contains(&model.catalog_id)
     };
-    let account = if available.iter().any(|model| {
+    let official_wanted = available.iter().any(|model| {
         wanted(model)
             && routes.iter().any(|route| {
                 route.id == model.route_id && route.provider_kind == ProviderKind::Official
             })
-    }) {
-        account_id.as_ref().and_then(|id| {
-            RemoteHostManager::resolve_target(state, host_id)
-                .ok()
-                .and_then(|target| {
-                    RemoteAgentClient::new(target)
-                        .codex_account_status(Some(id))
-                        .ok()
-                })
-        })
-    } else {
-        None
-    };
+    });
+    let account = super::converge_models::observe_official_account(
+        official_wanted,
+        account_id.as_deref(),
+        || RemoteHostManager::resolve_target(state, host_id),
+        |target, id| RemoteAgentClient::new(target).codex_account_status(Some(id)),
+    )?;
     let official_ready =
         super::converge_models::official_account_ready(account_id.as_deref(), account.as_ref());
     let official_blocker = if account_id.is_none() {
@@ -458,7 +452,10 @@ pub(crate) fn plan_for_converge(
         {
             Some("activationRequired") => "officialAccountActivationRequired",
             Some("reauthenticationRequired") => "officialAccountReauthenticationRequired",
-            _ => "officialAccountPairingRequired",
+            Some("pairingRequired" | "pairingPending" | "accountUnavailable") => {
+                "officialAccountPairingRequired"
+            }
+            _ => "officialAccountStatusUnavailable",
         }
     };
     let mut ready_routes = BTreeSet::new();
