@@ -105,7 +105,6 @@ pub struct BridgeAttestationV1 {
     ///
     /// A count, not identifiers: the restart guard needs to know whether to
     /// stop, and thread ids have no business in a file Settings displays.
-    #[serde(default)]
     pub open_turns: u32,
     /// Set when this bridge is standing in for a launch it could not run: the
     /// lease was released, or Desktop replaced the Official core with one this
@@ -113,6 +112,9 @@ pub struct BridgeAttestationV1 {
     /// counting turns so Vellum can tell when replacing it loses nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// Helpers present when this Official core was approved but now missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_official: Vec<String>,
     pub failure_reason: Option<String>,
 }
 
@@ -167,6 +169,7 @@ impl BridgeAttestationV1 {
     /// *this* configuration, which is [`Self::is_active_for`].
     pub fn is_serving(&self) -> bool {
         self.fallback.is_none()
+            && self.incomplete_official.is_empty()
             && self.is_live()
             && self.state == BridgeLifecycle::Ready
             && self.official.initialized
@@ -180,6 +183,7 @@ impl BridgeAttestationV1 {
     pub fn is_active_for(&self, launch_id: &str) -> bool {
         self.matches_launch(launch_id)
             && self.fallback.is_none()
+            && self.incomplete_official.is_empty()
             && self.is_live()
             && self.state == BridgeLifecycle::Ready
             && self.official.initialized
@@ -221,6 +225,12 @@ impl BridgeAttestationV1 {
         if let Some(reason) = &self.fallback {
             blockers.push(format!(
                 "the bridge is serving plain Official Codex ({reason})"
+            ));
+        }
+        if !self.incomplete_official.is_empty() {
+            blockers.push(format!(
+                "Official core is missing helpers: {}",
+                self.incomplete_official.join(", ")
             ));
         }
         if let Some(reason) = &self.failure_reason {
@@ -268,6 +278,7 @@ impl AttestationWriter {
                 session_features_applied: 0,
                 open_turns: 0,
                 fallback: None,
+                incomplete_official: Vec::new(),
                 failure_reason: None,
             },
         }
@@ -316,6 +327,10 @@ impl AttestationWriter {
         }
         self.attestation.open_turns = open;
         let _ = self.flush();
+    }
+
+    pub fn set_incomplete_official(&mut self, missing: Vec<String>) {
+        self.attestation.incomplete_official = missing;
     }
 
     pub fn set_fallback(&mut self, reason: impl Into<String>) {
@@ -515,6 +530,35 @@ mod tests {
             .blockers_for("launch-1")
             .iter()
             .any(|blocker| blocker.contains("plain Official")));
+    }
+
+    #[test]
+    fn an_incomplete_official_is_visible_even_with_a_valid_core_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer = writer(&temp);
+        writer.mark_initialized(ExecutionPlane::OfficialCodex);
+        writer.mark_initialized(ExecutionPlane::EnhancedCodex);
+        report_identity(&mut writer);
+        writer.set_incomplete_official(vec!["codex-code-mode-host.exe".into()]);
+        writer.flush().unwrap();
+        let loaded = BridgeAttestationV1::read(writer.path()).unwrap();
+        assert_eq!(loaded.incomplete_official, vec!["codex-code-mode-host.exe"]);
+        assert!(!loaded.is_serving());
+        assert!(!loaded.is_active_for("launch-1"));
+        assert!(loaded
+            .blockers_for("launch-1")
+            .iter()
+            .any(|blocker| blocker.contains("codex-code-mode-host.exe")));
+    }
+
+    #[test]
+    fn an_attestation_without_a_turn_count_is_not_evidence_of_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = writer(&temp);
+        let mut value = serde_json::to_value(writer.snapshot()).unwrap();
+        value.as_object_mut().unwrap().remove("openTurns");
+        std::fs::write(writer.path(), serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(BridgeAttestationV1::read(writer.path()).is_err());
     }
 
     #[test]

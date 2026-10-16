@@ -686,6 +686,7 @@ fn build_manifest(
         qualification_journal_path: run_root.join("qualification-journal.jsonl"),
         relay: None,
         official_successors: Vec::new(),
+        official_helpers: crate::enhanced_runtime::launch_manifest::official_helpers(official),
     })
 }
 

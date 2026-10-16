@@ -83,6 +83,10 @@ pub struct LaunchManifestV1 {
     /// launch's Enhanced core, so the bridge can take it on its own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub official_successors: Vec<OfficialSuccessor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Helper basenames observed when the pinned Official core was prepared.
+    /// Keep these even after Desktop removes files from the old directory.
+    pub official_helpers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +97,39 @@ pub struct OfficialSuccessor {
     pub artifact_sha256: String,
     /// Where Vellum found it. Informational: the bridge matches by hash.
     pub source: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helpers: Vec<String>,
+}
+
+/// Helpers are reachable beside the core or in its sibling resources folder.
+pub fn official_helpers(executable: &Path) -> Vec<String> {
+    let Some(dir) = executable.parent() else {
+        return Vec::new();
+    };
+    let mut helpers = std::collections::BTreeSet::new();
+    for folder in [dir.to_path_buf(), dir.join("resources")] {
+        if let Ok(entries) = std::fs::read_dir(folder) {
+            for entry in entries.flatten().filter(|entry| entry.path().is_file()) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".exe") && lower != "codex.exe" {
+                    helpers.insert(name);
+                }
+            }
+        }
+    }
+    helpers.into_iter().collect()
+}
+
+pub fn missing_official_helpers(executable: &Path, expected: &[String]) -> Vec<String> {
+    let Some(dir) = executable.parent() else {
+        return expected.to_vec();
+    };
+    expected
+        .iter()
+        .filter(|name| !dir.join(name).is_file() && !dir.join("resources").join(name).is_file())
+        .cloned()
+        .collect()
 }
 
 impl LaunchManifestV1 {
@@ -203,7 +240,9 @@ impl LaunchManifestV1 {
             .iter()
             .any(|successor| !successor.artifact_sha256.starts_with("sha256:"))
         {
-            return Err(LaunchManifestError::Incomplete("official successor identity"));
+            return Err(LaunchManifestError::Incomplete(
+                "official successor identity",
+            ));
         }
         self.assert_credential_free()?;
         Ok(())
@@ -439,6 +478,7 @@ mod tests {
             qualification_journal_path: root.join("journal.jsonl"),
             relay: None,
             official_successors: Vec::new(),
+            official_helpers: Vec::new(),
         }
     }
 
@@ -564,6 +604,7 @@ mod tests {
         manifest.official_successors.push(OfficialSuccessor {
             artifact_sha256: "sha256:next".into(),
             source: temp.path().join("staged").join("codex.exe"),
+            helpers: Vec::new(),
         });
         manifest.validate().unwrap();
         assert!(manifest.accepts_official_successor("sha256:next"));
@@ -572,7 +613,9 @@ mod tests {
         manifest.official_successors[0].artifact_sha256 = "next".into();
         assert!(matches!(
             manifest.validate(),
-            Err(LaunchManifestError::Incomplete("official successor identity"))
+            Err(LaunchManifestError::Incomplete(
+                "official successor identity"
+            ))
         ));
     }
 

@@ -47,9 +47,13 @@ pub(crate) fn spawn(state: AppState) {
 async fn steward_pass(state: &AppState, recycled: &mut HashSet<String>) {
     let data_root = state.data_root();
     let pass_root = data_root.clone();
+    let refresh_state = state.clone();
     // Successor checks probe Codex binaries; none of it belongs on a runtime
     // worker thread.
     let refreshed = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = refresh_state.lifecycle_lock().try_lock() else {
+            return false;
+        };
         if let Err(error) =
             crate::enhanced_runtime::desktop_manager::refresh_official_successors(&pass_root)
         {
@@ -68,6 +72,8 @@ async fn steward_pass(state: &AppState, recycled: &mut HashSet<String>) {
         let guard = status_state.lifecycle_lock().try_lock();
         let status = crate::enhanced_runtime::desktop_runtime_status(&status_state.data_root());
         if guard.is_ok() {
+            status_state
+                .reconcile_codex_restart(crate::commands::runtime::codex_process_identity());
             status_state.reconcile_enhanced_adoption(
                 (status.ready || status.bridge_protection_active) && !status.restart_required,
             );
@@ -115,6 +121,9 @@ fn recycle_reason(
     if !attestation.matches_launch(&manifest.launch_id) {
         return Some("supersededLaunch");
     }
+    if !attestation.incomplete_official.is_empty() {
+        return Some("incompleteOfficial");
+    }
     match attestation.fallback.as_deref() {
         Some("leaseReleased") => Some("leaseRestored"),
         Some(_) => Some("successorApproved"),
@@ -131,26 +140,38 @@ fn recycle_target(
     // A pending Enhanced core is promoted or rolled back by the managed
     // restart, which watches the new launch through its first turn. Swapping
     // the bridge underneath it here would skip that verdict.
-    if !state.proxy_status().running
-        || !status.enabled
-        || status.pending_core
-        || status.environment_state != "leased"
-    {
+    if !state.proxy_status().running || !status.enabled || status.environment_state != "leased" {
         return None;
     }
     let manifest = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)).ok()?;
-    if recycled.contains(&manifest.launch_id) {
+    let Some(attestation) = crate::enhanced_runtime::live_bridge_attestation(data_root) else {
+        log::info!(
+            "[Launch] bridge recycle skipped reason=unreadableAttestation launch={}",
+            manifest.launch_id
+        );
+        return None;
+    };
+    if let Some(reason) = recycle_skip(
+        status.pending_core,
+        recycled.contains(&manifest.launch_id),
+        attestation.has_open_turn(),
+    ) {
+        log::info!(
+            "[Launch] bridge recycle skipped reason={reason} launch={} pid={}",
+            manifest.launch_id,
+            attestation.bridge_pid
+        );
         return None;
     }
     let lease = crate::enhanced_runtime::env_lease::EnvironmentLease::read(data_root)?;
     if lease.launch_id != manifest.launch_id {
         return None;
     }
-    let attestation = crate::enhanced_runtime::live_bridge_attestation(data_root)?;
     let reason = recycle_reason(
         &manifest,
         &attestation,
-        crate::enhanced_runtime::official_drift::would_drift(&manifest),
+        crate::enhanced_runtime::official_drift::would_drift(&manifest)
+            || !crate::enhanced_runtime::official_drift::launch_is_complete(&manifest),
     )?;
     if !crate::enhanced_runtime::desktop_manager::adopted_by_codex_desktop(&attestation)
         || attestation.has_open_turn()
@@ -166,11 +187,24 @@ fn recycle_target(
     })
 }
 
+fn recycle_skip(pending: bool, spent: bool, open: bool) -> Option<&'static str> {
+    if pending {
+        Some("pendingPromotion")
+    } else if spent {
+        Some("alreadyRecycled")
+    } else if open {
+        Some("openTurn")
+    } else {
+        None
+    }
+}
+
 /// True once the bridge was ended, whatever came back after it.
 async fn recycle(state: &AppState, target: RecycleTarget) -> bool {
     let data_root = state.data_root();
     let kill_state = state.clone();
     let bridge_pid = target.bridge_pid;
+    let expected_launch = target.launch_id.clone();
     let killed = tokio::task::spawn_blocking(move || {
         // Launch publication and managed restarts own the bridge while they
         // hold this; the next pass will look again.
@@ -180,9 +214,35 @@ async fn recycle(state: &AppState, target: RecycleTarget) -> bool {
         // Read again immediately before acting: a turn opened since the pass
         // began is the one thing this must never cut short.
         let Some(current) = crate::enhanced_runtime::live_bridge_attestation(&data_root) else {
+            log::info!(
+                "[Launch] bridge recycle skipped reason=unreadableAttestation pid={bridge_pid}"
+            );
             return false;
         };
         if current.bridge_pid != bridge_pid || current.has_open_turn() {
+            log::info!(
+                "[Launch] bridge recycle skipped reason=bridgeChangedOrOpenTurn pid={bridge_pid}"
+            );
+            return false;
+        }
+        let status = crate::enhanced_runtime::desktop_runtime_status(&data_root);
+        if status.pending_core {
+            log::info!("[Launch] bridge recycle skipped reason=pendingPromotion pid={bridge_pid}");
+            return false;
+        }
+        let Ok(manifest) = LaunchManifestV1::read(&LaunchManifestV1::path_in(&data_root)) else {
+            return false;
+        };
+        let lease = crate::enhanced_runtime::env_lease::EnvironmentLease::read(&data_root);
+        if manifest.launch_id != expected_launch
+            || !kill_state.proxy_status().running
+            || !status.enabled
+            || status.environment_state != "leased"
+            || !lease.is_some_and(|lease| lease.launch_id == manifest.launch_id)
+            || !crate::enhanced_runtime::desktop_manager::adopted_by_codex_desktop(&current)
+            || crate::enhanced_runtime::official_drift::would_drift(&manifest)
+            || !crate::enhanced_runtime::official_drift::launch_is_complete(&manifest)
+        {
             return false;
         }
         let is_our_bridge = crate::enhanced_runtime::process_info::executable_of(bridge_pid)
@@ -190,6 +250,15 @@ async fn recycle(state: &AppState, target: RecycleTarget) -> bool {
                 crate::enhanced_runtime::process_info::is_bundled_sidecar_executable(&path)
             });
         if !is_our_bridge {
+            return false;
+        }
+        let Some(latest) = crate::enhanced_runtime::live_bridge_attestation(&data_root) else {
+            return false;
+        };
+        if latest.bridge_pid != bridge_pid || latest.has_open_turn() {
+            log::info!(
+                "[Launch] bridge recycle skipped reason=bridgeChangedOrOpenTurn pid={bridge_pid}"
+            );
             return false;
         }
         match crate::enhanced_runtime::process_info::terminate_tree(bridge_pid) {
@@ -206,7 +275,7 @@ async fn recycle(state: &AppState, target: RecycleTarget) -> bool {
         return false;
     }
     log::info!(
-        "[Enhanced] recycled idle bridge pid={} reason={} launch={}",
+        "[Launch] recycled idle bridge pid={} reason={} launch={}",
         target.bridge_pid,
         target.reason,
         target.launch_id
@@ -216,8 +285,13 @@ async fn recycle(state: &AppState, target: RecycleTarget) -> bool {
     let _ = tokio::task::spawn_blocking(move || {
         let _guard = status_state.lifecycle_lock().blocking_lock();
         let status = crate::enhanced_runtime::desktop_runtime_status(&status_state.data_root());
+        // #77 settles older reasons before any new process identity is bound.
+        // Bridge recycling itself does not satisfy catalog/config reasons.
+        status_state.reconcile_codex_restart(crate::commands::runtime::codex_process_identity());
         status_state.reconcile_enhanced_adoption(
-            (status.ready || status.bridge_protection_active) && !status.restart_required,
+            observed
+                && (status.ready || status.bridge_protection_active)
+                && !status.restart_required,
         );
     })
     .await;
@@ -239,6 +313,7 @@ fn served(attestation: &BridgeAttestationV1, launch_id: &str, bridge_only: bool)
     if bridge_only {
         attestation.matches_launch(launch_id)
             && attestation.fallback.is_none()
+            && attestation.incomplete_official.is_empty()
             && attestation.is_live()
             && attestation.official.initialized
             && !attestation.official.exited
@@ -312,6 +387,7 @@ mod tests {
             session_features_applied: 0,
             open_turns: 0,
             fallback: fallback.map(str::to_owned),
+            incomplete_official: Vec::new(),
             failure_reason: None,
         }
     }
@@ -356,5 +432,45 @@ mod tests {
             recycle_reason(&manifest, &attestation("L2", Some("officialDrift")), true),
             None
         );
+    }
+
+    #[test]
+    fn idle_superseded_launch_is_recycled_once_and_busy_passes_can_retry() {
+        let manifest = manifest("L2");
+        let mut bridge = attestation("L1", None);
+        assert_eq!(
+            recycle_reason(&manifest, &bridge, false),
+            Some("supersededLaunch")
+        );
+        let mut recycled = HashSet::new();
+        bridge.open_turns = 1;
+        assert_eq!(
+            recycle_skip(false, recycled.contains("L2"), bridge.has_open_turn()),
+            Some("openTurn")
+        );
+        bridge.open_turns = 0;
+        assert_eq!(
+            recycle_skip(false, recycled.contains("L2"), bridge.has_open_turn()),
+            None
+        );
+        recycled.insert("L2");
+        assert_eq!(
+            recycle_skip(false, recycled.contains("L2"), false),
+            Some("alreadyRecycled")
+        );
+        assert_eq!(recycle_skip(true, false, false), Some("pendingPromotion"));
+    }
+
+    #[test]
+    fn incomplete_official_is_recycled_only_into_a_complete_launch() {
+        let mut bridge = attestation("L2", None);
+        bridge
+            .incomplete_official
+            .push("codex-code-mode-host.exe".into());
+        assert_eq!(
+            recycle_reason(&manifest("L2"), &bridge, false),
+            Some("incompleteOfficial")
+        );
+        assert_eq!(recycle_reason(&manifest("L2"), &bridge, true), None);
     }
 }

@@ -206,7 +206,12 @@ pub fn terminate_tree(pid: u32) -> std::io::Result<()> {
     let result = crate::process::background_command("kill")
         .args(["-TERM", &pid.to_string()])
         .output();
-    result.map(|_| ())
+    let output = result?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("process termination failed: {}", output.status)))
+    }
 }
 
 fn process_images() -> Vec<ProcessImage> {

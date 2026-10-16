@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::atomic::write_atomic;
-use super::launch_manifest::{sha256_file, LaunchManifestV1, RuntimeBinaryIdentity};
+use super::launch_manifest::{
+    missing_official_helpers, sha256_file, LaunchManifestV1, RuntimeBinaryIdentity,
+};
 
 pub const OFFICIAL_DRIFT_FILE: &str = "official-drift.json";
 
@@ -86,12 +88,43 @@ pub fn resolve_official(
     resolve_official_with(manifest, desktop_official_candidates())
 }
 
+pub(crate) fn observe_official(
+    manifest: &LaunchManifestV1,
+) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
+    resolve_official_inner(manifest, desktop_official_candidates(), false)
+}
+
 /// Whether a bridge started now would have to serve this launch as plain
 /// Official. Asks the same question as [`resolve_official`] without leaving a
 /// drift record: Vellum asking is not a bridge having fallen back.
 pub fn would_drift(manifest: &LaunchManifestV1) -> bool {
-    resolve_official_inner(manifest, desktop_official_candidates(), false)
-        .is_ok_and(|(_, source)| source == OfficialSource::Drifted)
+    observe_official(manifest).map_or(true, |(_, source)| source == OfficialSource::Drifted)
+}
+
+/// A recycle must improve the running bridge, never respawn into the same
+/// incomplete directory. Errors are unsafe, just like missing helpers.
+pub fn launch_is_complete(manifest: &LaunchManifestV1) -> bool {
+    observe_official(manifest).is_ok_and(|(official, _)| {
+        missing_official_helpers(
+            &official.executable,
+            &expected_helpers(manifest, &official.artifact_sha256),
+        )
+        .is_empty()
+    })
+}
+
+pub fn expected_helpers(manifest: &LaunchManifestV1, sha256: &str) -> Vec<String> {
+    let mut expected = manifest.official_helpers.clone();
+    if let Some(successor) = manifest
+        .official_successors
+        .iter()
+        .find(|successor| successor.artifact_sha256 == sha256)
+    {
+        expected.extend(successor.helpers.clone());
+    }
+    expected.sort();
+    expected.dedup();
+    expected
 }
 
 fn resolve_official_with(
@@ -121,22 +154,33 @@ fn resolve_official_inner(
             }
         }
     }
-    let error = match manifest.official.verify_on_disk("official") {
-        Ok(()) => return Ok((manifest.official.clone(), OfficialSource::Pinned)),
-        Err(error) => error,
-    };
+    let verification = manifest.official.verify_on_disk("official");
+    let incomplete =
+        missing_official_helpers(&manifest.official.executable, &manifest.official_helpers);
+    if verification.is_ok() && incomplete.is_empty() {
+        return Ok((manifest.official.clone(), OfficialSource::Pinned));
+    }
     if let Some(successor) = candidates
         .iter()
         .find_map(|candidate| approved_successor(manifest, candidate))
     {
         return Ok((successor, OfficialSource::Successor));
     }
-    let Some((current, sha256)) = candidates
-        .into_iter()
-        .find_map(|candidate| sha256_file(&candidate).ok().map(|sha| (candidate, sha)))
-    else {
-        return Err(error);
+    let replacement = candidates.into_iter().find_map(|candidate| {
+        let sha = sha256_file(&candidate).ok()?;
+        missing_official_helpers(&candidate, &expected_helpers(manifest, &sha))
+            .is_empty()
+            .then_some((candidate, sha))
+    });
+    // Keep serving a hash-verified pin when there is no complete replacement.
+    // The bridge records the missing helpers; Vellum can converge later.
+    let Some((current, sha256)) = replacement else {
+        return verification.map(|()| (manifest.official.clone(), OfficialSource::Pinned));
     };
+    let error = verification
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| format!("Official core missing helpers: {}", incomplete.join(", ")));
     if record {
         OfficialDriftRecord {
             launch_id: manifest.launch_id.clone(),
@@ -145,7 +189,7 @@ fn resolve_official_inner(
             recorded_sha256: manifest.official.artifact_sha256.clone(),
             current_executable: current.clone(),
             current_sha256: sha256.clone(),
-            reason: error.to_string(),
+            reason: error,
         }
         .write_beside(&manifest.attestation_path);
     }
@@ -159,12 +203,11 @@ fn approved_successor(
     manifest: &LaunchManifestV1,
     candidate: &Path,
 ) -> Option<RuntimeBinaryIdentity> {
-    if manifest.official_successors.is_empty() {
+    let sha256 = sha256_file(candidate).ok()?;
+    if !missing_official_helpers(candidate, &expected_helpers(manifest, &sha256)).is_empty() {
         return None;
     }
-    let sha256 = sha256_file(candidate).ok()?;
-    manifest
-        .accepts_official_successor(&sha256)
+    (manifest.accepts_official_successor(&sha256) || sha256 == manifest.official.artifact_sha256)
         .then(|| official_identity(manifest, candidate.to_path_buf(), sha256))
 }
 
@@ -299,6 +342,7 @@ mod tests {
             qualification_journal_path: root.join("journal.jsonl"),
             relay: None,
             official_successors: Vec::new(),
+            official_helpers: Vec::new(),
         }
     }
 
@@ -399,6 +443,7 @@ mod tests {
         crate::enhanced_runtime::launch_manifest::OfficialSuccessor {
             artifact_sha256: sha256_file(path).unwrap(),
             source: path.to_path_buf(),
+            helpers: super::super::launch_manifest::official_helpers(path),
         }
     }
 
@@ -460,5 +505,120 @@ mod tests {
         assert_eq!(source, OfficialSource::Successor);
         assert_eq!(resolved.executable, approved);
         assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    fn helper_fixture(root: &Path) -> (LaunchManifestV1, PathBuf, PathBuf) {
+        let old = root.join("old/codex.exe");
+        let new = root.join("new/codex.exe");
+        write_all(&[(&old, "v1"), (&new, "v2")]);
+        let helper = old.parent().unwrap().join("codex-code-mode-host.exe");
+        fs::write(&helper, "host").unwrap();
+        let mut manifest = manifest(root, old);
+        manifest.official_helpers =
+            super::super::launch_manifest::official_helpers(&manifest.official.executable);
+        (manifest, helper, new)
+    }
+
+    #[test]
+    fn a_complete_pin_with_recorded_helpers_stays_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let (_, source) = resolve_official_with(&manifest, Vec::new()).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert!(missing_official_helpers(
+            &manifest.official.executable,
+            &manifest.official_helpers
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_hash_valid_incomplete_pin_uses_a_complete_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, helper, new) = helper_fixture(temp.path());
+        fs::remove_file(helper).unwrap();
+        let new_helper = new
+            .parent()
+            .unwrap()
+            .join("resources/codex-code-mode-host.exe");
+        fs::create_dir_all(new_helper.parent().unwrap()).unwrap();
+        fs::write(new_helper, "host").unwrap();
+        manifest.official_successors.push(successor(&new));
+        let (official, source) = resolve_official_with(&manifest, vec![new.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(official.executable, new);
+    }
+
+    #[test]
+    fn an_incomplete_pin_without_a_complete_replacement_keeps_its_missing_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, helper, _) = helper_fixture(temp.path());
+        fs::remove_file(helper).unwrap();
+        let (official, source) = resolve_official_with(&manifest, Vec::new()).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(
+            missing_official_helpers(&official.executable, &manifest.official_helpers),
+            vec!["codex-code-mode-host.exe"]
+        );
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn a_successor_still_unpacking_its_helpers_is_never_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, helper, new) = helper_fixture(temp.path());
+        manifest.official_successors.push(successor(&new));
+        fs::remove_file(helper).unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new]).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(official, manifest.official);
+    }
+
+    #[test]
+    fn an_incomplete_pin_can_use_a_complete_desktop_core_as_plain_official() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, helper, new) = helper_fixture(temp.path());
+        fs::remove_file(helper).unwrap();
+        fs::write(
+            new.parent().unwrap().join("codex-code-mode-host.exe"),
+            "host",
+        )
+        .unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Drifted);
+        assert_eq!(official.executable, new);
+    }
+
+    #[test]
+    fn a_complete_copy_with_the_same_digest_remains_trusted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, helper, new) = helper_fixture(temp.path());
+        fs::copy(&manifest.official.executable, &new).unwrap();
+        fs::remove_file(helper).unwrap();
+        fs::write(
+            new.parent().unwrap().join("codex-code-mode-host.exe"),
+            "host",
+        )
+        .unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(official.executable, new);
+        assert_eq!(official.artifact_sha256, manifest.official.artifact_sha256);
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn successor_specific_helpers_are_required_even_when_the_pin_has_fewer() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, _, new) = helper_fixture(temp.path());
+        let host = new.parent().unwrap().join("codex-code-mode-host.exe");
+        let extra = new.parent().unwrap().join("codex-extra.exe");
+        fs::write(host, "host").unwrap();
+        fs::write(&extra, "extra").unwrap();
+        manifest.official_successors.push(successor(&new));
+        fs::remove_file(extra).unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new]).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(official, manifest.official);
     }
 }

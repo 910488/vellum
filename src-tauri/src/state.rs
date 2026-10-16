@@ -3396,6 +3396,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bridge_recycle_adoption_settles_runtime_reason_without_rebinding_other_reasons() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("codexRunning"),
+            "desktop:old".into(),
+        );
+        // Arming goes through #77: a restart before the repair already
+        // satisfied the first reason, even if no status poll observed it.
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("enhancedDesktopRuntimeChanged"),
+            "desktop:current".into(),
+        );
+        state.mark_restart_required_for_process(
+            RuntimeNotice::new("catalogChanged"),
+            "desktop:current".into(),
+        );
+        // Only the bridge changes during the handover; the Desktop identity
+        // stays put. A verified adoption clears just the runtime notice.
+        state.reconcile_codex_restart(Some("desktop:current".into()));
+        state.reconcile_enhanced_adoption(true);
+        assert_eq!(
+            state.runtime_status().restart_reasons,
+            vec![RuntimeNotice::new("catalogChanged")]
+        );
+        state.reconcile_codex_restart(Some("desktop:next".into()));
+        assert!(!state.runtime_status().restart_required);
+    }
+
     /// Changing the catalog while Codex was closed recorded a reason with no
     /// process to outlive, and nothing but a managed restart could clear it:
     /// the badge stayed lit across any number of Codex launches.

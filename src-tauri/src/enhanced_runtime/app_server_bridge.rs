@@ -208,6 +208,8 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     if bridge_is_started_by_codex_desktop() {
         let mut manifest = LaunchManifestV1::read(&manifest_path)?;
         let (official, source) = super::official_drift::resolve_official(&manifest)?;
+        manifest.official_helpers =
+            super::official_drift::expected_helpers(&manifest, &official.artifact_sha256);
         // Desktop replaced its core with one this launch never checked, or
         // Vellum gave the lease back. Serving plain Official keeps Desktop
         // usable until Vellum rebuilds the launch; exiting here is what left it
@@ -387,6 +389,10 @@ fn run_with(config: BridgeConfig, fallback: Option<&str>) -> Result<(), BridgeEr
         },
         enhanced_child_attestation(&manifest),
     );
+    attestation.set_incomplete_official(super::launch_manifest::missing_official_helpers(
+        &manifest.official.executable,
+        &manifest.official_helpers,
+    ));
     if let Some(reason) = fallback {
         attestation.set_fallback(reason);
     }
