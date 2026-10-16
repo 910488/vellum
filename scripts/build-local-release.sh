@@ -65,7 +65,7 @@ proxy_image="vellum-proxy:$version-$proxy_fingerprint"
 complete_arch() {
   local arch_root="$1"
   local name
-  for name in vellum-remote-agent vellum-proxy-daemon codex; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     [[ -s "$arch_root/$name" ]] || return 1
   done
   [[ -s "$arch_root/native-source.ref" ]] || return 1
@@ -103,13 +103,8 @@ for arch in amd64 arm64; do
   else
     codex_target="x86_64-unknown-linux-musl"
   fi
-  codex_archive="$arch_root/codex.tar.gz"
-  codex_url="https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-$codex_target.tar.gz"
-  echo "==> Download pinned Codex $codex_version for $arch"
-  curl -fsSL --proto '=https' --tlsv1.2 "$codex_url" -o "$codex_archive"
-  tar -xzf "$codex_archive" -C "$arch_root" "codex-$codex_target"
-  mv "$arch_root/codex-$codex_target" "$arch_root/codex"
-  rm "$codex_archive"
+  echo "==> Download digest-verified Codex runtime package $codex_version for $arch"
+  node "$repo/scripts/download-codex-package.mjs" "$codex_version" "$codex_target" "$arch_root/codex-package.tar.gz"
 
   printf '%s\n' "$proxy_image:$codex_version" > "$arch_root/native-source.ref"
   cleanup_builder
@@ -122,7 +117,7 @@ for arch in amd64 arm64; do
   destination="$resource_root/linux-$arch"
   rm -rf "$destination"
   mkdir -p "$destination"
-  for name in vellum-remote-agent vellum-proxy-daemon codex; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     cp "$scratch_root/$arch/$name" "$destination/$name"
   done
 done
@@ -146,26 +141,20 @@ if [[ "$(uname -s)" == Darwin ]]; then
     "$darwin_root/vellum-remote-agent"
   cp "${CARGO_TARGET_DIR:-$repo/target}/aarch64-apple-darwin/release/vellum-proxy-daemon" \
     "$darwin_root/vellum-proxy-daemon"
-  codex_archive="$scratch_root/codex-darwin-arm64.tar.gz"
-  curl -fsSL --proto '=https' --tlsv1.2 \
-    "https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-aarch64-apple-darwin.tar.gz" \
-    -o "$codex_archive"
-  tar -xzf "$codex_archive" -C "$scratch_root" codex-aarch64-apple-darwin
-  mv "$scratch_root/codex-aarch64-apple-darwin" "$darwin_root/codex"
-  rm "$codex_archive"
+  node "$repo/scripts/download-codex-package.mjs" "$codex_version" aarch64-apple-darwin "$darwin_root/codex-package.tar.gz"
   node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root"
 fi
 
 echo "==> Embedded remote payload"
 du -sh "$resource_root"
 for arch in amd64 arm64; do
-  for name in vellum-remote-agent vellum-proxy-daemon codex; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     test -s "$resource_root/linux-$arch/$name"
   done
 done
 test -s "$resource_root/manifest.json"
 if [[ "$(uname -s)" == Darwin ]]; then
-  for name in vellum-remote-agent vellum-proxy-daemon codex; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     test -s "$resource_root/darwin-arm64/$name"
   done
 fi

@@ -5855,6 +5855,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "flate2",
  "fs2",
  "futures-util",
  "hex",

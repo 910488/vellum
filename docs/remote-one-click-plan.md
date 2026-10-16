@@ -252,9 +252,25 @@ UI 參考渲染稿：`src/dev/handoff-mock.tsx`，開 `/preview/handoff-mock.htm
 - **結果回來**：顯示相對交出時快照的 diffstat；動作是「套用到本機工作區」「開成分支」
   「看完整 diff」。若本機在交出後又改過同一檔案，偵測到衝突時改以「開成分支」為主要
   動作並警告。本機 thread 收到一則「遠端已完成」的摘要。
-- **先查清楚**：POC 發現 0.147 只裝單一執行檔時缺 `codex-code-mode-host`，所有 shell
-  指令都會失敗而模型只會說「執行主機不可用」；`desktop_codex.rs:478` 選的正是單一執行檔
-  archive。做 M3b 之前先確認並修正。
+- **runtime package（調查完成，第一段實作待驗收）**：pinned 0.147.0-alpha.6.6 的
+  `code_mode_host` 預設開啟，host 延遲啟動；缺 helper 時 thread 仍可能建立成功，
+  到工具呼叫才失敗。一般 Code Mode 可退回 direct tools，但 CodeModeOnly 或禁止
+  fallback 時會失敗，不能把 POC 的「所有 shell 都失敗」推廣到所有設定。依據 pinned
+  `features/src/lib.rs`、`core/src/tools/mod.rs`、`code-mode/src/remote_session.rs` 與
+  `core/tests/suite/code_mode.rs`，不以 thread／turn 建立成功作為可執行工作的證明。
+  改裝官方完整 `codex-package-*.tar.gz`，保留 metadata、bin、codex-resources、codex-path；
+  Linux／macOS 以相對 symlink `current/codex -> bin/codex` 滿足 daemon 固定路徑。
+  release／dev staging 與 Desktop sync 同步保留完整 archive，使用 publisher digest
+  與既有 bundle digest；Agent 解包驗證後原子切換，失敗回復整個舊目錄。
+  native／installation status 新增 runtimePackage.complete／missing；handoff preflight
+  遇到舊單檔或不完整 runtime 要求重新部署，一般 converge 即使版本相同也自動升級。
+  第一段先提供共用 preflight gate；handoffStart 串接時必須在開始工作前呼叫。
+  Linux harness 可另跑真實 package 解包／安裝測試：設定 `VELLUM_CODEX_PACKAGE` 為
+  官方 musl archive 路徑、`VELLUM_CODEX_PACKAGE_SHA256` 為 release metadata 的 publisher
+  digest（可帶 sha256:），執行 `cargo test --target x86_64-unknown-linux-musl
+  -p vellum-remote-agent --test codex_runtime_package -- --ignored`。
+  兩個架構的 archive 分別跑一次；這項測試不執行目標 Codex，以 fake version／service
+  client 驗證真實解包、完整性與相對 symlink，因此可在 x64 harness 檢查 arm64 package。
 - 四語 i18n、預覽台加上上述五個狀態；單元測試涵蓋快照不動工作區、衝突偵測、
   前置檢查擋下。
 

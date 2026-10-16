@@ -155,6 +155,7 @@ fn dispatch(
             "agentProtocol": AGENT_PROTOCOL_VERSION,
             "proxyMigrationRecovery": true,
             "confirmedTakeoverIdentity": true,
+            "fullCodexRuntimePackage": true,
         })),
         AgentRequest::HostCapabilities => {
             Ok(serde_json::to_value(probe_host()).map_err(|e| e.to_string())?)

@@ -687,6 +687,7 @@ const zhTW: ResourceTree = {
       "noModelsSelected": "尚未選取任何模型，沒有可同步的內容。",
       "noDeployableModels": "選擇的模型中，目前沒有同時通過資格檢查且具備桌面端可用憑證的模型。請啟用並驗證模型、補上憑證後再部署。",
       "bundledReleaseUnavailable": "內附部署檔案缺少或未通過驗證。請先安裝完整的 Vellum 發行版本，再部署。",
+      "codexRuntimeIncomplete": "遠端 Codex 缺少執行所需的 helper 或資源。請先重新部署這台主機，再交出工作。",
       "DeploymentAgentUpgradeRequired": "請先更新遠端 Agent，再確認接手。目前的 Agent 無法將確認綁定到已觀察的程序。",
       "DeploymentAlreadyRunning": "這台主機已有部署正在進行。請查看該操作，或取消後再開始。",
       "DeploymentControlUnavailable": "這筆部署已不在目前的 Vellum 工作階段執行。請重新部署以繼續。",

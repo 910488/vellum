@@ -24,7 +24,7 @@ export function finalizeRemoteDarwinManifest(root) {
 
   manifest.codex.artifacts["darwin-arm64"] = artifact(
     resolvedRoot,
-    "darwin-arm64/codex",
+    "darwin-arm64/codex-package.tar.gz",
   );
   manifest.agent.artifacts["darwin-arm64"] = artifact(
     resolvedRoot,

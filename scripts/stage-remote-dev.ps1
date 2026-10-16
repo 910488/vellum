@@ -47,40 +47,15 @@ function Copy-Into([string] $Source, [string] $Destination) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
-function Resolve-Tar {
-    # Never `tar.exe` off PATH: with Git for Windows ahead of System32 that is
-    # GNU tar, which reads `C:\...` as a `host:path` remote spec and fails with
-    # "Cannot connect to C: resolve failed". Windows ships bsdtar, which does not.
-    $bundled = Join-Path $env:SystemRoot "System32\tar.exe"
-    if (Test-Path -LiteralPath $bundled -PathType Leaf) { return $bundled }
-    return "tar.exe"
-}
-
 function Get-CachedCodex([string] $Architecture) {
     $target = if ($Architecture -eq "arm64") { "aarch64-unknown-linux-musl" } else { "x86_64-unknown-linux-musl" }
-    $cached = Join-Path $cacheRoot "codex\$CodexVersion\$target\codex"
+    $cached = Join-Path $cacheRoot "codex\$CodexVersion\$target\codex-package.tar.gz"
     if (Test-Path -LiteralPath $cached -PathType Leaf) {
         Write-Host "==> Reuse cached Codex $CodexVersion ($Architecture)"
         return $cached
     }
-    # Windows bsdtar cannot reliably open paths containing non-ASCII text, and
-    # this repository lives under one. Stage under the ASCII TEMP path.
-    $scratch = Join-Path $env:TEMP "vellum-codex-dev-$PID-$Architecture"
-    Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
-    try {
-        $archive = Join-Path $scratch "codex.tar.gz"
-        $url = "https://github.com/openai/codex/releases/download/rust-v$CodexVersion/codex-$target.tar.gz"
-        Invoke-Checked "Download pinned Codex $CodexVersion ($Architecture)" {
-            curl.exe -fsSL --proto '=https' --tlsv1.2 $url -o $archive
-        }
-        $tar = Resolve-Tar
-        Invoke-Checked "Extract pinned Codex ($Architecture)" {
-            & $tar -xzf $archive -C $scratch "codex-$target"
-        }
-        Copy-Into (Join-Path $scratch "codex-$target") $cached
-    } finally {
-        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    Invoke-Checked "Download digest-verified Codex runtime package $CodexVersion ($Architecture)" {
+        node (Join-Path $repo "scripts\download-codex-package.mjs") $CodexVersion $target $cached
     }
     return $cached
 }
@@ -106,7 +81,7 @@ foreach ($architecture in $Arch) {
     }
     Copy-Into (Join-Path $scratch "vellum-remote-agent") (Join-Path $destination "vellum-remote-agent")
     Copy-Into (Join-Path $scratch "vellum-proxy-daemon") (Join-Path $destination "vellum-proxy-daemon")
-    Copy-Into (Get-CachedCodex $architecture) (Join-Path $destination "codex")
+    Copy-Into (Get-CachedCodex $architecture) (Join-Path $destination "codex-package.tar.gz")
 
 }
 
@@ -116,7 +91,7 @@ foreach ($architecture in $Arch) {
 $carried = @()
 foreach ($architecture in $allArch) {
     if ($Arch -contains $architecture) { continue }
-    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
         $artifact = Join-Path $resourceRoot "linux-$architecture\$name"
         if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
             throw "linux-$architecture/$name is not staged. Stage it once with -Arch $architecture, or run scripts/build-local-release.ps1 -Mode stage-only."

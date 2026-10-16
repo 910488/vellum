@@ -166,6 +166,7 @@ interface BlockerEntry {
 }
 
 const BLOCKERS: Record<string, BlockerEntry> = {
+  codexRuntimeIncomplete: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   DeploymentAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
   DeploymentAlreadyRunning: { remedy: null, expectedBeforeBootstrap: false },
   DeploymentControlUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: false },

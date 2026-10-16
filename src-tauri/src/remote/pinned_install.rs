@@ -2,7 +2,8 @@
 //!
 //! Flow: verify that the resource manifest matches the hash embedded into the
 //! Vellum binary at compile time, resolve the bundled artifact for the host
-//! architecture, verify its SHA-256, stage it over SSH stdin, then ask the
+//! architecture, verify its SHA-256 and complete runtime layout, stage the
+//! archive over SSH stdin, then ask the
 //! agent to perform the digest-verified atomic install.
 
 use std::path::{Path, PathBuf};
@@ -403,6 +404,14 @@ pub(crate) fn inspect_bundled_artifact(artifact: &CodexArtifact) -> AppResult<u6
     inspect_artifact_file(&path, &artifact.sha256)
 }
 
+pub(crate) fn inspect_bundled_codex_package(artifact: &CodexArtifact) -> AppResult<u64> {
+    let relative = artifact.url.strip_prefix("bundle://").ok_or_else(|| {
+        AppError::Message("bundledReleaseUnavailable: Codex package is not bundled".into())
+    })?;
+    let path = bundled_artifact(relative)?;
+    vellum_remote_agent::codex_package::verify_archive(&path).map_err(AppError::Message)
+}
+
 fn inspect_artifact_file(path: &Path, expected: &str) -> AppResult<u64> {
     let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
     if sha256_file(path)? != expected {
@@ -490,6 +499,8 @@ pub fn install_pinned_codex(
     // Download + local digest verification.
     let local_staged = download_artifact(artifact)?;
     let result = (|| -> AppResult<serde_json::Value> {
+        vellum_remote_agent::codex_package::verify_archive(&local_staged)
+            .map_err(AppError::Message)?;
         let bytes = std::fs::read(&local_staged)
             .map_err(|error| AppError::Message(format!("read staged artifact: {error}")))?;
         let remote_path = format!("/tmp/vellum-codex-stage-{}.bin", ulid::Ulid::new());

@@ -3,6 +3,7 @@
 //! Owns install/update, proxy container lifecycle, host probes and repair.
 //! Does not own broker sessions, approvals, or model request adaptation.
 
+pub mod codex_package;
 pub mod configuration;
 pub mod docker;
 pub mod grok;

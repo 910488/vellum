@@ -18,6 +18,7 @@ path = "src/lib.rs"
 chrono = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
+flate2 = "1"
 fs2 = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
@@ -28,6 +29,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = "0.4"
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }

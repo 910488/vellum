@@ -13,6 +13,24 @@ pub struct DeploymentPreflight {
     pub repairs: std::collections::BTreeMap<String, String>,
 }
 
+/// Shared handoff readiness gate. Unknown/old Agent reports cannot certify a
+/// complete runtime; deploy first rather than starting a turn without tools.
+pub(crate) fn require_handoff_runtime(installation: &serde_json::Value) -> AppResult<()> {
+    if installation
+        .get("present")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && installation
+            .pointer("/runtimePackage/complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        Ok(())
+    } else {
+        Err(AppError::Message("codexRuntimeIncomplete: redeploy this host to install the complete Codex runtime before handing off work".into()))
+    }
+}
+
 /// Do not enter the deployment write phase until inspection succeeds.
 /// An existing SSH wrapper's idempotent recovery is outside this deployment.
 pub(crate) fn before_deployment<C, T>(
@@ -124,6 +142,25 @@ pub(crate) fn ps_start_time_preflight(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn handoff_requires_a_complete_runtime_and_redeploys_legacy_installations() {
+        for installation in [
+            serde_json::json!({"present": true, "compatible": true}),
+            serde_json::json!({"present": true, "runtimePackage": {"complete": false, "missing": ["bin/codex-code-mode-host"]}}),
+            serde_json::Value::Null,
+        ] {
+            let error = require_handoff_runtime(&installation)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("codexRuntimeIncomplete"));
+            assert!(error.contains("redeploy"));
+        }
+        assert!(require_handoff_runtime(
+            &serde_json::json!({"present": true, "runtimePackage": {"complete": true}})
+        )
+        .is_ok());
+    }
 
     #[test]
     fn multi_blocker_repairs_are_keyed_instead_of_associated_by_position() {

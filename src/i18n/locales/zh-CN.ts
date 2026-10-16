@@ -632,6 +632,7 @@ const zhCN: ResourceTree = {
       "noModelsSelected": "尚未选择任何模型，没有可同步的内容。",
       "noDeployableModels": "所选模型中，目前没有同时通过资格检查且具备桌面端可用凭证的模型。请启用并验证模型、补上凭证后再部署。",
       "bundledReleaseUnavailable": "内附部署文件缺少或未通过验证。请先安装完整的 Vellum 发行版本，再部署。",
+      "codexRuntimeIncomplete": "远端 Codex 缺少执行所需的 helper 或资源。请先重新部署这台主机，再交出工作。",
       "DeploymentAgentUpgradeRequired": "请先更新远端 Agent，再确认接手。当前 Agent 无法将确认绑定到已观察的进程。",
       "DeploymentAlreadyRunning": "这台主机已有部署正在进行。请查看该操作，或取消后再开始。",
       "DeploymentControlUnavailable": "这笔部署已不在当前 Vellum 会话执行。请重新部署以继续。",

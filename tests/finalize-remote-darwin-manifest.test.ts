@@ -20,7 +20,7 @@ describe("Darwin remote manifest finalizer", () => {
           proxy: { artifacts: {} },
         }),
       );
-      writeFileSync(join(root, "darwin-arm64", "codex"), "darwin codex");
+      writeFileSync(join(root, "darwin-arm64", "codex-package.tar.gz"), "darwin codex");
       writeFileSync(join(root, "darwin-arm64", "vellum-remote-agent"), "darwin agent");
       writeFileSync(
         join(root, "darwin-arm64", "vellum-proxy-daemon"),

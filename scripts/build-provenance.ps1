@@ -164,10 +164,10 @@ function Get-VellumRemoteArtifactLayout {
     [ordered]@{
         "linux-amd64/vellum-remote-agent" = "agent.linux-x64"
         "linux-amd64/vellum-proxy-daemon" = "proxy.linux-x64"
-        "linux-amd64/codex" = "codex.linux-x64"
+        "linux-amd64/codex-package.tar.gz" = "codex.linux-x64"
         "linux-arm64/vellum-remote-agent" = "agent.linux-arm64"
         "linux-arm64/vellum-proxy-daemon" = "proxy.linux-arm64"
-        "linux-arm64/codex" = "codex.linux-arm64"
+        "linux-arm64/codex-package.tar.gz" = "codex.linux-arm64"
     }
 }
 
@@ -314,12 +314,12 @@ function New-VellumBuildInfo {
         $info.remoteArtifacts = [ordered]@{
             "linux-amd64" = [ordered]@{
                 agent = $Remote.ArtifactSha256["linux-amd64/vellum-remote-agent"]
-                codex = $Remote.ArtifactSha256["linux-amd64/codex"]
+                codex = $Remote.ArtifactSha256["linux-amd64/codex-package.tar.gz"]
                 proxyDaemon = $Remote.ArtifactSha256["linux-amd64/vellum-proxy-daemon"]
             }
             "linux-arm64" = [ordered]@{
                 agent = $Remote.ArtifactSha256["linux-arm64/vellum-remote-agent"]
-                codex = $Remote.ArtifactSha256["linux-arm64/codex"]
+                codex = $Remote.ArtifactSha256["linux-arm64/codex-package.tar.gz"]
                 proxyDaemon = $Remote.ArtifactSha256["linux-arm64/vellum-proxy-daemon"]
             }
         }
@@ -337,7 +337,7 @@ function Assert-VellumResumeFingerprint {
         [string] $ExpectedImage
     )
 
-    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
         $artifact = Join-Path $ArchRoot $name
         if (-not (Test-Path -LiteralPath $artifact -PathType Leaf) -or
             (Get-Item -LiteralPath $artifact).Length -eq 0) {

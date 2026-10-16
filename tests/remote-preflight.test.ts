@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { convergeCredentialFailure, convergePairingSuggested, deploymentWaitControls, describeBlocker, deploymentPreflightFailure, deploymentVerificationFailure, phaseKey, psStartTimeFailure, proxyMigrationFailure, resumeConvergeAfterAccount, visibleBlockers } from "@/lib/remoteVocabulary";
 
 describe("Linux process start-time prerequisites", () => {
+  it("offers redeployment for an incomplete remote Codex runtime", () => {
+    expect(describeBlocker("codexRuntimeIncomplete")).toMatchObject({ messageKey: "remote.blocker.codexRuntimeIncomplete", remedy: "bootstrap" });
+  });
   it("shows wait controls only for this host's live deployment and a valid confirmation token", () => {
     const operation = { hostId: "host", kind: "oneClickBootstrap", state: "running", phase: "waitingForIdle", result: null as unknown };
     expect(deploymentWaitControls(operation, "host")).toEqual({ cancel: true, token: null });

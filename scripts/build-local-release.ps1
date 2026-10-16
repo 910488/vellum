@@ -74,23 +74,9 @@ foreach ($arch in @("amd64", "arm64")) {
     }
 
     $codexTarget = if ($arch -eq "arm64") { "aarch64-unknown-linux-musl" } else { "x86_64-unknown-linux-musl" }
-    # Windows bsdtar cannot reliably open paths containing non-ASCII text.
-    # Download/extract under the ASCII TEMP path, then copy the binary back.
-    $codexTemp = Join-Path $env:TEMP "vellum-codex-$PID-$arch"
-    if (Test-Path -LiteralPath $codexTemp) {
-        Remove-Item -LiteralPath $codexTemp -Recurse -Force
+    Invoke-Checked "Download digest-verified Codex runtime package $CodexVersion for $arch" {
+        node (Join-Path $repo "scripts\download-codex-package.mjs") $CodexVersion $codexTarget (Join-Path $archRoot "codex-package.tar.gz")
     }
-    New-Item -ItemType Directory -Force -Path $codexTemp | Out-Null
-    $codexArchive = Join-Path $codexTemp "codex.tar.gz"
-    $codexUrl = "https://github.com/openai/codex/releases/download/rust-v$CodexVersion/codex-$codexTarget.tar.gz"
-    Invoke-Checked "Download pinned Codex $CodexVersion for $arch" {
-        curl.exe -fsSL --proto '=https' --tlsv1.2 $codexUrl -o $codexArchive
-    }
-    Invoke-Checked "Extract pinned Codex for $arch" {
-        tar.exe -xzf $codexArchive -C $codexTemp "codex-$codexTarget"
-    }
-    Copy-Item -LiteralPath (Join-Path $codexTemp "codex-$codexTarget") -Destination (Join-Path $archRoot "codex") -Force
-    Remove-Item -LiteralPath $codexTemp -Recurse -Force
 
     [IO.File]::WriteAllText((Join-Path $archRoot "native-source.ref"), "${proxyImage}:$CodexVersion`n", $utf8)
     $staged[$arch] = $archRoot
@@ -107,7 +93,7 @@ foreach ($arch in @("amd64", "arm64")) {
         Remove-Item -LiteralPath $resolvedDestination -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
         Copy-Item -LiteralPath (Join-Path $staged[$arch] $name) -Destination (Join-Path $destination $name) -Force
     }
 }

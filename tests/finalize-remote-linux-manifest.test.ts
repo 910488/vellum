@@ -13,7 +13,7 @@ describe("native Linux remote manifest", () => {
     try {
       for (const arch of ["linux-amd64", "linux-arm64", "darwin-arm64"]) {
         mkdirSync(join(root, arch));
-        for (const file of ["codex", "vellum-remote-agent", "vellum-proxy-daemon"]) {
+        for (const file of ["codex-package.tar.gz", "vellum-remote-agent", "vellum-proxy-daemon"]) {
           writeFileSync(join(root, arch, file), `${arch}/${file}`);
         }
       }
@@ -22,6 +22,10 @@ describe("native Linux remote manifest", () => {
       expect(manifest.protocolVersion).toBe(5);
       expect(manifest.broker).toBeUndefined();
       expect(manifest.proxy.image).toBeUndefined();
+      expect(manifest.codex.artifacts["linux-arm64"]).toEqual({
+        url: "bundle://linux-arm64/codex-package.tar.gz",
+        sha256: createHash("sha256").update("linux-arm64/codex-package.tar.gz").digest("hex"),
+      });
       expect(manifest.proxy.artifacts["linux-arm64"]).toEqual({
         url: "bundle://linux-arm64/vellum-proxy-daemon",
         sha256: createHash("sha256").update("linux-arm64/vellum-proxy-daemon").digest("hex"),

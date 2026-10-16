@@ -639,6 +639,13 @@ fn inspect_bootstrap_with(
             AppError::Message("insufficientDiskSpace: release size overflow".into())
         })?;
     }
+    let expanded_codex = super::pinned_install::inspect_bundled_codex_package(codex_artifact)
+        .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
+    // A compressed package is much smaller than its installed runtime. Reserve
+    // expanded bytes too, rather than passing the archive size as extraction cost.
+    payload = payload.checked_add(expanded_codex).ok_or_else(|| {
+        AppError::Message("insufficientDiskSpace: expanded release size overflow".into())
+    })?;
     super::space::gate_replace(probe.disk_free_bytes, payload).map_err(AppError::Message)?;
     let expected_agent = agent_artifact
         .sha256
@@ -986,6 +993,10 @@ fn classify_existing_agent(
         .and_then(|version| version.split_whitespace().last())
         == Some(pinned_version);
     if !version_matches
+        || native
+            .and_then(|native| native.pointer("/runtimePackage/complete"))
+            .and_then(Value::as_bool)
+            != Some(true)
         || native
             .and_then(|native| native.get("compatible"))
             .and_then(Value::as_bool)
@@ -1579,7 +1590,7 @@ mod tests {
         ] {
             let mut report = super::super::preflight::DeploymentPreflight::default();
             classify_existing_agent(
-                &serde_json::json!({"configuration": {"state": state}, "nativeCodex": {"codexVersion": "codex-cli pinned", "compatible": true, "daemonRunning": false}}),
+                &serde_json::json!({"configuration": {"state": state}, "nativeCodex": {"codexVersion": "codex-cli pinned", "compatible": true, "runtimePackage": {"complete": true}, "daemonRunning": false}}),
                 None,
                 "pinned",
                 &mut report,
@@ -1593,6 +1604,31 @@ mod tests {
                 .iter()
                 .any(|fix| fix == "codex.installPinned"));
             assert_eq!(report.blockers.first().map(String::as_str), blocker);
+        }
+    }
+
+    #[test]
+    fn converge_upgrades_same_version_legacy_and_incomplete_runtimes() {
+        for runtime in [
+            serde_json::Value::Null,
+            serde_json::json!({"complete": false}),
+            serde_json::json!({"complete": true}),
+        ] {
+            let mut report = super::super::preflight::DeploymentPreflight::default();
+            let complete = runtime["complete"] == true;
+            classify_existing_agent(
+                &serde_json::json!({"configuration": {"state": "current"}, "nativeCodex": {
+                    "codexVersion": "codex-cli pinned", "compatible": true, "daemonRunning": false, "runtimePackage": runtime
+                }}),
+                None,
+                "pinned",
+                &mut report,
+            );
+            assert_eq!(
+                report.auto_fix.contains(&"codex.installPinned".into()),
+                !complete
+            );
+            assert!(report.blockers.is_empty());
         }
     }
 

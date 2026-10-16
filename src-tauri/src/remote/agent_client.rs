@@ -204,6 +204,14 @@ impl RemoteAgentClient {
         expected_sha256: &str,
         expected_version: &str,
     ) -> AppResult<Value> {
+        if self
+            .agent_version()?
+            .pointer("/features/fullCodexRuntimePackage")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(AppError::Message("RemoteCodexAgentUpdateRequired: update the Agent before installing a runtime package".into()));
+        }
         self.rpc(json!({
             "method": "codex.installPinned",
             "operationId": operation_id,

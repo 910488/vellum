@@ -31,7 +31,7 @@ function New-FakePayload {
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $hashes = @{}
     foreach ($arch in @("linux-amd64", "linux-arm64")) {
-        foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex")) {
+        foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
             if ($SkipAmd64Agent -and $arch -eq "linux-amd64" -and $name -eq "vellum-remote-agent") {
                 continue
             }
@@ -54,8 +54,8 @@ function New-FakePayload {
             pinnedVersion = "0.147.0-alpha.6.6"
             compatibleRange = "0.147.0-alpha.6.6"
             artifacts = [ordered]@{
-                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/codex"; sha256 = $hashes["linux-amd64/codex"] }
-                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/codex"; sha256 = $hashes["linux-arm64/codex"] }
+                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/codex-package.tar.gz"; sha256 = $hashes["linux-amd64/codex-package.tar.gz"] }
+                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/codex-package.tar.gz"; sha256 = $hashes["linux-arm64/codex-package.tar.gz"] }
             }
         }
         agent = [ordered]@{
@@ -145,7 +145,7 @@ try {
 
     $embedded = Join-Path $temp "embedded-mismatch"
     New-FakePayload -Root $embedded
-    [IO.File]::WriteAllText((Join-Path $embedded "linux-amd64\codex"), "mutated", $utf8)
+    [IO.File]::WriteAllText((Join-Path $embedded "linux-amd64\codex-package.tar.gz"), "mutated", $utf8)
     Assert-Throws "embedded artifact drift" {
         Assert-VellumEmbeddedRemotePayload -Staged $staged -EmbeddedRoot $embedded
     } "does not match"

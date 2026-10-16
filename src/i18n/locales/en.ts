@@ -663,6 +663,7 @@ const en: ResourceTree = {
       "noModelsSelected": "No model is selected, so there is nothing to sync.",
       "noDeployableModels": "No selected model has both current qualification and a usable Desktop credential. Enable and qualify a model, and add its credential, then deploy again.",
       "bundledReleaseUnavailable": "The bundled deployment files are missing or failed verification. Install a complete Vellum release before deploying.",
+      "codexRuntimeIncomplete": "The remote Codex runtime is missing helpers or resources. Redeploy this host before handing off work.",
       "DeploymentAgentUpgradeRequired": "Update the remote Agent before confirming takeover. This Agent cannot bind your confirmation to the observed process.",
       "DeploymentAlreadyRunning": "A deployment is already running for this host. Follow that operation or cancel it before starting another.",
       "DeploymentControlUnavailable": "This deployment is no longer active in this Vellum session. Start deployment again to continue.",
