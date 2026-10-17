@@ -532,7 +532,6 @@ describe("Remote Manager operations UI", () => {
     expect(screen.getByText("credential cc is unavailable")).toBeTruthy();
     const surface = await inspectedWorkSurface();
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     await waitFor(() => expect(surface.getByRole("status").textContent).toBe(i18n.t("remoteWork.failed")));
     expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
     expect(surface.queryByRole("button", { name: /安裝 pinned|更新遠端|重試/ })).toBeNull();
@@ -683,6 +682,31 @@ describe("Remote Manager operations UI", () => {
       .toHaveBeenCalledWith("jetson", "acct-a"), { timeout: 4000 });
   });
 
+  it("finishes the models a deploy deferred as soon as the Desktop account is paired", async () => {
+    apiMocks.getRemoteOperation.mockResolvedValue({
+      operationId: "one-click-bootstrap-1", hostId: "jetson", kind: "oneClickBootstrap",
+      phase: "verified", percent: 100, state: "completed", message: null,
+      result: { chatgptPairingSuggested: true, omittedCatalogIds: ["gpt-5.6-luna"] },
+      updatedAt: "2026-10-17T00:00:01Z",
+    });
+    apiMocks.listRemoteCodexAccountPairings.mockResolvedValue([
+      { accountId: "acct-a", email: "a@example.com", isDesktopDefault: true, paired: false, active: false, detail: null },
+    ]);
+    apiMocks.startRemoteCodexAccountLogin.mockResolvedValue({
+      loginId: "login-a", verificationUrl: "https://auth.openai.com/device#a", userCode: "CODE-A", expectedAccountId: "acct-a",
+    });
+    apiMocks.pollRemoteCodexAccountLogin.mockResolvedValue({ ...status.chatgpt, state: "synchronized" });
+    vi.spyOn(window, "open").mockImplementation(() => null);
+    renderRemote();
+    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    const pair = await screen.findByRole("button", { name: i18n.t("remote.act.chatgptPair") }, { timeout: 2500 });
+    await waitFor(() => expect((pair as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(pair);
+    await waitFor(() => expect(apiMocks.startRemoteCodexAccountLogin).toHaveBeenCalledWith("jetson", undefined));
+    // No second click: the deferred models deploy on their own.
+    await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledTimes(2), { timeout: 4000 });
+  });
+
   it("locks Grok login immediately and shows CLI progress until the URL is returned", async () => {
     let resolveLogin!: (value: unknown) => void;
     apiMocks.startRemoteGrokLogin.mockReturnValue(new Promise((resolve) => {
@@ -714,11 +738,13 @@ describe("Remote Manager operations UI", () => {
     expect(luna?.disabled).toBe(true);
   });
 
-  it("confirms deployment with three scannable facts instead of a native dialog", async () => {
+  it("confirms the first deployment with three scannable facts instead of a native dialog", async () => {
     const confirm = vi.spyOn(window, "confirm");
+    apiMocks.inspectRemoteHost.mockResolvedValue({ ...status, managerState: "unmanaged" });
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
+    const surface = within(await screen.findByRole("region", { name: i18n.t("remoteWork.label") }));
+    fireEvent.click(await surface.findByRole("button", { name: i18n.t("remote.act.bootstrap") }));
     const modal = dialog();
     expect(modal.getByText("會改")).toBeTruthy();
     expect(modal.getByText("不動")).toBeTruthy();
@@ -728,12 +754,12 @@ describe("Remote Manager operations UI", () => {
     expect(apiMocks.bootstrapRemoteHost).not.toHaveBeenCalled();
   });
 
-  it("starts one-click bootstrap as an in-place background operation", async () => {
+  it("redeploys a managed host in place without asking again", async () => {
     renderRemote();
 
     const button = await screen.findByRole("button", { name: "重新部署" });
     fireEvent.click(button);
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
+    expect(document.querySelector("dialog[open]")).toBeNull();
 
     await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledWith("jetson"));
     // 進度留在工作面，主要按鈕停用，避免重複部署。
@@ -766,7 +792,6 @@ describe("Remote Manager operations UI", () => {
     }
     renderRemote();
     fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     expect(await screen.findByText(
       "主機的 ps 無法查詢程序啟動時間，無法啟動 Codex daemon。請依修復指令安裝相容的 ps，再重新部署。",
       {}, { timeout: 2500 },
@@ -801,7 +826,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
 
     fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     // 失敗原地顯示，說出停在哪一步，並附上補救動作。使用者沒按任何東西之前，
     // 不會有任何視窗自己跳出來。
@@ -833,7 +857,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
 
     fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     expect(await screen.findByText(
       "OneClickBootstrapBlocked: nativeDaemonAppOwned",
@@ -870,7 +893,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
 
     fireEvent.click(await screen.findByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
 
     const mismatch = await screen.findByText(
       "遠端 Codex runtime 與目前 Desktop 協定不相容。請先同步 Desktop Codex runtime，再重試一次。",
@@ -903,7 +925,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     const surface = await inspectedWorkSurface();
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     expect(await surface.findByText(i18n.t("remote.error.boundaryKeyProvisionFailed"), {}, { timeout: 2500 })).toBeTruthy();
     expect(surface.getAllByRole("button")).toHaveLength(2);
     expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
@@ -917,7 +938,6 @@ describe("Remote Manager operations UI", () => {
     openTray("進階");
     expect(screen.getByRole("button", { name: "匯出診斷包" })).toBeTruthy();
     fireEvent.click(surface.getByRole("button", { name: "下一步：重試" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledTimes(2));
   });
 
@@ -934,7 +954,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     const surface = await inspectedWorkSurface();
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     expect(await surface.findByText(i18n.t("remote.blocker.nativeDaemonAppOwned"))).toBeTruthy();
     expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true);
     expect(surface.queryByRole("button", { name: "重試" })).toBeNull();
@@ -953,7 +972,6 @@ describe("Remote Manager operations UI", () => {
     expect(advanced?.open).toBe(true);
     expect(screen.queryByRole("button", { name: /安裝 pinned|更新遠端 Agent|變更模型|修復|同步 Desktop Codex|重新啟動遠端/ })).toBeNull();
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledWith("jetson"));
     expect(apiMocks.planRemoteDeployment).not.toHaveBeenCalled();
     expect(await surface.findByText("正在部署")).toBeTruthy();
@@ -964,7 +982,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     const surface = await inspectedWorkSurface();
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     expect(await surface.findByText("apk add procps-ng")).toBeTruthy();
     await waitFor(() => expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(true));
     await waitFor(() => expect(screen.getByRole<HTMLButtonElement>("button", { name: "重新掃描" }).disabled).toBe(false));
@@ -973,7 +990,6 @@ describe("Remote Manager operations UI", () => {
     expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledTimes(1);
     expect(surface.getByRole<HTMLButtonElement>("button", { name: "重新部署" }).disabled).toBe(false);
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledTimes(2));
   });
 
@@ -983,7 +999,6 @@ describe("Remote Manager operations UI", () => {
     const surface = await inspectedWorkSurface();
     expect(surface.getAllByRole("button")).toHaveLength(1);
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     await waitFor(() => expect(apiMocks.bootstrapRemoteHost).toHaveBeenCalledWith("jetson"));
     expect(screen.queryByRole("button", { name: "重新同步" })).toBeNull();
   });
@@ -994,7 +1009,6 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     const surface = await inspectedWorkSurface();
     fireEvent.click(surface.getByRole("button", { name: "重新部署" }));
-    fireEvent.click(dialog().getByRole("button", { name: "重新部署" }));
     fireEvent.click(await surface.findByRole("button", { name: "下一步：同步 Desktop Codex runtime" }, { timeout: 2500 }));
     fireEvent.click(dialog().getByRole("button", { name: "同步 Desktop Codex runtime" }));
     await waitFor(() => expect(apiMocks.updateRemoteCodexForDesktop).toHaveBeenCalledWith("jetson"));
@@ -1219,6 +1233,8 @@ describe("Remote Manager operations UI", () => {
     renderRemote();
     const label = (await screen.findByText("DeepSeek V4 Flash")).closest("label")!;
     fireEvent.click(within(label).getByRole("checkbox"));
+    expect(apiMocks.updateRemoteHostModels).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("remoteModels.apply") }));
     await waitFor(() => expect(apiMocks.updateRemoteHostModels).toHaveBeenCalledWith("jetson", ["gpt-5.6-luna"]));
     expect(apiMocks.planRemoteDeployment).not.toHaveBeenCalled();
     expect(apiMocks.reapplyRemoteDeployment).not.toHaveBeenCalled();

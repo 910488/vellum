@@ -11,7 +11,6 @@ export function RemoteHostDetails({ model }: {
     probeErrors,
     release,
     desktopCodex,
-    setPending,
     host,
     status,
     native,
@@ -19,9 +18,7 @@ export function RemoteHostDetails({ model }: {
     configurationKey,
     inventory,
     unknown,
-    operationRunning,
     exportBundle,
-    workSurface,
   } = model;
   return <>{/* ---------- 主機細節 ----------
                             原本是十九行同權重的狀態，常駐在主卡上，其中 Docker 還出現兩次
@@ -90,10 +87,10 @@ export function RemoteHostDetails({ model }: {
       </div>) : null}
     </Card>
 
-    {/* 進階只留重新部署與診斷包；安裝、更新與修復由 converge 處理。 */}
+    {/* 進階只留診斷包；重新部署就是工作面上那一顆，不在這裡再放第二顆。
+        安裝、更新與修復由 converge 處理。 */}
     <Card>
       <div className="remote-actions">
-        <Btn soft onClick={() => setPending("bootstrap")} disabled={busy !== null || operationRunning || workSurface.primaryDisabled}>{t("remoteWork.redeploy")}</Btn>
         <Btn soft onClick={exportBundle} disabled={busy !== null}>{t("remote.act.bundle")}</Btn>
       </div>
     </Card>

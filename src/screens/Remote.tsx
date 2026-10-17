@@ -93,21 +93,20 @@ export function Remote(props: RemoteProps) {
           <RemoteAdvancedAccounts model={model} />
           <RemoteHostDetails model={model} />
           <RemoteThreadDetails model={model} />
-
-
+          {/* ---------- 危險區 ----------
+                  「一鍵還原」在 Windows 語境聽起來是救援、是安全的，但它其實是
+                  拆除。名字要講出後果，而且不能跟「匯出診斷包」擺在同一排 ——
+                  肌肉記憶會按錯。拆除一年按不到一次，所以收在進階的最底下，
+                  不跟日常的部署擠在同一個視線裡。 */}
+          <div className="remote-danger">
+            <b>{t("tabPolish.restoreHost")}</b>
+            <p>{t("remote.danger.body")}</p>
+            <Btn danger onClick={() => setPending("restore")} disabled={!selectedHostId || busy !== null || operationRunning}>
+              {t("remote.act.restore")}
+            </Btn>
+          </div>
         </details>
 
-        {/* ---------- 危險區 ----------
-                「一鍵還原」在 Windows 語境聽起來是救援、是安全的，但它其實是
-                拆除。名字要講出後果，而且不能跟「匯出診斷包」擺在同一排 ——
-                肌肉記憶會按錯。 */}
-        <div className="remote-danger">
-          <b>{t("tabPolish.restoreHost")}</b>
-          <p>{t("remote.danger.body")}</p>
-          <Btn danger onClick={() => setPending("restore")} disabled={!selectedHostId || busy !== null || operationRunning}>
-            {t("remote.act.restore")}
-          </Btn>
-        </div>
       </div>
     </div>)}
 

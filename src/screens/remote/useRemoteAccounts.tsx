@@ -70,6 +70,7 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
     pairQueueRestoreAccount.current = activeControlAccount?.accountId ?? null;
     pairQueue.current = pending;
     setPairQueueLength(pending.length);
+    setResumeBootstrapAfterPairing(resumeConvergeAfterAccount(operation, selectedHostId));
     void run("remote.act.chatgptPairAll", async () => {
       await advancePairQueue(selectedHostId);
     });
