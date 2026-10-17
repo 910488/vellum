@@ -1177,6 +1177,58 @@ mod tests {
         assert!(ssh.contains("HostKeyAlias=[host.test]:2222"));
         assert!(ssh.contains("StrictHostKeyChecking=yes"));
     }
+
+    #[test]
+    fn discovered_host_push_and_fetch_use_managed_alias_and_default_ssh_config() {
+        let root = Path::new("data");
+        let git = Git::new(Path::new("repo"), root);
+        let alias = super::super::ssh_isolation::managed_alias("remote-host");
+        let snapshot = Snapshot {
+            base: "a".repeat(40),
+            commit: "b".repeat(40),
+            local_ref: String::new(),
+            changes: vec![],
+        };
+        for fetch in [false, true] {
+            let reference = if fetch {
+                "refs/vellum-handoff-results/handoff/capture"
+            } else {
+                "refs/vellum-handoff/handoff"
+            };
+            let mut cmd = git
+                .transport_command(
+                    root,
+                    &alias,
+                    "/state/repo.git",
+                    &snapshot,
+                    reference,
+                    None,
+                    fetch,
+                )
+                .unwrap();
+            pin_transport_target(
+                &mut cmd,
+                &ssh_trust::SshTarget {
+                    host: "host.test".into(),
+                    port: 22,
+                },
+            )
+            .unwrap();
+            assert!(cmd
+                .get_args()
+                .any(|a| a == format!("{alias}:/state/repo.git").as_str()));
+            let ssh = cmd
+                .get_envs()
+                .find(|(name, _)| *name == "GIT_SSH_COMMAND")
+                .unwrap()
+                .1
+                .unwrap()
+                .to_string_lossy();
+            assert!(!ssh.contains("'-F'"));
+            assert!(ssh.contains("HostKeyAlias=host.test"));
+            assert!(ssh.contains("StrictHostKeyChecking=yes"));
+        }
+    }
     fn configured_fixture() -> (tempfile::TempDir, Git) {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");

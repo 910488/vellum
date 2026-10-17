@@ -21,6 +21,9 @@ pub use result::{acknowledge, capture, discard, review, settle, ResultState, Rev
 #[path = "handoff_desktop.rs"]
 mod desktop;
 pub use desktop::thread_link;
+#[cfg(test)]
+#[path = "handoff_transport_tests.rs"]
+mod transport_tests;
 
 fn error(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
@@ -119,14 +122,34 @@ impl Transport for SshTransport {
     }
 }
 fn transport(state: &AppState, host: &str) -> AppResult<SshTransport> {
-    let target = RemoteHostManager::resolve_target(state, host)?;
+    transport_with_home(state, host, dirs::home_dir().as_deref())
+}
+
+fn transport_with_home(
+    state: &AppState,
+    host: &str,
+    home: Option<&Path>,
+) -> AppResult<SshTransport> {
+    let mut target = RemoteHostManager::resolve_target(state, host)?;
+    let config = if host.starts_with("added-") {
+        Some(super::ssh_added::config_path(&state.data_root()))
+    } else {
+        home.map(|home| home.join(".ssh/config"))
+    };
     // Handoff uses the dedicated key/wrapper, preserving CODEX_HOME isolation.
-    if target.ssh_destination.as_deref() != Some(super::ssh_isolation::managed_alias(host).as_str())
+    // Discovery keeps the user's alias for display and ordinary RPCs. Authority
+    // comes from bootstrap's actual marked config block, never the cached name.
+    if !config
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|contents| super::ssh_isolation::has_managed_alias(&contents, host))
     {
         return Err(error(
             "HandoffManagedSshRequired: deploy managed SSH isolation first",
         ));
     }
+    // RPC, push and fetch all read this same target. Do not persist this alias
+    // into discovery/cache, where the next refresh would replace it again.
+    target.ssh_destination = Some(super::ssh_isolation::managed_alias(host));
     Ok(SshTransport {
         client: RemoteAgentClient::new(target),
         root: state.data_root(),

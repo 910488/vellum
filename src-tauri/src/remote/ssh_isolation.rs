@@ -125,6 +125,47 @@ pub fn managed_alias(host_id: &str) -> String {
     format!("vellum-remote-{safe}")
 }
 
+/// Only a complete, uniquely marked block for this host authorizes its alias.
+/// An unmarked Host stanza or another host's marker is not managed isolation.
+pub(crate) fn has_managed_alias(contents: &str, host_id: &str) -> bool {
+    let begin = format!("{SSH_BEGIN_PREFIX}{host_id}");
+    let end = format!("{SSH_END_PREFIX}{host_id}");
+    let alias = managed_alias(host_id);
+    let mut inside = false;
+    let mut found = false;
+    let mut matched_host = false;
+    for line in contents.lines().map(str::trim) {
+        if line == begin {
+            if inside || found {
+                return false;
+            }
+            inside = true;
+        } else if line == end {
+            if !inside || !matched_host {
+                return false;
+            }
+            inside = false;
+            found = true;
+        } else if inside {
+            if line.starts_with(SSH_BEGIN_PREFIX) || line.starts_with(SSH_END_PREFIX) {
+                return false;
+            }
+            let mut fields = line.split_whitespace();
+            if fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("Host"))
+            {
+                if matched_host || fields.next() != Some(alias.as_str()) || fields.next().is_some()
+                {
+                    return false;
+                }
+                matched_host = true;
+            }
+        }
+    }
+    found && !inside
+}
+
 pub fn managed_ssh_wrapper_contents(
     codex_home: &str,
     install_dir: &str,
