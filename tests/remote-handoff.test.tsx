@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import i18n from "i18next";
 import "@/i18n";
 import { api } from "@/lib/api";
+import { refreshHandoffs } from "@/lib/handoffStore";
 import { RemoteHandoff } from "@/components/RemoteHandoff";
 import { HandoffNotifications } from "@/components/HandoffNotifications";
 import { handoffDraft, handoffState, handoffSummary, type RemoteHandoffRecord, type RemoteHandoffThread } from "@/lib/remoteHandoff";
@@ -18,16 +19,40 @@ function record(state = "completed"): RemoteHandoffRecord {
 }
 beforeEach(async () => {
   store.records = [];
+  vi.mocked(refreshHandoffs).mockReset().mockResolvedValue(undefined);
   await i18n.changeLanguage("en");
   vi.spyOn(api, "listRemoteHandoffThreads").mockResolvedValue([thread]);
   vi.spyOn(api, "preflightRemoteHandoff").mockResolvedValue({ thread, changes: [{ path: "wordcount.py", staged: true, untracked: false }], blockers: [], warnings: [], remoteOs: "linux", localRefNotice: "ref notice" });
   vi.spyOn(api, "reviewRemoteHandoff").mockResolvedValue({ canApply: true, patch: "+ remote result" });
+  vi.spyOn(api, "captureRemoteHandoff").mockImplementation(async () => store.records[0]!);
   vi.spyOn(api, "getRemoteHandoffThreadLink").mockResolvedValue("codex://threads/remote-thread?hostId=remote-ssh-discovered%3Ajetson-orin");
   vi.spyOn(api, "openRemoteHandoffThread").mockResolvedValue(undefined);
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(async () => {
+  cleanup();
+  // Finish pending handoff actions before restoring the API mocks they use.
+  await act(async () => {});
+  vi.restoreAllMocks(); vi.unstubAllGlobals();
+});
 const view = () => render(<RemoteHandoff hostId="host" hostName="Jetson" active />);
 describe("remote handoff", () => {
+  it.each(["rejected", "undefined"] as const)("keeps the action failure when recovery refresh is %s", async (refreshResult) => {
+    store.records = [record()];
+    vi.mocked(api.captureRemoteHandoff).mockRejectedValue("HandoffLocalDrift: original action failure");
+    if (refreshResult === "rejected") {
+      vi.mocked(refreshHandoffs).mockRejectedValue(new Error("refresh failed"));
+    } else {
+      // Exercise a malformed mock without weakening the production contract.
+      vi.mocked(refreshHandoffs).mockReturnValueOnce(undefined as unknown as Promise<void>);
+    }
+    view();
+    const recapture = screen.getByRole("button", { name: i18n.t("handoff.recapture") });
+    fireEvent.click(recapture);
+    expect(await screen.findByText("HandoffLocalDrift: original action failure")).toBeTruthy();
+    await waitFor(() => expect(recapture.hasAttribute("disabled")).toBe(false));
+    expect(refreshHandoffs).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Error: refresh failed")).toBeNull();
+  });
   it("shows writeback eligibility and refreshes threads while the form is open", async () => {
     view();
     expect(await screen.findByText(i18n.t("handoff.noAutoWriteback"))).toBeTruthy();

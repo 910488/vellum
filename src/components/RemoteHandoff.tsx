@@ -85,7 +85,10 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
       setRecordId(next.id); setCompose(false);
       await refreshHandoffs();
       if (next.result.outcome) setThreads(await api.listRemoteHandoffThreads());
-    } catch (e) { setFailure(String(e)); await refreshHandoffs().catch(() => undefined); }
+    } catch (e) {
+      setFailure(String(e));
+      try { await refreshHandoffs(); } catch { /* keep the original failure */ }
+    }
     finally { inFlight.current = false; setBusy(false); }
   }
   function message(detail: string) {

@@ -50,7 +50,9 @@ export function useRemoteAccounts(context: ReturnType<typeof useRemoteActions>) 
     if (!next) {
       const restoreAccount = pairQueueRestoreAccount.current;
       pairQueueRestoreAccount.current = null;
-      if (restoreAccount) await api.activateRemoteCodexAccount(hostId, restoreAccount).catch(() => {});
+      if (restoreAccount) {
+        try { await api.activateRemoteCodexAccount(hostId, restoreAccount); } catch { /* restoration is best effort */ }
+      }
       return false;
     }
     const login = await api.startRemoteCodexAccountLogin(hostId, next);
