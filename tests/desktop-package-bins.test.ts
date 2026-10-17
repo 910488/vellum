@@ -62,7 +62,7 @@ describe("daily Desktop package", () => {
       // build.rs compiles the remote manifest hash into the executable, so a
       // Desktop update without its own payload cannot deploy remote hosts.
       expect(job).toMatch(/needs: \[resolve, desktop-remote-payload-darwin\]/);
-      expect(job).toMatch(/name: desktop-remote-payload\n/);
+      expect(job).toMatch(/name: desktop-remote-payload\r?\n/);
       expect(job).toMatch(/path: src-tauri\/resources\/remote/);
     }
 
