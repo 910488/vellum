@@ -36,7 +36,7 @@ fn writeback_metadata_is_read_only_and_reports_delivered_and_official_skip() {
             "digest",
             "provider",
             "model",
-            &format!("native-{thread}"),
+            format!("native-{thread}"),
             1,
         ))
         .unwrap();
