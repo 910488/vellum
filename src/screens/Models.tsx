@@ -1514,6 +1514,7 @@ export function Models({
             <label>
               {t("models.ui.pool.strategyLabel")}{" "}
               <select
+                className="input"
                 value={normalizedQuotaPool.strategy}
                 disabled={quotaPoolBusy}
                 onChange={(event) => void saveQuotaPool({ ...normalizedQuotaPool,
