@@ -362,6 +362,21 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 "[OfficialSocket] account handoff replayed on socket connection={connection_id} input_items={}",
                                 crate::request::request_input_items(&body).len()
                             );
+                            // Only a chained frame can be retried as full
+                            // input by Codex; that retry carries no
+                            // previous_response_id and is never marked.
+                            if request
+                                .get("previous_response_id")
+                                .and_then(Value::as_str)
+                                .is_some()
+                            {
+                                if let WebSocketTurnDispatch::OfficialNative(plan) =
+                                    &mut turn_dispatch
+                                {
+                                    plan.handoff_replay =
+                                        Some(handoff_replay_summary(&request, &body));
+                                }
+                            }
                             request = body;
                             runtime_request.body = request.clone();
                         }
@@ -1516,6 +1531,66 @@ async fn handle_official_upstream_frame(
             } else {
                 None
             };
+            if let Some(failed) = failed.as_ref() {
+                if let Some(turn) = segment.pending.front_mut() {
+                    if let Some(summary) = rejected_handoff_replay(turn, failed) {
+                        let message = failed
+                            .pointer("/response/error/message")
+                            .or_else(|| failed.pointer("/error/message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("upstream Official WebSocket failure")
+                            .to_owned();
+                        log::warn!(
+                            "[OfficialSocket] account handoff replay rejected; asking Codex for full input connection={connection_id} error={message:?} {summary}"
+                        );
+                        segment.stages.terminal_ms =
+                            Some(segment.started.elapsed().as_millis() as u64);
+                        record_official_pending_outcome(
+                            runtime,
+                            turn,
+                            connection_id,
+                            "protocol_failure",
+                            Some("invalid_request"),
+                            Some(&message),
+                            &segment.stages,
+                        );
+                        let previous = turn
+                            .request
+                            .get("previous_response_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        segment.pending.pop_front();
+                        // The same wrapped error Codex already handles for a
+                        // missing local chain: it drops the incremental
+                        // request and resends its own full input, which
+                        // Official accepts on the new account.
+                        if !send_runtime_failure(
+                            client,
+                            &RuntimeError::PreviousResponseNotFound(previous),
+                        )
+                        .await
+                        {
+                            return false;
+                        }
+                        *frames_out += 1;
+                        return true;
+                    }
+                }
+            }
+            if application {
+                if let Some(turn) = segment.pending.front_mut() {
+                    if !turn.output_forwarded
+                        && turn
+                            .plan
+                            .as_ref()
+                            .is_some_and(|plan| plan.handoff_replay.is_some())
+                    {
+                        turn.output_forwarded = websocket_event(&message)
+                            .is_none_or(|event| !handoff_preamble_event(&event));
+                    }
+                }
+            }
             let closing = matches!(message, TungsteniteMessage::Close(_));
             if client.send(from_tungstenite(message)).await.is_err() || closing {
                 return false;
@@ -1944,6 +2019,100 @@ fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
         )
         .then_some(event)
     })
+}
+
+/// Lifecycle frames that precede any model output. A handoff replay that
+/// fails after only these is retried without Codex having seen output.
+fn handoff_preamble_event(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.created" | "response.in_progress" | "response.queued")
+    )
+}
+
+/// A locally rebuilt account-handoff frame that Official rejected as an
+/// invalid request before any output. Returns the replay's diagnostic
+/// summary; Codex's own full-input retry is the recovery.
+fn rejected_handoff_replay<'a>(turn: &'a OfficialPendingTurn, failed: &Value) -> Option<&'a str> {
+    if turn.output_forwarded || turn.recorded {
+        return None;
+    }
+    let summary = turn.plan.as_ref()?.handoff_replay.as_deref()?;
+    (official_websocket_failure_category(failed) == "invalid_request").then_some(summary)
+}
+
+/// Redacted shape of a locally rebuilt handoff frame against Codex's
+/// original: top-level keys, which control fields changed, and the declared
+/// tool names. Never includes item content, schemas or instruction text.
+fn handoff_replay_summary(original: &Value, replay: &Value) -> String {
+    fn tool_names(tools: Option<&Value>) -> String {
+        tools
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        let kind = tool.get("type").and_then(Value::as_str).unwrap_or("?");
+                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                        match tool.get("tools") {
+                            Some(children) => {
+                                format!("{kind}:{name}{{{}}}", tool_names(Some(children)))
+                            }
+                            None => format!("{kind}:{name}"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default()
+    }
+    let keys = replay
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| *key != "input")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let changed = [
+        "previous_response_id",
+        "instructions",
+        "include",
+        "store",
+        "tools",
+        "tool_choice",
+        "model",
+    ]
+    .into_iter()
+    .filter(|field| original.get(*field) != replay.get(*field))
+    .collect::<Vec<_>>()
+    .join(",");
+    let input = crate::request::request_input_items(replay);
+    let declarations = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .map(|item| {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.split_once('_'))
+                .map_or("none", |(prefix, _)| prefix);
+            format!("id={id}:[{}]", tool_names(item.get("tools")))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let without_id = input
+        .iter()
+        .filter(|item| item.get("id").and_then(Value::as_str).is_none())
+        .count();
+    format!(
+        "keys=[{keys}] changed=[{changed}] tools=[{}] additional_tools=[{declarations}] input_items={} items_without_id={without_id}",
+        tool_names(replay.get("tools")),
+        input.len()
+    )
 }
 
 fn official_websocket_failure_category(event: &Value) -> &str {
@@ -2529,6 +2698,8 @@ struct OfficialPendingTurn {
     first_downstream_ms: Option<u64>,
     terminal_ms: Option<u64>,
     recorded: bool,
+    /// A model-output frame of this turn already reached Codex.
+    output_forwarded: bool,
     cancelled_at: Option<std::time::Instant>,
     quota_retried: bool,
 }
@@ -2559,6 +2730,7 @@ impl OfficialPendingTurn {
             first_downstream_ms: None,
             terminal_ms: None,
             recorded: false,
+            output_forwarded: false,
             cancelled_at: None,
             quota_retried: false,
         }
@@ -3198,6 +3370,7 @@ mod tests {
             first_downstream_ms: Some(22),
             terminal_ms: Some(40),
             recorded: false,
+            output_forwarded: false,
             cancelled_at: None,
             quota_retried: false,
         };
@@ -3215,6 +3388,7 @@ mod tests {
             first_downstream_ms: Some(95),
             terminal_ms: Some(120),
             recorded: false,
+            output_forwarded: false,
             cancelled_at: None,
             quota_retried: false,
         };
@@ -3510,6 +3684,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_account_handoff_replay_asks_codex_for_full_input() {
+        run_official_websocket_account_switch(false, "switch_rejected").await;
+    }
+
+    #[tokio::test]
     async fn official_websocket_switches_users_in_the_same_workspace() {
         run_official_websocket_account_switch(true, "switch").await;
     }
@@ -3650,6 +3829,7 @@ mod tests {
         let get_capture = capture.clone();
         let post_capture = capture.clone();
         let check_contract = mode != "missing";
+        let reject_replay = mode == "switch_rejected";
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
@@ -3672,6 +3852,21 @@ mod tests {
                                     .unwrap()
                                     .push((account.clone(), request.clone()));
                                 let turn_count = capture.responses.fetch_add(1, Ordering::SeqCst) + 1;
+                                if reject_replay && turn_count == 2 {
+                                    // What Official answered the locally
+                                    // rebuilt handoff on 2026-10-17.
+                                    socket
+                                        .send(AxumWsMessage::Text(
+                                            json!({"type":"error","status":400,"error":{
+                                                "type":"invalid_request_error","param":"tools","code":null,
+                                                "message":"Invalid Value: 'tools'. Function 'collaboration.followup_task' is reserved for use by this model and must match the configured schema."}})
+                                            .to_string()
+                                            .into(),
+                                        ))
+                                        .await
+                                        .unwrap();
+                                    continue;
+                                }
                                 socket
                                     .send(AxumWsMessage::Text(
                                         json!({
@@ -3831,7 +4026,10 @@ mod tests {
         let tools = desktop_tools();
         // An account or selection change on a live Official socket replays
         // the history on a socket; only Auto Review keeps the HTTP bridge.
-        let socket_handoff = matches!(mode, "switch" | "switch_reconnect" | "revision");
+        let socket_handoff = matches!(
+            mode,
+            "switch" | "switch_reconnect" | "switch_rejected" | "revision"
+        );
         client
             .send(TungsteniteMessage::Text(
                 json!({
@@ -3863,6 +4061,34 @@ mod tests {
                 .unwrap();
             if let TungsteniteMessage::Text(text) = frame {
                 let event: Value = serde_json::from_str(&text).unwrap();
+                if reject_replay && event["type"] == "error" {
+                    // Codex's handling of this code: drop the incremental
+                    // request and resend its own full input, unchained.
+                    assert_eq!(
+                        event["error"]["code"], "previous_response_not_found",
+                        "{event}"
+                    );
+                    assert!(
+                        !text.contains("reserved"),
+                        "the rejection is not surfaced: {event}"
+                    );
+                    client.send(TungsteniteMessage::Text(json!({
+                        "type": "response.create",
+                        "model": "vellum-official",
+                        "tools": tools, "tool_choice":"auto", "parallel_tool_calls":true,
+                        "client_metadata":{"x-codex-turn-metadata":{"root_turn_id":"root-two"}},
+                        "include":["reasoning.encrypted_content"],
+                        "text":{"format":{"type":"text"}},
+                        "reasoning":{"effort":"high","summary":"auto"},
+                        "prompt_cache_key":"account-switch-contract",
+                        "instructions": "be brief",
+                        "input": [{"role": "user", "content": "first question"},
+                            {"role": "assistant", "content": "answer from A"},
+                            {"role": "user", "content": "follow-up question"}],
+                        "stream": false
+                    }).to_string().into())).await.unwrap();
+                    continue;
+                }
                 if event["type"] == "error" || event["type"] == "response.failed" {
                     assert_eq!(mode, "missing", "unexpected failure: {event}");
                     assert_eq!(event["error"]["code"], "previous_response_not_found");
@@ -3915,7 +4141,17 @@ mod tests {
             );
             assert_eq!(websocket_accounts.last(), Some(expected));
             let frames = capture.websocket_frames.lock().unwrap().clone();
-            assert_eq!(frames.len(), 2);
+            assert_eq!(frames.len(), if reject_replay { 3 } else { 2 });
+            if reject_replay {
+                let (account, retry) = &frames[2];
+                assert_eq!(account, expected);
+                assert!(retry.get("previous_response_id").is_none());
+                assert_eq!(
+                    retry["input"].as_array().map(Vec::len),
+                    Some(3),
+                    "Codex's full input reaches upstream unchanged: {retry}"
+                );
+            }
             let (account, body) = &frames[1];
             assert_eq!(account, expected);
             assert!(
@@ -6820,6 +7056,60 @@ mod tests {
 
         proxy_task.abort();
         upstream_task.abort();
+    }
+
+    #[test]
+    fn handoff_replay_summary_names_shape_without_content() {
+        let original = json!({"type":"response.create","model":"gpt","previous_response_id":"resp_old",
+            "instructions":"","store":false,"input":[{"type":"function_call_output","call_id":"c","output":"secret output"}]});
+        let replay = json!({"type":"response.create","model":"gpt","instructions":"","store":false,"input":[
+            {"type":"additional_tools","role":"developer","tools":[
+                {"type":"custom","name":"exec","format":{"definition":"secret grammar"}},
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"followup_task","description":"secret description"}]}]},
+            {"type":"message","id":"msg_01a148ce-f306-7eb3-a3c3-2915d30c9fb9","role":"user","content":"secret task"},
+            {"type":"function_call_output","call_id":"c","output":"secret output"}]});
+        let summary = handoff_replay_summary(&original, &replay);
+        assert_eq!(
+            summary,
+            "keys=[type,model,instructions,store] changed=[previous_response_id] tools=[] \
+             additional_tools=[id=none:[custom:exec,namespace:collaboration{function:followup_task}]] \
+             input_items=3 items_without_id=2"
+        );
+        assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn handoff_rejection_is_recovered_only_before_output() {
+        let failed = json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"bad"}});
+        let mut turn = OfficialPendingTurn {
+            plan: None,
+            request: json!({}),
+            request_id: "r".into(),
+            execution_id: "e".into(),
+            conversation_key: "c".into(),
+            _cancel_guard: None,
+            cancel_rx: None,
+            started: std::time::Instant::now(),
+            request_forwarded_ms: None,
+            first_byte_ms: None,
+            first_downstream_ms: None,
+            terminal_ms: None,
+            recorded: false,
+            output_forwarded: false,
+            cancelled_at: None,
+            quota_retried: false,
+        };
+        assert!(
+            rejected_handoff_replay(&turn, &failed).is_none(),
+            "an ordinary turn surfaces its error"
+        );
+        assert!(handoff_preamble_event(&json!({"type":"response.created"})));
+        assert!(!handoff_preamble_event(
+            &json!({"type":"response.output_item.added"})
+        ));
+        turn.output_forwarded = true;
+        assert!(rejected_handoff_replay(&turn, &failed).is_none());
     }
 
     #[test]
