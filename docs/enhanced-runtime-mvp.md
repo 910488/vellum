@@ -35,7 +35,7 @@ Pinned commits:
 
 | Project | Commit |
 |---|---|
-| OpenAI Codex | `6bc50f104dcc0192e696cdeae721dfc19b507391` (`rust-v0.153.0`) |
+| OpenAI Codex | `83086188ae0614bd882818ff1aa23f3194962012` (`rust-v0.163.0`) |
 | Qwen Code | `2b8f73c1e9cf8b355ec46c4623398c27b458b076` |
 | DeepSeek Harness | `dd6322d604e00eec1ba5e0c8541159906a21094a` |
 

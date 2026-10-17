@@ -12,7 +12,7 @@ pub const BUILD_PROFILE_ENHANCED_MVP_V1: &str = "enhanced-mvp-v1";
 
 /// Pinned source revisions for the Enhanced Codex MVP. These must not drift
 /// with `main` / `master` / `latest`.
-pub const CODEX_UPSTREAM_COMMIT: &str = "6bc50f104dcc0192e696cdeae721dfc19b507391";
+pub const CODEX_UPSTREAM_COMMIT: &str = "83086188ae0614bd882818ff1aa23f3194962012";
 pub const QWEN_CODE_SOURCE_COMMIT: &str = "2b8f73c1e9cf8b355ec46c4623398c27b458b076";
 pub const DEEPSEEK_HARNESS_SOURCE_COMMIT: &str = "dd6322d604e00eec1ba5e0c8541159906a21094a";
 
