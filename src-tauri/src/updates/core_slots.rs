@@ -415,6 +415,69 @@ pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
         })
 }
 
+/// Compare signed metadata first, and verify a matching source exactly once.
+/// Full relative paths matter: two helpers with the same basename are distinct.
+pub(super) type LocalCoreFiles = Vec<(String, PathBuf)>;
+
+pub(super) fn matching_local_core(
+    root: &Path,
+    core: &super::manifest::CoreManifest,
+    target: &CoreTarget,
+    trust: &TrustStore,
+    bundled: Option<&Path>,
+) -> Option<(String, LocalCoreFiles)> {
+    let slots = CoreSlots::load(root);
+    for slot in [slots.active, slots.pending].into_iter().flatten() {
+        let tree = slot_tree_root(root, &slot.version);
+        let expected = super::core_package::build_slot(&tree, &slot.version, core, target).ok()?;
+        let metadata_matches = slot.path == expected.path
+            && slot.helpers == expected.helpers
+            && slot.files.len() == expected.files.len()
+            && slot.files.iter().all(|file| {
+                expected.files.iter().any(|other| {
+                    file.path == other.path
+                        && file.size == other.size
+                        && file
+                            .sha256
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&file.sha256)
+                            .eq_ignore_ascii_case(
+                                other
+                                    .sha256
+                                    .strip_prefix("sha256:")
+                                    .unwrap_or(&other.sha256),
+                            )
+                })
+            });
+        if metadata_matches && verified_slot(root, &slot, trust) {
+            return Some((
+                slot.version,
+                target
+                    .files
+                    .iter()
+                    .map(|file| (file.path.clone(), tree.join(&file.path)))
+                    .collect(),
+            ));
+        }
+    }
+    let bundled = bundled?;
+    let sources = target
+        .files
+        .iter()
+        .map(|file| {
+            let path = if file.path == target.executable {
+                bundled.to_path_buf()
+            } else {
+                bundled.parent()?.join(&file.path)
+            };
+            (std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == file.size)
+                && file_matches_digest(&path, &file.sha256))
+            .then(|| (file.path.clone(), path))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(("bundled".into(), sources))
+}
+
 /// Nightly releases re-label one core build, so a "new" core is often the
 /// running one under another version: same signed files, same protocol.
 /// Switching to it changes no byte that runs, so it needs no restart.
