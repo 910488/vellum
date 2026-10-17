@@ -260,9 +260,14 @@ impl AppState {
             remote_sidebar_forced: false,
             remote_sidebar_hidden: false,
         });
+        let (free_tier_migrated, removed_free_routes) =
+            migrate_opencode_free_tier_models(&mut inner.routes);
+        for route_id in &removed_free_routes {
+            inner.overrides.remove(route_id);
+        }
         let migrated = migrate_seeded_route_names(&mut inner.routes)
             | migrate_opencode_access_modes(&mut inner.routes)
-            | migrate_opencode_catalog_scopes(&mut inner.routes);
+            | free_tier_migrated;
         let outbound_disabled = disable_noncompliant_outbound_routes(&mut inner.routes);
         // Brave is now the only web search backend. A settings file written
         // before this change may still carry `enabled: true` from a
@@ -911,7 +916,6 @@ impl AppState {
             context_window: input.context_window,
             model_capabilities: input.model_capabilities,
             insecure_http_policy: crate::model::InsecureHttpPolicy::Deny,
-            catalog_scope: input.catalog_scope.unwrap_or_default(),
         });
         persist_inner(&self.data_root, &guard);
         drop(guard);
@@ -1458,26 +1462,8 @@ impl AppState {
         let Some(route) = guard.routes.iter_mut().find(|route| route.id == route_id) else {
             return false;
         };
-        let is_free_only = route.catalog_scope == crate::model::CatalogScope::FreeOnly;
-        let mut discovered_models = discovery.models.clone();
-        let mut discovered_capabilities = discovery.model_capabilities.clone();
-        if is_free_only {
-            let on_free_tier = |model: &str| {
-                crate::probe::opencode_zen_catalog(&route.base_url)
-                    .map(|catalog| crate::probe::opencode_zen_free_tier_model(catalog, model))
-                    .unwrap_or_else(|| {
-                        vellum_proxy_runtime::opencode::confirmed_free_zen_model(model)
-                    })
-            };
-            discovered_models.retain(|model| on_free_tier(model));
-            // A capability's own `free` flag is not enough on its own: a
-            // retired model still costs nothing, and reading only the price
-            // is what kept `deepseek-v4-flash-free` in the catalog after
-            // OpenCode withdrew it.
-            discovered_capabilities.retain(|cap| {
-                cap.deprecated != Some(true) && (cap.free == Some(true) || on_free_tier(&cap.model))
-            });
-        }
+        let discovered_models = discovery.models.clone();
+        let discovered_capabilities = discovery.model_capabilities.clone();
         if !discovered_models.is_empty() {
             route.models = discovered_models;
             if route.provider_kind != ProviderKind::Official {
@@ -1537,14 +1523,12 @@ impl AppState {
                     .and_then(|e| e.display_name.clone())
                     .or_else(|| placeholder.display_name.clone());
                 let prior_vision = existing.as_ref().and_then(|e| e.vision);
-                let prior_free = existing.as_ref().and_then(|e| e.free).or(placeholder.free);
                 let prior_access_mode = existing
                     .as_ref()
                     .and_then(|e| e.access_mode)
                     .or(placeholder.access_mode);
                 resolved.display_name = prior_display_name.or(resolved.display_name);
                 resolved.vision = prior_vision.or(resolved.vision);
-                resolved.free = resolved.free.or(prior_free);
                 resolved.access_mode = resolved.access_mode.or(prior_access_mode);
                 resolved
             })
@@ -2146,13 +2130,7 @@ fn migrate_opencode_access_modes(routes: &mut [Route]) -> bool {
         for capability in &mut route.model_capabilities {
             if capability.access_mode.is_none() {
                 capability.access_mode = Some(
-                    match vellum_proxy_runtime::opencode::default_access_mode(
-                        profile,
-                        &capability.model,
-                    ) {
-                        vellum_proxy_runtime::RuntimeAccessMode::AnonymousFree => {
-                            crate::model::AccessMode::AnonymousFree
-                        }
+                    match vellum_proxy_runtime::opencode::default_access_mode(profile) {
                         vellum_proxy_runtime::RuntimeAccessMode::Credentialed => {
                             crate::model::AccessMode::Credentialed
                         }
@@ -2200,10 +2178,6 @@ fn merge_capability_probe_update(
         .vision
         .or_else(|| placeholder.and_then(|value| value.vision))
         .or(merged.vision);
-    merged.free = fresh
-        .free
-        .or(existing.free)
-        .or_else(|| placeholder.and_then(|value| value.free));
     merged.access_mode = fresh
         .access_mode
         .or(existing.access_mode)
@@ -2217,96 +2191,71 @@ fn merge_capability_probe_update(
     merged
 }
 
-/// Records `freeOnly` on OpenCode routes written before the field existed, and
-/// keeps a `freeOnly` route's stored catalog consistent with that scope.
-///
-/// This runs on *every* settings load, so it must only ever label a route as
-/// what it already is. It used to also impose the scope: any keyless OpenCode
-/// route was forced to `freeOnly` and its paid models deleted from `models`,
-/// `model_capabilities` and `selected_models`. That defeated the documented
-/// escape hatch -- adding the provider by hand through the generic Add
-/// Provider flow, which offers the full catalog -- because the next load
-/// silently reverted the choice and destroyed the discovered models, and
-/// re-probing could not restore them (`merge_route_probe_result` filters on
-/// the same scope). The user's only way out was to invent an API key.
-fn migrate_opencode_catalog_scopes(routes: &mut [Route]) -> bool {
+/// Drops OpenCode free-tier models from every OpenCode route. OpenCode
+/// serves its free tier only to the OpenCode app, so these models can never
+/// answer a Vellum request; leaving them in the catalog only offers Codex a
+/// model that fails on every turn. A route left with no models at all -- the
+/// keyless "OpenCode Zen (Free models)" route Vellum used to create -- is
+/// removed. Returns whether anything changed, and the ids of removed routes.
+fn migrate_opencode_free_tier_models(routes: &mut Vec<Route>) -> (bool, Vec<String>) {
+    let is_free = vellum_proxy_runtime::opencode::is_free_tier_model;
     let mut changed = false;
-    for route in routes {
-        if route.provider_kind != crate::model::ProviderKind::OpenAiCompatible {
-            continue;
-        }
-        if !crate::probe::is_opencode_zen_endpoint(&route.base_url) {
-            continue;
-        }
-        let catalog = crate::probe::opencode_zen_catalog(&route.base_url);
-        let is_free = |model: &str| {
-            catalog
-                .map(|catalog| crate::probe::opencode_zen_free_tier_model(catalog, model))
-                .unwrap_or_else(|| vellum_proxy_runtime::opencode::confirmed_free_zen_model(model))
-        };
-        // Label, never impose. A keyless route whose catalog is already all
-        // free models is a `freeOnly` route that predates the field, and
-        // writing the scope down changes nothing the user can see. A keyless
-        // route that carries paid models was asked for that way, and is left
-        // alone -- those models fail at call time with a clear "requires an
-        // API key", which is a better answer than deleting them.
-        if route.auth_kind == crate::model::AuthKind::None
-            && route.catalog_scope != crate::model::CatalogScope::FreeOnly
-            && !route.models.is_empty()
-            && route.models.iter().all(|model| is_free(model))
+    let mut removed = Vec::new();
+    for route in routes.iter_mut() {
+        if route.provider_kind != crate::model::ProviderKind::OpenAiCompatible
+            || !crate::probe::is_opencode_zen_endpoint(&route.base_url)
         {
-            route.catalog_scope = crate::model::CatalogScope::FreeOnly;
-            changed = true;
+            continue;
         }
-        if route.catalog_scope == crate::model::CatalogScope::FreeOnly {
-            // Pruning must never empty a route. `opencode_zen_known_free`
-            // answers `Some(false)` for every OpenCode **Go** model, and the
-            // endpoint test above matches Go as well, so a Go route that lost
-            // its API key would otherwise have its entire catalog deleted and
-            // then be left with nothing to select.
-            if !route.models.iter().any(|model| is_free(model)) {
-                continue;
-            }
-            let before = (
-                route.models.clone(),
-                route.selected_models.clone(),
-                route.model.clone(),
-                route.model_capabilities.len(),
-            );
-            route.models.retain(|model| is_free(model));
-            route
+        let carries_free = route.models.iter().any(|model| is_free(model))
+            || route
                 .model_capabilities
-                .retain(|capability| is_free(&capability.model));
-            if let Some(selected) = &mut route.selected_models {
-                selected.retain(|model| is_free(model));
-                if selected.is_empty() {
-                    if let Some(first) = route.models.first() {
-                        selected.push(first.clone());
-                    }
-                }
-            }
-            let selected = route.selected_models.as_deref().unwrap_or(&route.models);
-            if !selected
                 .iter()
-                .any(|model| model.eq_ignore_ascii_case(&route.model))
-            {
-                if let Some(first) = selected.first() {
-                    route.model = first.clone();
-                }
+                .any(|capability| is_free(&capability.model))
+            || route
+                .selected_models
+                .iter()
+                .flatten()
+                .any(|model| is_free(model))
+            || is_free(&route.model);
+        if !carries_free {
+            continue;
+        }
+        changed = true;
+        route.models.retain(|model| !is_free(model));
+        route
+            .model_capabilities
+            .retain(|capability| !is_free(&capability.model));
+        if let Some(selected) = &mut route.selected_models {
+            selected.retain(|model| !is_free(model));
+        }
+        if route.models.is_empty() {
+            removed.push(route.id.clone());
+            continue;
+        }
+        if let Some(selected) = &mut route.selected_models {
+            if selected.is_empty() {
+                selected.push(route.models[0].clone());
             }
-            if before
-                != (
-                    route.models.clone(),
-                    route.selected_models.clone(),
-                    route.model.clone(),
-                    route.model_capabilities.len(),
-                )
-            {
-                changed = true;
-            }
+        }
+        if is_free(&route.model) {
+            let selected = route.selected_models.as_deref().unwrap_or(&route.models);
+            route.model = selected[0].clone();
         }
     }
-    changed
+    if removed.is_empty() {
+        return (changed, removed);
+    }
+    let lost_current = routes
+        .iter()
+        .any(|route| route.is_current && removed.contains(&route.id));
+    routes.retain(|route| !removed.contains(&route.id));
+    if lost_current {
+        if let Some(fallback) = routes.iter_mut().find(|route| route.enabled) {
+            fallback.is_current = true;
+        }
+    }
+    (changed, removed)
 }
 
 fn migrate_seeded_route_names(routes: &mut [Route]) -> bool {
@@ -2384,7 +2333,6 @@ fn seed_routes() -> Vec<Route> {
             context_window: None,
             model_capabilities: Vec::new(),
             insecure_http_policy: Default::default(),
-            catalog_scope: Default::default(),
         },
         Route {
             id: "grok-cli".into(),
@@ -2404,7 +2352,6 @@ fn seed_routes() -> Vec<Route> {
             context_window: Some(500_000),
             model_capabilities: Vec::new(),
             insecure_http_policy: Default::default(),
-            catalog_scope: Default::default(),
         },
     ]
 }
@@ -2793,7 +2740,6 @@ mod tests {
                 ]),
                 context_window: Some(128_000),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -2813,7 +2759,6 @@ mod tests {
                 selected_models: Some(vec!["qwen".into()]),
                 context_window: Some(128_000),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -2931,7 +2876,6 @@ mod tests {
                 selected_models: Some(vec!["review-model-a".into(), "review-model-b".into()]),
                 context_window: Some(128_000),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -3592,7 +3536,6 @@ mod tests {
                     ..Default::default()
                 }],
                 insecure_http_policy: Default::default(),
-                catalog_scope: Default::default(),
             });
         }
         state.activate_proxy_routes();
@@ -3662,7 +3605,6 @@ mod tests {
                     probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
                     ..Default::default()
                 }],
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -3713,7 +3655,6 @@ mod tests {
                 selected_models: Some(vec!["qwen-local".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -3748,7 +3689,6 @@ mod tests {
                 selected_models: Some(vec!["qwen3.6".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -3799,7 +3739,6 @@ mod tests {
                 selected_models: Some(vec!["old/model".into()]),
                 context_window: None,
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -3860,19 +3799,19 @@ mod tests {
             CreateRouteInput {
                 name: "OpenCode Zen".into(),
                 base_url: crate::probe::OPENCODE_ZEN_BASE_URL.into(),
-                model: "big-pickle".into(),
+                model: "glm-5.1".into(),
                 wire: WireFormat::Chat,
                 streaming: true,
                 reasoning: true,
                 server_side_resume: false,
                 provider_kind: Some(ProviderKind::OpenAiCompatible),
                 api_key: None,
-                models: Some(vec!["big-pickle".into(), "gpt-5.4-mini".into()]),
-                selected_models: Some(vec!["big-pickle".into()]),
+                models: Some(vec!["glm-5.1".into(), "gpt-5.4-mini".into()]),
+                selected_models: Some(vec!["glm-5.1".into()]),
                 context_window: None,
                 model_capabilities: vec![
                     ModelCapability {
-                        model: "big-pickle".into(),
+                        model: "glm-5.1".into(),
                         wire: Some(WireFormat::Chat),
                         tool_calling: Some(true),
                         probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
@@ -3884,7 +3823,6 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,
@@ -3926,7 +3864,7 @@ mod tests {
             Some(crate::probe::HARNESS_PROBE_VERSION)
         );
         assert!(route.model_capabilities.iter().any(|capability| {
-            capability.model == "big-pickle" && capability.tool_calling == Some(true)
+            capability.model == "glm-5.1" && capability.tool_calling == Some(true)
         }));
     }
 
@@ -3947,7 +3885,6 @@ mod tests {
                 selected_models: Some(models),
                 context_window: None,
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,
@@ -4117,21 +4054,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_route_probe_result_preserves_user_declared_display_name_vision_and_free_metadata() {
+    fn merge_route_probe_result_preserves_user_declared_display_name_vision_and_access_mode() {
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir(temp.path().to_path_buf());
-        let route_id = zen_route_for_merge_tests(&state, vec!["big-pickle"]);
+        let route_id = zen_route_for_merge_tests(&state, vec!["glm-5.2"]);
         assert!(state.replace_route_model_capability(
             &route_id,
             ModelCapability {
-                model: "big-pickle".into(),
+                model: "glm-5.2".into(),
                 wire: Some(WireFormat::Chat),
                 tool_calling: Some(true),
                 probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
-                display_name: Some("My Pickle".into()),
+                display_name: Some("My GLM".into()),
                 vision: Some(true),
-                free: Some(true),
-                access_mode: Some(crate::model::AccessMode::AnonymousFree),
+                access_mode: Some(crate::model::AccessMode::Credentialed),
                 ..Default::default()
             },
         ));
@@ -4139,19 +4075,19 @@ mod tests {
         let discovery = crate::model::ProbeResult {
             reachable: true,
             wire: None,
-            models: vec!["big-pickle".into()],
+            models: vec!["glm-5.2".into()],
             context_window: None,
             streaming: false,
             reasoning: false,
             server_side_resume: false,
-            model_capabilities: vec![placeholder_capability("big-pickle")],
+            model_capabilities: vec![placeholder_capability("glm-5.2")],
             stream_quality: None,
             needs_input: Vec::new(),
         };
-        // The live-verify path never sets display_name/vision/free/access_mode
+        // The live-verify path never sets display_name/vision/access_mode
         // itself -- exactly what `probe_model_capability` actually produces.
         let freshly_verified = vec![ModelCapability {
-            model: "big-pickle".into(),
+            model: "glm-5.2".into(),
             wire: Some(WireFormat::Chat),
             tool_calling: Some(true),
             probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
@@ -4164,54 +4100,51 @@ mod tests {
             .into_iter()
             .find(|route| route.id == route_id)
             .unwrap();
-        let big_pickle = route
+        let glm = route
             .model_capabilities
             .iter()
-            .find(|capability| capability.model == "big-pickle")
+            .find(|capability| capability.model == "glm-5.2")
             .unwrap();
-        assert_eq!(big_pickle.display_name.as_deref(), Some("My Pickle"));
-        assert_eq!(big_pickle.vision, Some(true));
-        assert_eq!(big_pickle.free, Some(true));
+        assert_eq!(glm.display_name.as_deref(), Some("My GLM"));
+        assert_eq!(glm.vision, Some(true));
         assert_eq!(
-            big_pickle.access_mode,
-            Some(crate::model::AccessMode::AnonymousFree)
+            glm.access_mode,
+            Some(crate::model::AccessMode::Credentialed)
         );
         // The fresh verification's own fields still apply.
-        assert_eq!(big_pickle.tool_calling, Some(true));
+        assert_eq!(glm.tool_calling, Some(true));
     }
 
     #[test]
     fn merge_route_probe_result_keeps_a_first_time_discovered_display_name_verification_never_sets()
     {
-        // The Ox Alpha Free case: a model verified for the very first time
-        // has no persisted `existing` row yet, but its discovery placeholder
-        // already carries a catalog-sourced display name (OpenCode Zen's
-        // `x-preview-f-free` -> "Ox Alpha Free" -- id unreadable, real name
-        // known statically). The live-verify path never sets display_name
+        // A model verified for the very first time has no persisted
+        // `existing` row yet, but its discovery placeholder already carries
+        // a display name. The live-verify path never sets display_name
         // itself, so without falling back to the placeholder, this name
         // would be dropped on exactly the pass that first discovers and
         // verifies the model together.
         let temp = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir(temp.path().to_path_buf());
-        let route_id = zen_route_for_merge_tests(&state, vec!["x-preview-f-free"]);
+        let route_id = zen_route_for_merge_tests(&state, vec!["glm-5.2"]);
 
         let discovery = crate::model::ProbeResult {
             reachable: true,
             wire: None,
-            models: vec!["x-preview-f-free".into()],
+            models: vec!["glm-5.2".into()],
             context_window: None,
             streaming: false,
             reasoning: false,
             server_side_resume: false,
             model_capabilities: vec![ModelCapability {
-                display_name: Some("Ox Alpha Free".into()),
-                ..placeholder_capability("x-preview-f-free")
+                display_name: Some("GLM 5.2".into()),
+                ..placeholder_capability("glm-5.2")
             }],
             stream_quality: None,
             needs_input: Vec::new(),
         };
         let freshly_verified = vec![ModelCapability {
-            model: "x-preview-f-free".into(),
+            model: "glm-5.2".into(),
             wire: Some(WireFormat::Chat),
             tool_calling: Some(true),
             probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
@@ -4227,23 +4160,23 @@ mod tests {
         let ox = route
             .model_capabilities
             .iter()
-            .find(|capability| capability.model == "x-preview-f-free")
+            .find(|capability| capability.model == "glm-5.2")
             .unwrap();
-        assert_eq!(ox.display_name.as_deref(), Some("Ox Alpha Free"));
+        assert_eq!(ox.display_name.as_deref(), Some("GLM 5.2"));
         // Routing/persistence still key off the raw upstream id, never the
         // display name.
-        assert_eq!(ox.model, "x-preview-f-free");
+        assert_eq!(ox.model, "glm-5.2");
         assert_eq!(ox.tool_calling, Some(true));
 
         // A second re-probe round (no display_name in discovery this time,
         // matching a route whose catalog cache was already warm) must not
         // regress the name back to nothing.
         let quiet_discovery = crate::model::ProbeResult {
-            model_capabilities: vec![placeholder_capability("x-preview-f-free")],
+            model_capabilities: vec![placeholder_capability("glm-5.2")],
             ..discovery
         };
         let reverified = vec![ModelCapability {
-            model: "x-preview-f-free".into(),
+            model: "glm-5.2".into(),
             wire: Some(WireFormat::Chat),
             tool_calling: Some(true),
             probe_version: Some(crate::probe::HARNESS_PROBE_VERSION),
@@ -4258,9 +4191,9 @@ mod tests {
         let ox = route
             .model_capabilities
             .iter()
-            .find(|capability| capability.model == "x-preview-f-free")
+            .find(|capability| capability.model == "glm-5.2")
             .unwrap();
-        assert_eq!(ox.display_name.as_deref(), Some("Ox Alpha Free"));
+        assert_eq!(ox.display_name.as_deref(), Some("GLM 5.2"));
     }
 
     #[test]
@@ -4291,7 +4224,6 @@ mod tests {
                     effort_probe_status: crate::model::EffortProbeStatus::Supported,
                     ..Default::default()
                 }],
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,
@@ -4343,57 +4275,74 @@ mod tests {
         assert_eq!(qwen.probe_attempts[0].stage, "typedTool");
     }
 
-    /// A keyless route carrying a paid model was *asked* for that way -- the
-    /// generic Add Provider flow offers the full catalog on purpose. The
-    /// migration runs on every load, so imposing `freeOnly` here deleted that
-    /// choice, and the models with it, every time the app started.
+    /// The keyless route Vellum used to create for OpenCode's free tier
+    /// holds nothing but free models; it is removed, and the current route
+    /// moves to another enabled one.
     #[test]
-    fn a_keyless_route_that_carries_paid_models_keeps_them_and_its_scope() {
-        let mut routes = vec![zen_route(
-            CatalogScope::All,
+    fn a_free_models_only_route_is_removed() {
+        let mut free = zen_route(
             AuthKind::None,
-            vec!["gpt-5.6-sol".into(), "big-pickle".into()],
-        )];
-        assert!(!migrate_opencode_catalog_scopes(&mut routes));
-        assert_eq!(routes[0].catalog_scope, CatalogScope::All);
-        assert_eq!(routes[0].models, vec!["gpt-5.6-sol", "big-pickle"]);
-    }
-
-    /// Labelling a route that is already free-only is safe: it writes down
-    /// what is true and removes nothing.
-    #[test]
-    fn a_keyless_route_that_is_already_free_only_is_labelled_without_losing_models() {
-        let mut routes = vec![zen_route(
-            CatalogScope::All,
-            AuthKind::None,
-            vec!["big-pickle".into(), "mimo-v2.5-free".into()],
-        )];
-        assert!(migrate_opencode_catalog_scopes(&mut routes));
-        assert_eq!(routes[0].catalog_scope, CatalogScope::FreeOnly);
-        assert_eq!(routes[0].models, vec!["big-pickle", "mimo-v2.5-free"]);
-    }
-
-    /// `opencode_zen_known_free` answers `Some(false)` for every OpenCode Go
-    /// model, and the endpoint test matches Go too. Pruning a Go route would
-    /// therefore delete its entire catalog and leave nothing selectable.
-    #[test]
-    fn a_free_only_go_route_is_never_pruned_to_an_empty_catalog() {
-        let mut route = zen_route(
-            CatalogScope::FreeOnly,
-            AuthKind::None,
-            vec!["deepseek-v4-pro".into(), "glm-5".into()],
+            vec!["big-pickle".into(), "deepseek-v4.1-flash-free".into()],
         );
-        route.base_url = "https://opencode.ai/zen/go/v1".into();
-        let mut routes = vec![route];
-        migrate_opencode_catalog_scopes(&mut routes);
-        assert_eq!(routes[0].models, vec!["deepseek-v4-pro", "glm-5"]);
-        assert!(routes[0]
-            .selected_models
-            .as_ref()
-            .is_some_and(|s| !s.is_empty()));
+        free.is_current = true;
+        let mut other = zen_route(AuthKind::Bearer, vec!["glm-5.2".into()]);
+        other.id = "zen-paid".into();
+        let mut routes = vec![free, other];
+        assert_eq!(
+            migrate_opencode_free_tier_models(&mut routes),
+            (true, vec!["zen".to_string()])
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].id, "zen-paid");
+        assert!(routes[0].is_current);
     }
 
-    fn zen_route(scope: CatalogScope, auth_kind: AuthKind, models: Vec<String>) -> Route {
+    /// A mixed route keeps its paid models; every catalog surface drops the
+    /// free ones together, and a default that pointed at one is repaired.
+    #[test]
+    fn a_mixed_route_drops_free_models_from_every_catalog_surface() {
+        let mut route = zen_route(
+            AuthKind::Bearer,
+            vec!["big-pickle".into(), "gpt-5.6-sol".into(), "mimo-v2.5-free".into()],
+        );
+        route.selected_models = Some(vec!["big-pickle".into(), "mimo-v2.5-free".into()]);
+        let mut routes = vec![route];
+        assert_eq!(migrate_opencode_free_tier_models(&mut routes), (true, Vec::new()));
+        let route = &routes[0];
+        assert_eq!(route.models, vec!["gpt-5.6-sol"]);
+        assert_eq!(route.selected_models, Some(vec!["gpt-5.6-sol".into()]));
+        assert_eq!(route.model, "gpt-5.6-sol");
+        assert_eq!(route.model_capabilities.len(), 1);
+        assert_eq!(route.model_capabilities[0].model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn routes_without_free_models_are_left_alone() {
+        let mut go = zen_route(AuthKind::Bearer, vec!["deepseek-v4-pro".into(), "glm-5".into()]);
+        go.base_url = "https://opencode.ai/zen/go/v1".into();
+        let mut routes = vec![go];
+        assert_eq!(migrate_opencode_free_tier_models(&mut routes), (false, Vec::new()));
+        assert_eq!(routes[0].models, vec!["deepseek-v4-pro", "glm-5"]);
+    }
+
+    #[test]
+    fn settings_written_with_the_free_tier_still_load() {
+        let capability: ModelCapability = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.2",
+            "free": true,
+            "accessMode": "anonymousFree"
+        }))
+        .unwrap();
+        assert_eq!(
+            capability.access_mode,
+            Some(crate::model::AccessMode::Credentialed)
+        );
+        let mut value = serde_json::to_value(zen_route_shell()).unwrap();
+        value["catalogScope"] = serde_json::json!("freeOnly");
+        assert!(serde_json::from_value::<Route>(value).is_ok());
+    }
+
+    fn zen_route(auth_kind: AuthKind, models: Vec<String>) -> Route {
         Route {
             model: models[0].clone(),
             model_capabilities: models
@@ -4406,7 +4355,6 @@ mod tests {
             selected_models: Some(models.clone()),
             models,
             auth_kind,
-            catalog_scope: scope,
             ..zen_route_shell()
         }
     }
@@ -4430,56 +4378,7 @@ mod tests {
             context_window: None,
             model_capabilities: Vec::new(),
             insecure_http_policy: Default::default(),
-            catalog_scope: CatalogScope::All,
         }
-    }
-
-    /// An **explicitly** free-only route still has every catalog surface
-    /// pruned together, and its default model repaired if the prune removed
-    /// it. Only the imposing of that scope on a route that never asked for it
-    /// was dropped; enforcing a scope the route really carries is unchanged.
-    #[test]
-    fn an_explicitly_free_only_route_filters_every_catalog_surface_and_repairs_default() {
-        let mut routes = vec![Route {
-            id: "opencode-zen".into(),
-            name: "OpenCode Zen".into(),
-            base_url: crate::probe::OPENCODE_ZEN_BASE_URL.into(),
-            model: "gpt-5.6-sol".into(),
-            wire: WireFormat::Chat,
-            is_current: false,
-            server_side_resume: false,
-            streaming: true,
-            reasoning: true,
-            provider_kind: ProviderKind::OpenAiCompatible,
-            auth_kind: AuthKind::None,
-            enabled: true,
-            models: vec!["gpt-5.6-sol".into(), "big-pickle".into()],
-            selected_models: Some(vec!["gpt-5.6-sol".into()]),
-            context_window: None,
-            model_capabilities: vec![
-                ModelCapability {
-                    model: "gpt-5.6-sol".into(),
-                    free: Some(false),
-                    ..Default::default()
-                },
-                ModelCapability {
-                    model: "big-pickle".into(),
-                    free: Some(true),
-                    ..Default::default()
-                },
-            ],
-            insecure_http_policy: Default::default(),
-            catalog_scope: CatalogScope::FreeOnly,
-        }];
-
-        assert!(migrate_opencode_catalog_scopes(&mut routes));
-        let route = &routes[0];
-        assert_eq!(route.catalog_scope, CatalogScope::FreeOnly);
-        assert_eq!(route.models, vec!["big-pickle"]);
-        assert_eq!(route.selected_models, Some(vec!["big-pickle".into()]));
-        assert_eq!(route.model, "big-pickle");
-        assert_eq!(route.model_capabilities.len(), 1);
-        assert_eq!(route.model_capabilities[0].model, "big-pickle");
     }
 
     #[test]
@@ -4509,7 +4408,6 @@ mod tests {
                     probe_version: None,
                     ..Default::default()
                 }],
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::None,

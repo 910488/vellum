@@ -449,7 +449,6 @@ mod tests {
             context_window: Some(200_000),
             model_capabilities: Vec::new(),
             insecure_http_policy: Default::default(),
-            catalog_scope: Default::default(),
         }
     }
 

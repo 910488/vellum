@@ -89,13 +89,11 @@ fn register_host(state: &AppState, host_id: &str) {
 /// only if some field of its `RuntimeModelRoute` is resolved from state the
 /// remote host does not have.
 fn build_route_matrix(state: &AppState) {
-    // OpenCode Zen with an access mode the URL does not imply. `to_route()`
-    // infers access mode from the profile and the model name; Desktop reads
-    // what the probe actually persisted. `zen-paid-model` is not in
-    // CONFIRMED_FREE_ZEN_MODELS, so inference says `credentialed` while the
-    // stored capability says otherwise -- which is the point of the case.
+    // OpenCode Zen with a persisted access mode. `to_route()` infers access
+    // mode from the profile; Desktop reads what the probe actually persisted.
+    // Both must land on the same `credentialed` value.
     let mut zen = qualified("zen-paid-model");
-    zen.access_mode = Some(AccessMode::AnonymousFree);
+    zen.access_mode = Some(AccessMode::Credentialed);
     state.create_route(
         CreateRouteInput {
             name: "zen".into(),
@@ -111,7 +109,6 @@ fn build_route_matrix(state: &AppState) {
             selected_models: Some(vec!["zen-paid-model".into()]),
             context_window: Some(200_000),
             model_capabilities: vec![zen],
-            catalog_scope: None,
         },
         ProviderKind::OpenAiCompatible,
         AuthKind::None,
@@ -135,7 +132,6 @@ fn build_route_matrix(state: &AppState) {
             selected_models: Some(vec!["lan-model".into()]),
             context_window: Some(131_072),
             model_capabilities: vec![qualified("lan-model")],
-            catalog_scope: None,
         },
         ProviderKind::OpenAiCompatible,
         AuthKind::None,
@@ -176,7 +172,6 @@ fn build_route_matrix(state: &AppState) {
             selected_models: Some(vec!["bearer-model".into()]),
             context_window: Some(65_536),
             model_capabilities: vec![qualified("bearer-model")],
-            catalog_scope: None,
         },
         ProviderKind::OpenAiCompatible,
         AuthKind::Bearer,

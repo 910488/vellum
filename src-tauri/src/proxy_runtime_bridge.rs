@@ -1223,14 +1223,7 @@ pub(crate) fn runtime_route(
         provider_profile,
         access_mode: cap
             .and_then(|capability| capability.access_mode.map(Into::into))
-            .or_else(|| {
-                provider_profile.map(|profile| {
-                    vellum_proxy_runtime::opencode::default_access_mode(
-                        profile,
-                        &model.upstream_model,
-                    )
-                })
-            }),
+            .or_else(|| provider_profile.map(vellum_proxy_runtime::opencode::default_access_mode)),
         chat_capabilities: cap
             .map(|capability| {
                 capability.chat_capabilities.clone().migrate_legacy(
@@ -1479,7 +1472,6 @@ mod tests {
                 selected_models: Some(vec!["qwen3.6".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,
@@ -1563,7 +1555,6 @@ mod tests {
                 selected_models: Some(vec!["qwen-35b".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,
@@ -1630,7 +1621,6 @@ mod tests {
                 selected_models: Some(vec!["qwen-35b".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,
@@ -1650,7 +1640,6 @@ mod tests {
                 selected_models: Some(vec!["qwen-70b".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,
@@ -1697,7 +1686,6 @@ mod tests {
                 selected_models: Some(vec!["qwen-35b".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             ProviderKind::OpenAiCompatible,
             AuthKind::Bearer,

@@ -1,8 +1,9 @@
 //! OpenCode Zen / OpenCode Go compatibility.
 //!
-//! Vellum never downloads, launches, or talks to the OpenCode CLI. `public`
-//! is the fixed free-access identity the OpenCode app sends; it is not a
-//! second secret derived from a private API key.
+//! Vellum never downloads, launches, or talks to the OpenCode CLI. Every
+//! OpenCode route is credentialed: OpenCode restricts its free tier to the
+//! OpenCode app itself (`FreeTierError`, 401), so Vellum does not offer the
+//! free models at all.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -17,7 +18,6 @@ use crate::route::{RuntimeAccessMode, RuntimeProviderProfile};
 
 pub const OPENCODE_ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
 pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
-pub const OPENCODE_PUBLIC_TOKEN: &str = "public";
 pub const OPENCODE_CLIENT: &str = "vellum";
 pub const DEFAULT_QUOTA_RETRY_AFTER_SECS: u64 = 60;
 pub const MAX_QUOTA_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
@@ -26,41 +26,6 @@ pub const MAX_QUOTA_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
 pub const OPENCODE_GO_REQUEST_BODY_BYTES: usize = 9 * 1024 * 1024 / 2;
 pub const OPENCODE_GO_REQUEST_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const QUOTA_DIAGNOSTIC_LIMIT: usize = 240;
-
-/// Official Zen catalog rows confirmed free. Unknown ids are never inferred
-/// from a `-free` suffix or from `big-pickle`-style aliases outside this list.
-const CONFIRMED_FREE_ZEN_MODELS: &[&str] = &[
-    "big-pickle",
-    "deepseek-v4-flash-free",
-    "glm-4.7-free",
-    "glm-5-free",
-    "grok-code",
-    "hy3-free",
-    "hy3-preview-free",
-    "kimi-k2.5-free",
-    "laguna-s-2.1-free",
-    "ling-2.6-flash-free",
-    "ling-3.0-flash-fin-free",
-    "ling-3.0-flash-free",
-    "longcat-2.0-free",
-    "mimo-v2-flash-free",
-    "mimo-v2-omni-free",
-    "mimo-v2-pro-free",
-    "mimo-v2.5-free",
-    "minimax-m2.1-free",
-    "minimax-m2.5-free",
-    "minimax-m3-free",
-    "muse-spark-1.2-contributor-free",
-    "muse-spark-1.3-contributor-free",
-    "nemotron-3-super-free",
-    "nemotron-3-ultra-free",
-    "nemotron-3.5-lightning-free",
-    "north-mini-code-free",
-    "qwen3.6-plus-free",
-    "ring-2.6-1t-free",
-    "trinity-large-preview-free",
-    "x-preview-f-free",
-];
 
 /// Exact OpenCode catalog roots. Other OpenAI-compatible URLs, including
 /// lookalike hosts and extra path segments, stay generic.
@@ -126,26 +91,17 @@ pub fn normalize_opencode_base_url(base_url: &str) -> String {
     normalized
 }
 
-pub fn confirmed_free_zen_model(model: &str) -> bool {
-    CONFIRMED_FREE_ZEN_MODELS
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(model))
+/// Zen free-tier model ids: the `-free` family plus the `big-pickle` alias.
+/// Used only to keep these models *out* of Vellum -- OpenCode answers every
+/// non-OpenCode client on them with `FreeTierError` -- so erring towards a
+/// match never grants anything.
+pub fn is_free_tier_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.ends_with("-free") || model == "big-pickle"
 }
 
-/// Official display names for Zen catalog ids whose id is not itself
-/// readable. Zen's `/models` response carries no name field at all (just
-/// `id`, `object`, `created`, `owned_by`), so an id like `x-preview-f-free`
-/// would otherwise show up in the Codex model picker exactly as-is. Sourced
-/// from OpenCode's own catalog UI, the same way `CONFIRMED_FREE_ZEN_MODELS`
-/// is -- never guessed from the id string.
-const CONFIRMED_ZEN_MODEL_DISPLAY_NAMES: &[(&str, &str)] = &[("x-preview-f-free", "Ox Alpha Free")];
-
-pub fn confirmed_zen_model_display_name(model: &str) -> Option<&'static str> {
-    CONFIRMED_ZEN_MODEL_DISPLAY_NAMES
-        .iter()
-        .find(|(id, _)| id.eq_ignore_ascii_case(model))
-        .map(|(_, name)| *name)
-}
+pub const FREE_TIER_UNSUPPORTED: &str =
+    "OpenCode free models are not supported: OpenCode only serves its free tier to the OpenCode app. Use a paid OpenCode Zen or Go model with an API key.";
 
 /// Wire for an OpenCode catalog model. GPT/Grok stay on Responses; Claude,
 /// Gemini and Qwen 3.5+ native protocols are unsupported; everything else
@@ -168,22 +124,14 @@ pub fn wire_for_model(model: &str) -> Option<&'static str> {
     }
 }
 
-pub fn default_access_mode(profile: RuntimeProviderProfile, model: &str) -> RuntimeAccessMode {
-    match profile {
-        RuntimeProviderProfile::OpenCodeZen if confirmed_free_zen_model(model) => {
-            RuntimeAccessMode::AnonymousFree
-        }
-        RuntimeProviderProfile::OpenCodeZen | RuntimeProviderProfile::OpenCodeGo => {
-            RuntimeAccessMode::Credentialed
-        }
-    }
+/// Every OpenCode model is credentialed.
+pub fn default_access_mode(_profile: RuntimeProviderProfile) -> RuntimeAccessMode {
+    RuntimeAccessMode::Credentialed
 }
 
-/// Persist profile/access mode for an exact Zen/Go URL. Unknown models stay
-/// credentialed; they are never guessed free from a name suffix.
+/// Persist profile/access mode for an exact Zen/Go URL.
 pub fn migrate_route_profile(
     base_url: &str,
-    upstream_model: &str,
     provider_profile: &mut Option<RuntimeProviderProfile>,
     access_mode: &mut Option<RuntimeAccessMode>,
 ) -> bool {
@@ -197,25 +145,19 @@ pub fn migrate_route_profile(
     }
     if access_mode.is_none() {
         if let Some(profile) = *provider_profile {
-            *access_mode = Some(default_access_mode(profile, upstream_model));
+            *access_mode = Some(default_access_mode(profile));
             changed = true;
         }
     }
     changed
 }
 
-pub fn authorization_token(
-    access_mode: RuntimeAccessMode,
-    stored_secret: Option<&str>,
-) -> Result<String, String> {
-    match access_mode {
-        RuntimeAccessMode::AnonymousFree => Ok(OPENCODE_PUBLIC_TOKEN.to_string()),
-        RuntimeAccessMode::Credentialed => stored_secret
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| "OpenCode credentialed models require an API key".into()),
-    }
+pub fn authorization_token(stored_secret: Option<&str>) -> Result<String, String> {
+    stored_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "OpenCode models require an API key".into())
 }
 
 /// SHA-256 conversation identity from the existing conversation-key/history
@@ -439,18 +381,16 @@ mod tests {
         let mut access = None;
         assert!(migrate_route_profile(
             OPENCODE_ZEN_BASE_URL,
-            "mimo-v2.5-free",
             &mut profile,
             &mut access
         ));
         assert_eq!(profile, Some(RuntimeProviderProfile::OpenCodeZen));
-        assert_eq!(access, Some(RuntimeAccessMode::AnonymousFree));
+        assert_eq!(access, Some(RuntimeAccessMode::Credentialed));
 
         let mut profile = None;
         let mut access = None;
         assert!(migrate_route_profile(
             OPENCODE_GO_BASE_URL,
-            "mimo-v2.5",
             &mut profile,
             &mut access
         ));
@@ -461,7 +401,6 @@ mod tests {
         let mut access = None;
         assert!(!migrate_route_profile(
             "https://api.provider.example/v1",
-            "qwen3.6",
             &mut profile,
             &mut access
         ));
@@ -470,43 +409,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_models_are_not_guessed_free_from_a_suffix() {
-        assert!(confirmed_free_zen_model("mimo-v2.5-free"));
-        assert!(confirmed_free_zen_model("big-pickle"));
-        assert!(!confirmed_free_zen_model("mystery-free"));
-        assert!(!confirmed_free_zen_model("gpt-5-nano"));
-        assert!(!confirmed_free_zen_model("mimo-v2.5"));
-        assert_eq!(
-            default_access_mode(RuntimeProviderProfile::OpenCodeZen, "mystery-free"),
-            RuntimeAccessMode::Credentialed
-        );
-        assert_eq!(
-            default_access_mode(RuntimeProviderProfile::OpenCodeGo, "mimo-v2.5-free"),
-            RuntimeAccessMode::Credentialed
-        );
+    fn free_tier_ids_are_recognised_only_to_be_excluded() {
+        assert!(is_free_tier_model("deepseek-v4.1-flash-free"));
+        assert!(is_free_tier_model("Big-Pickle"));
+        assert!(!is_free_tier_model("deepseek-v4.1-flash"));
+        assert!(!is_free_tier_model("gpt-5-nano"));
     }
 
     #[test]
-    fn public_token_is_fixed_and_never_derived_from_a_private_key() {
-        assert_eq!(
-            authorization_token(RuntimeAccessMode::AnonymousFree, Some("sk-private")).unwrap(),
-            OPENCODE_PUBLIC_TOKEN
-        );
-        assert_eq!(
-            authorization_token(RuntimeAccessMode::AnonymousFree, None).unwrap(),
-            OPENCODE_PUBLIC_TOKEN
-        );
-        assert_eq!(
-            authorization_token(RuntimeAccessMode::Credentialed, Some("sk-private")).unwrap(),
-            "sk-private"
-        );
-        assert!(authorization_token(RuntimeAccessMode::Credentialed, None).is_err());
-        assert!(authorization_token(RuntimeAccessMode::Credentialed, Some("  ")).is_err());
+    fn every_model_needs_the_stored_key() {
+        assert_eq!(authorization_token(Some("sk-private")).unwrap(), "sk-private");
+        assert!(authorization_token(None).is_err());
+        assert!(authorization_token(Some("  ")).is_err());
     }
 
     #[test]
     fn mimo_stays_on_chat_completions() {
-        assert_eq!(wire_for_model("mimo-v2.5-free"), Some("chat"));
+        assert_eq!(wire_for_model("mimo-v2.5"), Some("chat"));
         assert_eq!(wire_for_model("gpt-5.4-mini"), Some("responses"));
         assert_eq!(wire_for_model("claude-opus-5"), None);
     }
@@ -514,17 +433,17 @@ mod tests {
     #[test]
     fn session_is_stable_across_turns_and_request_id_follows_the_body() {
         let turn_one = json!({
-            "model": "mimo-v2.5-free",
+            "model": "mimo-v2.5",
             "prompt_cache_key": "thread-abc",
             "input": "one"
         });
         let turn_two = json!({
-            "model": "mimo-v2.5-free",
+            "model": "mimo-v2.5",
             "prompt_cache_key": "thread-abc",
             "input": "two"
         });
         let other = json!({
-            "model": "mimo-v2.5-free",
+            "model": "mimo-v2.5",
             "prompt_cache_key": "thread-xyz",
             "input": "one"
         });
@@ -534,8 +453,8 @@ mod tests {
         assert!(!session.contains("thread-abc"));
         assert_eq!(session.len(), 64);
 
-        let body_a = br#"{"model":"mimo-v2.5-free"}"#;
-        let body_b = br#"{"model":"mimo-v2.5-free","messages":[]}"#;
+        let body_a = br#"{"model":"mimo-v2.5"}"#;
+        let body_b = br#"{"model":"mimo-v2.5","messages":[]}"#;
         let request_a = request_identity(&session, body_a);
         assert_eq!(request_a, request_identity(&session, body_a));
         assert_ne!(request_a, request_identity(&session, body_b));
@@ -543,7 +462,7 @@ mod tests {
 
     #[test]
     fn requests_without_body_identity_use_the_resolved_conversation_key() {
-        let body = json!({"model": "mimo-v2.5-free"});
+        let body = json!({"model": "mimo-v2.5"});
         let first = identity_headers(&body, "codex:session-a:thread-a", b"{}");
         let retry = identity_headers(&body, "codex:session-a:thread-a", b"{}");
         let other = identity_headers(&body, "codex:session-a:thread-b", b"{}");
@@ -603,18 +522,18 @@ mod tests {
     #[test]
     fn cooldown_is_per_route_and_model() {
         let store = OpenCodeQuotaCooldown::new();
-        store.record("route-a", "mimo-v2.5-free", 30, "rate limited");
-        assert!(store.get("route-a", "mimo-v2.5-free").is_some());
-        assert!(store.get("route-a", "big-pickle").is_none());
-        assert!(store.get("route-b", "mimo-v2.5-free").is_none());
-        store.expire("route-a", "mimo-v2.5-free");
-        assert!(store.get("route-a", "mimo-v2.5-free").is_none());
+        store.record("route-a", "mimo-v2.5", 30, "rate limited");
+        assert!(store.get("route-a", "mimo-v2.5").is_some());
+        assert!(store.get("route-a", "glm-5.1").is_none());
+        assert!(store.get("route-b", "mimo-v2.5").is_none());
+        store.expire("route-a", "mimo-v2.5");
+        assert!(store.get("route-a", "mimo-v2.5").is_none());
     }
 
     #[test]
     fn strip_removes_responses_only_identity_fields() {
         let mut body = json!({
-            "model": "mimo-v2.5-free",
+            "model": "mimo-v2.5",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [],
             "stream": true,
@@ -628,26 +547,9 @@ mod tests {
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("store").is_none());
         assert!(body.get("include").is_none());
-        assert_eq!(body["model"], "mimo-v2.5-free");
+        assert_eq!(body["model"], "mimo-v2.5");
         assert_eq!(body["stream"], true);
         assert!(body.get("messages").is_some());
         assert!(body.get("tools").is_some());
-    }
-
-    #[test]
-    fn confirmed_zen_model_display_name_only_covers_the_confirmed_table() {
-        assert_eq!(
-            confirmed_zen_model_display_name("x-preview-f-free"),
-            Some("Ox Alpha Free")
-        );
-        // Case-insensitive, matching confirmed_free_zen_model's own lookup.
-        assert_eq!(
-            confirmed_zen_model_display_name("X-Preview-F-Free"),
-            Some("Ox Alpha Free")
-        );
-        // An id not in the table is never guessed at -- None shows the
-        // upstream id unchanged, same as any other unmapped model.
-        assert_eq!(confirmed_zen_model_display_name("big-pickle"), None);
-        assert_eq!(confirmed_zen_model_display_name("not-a-real-model"), None);
     }
 }
