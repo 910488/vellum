@@ -147,9 +147,21 @@ function deferredSubagentSave() {
 }
 
 describe("sub-agent default settings", () => {
+  it.each(["en", "ja", "zh-CN", "zh-TW"])("translates close timeout and data-loss consent in %s", (locale) => {
+    const translate = i18n.getFixedT(locale);
+    const message = translate("runtime.notice.restartProcessCloseTimedOut", { seconds: 10 });
+    expect(message).toContain("10");
+    expect(message).toContain(translate("settings.page.advanced.restartAnyway"));
+    expect(message).not.toContain("{{");
+    expect(message).not.toContain("none");
+    expect(message).toMatch(/disk|ディスク|磁盘|磁碟/);
+  });
+
   it.each([
     ["restartBlockedByCodexTurn", { count: "1" }, true],
-    ["restartProcessStillRunning", { exitCode: "none", canForce: "true" }, true],
+    ["restartProcessStillRunning", { exitCode: "128", canForce: "true" }, true],
+    ["restartProcessCloseTimedOut", { seconds: "10", canForce: "true" }, true],
+    ["restartProcessCloseTimedOut", { seconds: "12", canForce: "false" }, false],
     ["restartProcessStillRunning", { exitCode: "1", canForce: "false" }, false],
     ["restartSucceeded", {}, false],
   ])("restart override for %s (%j)", async (code, params, canForce) => {
@@ -160,6 +172,10 @@ describe("sub-agent default settings", () => {
     fireEvent.click(restartButton);
     await waitFor(() => expect(apiMocks.restartCodexSafely).toHaveBeenCalledWith(false));
     await waitFor(() => expect((restartButton as HTMLButtonElement).disabled).toBe(false));
+    if (code === "restartProcessCloseTimedOut") {
+      expect(screen.getByText(i18n.t("runtime.notice.restartProcessCloseTimedOut", params))).toBeTruthy();
+      expect(screen.queryByText(/exit.*none/i)).toBeNull();
+    }
     const override = screen.queryByRole("button", { name: t("settings.page.advanced.restartAnyway") });
     if (canForce) {
       expect(override).not.toBeNull();

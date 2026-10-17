@@ -1194,12 +1194,10 @@ impl StopObservation {
     }
 
     fn annotate(&self, notice: RuntimeNotice) -> RuntimeNotice {
-        let notice = notice.with("stopMethod", self.stop_method).with(
-            "exitCode",
-            self.exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "none".into()),
-        );
+        let mut notice = notice.with("stopMethod", self.stop_method);
+        if let Some(code) = self.exit_code {
+            notice = notice.with("exitCode", code.to_string());
+        }
         if self.force_used {
             notice.with("forceUsed", "true")
         } else {
@@ -1208,16 +1206,37 @@ impl StopObservation {
     }
 
     pub fn notice(&self) -> RuntimeNotice {
-        let notice = RuntimeNotice::new("restartProcessStillRunning")
-            .with(
-                "exitCode",
-                self.exit_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "none".into()),
-            )
-            .with("stderr", truncate_stop_stderr(&self.stderr))
-            .with("canForce", self.can_force.to_string());
+        let notice = if self.exit_code.is_some() {
+            RuntimeNotice::new("restartProcessStillRunning")
+        } else {
+            RuntimeNotice::new("restartProcessCloseTimedOut")
+                .with("seconds", if self.force_used { "12" } else { "10" })
+        }
+        .with("stderr", truncate_stop_stderr(&self.stderr))
+        .with("canForce", self.can_force.to_string());
         self.annotate(notice)
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum OpenProcessFailure {
+    Abort,
+    Gone,
+    Skip,
+}
+
+/// Only an unobservable original root prevents shutdown from starting.
+/// Later failures must not abandon a tree whose windows may already be closing.
+#[cfg(any(target_os = "windows", test))]
+fn open_process_failure(is_root: bool, attempt: usize, code: Option<i32>) -> OpenProcessFailure {
+    if is_root && attempt == 0 {
+        OpenProcessFailure::Abort
+    } else if code == Some(87) {
+        // ERROR_INVALID_PARAMETER: the snapshot raced with process exit.
+        OpenProcessFailure::Gone
+    } else {
+        OpenProcessFailure::Skip
     }
 }
 
@@ -1324,6 +1343,7 @@ async fn stop_windows_codex_and_wait(
     // Hold handles throughout shutdown: even if Windows reuses a PID, force
     // escalation can only terminate the processes we actually observed.
     let mut handles: Vec<(u32, OwnedHandle)> = Vec::new();
+    let mut reported_failures = std::collections::HashSet::new();
     // WM_CLOSE can stop the bridge before Desktop's remaining helpers exit.
     // Preserve the live evidence collected before sending the first close.
     let mut observation = StopObservation::not_running();
@@ -1354,11 +1374,20 @@ async fn stop_windows_codex_and_wait(
                     )
                 };
                 if raw.is_null() {
-                    // Processes can disappear between the snapshot and OpenProcess.
-                    if std::io::Error::last_os_error().raw_os_error() == Some(87) {
-                        continue;
+                    let error = std::io::Error::last_os_error();
+                    match open_process_failure(pid == target.pid, attempt, error.raw_os_error()) {
+                        OpenProcessFailure::Abort => return Err(error),
+                        OpenProcessFailure::Gone => {}
+                        OpenProcessFailure::Skip => {
+                            if reported_failures.insert(pid) {
+                                observation.stderr = truncate_stop_stderr(&format!(
+                                    "{} OpenProcess PID {pid} skipped: {error};",
+                                    observation.stderr
+                                ));
+                            }
+                        }
                     }
-                    return Err(std::io::Error::last_os_error());
+                    continue;
                 }
                 handles.push((pid, unsafe { OwnedHandle::from_raw_handle(raw) }));
             }
@@ -1409,7 +1438,11 @@ async fn stop_windows_codex_and_wait(
                 if alive.contains(pid)
                     && unsafe { TerminateProcess(handle.as_raw_handle(), 1) } == 0
                 {
-                    observation.stderr = std::io::Error::last_os_error().to_string();
+                    observation.stderr = truncate_stop_stderr(&format!(
+                        "{} TerminateProcess PID {pid}: {};",
+                        observation.stderr,
+                        std::io::Error::last_os_error()
+                    ));
                 }
             }
         }
@@ -1643,6 +1676,52 @@ mod tests {
 mod restart_guard_tests {
     use super::*;
     use crate::enhanced_runtime::{BridgeLifecycle, ChildAttestation};
+
+    #[test]
+    fn open_process_failures_only_abort_for_the_initial_root() {
+        use OpenProcessFailure::{Abort, Gone, Skip};
+        for code in [Some(5), Some(87), Some(6), None] {
+            assert_eq!(open_process_failure(true, 0, code), Abort);
+            for (is_root, attempt) in [(false, 0), (false, 1), (true, 1), (false, 100)] {
+                assert_eq!(
+                    open_process_failure(is_root, attempt, code),
+                    if code == Some(87) { Gone } else { Skip }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn close_timeout_without_exit_code_reports_seconds_and_consent() {
+        let mut observation = StopObservation::not_running();
+        observation.exited = false;
+        observation.stop_method = "graceful";
+        observation.can_force = true;
+        observation.stderr = "OpenProcess PID 123 skipped: Access denied;".into();
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessCloseTimedOut");
+        assert_eq!(notice.params["seconds"], "10");
+        assert_eq!(notice.params["canForce"], "true");
+        assert_eq!(notice.params["stopMethod"], "graceful");
+        assert!(notice.params["stderr"].contains("PID 123"));
+        assert!(!notice.params.contains_key("exitCode"));
+
+        observation.force_used = true;
+        observation.stop_method = "forced";
+        observation.can_force = false;
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessCloseTimedOut");
+        assert_eq!(notice.params["seconds"], "12");
+        assert_eq!(notice.params["forceUsed"], "true");
+        assert_eq!(notice.params["canForce"], "false");
+        assert!(!notice.params.contains_key("exitCode"));
+
+        observation.exit_code = Some(1);
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessStillRunning");
+        assert_eq!(notice.params["exitCode"], "1");
+        assert!(!notice.params.contains_key("seconds"));
+    }
 
     fn attestation(open_turns: u32) -> BridgeAttestationV1 {
         BridgeAttestationV1 {

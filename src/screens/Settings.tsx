@@ -618,7 +618,8 @@ export function Settings({
 
   // 進行中的對話，或無法確認閒置而未能關閉時，讓使用者看過警告後明確覆寫。
   const restartCanForce = restart?.notice.code === "restartBlockedByCodexTurn"
-    || (restart?.notice.code === "restartProcessStillRunning" && restart.notice.params.canForce === "true");
+    || ((restart?.notice.code === "restartProcessStillRunning"
+      || restart?.notice.code === "restartProcessCloseTimedOut") && restart.notice.params.canForce === "true");
 
   /// 這顆按鈕就是交接本身：寫 launch manifest、取得 CODEX_CLI_PATH 的 lease、
   /// 關掉並重開 Codex Desktop，然後最多等 90 秒看 bridge 有沒有回報 attestation。
