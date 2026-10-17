@@ -70,7 +70,7 @@ describe("daily Desktop package", () => {
     expect(darwinJob).toMatch(/finalize-remote-darwin-manifest\.mjs/);
     expect(buildLocalRelease).toMatch(/aarch64-apple-darwin/);
     expect(buildLocalRelease).toMatch(/finalize-remote-darwin-manifest\.mjs/);
-    expect(finalizeDarwinManifest).toMatch(/schemaVersion = 4/);
+    expect(finalizeDarwinManifest).toMatch(/schemaVersion === 5 \? 5 : 4/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/codex/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-remote-agent/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-proxy-daemon/);

@@ -37,29 +37,6 @@ if ($Resume -and $Mode -eq "stage-only") {
 $proxyFingerprint = Get-VellumProxySourceFingerprint $repo
 $proxyImage = Get-VellumExpectedProxyImage $repo $version
 
-function BundleArtifact([string] $Relative, [string] $Path) {
-    [ordered]@{
-        url = "bundle://$Relative"
-        sha256 = Sha256 $Path
-    }
-}
-
-function Test-CompleteArch([string] $ArchRoot, [string] $ExpectedImage) {
-    foreach ($name in @("vellum-remote-agent", "vellum-remote-broker", "codex", "proxy-image.tar")) {
-        $artifact = Join-Path $ArchRoot $name
-        if (-not (Test-Path -LiteralPath $artifact -PathType Leaf) -or
-            (Get-Item -LiteralPath $artifact).Length -eq 0) {
-            return $false
-        }
-    }
-    $imageMarker = Join-Path $ArchRoot "proxy-image.ref"
-    if (-not (Test-Path -LiteralPath $imageMarker -PathType Leaf) -or
-        [IO.File]::ReadAllText($imageMarker, [Text.Encoding]::UTF8).Trim() -ne $ExpectedImage) {
-        return $false
-    }
-    return $true
-}
-
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "Docker Desktop with buildx is required"
 }
@@ -72,7 +49,7 @@ $staged = @{}
 foreach ($arch in @("amd64", "arm64")) {
     $archRoot = Join-Path $scratchRoot $arch
     if ($Resume) {
-        Assert-VellumResumeFingerprint -ExpectedFingerprint $proxyFingerprint -ArchRoot $archRoot -ExpectedImage $proxyImage
+        Assert-VellumResumeFingerprint -ExpectedFingerprint $proxyFingerprint -ArchRoot $archRoot -ExpectedImage "${proxyImage}:$CodexVersion"
         Write-Host "==> Reuse completed Linux $arch payload"
         $staged[$arch] = $archRoot
         continue
@@ -87,9 +64,9 @@ foreach ($arch in @("amd64", "arm64")) {
     }
     New-Item -ItemType Directory -Force -Path $archRoot | Out-Null
 
-    Invoke-Checked "Build Linux $arch Agent and Broker" {
+    Invoke-Checked "Build Linux $arch musl Agent and native Proxy" {
         docker buildx build `
-            --platform "linux/$arch" `
+            --build-arg "REMOTE_ARCH=$arch" `
             --file (Join-Path $repo "deploy\remote-bundle\Dockerfile") `
             --target export `
             --output "type=local,dest=$archRoot" `
@@ -97,34 +74,11 @@ foreach ($arch in @("amd64", "arm64")) {
     }
 
     $codexTarget = if ($arch -eq "arm64") { "aarch64-unknown-linux-musl" } else { "x86_64-unknown-linux-musl" }
-    # Windows bsdtar cannot reliably open paths containing non-ASCII text.
-    # Download/extract under the ASCII TEMP path, then copy the binary back.
-    $codexTemp = Join-Path $env:TEMP "vellum-codex-$PID-$arch"
-    if (Test-Path -LiteralPath $codexTemp) {
-        Remove-Item -LiteralPath $codexTemp -Recurse -Force
+    Invoke-Checked "Download digest-verified Codex runtime package $CodexVersion for $arch" {
+        node (Join-Path $repo "scripts\download-codex-package.mjs") $CodexVersion $codexTarget (Join-Path $archRoot "codex-package.tar.gz")
     }
-    New-Item -ItemType Directory -Force -Path $codexTemp | Out-Null
-    $codexArchive = Join-Path $codexTemp "codex.tar.gz"
-    $codexUrl = "https://github.com/openai/codex/releases/download/rust-v$CodexVersion/codex-$codexTarget.tar.gz"
-    Invoke-Checked "Download pinned Codex $CodexVersion for $arch" {
-        curl.exe -fsSL --proto '=https' --tlsv1.2 $codexUrl -o $codexArchive
-    }
-    Invoke-Checked "Extract pinned Codex for $arch" {
-        tar.exe -xzf $codexArchive -C $codexTemp "codex-$codexTarget"
-    }
-    Copy-Item -LiteralPath (Join-Path $codexTemp "codex-$codexTarget") -Destination (Join-Path $archRoot "codex") -Force
-    Remove-Item -LiteralPath $codexTemp -Recurse -Force
 
-    $proxyArchive = Join-Path $archRoot "proxy-image.tar"
-    Invoke-Checked "Build Proxy OCI archive for $arch" {
-        docker buildx build `
-            --platform "linux/$arch" `
-            --file (Join-Path $repo "deploy\proxy\Dockerfile") `
-            --tag $proxyImage `
-            --output "type=docker,dest=$proxyArchive" `
-            $repo
-    }
-    [IO.File]::WriteAllText((Join-Path $archRoot "proxy-image.ref"), "$proxyImage`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $archRoot "native-source.ref"), "${proxyImage}:$CodexVersion`n", $utf8)
     $staged[$arch] = $archRoot
 }
 
@@ -139,52 +93,15 @@ foreach ($arch in @("amd64", "arm64")) {
         Remove-Item -LiteralPath $resolvedDestination -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    foreach ($name in @("vellum-remote-agent", "vellum-remote-broker", "codex", "proxy-image.tar")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
         Copy-Item -LiteralPath (Join-Path $staged[$arch] $name) -Destination (Join-Path $destination $name) -Force
     }
 }
 
-$amd64 = Join-Path $resourceRoot "linux-amd64"
-$arm64 = Join-Path $resourceRoot "linux-arm64"
 $agentVersion = (Select-String -Path (Join-Path $repo "crates\vellum-remote-agent\Cargo.toml") -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-$brokerVersion = (Select-String -Path (Join-Path $repo "crates\vellum-remote-broker\Cargo.toml") -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-$manifest = [ordered]@{
-    schemaVersion = 3
-    releaseVersion = $version
-    codex = [ordered]@{
-        pinnedVersion = $CodexVersion
-        compatibleRange = $CodexVersion
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/codex" (Join-Path $amd64 "codex")
-            'linux-arm64' = BundleArtifact "linux-arm64/codex" (Join-Path $arm64 "codex")
-        }
-    }
-    agent = [ordered]@{
-        version = $agentVersion
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/vellum-remote-agent" (Join-Path $amd64 "vellum-remote-agent")
-            'linux-arm64' = BundleArtifact "linux-arm64/vellum-remote-agent" (Join-Path $arm64 "vellum-remote-agent")
-        }
-    }
-    broker = [ordered]@{
-        version = $brokerVersion
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/vellum-remote-broker" (Join-Path $amd64 "vellum-remote-broker")
-            'linux-arm64' = BundleArtifact "linux-arm64/vellum-remote-broker" (Join-Path $arm64 "vellum-remote-broker")
-        }
-    }
-    proxy = [ordered]@{
-        image = $proxyImage
-        artifacts = [ordered]@{
-            'linux-x64' = BundleArtifact "linux-amd64/proxy-image.tar" (Join-Path $amd64 "proxy-image.tar")
-            'linux-arm64' = BundleArtifact "linux-arm64/proxy-image.tar" (Join-Path $arm64 "proxy-image.tar")
-        }
-    }
-    protocolVersion = 3
+Invoke-Checked "Finalize schema 5 native remote manifest" {
+    node (Join-Path $repo "scripts\finalize-remote-linux-manifest.mjs") $resourceRoot $version $CodexVersion $agentVersion $proxyFingerprint
 }
-$manifestPath = Join-Path $resourceRoot "manifest.json"
-$manifestJson = $manifest | ConvertTo-Json -Depth 8
-[IO.File]::WriteAllText($manifestPath, $manifestJson, (New-Object Text.UTF8Encoding($false)))
 
 $staged = Assert-VellumStagedRemotePayload `
     -ResourceRoot $resourceRoot `

@@ -7,7 +7,6 @@
  * remoteVocabulary 的真實清單展開 —— 那份清單本身對齊後端送得出來的值。
  */
 import { describe, expect, it } from "vitest";
-import remoteSource from "../src/screens/Remote.tsx?raw";
 import uiSource from "../src/components/ui.tsx?raw";
 import zhTW from "@/i18n/locales/zh-TW";
 import zhCN from "@/i18n/locales/zh-CN";
@@ -16,18 +15,23 @@ import ja from "@/i18n/locales/ja";
 import type { ResourceTree } from "@/i18n/resources";
 
 const LOCALES: Record<string, ResourceTree> = { "zh-TW": zhTW, "zh-CN": zhCN, en, ja };
+const remoteSources = import.meta.glob<string>([
+  "../src/screens/Remote.tsx", "../src/screens/remote/**/*.{ts,tsx}",
+  "../src/components/Remote*.tsx", "../src/components/remote/**/*.{ts,tsx}",
+  "../src/lib/remote*.ts",
+], { query: "?raw", import: "default", eager: true });
 
 /** 後端會送出來的 blocker 代號。跟 remoteVocabulary 的 BLOCKERS 一致。 */
 const BLOCKER_CODES = [
   "agentUnavailable", "codexRestartRequired", "credentialsMissing",
   "desktopOfficialAccountMissing", "dockerUnavailable", "intelMacUnsupported",
-  "guiSessionUnavailable", "proxyPortConflict", "insufficientDiskSpace",
+  "guiSessionUnavailable", "proxyPortConflict", "proxyPortOccupied", "insufficientDiskSpace",
   "incompleteObservation", "hostNotConfigured",
   "injectionRequiresReadyProxy", "invalidCompactionThreshold",
   "managedRuntimeRecoveryRequired", "nativeCodexVersionMismatch",
   "nativeDaemonAppOwned", "noModelsSelected", "officialAccountActivationRequired",
   "officialAccountPairingRequired", "officialAccountReauthenticationRequired", "proxyConfigurationMissing",
-  "systemdUserUnavailable", "versionMismatch",
+  "systemdUserUnavailable", "psStartTimeUnavailable", "versionMismatch",
 ];
 
 /** 三個 operation kind 走得到的 phase。 */
@@ -54,13 +58,13 @@ const PLURAL = new Set([
 
 function collectKeys(): string[] {
   const keys = new Set<string>();
-  for (const source of [remoteSource, uiSource]) {
+  for (const source of [...Object.values(remoteSources), uiSource]) {
     // t("…") 直接查的鍵
     for (const match of source.matchAll(/t\(\s*"([a-zA-Z0-9_.]+)"/g)) {
       if (match[1]) keys.add(match[1]);
     }
     // 先存成變數再查的鍵（primaryActionKey、restartKey、chore 的三元式…）
-    for (const match of source.matchAll(/"(remote\.[a-zA-Z0-9_.]+)"/g)) {
+    for (const match of source.matchAll(/"(remote(?:Work|Models)?\.(?:[a-zA-Z0-9_]+\.)*[a-zA-Z0-9_]+)"/g)) {
       if (match[1]) keys.add(match[1]);
     }
   }
@@ -102,8 +106,10 @@ describe("Remote screen translation keys", () => {
     // 抽取壞掉時（例如改了呼叫寫法）這一支會安靜地通過，所以先釘一個下限。
     expect(keys.length).toBeGreaterThan(120);
     expect(keys).toContain("remote.act.bootstrap");
-    expect(keys).toContain("remote.act.reconverge");
-    expect(keys).toContain("remote.chore.takeoverNative");
+    expect(keys).toContain("remoteWork.redeploy");
+    expect(keys).toContain("remote.act.takeoverNative");
+    expect(keys).toContain("remoteWork.details");
+    expect(keys).toContain("remoteModels.title");
   });
 
   for (const [locale, tree] of Object.entries(LOCALES)) {

@@ -9,24 +9,28 @@ pub fn probe_host() -> HostCapabilities {
     let arch = std::env::consts::ARCH.to_string();
     let platform = crate::platform::RemotePlatform::from_os_arch(&os, &arch).ok();
     let user_home = dirs::home_dir();
+    let persistence = crate::persistence::probe();
     HostCapabilities {
         os: os.clone(),
         arch,
         docker_available: docker.available,
         docker_mode: docker.mode,
         rootless_docker: docker.rootless,
-        user_systemd_available: user_systemd_available(),
-        linger_enabled: linger_enabled(),
+        user_systemd_available: persistence.systemd_user,
+        linger_enabled: persistence.linger,
         codex_binary: codex.binary,
         codex_version: codex.version,
         platform: platform.map(|item| item.artifact_key().to_string()),
         proxy_backend: platform.map(|item| item.proxy_backend_name().to_string()),
-        service_manager: platform.map(|item| item.service_manager().to_string()),
-        persistence_scope: platform.map(|item| item.persistence_scope().to_string()),
-        managed_codex_home: user_home
-            .as_ref()
-            .map(|home| crate::platform::managed_codex_home(home, &os).display().to_string()),
+        service_manager: observed_service_manager(&os, platform, persistence),
+        persistence_scope: observed_persistence_scope(&os, platform, persistence),
+        managed_codex_home: user_home.as_ref().map(|home| {
+            crate::platform::managed_codex_home(home, &os)
+                .display()
+                .to_string()
+        }),
         gui_session_available: Some(gui_session_available()),
+        supervisor_ready: None,
     }
 }
 
@@ -260,7 +264,11 @@ fn probe_disk_posix() -> Option<(u64, u64)> {
 }
 
 fn sysctl_u64(args: &[&str]) -> Option<u64> {
-    let output = Command::new("sysctl").args(["-n"]).args(args).output().ok()?;
+    let output = Command::new("sysctl")
+        .args(["-n"])
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -339,27 +347,34 @@ fn parse_cpu_count(input: &str) -> Option<u64> {
     (count > 0).then_some(count as u64)
 }
 
-fn user_systemd_available() -> bool {
-    Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .output()
-        .is_ok_and(|output| output.status.success())
+pub fn observed_service_manager(
+    os: &str,
+    platform: Option<crate::platform::RemotePlatform>,
+    persistence: crate::persistence::LinuxPersistence,
+) -> Option<String> {
+    platform.map(|platform| {
+        if os == "linux" {
+            persistence.service_manager()
+        } else {
+            platform.service_manager()
+        }
+        .into()
+    })
 }
 
-fn linger_enabled() -> bool {
-    let user = Command::new("id")
-        .arg("-un")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
-    let Some(user) = user else { return false };
-    Command::new("loginctl")
-        .args(["show-user", &user, "-p", "Linger", "--value"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "yes")
+pub fn observed_persistence_scope(
+    os: &str,
+    platform: Option<crate::platform::RemotePlatform>,
+    persistence: crate::persistence::LinuxPersistence,
+) -> Option<String> {
+    platform.map(|platform| {
+        if os == "linux" {
+            persistence.scope()
+        } else {
+            platform.persistence_scope()
+        }
+        .into()
+    })
 }
 
 fn gui_session_available() -> bool {

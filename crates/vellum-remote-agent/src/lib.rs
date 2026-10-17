@@ -3,10 +3,14 @@
 //! Owns install/update, proxy container lifecycle, host probes and repair.
 //! Does not own broker sessions, approvals, or model request adaptation.
 
+pub mod codex_package;
 pub mod configuration;
 pub mod docker;
 pub mod grok;
+pub mod handoff;
+mod handoff_git;
 pub mod host_probe;
+mod migration;
 pub mod mobile_account;
 pub mod mutation_lock;
 pub mod native_account;
@@ -14,8 +18,10 @@ pub mod native_codex;
 pub mod native_proxy;
 pub mod native_session;
 pub mod official_account;
+pub mod on_demand;
 pub mod operations;
 pub mod permissions;
+pub mod persistence;
 pub mod platform;
 pub mod process_identity;
 pub mod profile;
@@ -42,5 +48,5 @@ pub use protocol::{
 pub use proxy::{ProxyManager, ProxyStartRequest};
 pub use state::{AgentPaths, AgentStateStore, InstallRecord};
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const AGENT_PROTOCOL_VERSION: u32 = 5;
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");

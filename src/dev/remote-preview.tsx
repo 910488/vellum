@@ -19,6 +19,10 @@ import { usePreviewCaptureReady } from "@/dev/usePreviewCaptureReady";
 import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { Remote } from "@/screens/Remote";
+import { HandoffNotifications } from "@/components/HandoffNotifications";
+import { refreshHandoffs } from "@/lib/handoffStore";
+import { requestHandoffReview } from "@/lib/handoffNavigation";
+import type { RemoteHandoffRecord, RemoteHandoffThread } from "@/lib/remoteHandoff";
 import type {
   RemoteHostCandidate,
   RemoteHostStatus,
@@ -29,20 +33,32 @@ import "@/styles/tokens.css";
 import "@/styles/base.css";
 import "@/styles/components.css";
 
-/** 工作面的四個狀態，加上兩個最會出事的變體。 */
+/** 工作面的五個狀態，加上交接與 SSH 信任的既有場景。 */
 const SCENES = {
   ready: "就緒",
   fresh: "未部署",
+  waitingForIdle: "等待閒置",
   running: "進行中",
   failed: "失敗",
+  readyOnDemand: "就緒（onDemand 常駐）",
+  deployHistory: "進階展開＋部署紀錄",
   appOwned: "被 Codex App 佔住",
   unreachable: "連不上",
+  handoffCompose: "交接：準備交出",
+  handoffBlocked: "交接：平台阻擋",
+  handoffRunning: "交接：遠端進行中",
+  handoffBack: "交接：結果回來",
+  handoffBackNoHost: "交接：結果回來（未加入 Codex App）",
+  handoffDrift: "交接：本機已變動",
+  emptyHosts: "SSH：空清單",
+  addingHost: "SSH：新增中",
+  inheritedTrust: "SSH：指紋沿用信任",
 } as const;
 type Scene = keyof typeof SCENES;
 
 const HOSTS: RemoteHostCandidate[] = [
   {
-    codexHostId: "jetson", vellumHostId: "jetson", displayName: "Jetson Orin",
+    codexHostId: "remote-ssh-discovered:jetson-orin", vellumHostId: "jetson", displayName: "Jetson Orin",
     sshAlias: "example-host", hostname: "192.0.2.10", user: "operator", port: 22,
     source: "codexApp", validated: true, validationError: null,
   },
@@ -129,6 +145,12 @@ function baseStatus(): RemoteHostStatus {
 function statusFor(scene: Scene): RemoteHostStatus {
   const status = baseStatus();
   switch (scene) {
+    case "readyOnDemand":
+      return {
+        ...status,
+        agent: { ...status.agent!, capabilities: { ...status.agent!.capabilities, persistenceScope: "onDemand", serviceManager: "supervisor", userSystemdAvailable: false, lingerEnabled: false } },
+        inventory: { ...status.inventory!, persistenceScope: "onDemand", serviceManager: "supervisor" },
+      };
     case "fresh":
       return {
         ...status,
@@ -175,13 +197,49 @@ const FAILED: RemoteOperationProgress = {
  * 真的那條路徑（hasTauri() 為真、call() 真的走 invoke）。
  */
 function installFixture(getScene: () => Scene) {
-  const invoke = async (cmd: string): Promise<unknown> => {
+  const thread: RemoteHandoffThread = { threadId: "local-thread", name: "word-count CLI：加 top_words 與命令列介面", repo: "E:\\code_E\\demo-repo", branch: "main", updatedAt: Date.now() / 1000 - 720, model: "GPT-5.6 Sol", modelProvider: "vellum", effort: "high", active: false, handedOff: false,
+    draft: { task: "完成 top_words(text, n) 與命令列介面，並補測試。", originalRequest: "實作 word-count CLI，第 1 項先在本機完成，第 2 項交給遠端。", lastProgress: "第 1 項 parser 已完成，CLI 與 top_words 尚未實作。" } };
+  let handoff: RemoteHandoffRecord | null = null;
+  const makeRecord = (running: boolean): RemoteHandoffRecord => ({
+    id: "01JPREVIEWHANDOFF", hostId: "jetson", source: thread,
+    snapshot: { base: "a".repeat(40), commit: "b".repeat(40), localRef: "refs/vellum-handoff/01JPREVIEWHANDOFF", changes: [] },
+    request: {}, stage: "running", error: null,
+    remote: { handoffId: "01JPREVIEWHANDOFF", phase: "running", state: running ? "running" : "completed", threadId: "remote-thread", turnId: "remote-turn", turnStatus: running ? "inProgress" : "completed", plan: ["補上 top_words", "實作命令列介面", "執行測試"], recentOutput: "$ python3 -m unittest -v\ntest_top_words_basic ... ok\ntest_top_words_empty ... ok", summary: running ? "正在補測試。" : "已完成 top_words 與 CLI；6 個測試通過。", capture: null },
+    result: { captureOperation: null, capture: running ? null : { resultRef: "refs/vellum-handoff-results/01JPREVIEWHANDOFF/capture", commit: "c".repeat(40), snapshotCommit: "b".repeat(40), partial: false, diffstat: [{ path: "wordcount.py", added: 46, deleted: 1 }, { path: "wordcount/__main__.py", added: 19, deleted: 0 }, { path: "tests/test_wordcount.py", added: 16, deleted: 0 }] }, fetched: !running, outcome: null, branch: null, applyIntent: false, cleaned: false, acknowledged: false },
+  });
+  if (["handoffRunning", "handoffBack", "handoffBackNoHost", "handoffDrift"].includes(getScene())) handoff = makeRecord(getScene() === "handoffRunning");
+  const invoke = async (cmd: string, args: Record<string, unknown> = {}): Promise<unknown> => {
     const scene = getScene();
     switch (cmd) {
+      case "get_remote_deploy_summary": return scene === "deployHistory"
+        ? { total: 12, succeeded: 9, failed: 2, interrupted: 1, blocked: 3, lastFailureCode: "proxyPortConflict" }
+        : { total: 0, succeeded: 0, failed: 0, interrupted: 0, blocked: 0, lastFailureCode: null };
+      case "list_remote_handoff_threads": return [thread, { ...thread, threadId: "second", name: "修正 restart pill 反覆亮起", branch: "codex/restart-pill" }];
+      case "list_remote_host_models": return [
+        { catalogId: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", routeId: "official", upstreamModel: "gpt-5.6-luna", selected: true, mandatory: true },
+        { catalogId: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", routeId: "cc", upstreamModel: "deepseek-v4-flash", selected: true, mandatory: false },
+      ];
+      case "update_remote_host_models": return { ...RUNNING, phase: "waitingForIdle", percent: 15 };
+      case "preflight_remote_handoff": return { thread, changes: [{ path: "wordcount.py", staged: true, untracked: false }, { path: "tests/test_wordcount.py", staged: false, untracked: false }, { path: "NOTES.local.md", staged: false, untracked: true }], blockers: scene === "handoffBlocked" || args.requirements && (args.requirements as {requiredOs?: string}).requiredOs === "windows" ? ["HandoffPlatformMismatch: task requires windows, remote is linux"] : [], warnings: ["Remote tool python is unavailable; use python3 instead."], remoteOs: "linux", localRefNotice: "Snapshot ref retained until apply/discard." };
+      case "list_remote_handoffs": return handoff ? [handoff] : [];
+      case "get_remote_handoff_thread_link": return scene === "handoffBackNoHost" ? null : "codex://threads/remote-thread?hostId=remote-ssh-discovered%3Ajetson-orin";
+      case "open_remote_handoff_thread": return null;
+      case "start_remote_handoff": handoff = makeRecord(true); return handoff;
+      case "poll_remote_handoff": case "resume_remote_handoff": return handoff;
+      case "capture_remote_handoff": if (handoff) { const partial = handoff.remote?.state === "running"; handoff.result = makeRecord(false).result; if (handoff.result.capture) handoff.result.capture.partial = partial; } return handoff;
+      case "review_remote_handoff": return { canApply: scene !== "handoffDrift", patch: "diff --git a/wordcount.py b/wordcount.py\n--- a/wordcount.py\n+++ b/wordcount.py\n@@ -1 +1 @@\n-pass\n+def top_words(text, n): ...\n" };
+      case "settle_remote_handoff": if (handoff) { handoff.result.outcome = args.branchOnly ? "branched" : "applied"; handoff.result.branch = args.branchOnly ? `vellum/handoff-${handoff.id}` : null; handoff.result.cleaned = true; } return handoff;
+      case "discard_remote_handoff": if (handoff) { handoff.result.outcome = "discarded"; handoff.result.cleaned = true; } return handoff;
+      case "acknowledge_remote_handoff": if (handoff) handoff.result.acknowledged = true; return null;
       case "get_remote_manager_feature_flags":
         return { nativeCodexRemoteManager: true, legacyBrokerHostsDropped: [] };
       case "remote_ssh_trust_status":
-        return { host: "192.0.2.10", port: 22, confirmed: true };
+        return { host: "192.0.2.10", port: 22, confirmed: true,
+          source: scene === "inheritedTrust" ? "userKnownHosts" : "explicitConfirmation",
+          fingerprint: scene === "inheritedTrust" ? {host: "192.0.2.10", port: 22, keyType: "ssh-ed25519", fingerprint: "SHA256:fWGOBFJCuLczHBhYs/jCgMIJ/NUUnYJmt5/owwnZAc4"} : null };
+      case "add_remote_ssh_host":
+        if (scene === "addingHost") return new Promise(() => undefined);
+        return { candidate: HOSTS[0], loginCommand: "ssh -F '/vellum/remote-ssh/config' -- vellum-added-preview", keyInstallCommand: "ssh-copy-id -F '/vellum/remote-ssh/config' vellum-added-preview" };
       case "remote_ssh_fetch_fingerprint":
         return {
           host: "192.0.2.10",
@@ -199,7 +257,7 @@ function installFixture(getScene: () => Scene) {
           proxyDigest: `sha256:${"a".repeat(64)}`, detail: "verified",
         };
       case "discover_remote_connections":
-        return HOSTS;
+        return scene === "emptyHosts" || scene === "addingHost" ? [] : scene === "handoffBackNoHost" ? HOSTS.map((host) => ({ ...host, codexHostId: null, source: "openSsh" })) : HOSTS;
       case "inspect_remote_host":
         return statusFor(scene);
       case "get_remote_session_summary":
@@ -215,7 +273,9 @@ function installFixture(getScene: () => Scene) {
       case "restore_remote_host":
       case "apply_remote_deployment":
       case "get_remote_operation":
-        return scene === "failed" || scene === "appOwned" ? FAILED : RUNNING;
+        return scene === "failed" || scene === "appOwned" ? FAILED
+          : scene === "waitingForIdle" ? { ...RUNNING, phase: "waitingForIdle", percent: 15, message: "activeWorkInProgress" }
+          : RUNNING;
       case "plan_remote_deployment":
         return {
           planId: "plan-preview", hostId: "jetson", state: "readyToApply",
@@ -273,8 +333,57 @@ function Harness() {
 
   useEffect(() => {
     installFixture(() => scene);
+    void refreshHandoffs();
     setNonce((current) => current + 1);
   }, [scene]);
+
+  useEffect(() => {
+    if (!["running", "failed", "waitingForIdle"].includes(scene)) return;
+    // Exercise the real deploy + confirmation path, only against the fixture.
+    let deployed = false;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      if (++attempts > 80) { window.clearInterval(timer); return; }
+      if (!deployed) {
+        const button = document.querySelector<HTMLButtonElement>(".remote-work__line button");
+        if (!button || button.disabled) return;
+        button.click();
+        deployed = true;
+      }
+      const confirm = document.querySelector<HTMLButtonElement>("dialog[open] .dialog__acts button:last-child");
+      if (!confirm || confirm.disabled) return;
+      confirm.click();
+      window.clearInterval(timer);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [scene, nonce]);
+
+  useEffect(() => {
+    if (scene !== "deployHistory") return;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      const advanced = document.querySelector<HTMLDetailsElement>(".remote-advanced");
+      if (advanced) advanced.open = true;
+      if (advanced || ++attempts > 80) window.clearInterval(timer);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [scene, nonce]);
+
+  useEffect(() => {
+    if (scene !== "addingHost") return;
+    // Drive the real form against a never-resolving fixture, with no network.
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      const input = document.querySelector<HTMLInputElement>("[data-remote-add-input]");
+      if (!input || input.disabled) { if (++attempts > 40) window.clearInterval(timer); return; }
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, "dev@example.test:2222");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      window.requestAnimationFrame(() => input.closest("form")?.requestSubmit());
+      window.clearInterval(timer);
+    }, 50);
+    return () => window.clearInterval(timer);
+  }, [scene, nonce]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -316,6 +425,7 @@ function Harness() {
           會是一個永遠不捲的版面，也就驗不到這一版最主要的那個決定。 */}
       <div className="shell" style={{ gridTemplateColumns: "minmax(0, 1fr)", gridTemplateRows: "minmax(0, 1fr)" }}>
         <div className="canvas">
+          <HandoffNotifications key={`${scene}-${nonce}`} onReview={requestHandoffReview} />
           <Remote key={`${scene}-${nonce}`} refreshVersion={0} onRefreshComplete={() => {}} />
         </div>
       </div>

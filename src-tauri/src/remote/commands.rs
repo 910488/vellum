@@ -3,6 +3,7 @@
 use crate::error::AppResult;
 use crate::state::{AppState, RemoteSidebarMode};
 use sha2::{Digest, Sha256};
+use tauri_plugin_opener::OpenerExt;
 
 /// Remote commands talk to the host over `ssh` and wait for it. A synchronous
 /// Tauri command runs on the main thread, so each call froze the window for a
@@ -145,6 +146,21 @@ pub async fn discover_remote_connections(
 }
 
 #[tauri::command]
+pub async fn add_remote_ssh_host(
+    state: tauri::State<'_, AppState>,
+    destination: String,
+) -> AppResult<super::ssh_added::AddedHost> {
+    off_main_thread(&state, move |state| {
+        let home = dirs::home_dir()
+            .ok_or_else(|| crate::error::AppError::Message("SshConfigHomeMissing".into()))?;
+        let added = super::ssh_added::add(&state.data_root(), &destination, &home)?;
+        state.remote().import_discovered_host(&added.candidate)?;
+        Ok(added)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn inspect_remote_host(
     state: tauri::State<'_, AppState>,
     host_id: String,
@@ -160,31 +176,263 @@ pub async fn inspect_remote_host(
 }
 
 #[tauri::command]
+pub async fn list_remote_handoff_threads(
+    state: tauri::State<'_, AppState>,
+) -> AppResult<Vec<super::handoff::LocalThread>> {
+    off_main_thread(&state, |state| super::handoff::list_threads(&state)).await
+}
+
+#[tauri::command]
+pub async fn get_remote_handoff_thread_link(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<Option<String>> {
+    off_main_thread(&state, move |state| {
+        super::handoff::thread_link(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_remote_handoff_thread(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<()> {
+    // Resolve again on click; neither URI nor Desktop host ID comes from the renderer.
+    let uri = off_main_thread(&state, move |state| {
+        super::handoff::thread_link(&state, &handoff_id)
+    })
+    .await?
+    .ok_or_else(|| crate::error::AppError::Message("HandoffCodexHostUnavailable".into()))?;
+    app.opener()
+        .open_url(&uri, None::<String>)
+        .map_err(|error| {
+            crate::error::AppError::Message(format!("HandoffCodexOpenFailed: {error}"))
+        })
+}
+
+#[tauri::command]
+pub async fn preflight_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    thread_id: String,
+    requirements: super::handoff::Requirements,
+) -> AppResult<super::handoff::Preflight> {
+    off_main_thread(&state, move |state| {
+        super::handoff::preflight(&state, &host_id, &thread_id, &requirements)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn start_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    thread_id: String,
+    brief: String,
+    requirements: super::handoff::Requirements,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::start(&state, &host_id, &thread_id, &brief, &requirements)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn resume_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::resume(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn poll_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::poll(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_remote_handoffs(
+    state: tauri::State<'_, AppState>,
+) -> AppResult<Vec<super::handoff::Record>> {
+    off_main_thread(&state, |state| super::handoff::list(&state)).await
+}
+
+#[tauri::command]
+pub async fn capture_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::capture(&state, &handoff_id)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn review_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Review> {
+    off_main_thread(&state, move |state| {
+        super::handoff::review(&state, &handoff_id)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn settle_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+    branch_only: bool,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::settle(&state, &handoff_id, branch_only)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn discard_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<super::handoff::Record> {
+    off_main_thread(&state, move |state| {
+        super::handoff::discard(&state, &handoff_id)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn acknowledge_remote_handoff(
+    state: tauri::State<'_, AppState>,
+    handoff_id: String,
+) -> AppResult<()> {
+    off_main_thread(&state, move |state| {
+        super::handoff::acknowledge(&state, &handoff_id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn bootstrap_remote_host(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
+    off_main_thread(&state, move |state| start_converge(&state, &host_id, None)).await
+}
+
+#[tauri::command]
+pub async fn list_remote_host_models(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> AppResult<Vec<super::deployment::RemoteModelOption>> {
+    off_main_thread(&state, move |state| {
+        super::deployment::model_options(&state, &host_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_remote_host_models(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    catalog_ids: Vec<String>,
+) -> AppResult<crate::remote::RemoteOperationProgress> {
+    off_main_thread(&state, move |state| {
+        start_converge(&state, &host_id, Some(catalog_ids))
+    })
+    .await
+}
+
+fn start_converge(
+    state: &AppState,
+    host_id: &str,
+    catalog_ids: Option<Vec<String>>,
+) -> AppResult<crate::remote::RemoteOperationProgress> {
+    let (queued, run) = prepare_converge(state, host_id, catalog_ids)?;
+    tauri::async_runtime::spawn(run);
+    crate::remote::operation::load(&state.data_root(), &queued.operation_id)
+}
+
+/// UI and live qualification share registration, journaling and execution.
+/// The caller chooses its executor; no Tauri runtime is required by the core.
+pub(crate) fn prepare_converge(
+    state: &AppState,
+    host_id: &str,
+    catalog_ids: Option<Vec<String>>,
+) -> AppResult<(
+    crate::remote::RemoteOperationProgress,
+    impl std::future::Future<Output = crate::remote::RemoteOperationProgress> + Send + 'static,
+)> {
+    let host_id = host_id.to_owned();
     let operation_id = format!("one-click-bootstrap-{}", ulid::Ulid::new());
-    let progress = crate::remote::RemoteOperationProgress::queued(
+    let control = super::converge_control::register(&operation_id, &host_id)?;
+    let registration = super::converge_control::Registration(operation_id.clone());
+    let desired = catalog_ids
+        .map(|ids| super::host_models::prepare_selection(state, &host_id, &ids))
+        .transpose()?;
+    let trigger = if desired.is_some() {
+        super::deploy_log::Trigger::Models
+    } else if super::desired_state::load(&state.data_root(), &host_id)?.observed_revision > 0 {
+        super::deploy_log::Trigger::Redeploy
+    } else {
+        super::deploy_log::Trigger::Deploy
+    };
+    let mut progress = crate::remote::RemoteOperationProgress::queued(
         operation_id.clone(),
         host_id.clone(),
         "oneClickBootstrap",
     );
     crate::remote::operation::save(&state.data_root(), &progress)?;
-    let owned = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
+    let mut evidence = super::deploy_log::Recorder::begin(
+        &state.data_root(),
+        &progress,
+        trigger,
+        state.remote().cached_snapshot(&host_id),
+    )?;
+    let saved = desired.map_or(Ok(()), |desired| {
+        super::desired_state::save(&state.data_root(), &desired)
+    });
+    if let Err(error) = saved {
+        progress.state = "failed".into();
+        progress.phase = "failed".into();
+        progress.message = Some(error.to_string());
+        let _ = super::operation::save(&state.data_root(), &progress);
+        let _ = evidence.finish(&progress);
+        return Err(error);
+    }
+    let owned = state.clone();
+    let queued = progress.clone();
+    Ok((queued, async move {
+        let _registration = registration;
         let mut running = progress;
         let progress_root = owned.data_root();
-        let result = crate::remote::bootstrap::one_click_bootstrap(
+        let result = crate::remote::bootstrap::one_click_bootstrap_controlled(
             &owned,
             &host_id,
             |phase, percent, message| {
+                evidence.phase(phase);
                 running.phase = phase.into();
                 running.percent = percent;
                 running.message = Some(message.into());
+                running.result = if phase == "awaitingTakeover" {
+                    control
+                        .token()
+                        .map(|token| serde_json::json!({"takeoverToken": token}))
+                } else {
+                    None
+                };
                 running.updated_at = chrono::Utc::now();
                 let _ = crate::remote::operation::save(&progress_root, &running);
             },
+            Some(control.as_ref()),
         )
         .await;
         match result {
@@ -196,15 +444,71 @@ pub async fn bootstrap_remote_host(
                 running.result = serde_json::to_value(result).ok();
             }
             Err(error) => {
-                running.phase = "failed".into();
-                running.state = "failed".into();
+                let cancelled = error.to_string() == "DeploymentCancelled";
+                running.phase = if cancelled { "cancelled" } else { "failed" }.into();
+                running.state = if cancelled { "cancelled" } else { "failed" }.into();
                 running.message = Some(error.to_string());
+                running.result = None;
             }
         }
         running.updated_at = chrono::Utc::now();
+        if evidence.finish(&running).is_err() {
+            log::warn!("DeploymentLogUnavailable");
+        }
         let _ = crate::remote::operation::save(&progress_root, &running);
-    });
-    crate::remote::operation::load(&state.data_root(), &operation_id)
+        running
+    }))
+}
+
+#[tauri::command]
+pub fn cancel_remote_deployment(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    operation_id: String,
+) -> AppResult<()> {
+    validate_live_deployment(&state.data_root(), &host_id, &operation_id)?;
+    super::converge_control::resolve(&operation_id, &host_id)?.cancel();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn confirm_remote_deployment_takeover(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    operation_id: String,
+    token: String,
+) -> AppResult<()> {
+    let progress = validate_live_deployment(&state.data_root(), &host_id, &operation_id)?;
+    if progress.phase != "awaitingTakeover"
+        || progress
+            .result
+            .as_ref()
+            .and_then(|result| result.get("takeoverToken"))
+            .and_then(serde_json::Value::as_str)
+            != Some(token.as_str())
+    {
+        return Err(crate::error::AppError::Message(
+            "DeploymentConfirmationExpired".into(),
+        ));
+    }
+    super::converge_control::resolve(&operation_id, &host_id)?.confirm(&token)
+}
+
+fn validate_live_deployment(
+    root: &std::path::Path,
+    host_id: &str,
+    operation_id: &str,
+) -> AppResult<crate::remote::RemoteOperationProgress> {
+    let progress = super::operation::load(root, operation_id)?;
+    if progress.host_id != host_id
+        || progress.kind != "oneClickBootstrap"
+        || progress.state != "running"
+    {
+        return Err(crate::error::AppError::Message(
+            "DeploymentControlUnavailable".into(),
+        ));
+    }
+    Ok(progress)
 }
 
 #[tauri::command]
@@ -245,16 +549,26 @@ pub async fn apply_remote_deployment(
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
     off_main_thread(&state, move |state| {
         let operation_id = ulid::Ulid::new().to_string();
+        let _control = super::converge_control::register(&operation_id, &host_id)?;
+        let registration = super::converge_control::Registration(operation_id.clone());
         let progress = crate::remote::RemoteOperationProgress::queued(
             operation_id.clone(),
             host_id.clone(),
             "applyDeployment",
         );
         crate::remote::operation::save(&state.data_root(), &progress)?;
+        let mut evidence = super::deploy_log::Recorder::begin(
+            &state.data_root(),
+            &progress,
+            super::deploy_log::Trigger::Redeploy,
+            state.remote().cached_snapshot(&host_id),
+        )?;
         let owned = state.clone();
         tauri::async_runtime::spawn(async move {
+            let _registration = registration;
             let mut running = progress;
             running.phase = "applying".into();
+            evidence.phase("applying");
             running.percent = 10;
             running.updated_at = chrono::Utc::now();
             let _ = crate::remote::operation::save(&owned.data_root(), &running);
@@ -272,6 +586,9 @@ pub async fn apply_remote_deployment(
                 }
             }
             running.updated_at = chrono::Utc::now();
+            if evidence.finish(&running).is_err() {
+                log::warn!("DeploymentLogUnavailable");
+            }
             let _ = crate::remote::operation::save(&owned.data_root(), &running);
         });
         crate::remote::operation::load(&state.data_root(), &operation_id)
@@ -284,7 +601,18 @@ pub fn get_remote_operation(
     state: tauri::State<'_, AppState>,
     operation_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
-    crate::remote::operation::load(&state.data_root(), &operation_id)
+    crate::remote::operation::load_reconciled(&state.data_root(), &operation_id)
+}
+
+#[tauri::command]
+pub async fn get_remote_deploy_summary(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> AppResult<super::deploy_log::Summary> {
+    off_main_thread(&state, move |state| {
+        super::deploy_log::summary(&state.data_root(), &host_id)
+    })
+    .await
 }
 
 fn restart_remote_native_codex_inner(
@@ -357,15 +685,24 @@ pub async fn restore_remote_host(
     host_id: String,
 ) -> AppResult<crate::remote::RemoteOperationProgress> {
     let operation_id = format!("one-click-restore-{}", ulid::Ulid::new());
+    let _control = super::converge_control::register(&operation_id, &host_id)?;
+    let registration = super::converge_control::Registration(operation_id.clone());
     let progress = crate::remote::RemoteOperationProgress::queued(
         operation_id.clone(),
         host_id.clone(),
         "oneClickRestore",
     );
     crate::remote::operation::save(&state.data_root(), &progress)?;
+    let mut evidence = super::deploy_log::Recorder::begin(
+        &state.data_root(),
+        &progress,
+        super::deploy_log::Trigger::Restore,
+        state.remote().cached_snapshot(&host_id),
+    )?;
     let owned = state.inner().clone();
     let task_operation_id = operation_id.clone();
     tauri::async_runtime::spawn(async move {
+        let _registration = registration;
         let mut running = progress;
         let progress_root = owned.data_root();
         let result = crate::remote::restore::one_click_restore(
@@ -373,6 +710,7 @@ pub async fn restore_remote_host(
             &host_id,
             &task_operation_id,
             |phase, percent, message| {
+                evidence.phase(phase);
                 running.phase = phase.into();
                 running.percent = percent;
                 running.message = Some(message.into());
@@ -395,6 +733,9 @@ pub async fn restore_remote_host(
             }
         }
         running.updated_at = chrono::Utc::now();
+        if evidence.finish(&running).is_err() {
+            log::warn!("DeploymentLogUnavailable");
+        }
         let _ = crate::remote::operation::save(&progress_root, &running);
     });
     crate::remote::operation::load(&state.data_root(), &operation_id)
@@ -455,10 +796,7 @@ pub async fn cancel_remote_grok_login(
 /// the original single-account behaviour — Desktop's current default — so the
 /// one-account-at-a-time repair path stays exactly as it was; passing one is
 /// what lets first-run setup walk the whole account list.
-fn requested_account_id(
-    state: &AppState,
-    account_id: Option<String>,
-) -> AppResult<String> {
+fn requested_account_id(state: &AppState, account_id: Option<String>) -> AppResult<String> {
     let requested = account_id
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty());
@@ -471,8 +809,7 @@ fn requested_account_id(
             .peek_accounts()
             .iter()
             .any(|(id, _, _)| *id == requested)
-            && super::desktop_control_account_id(state).as_deref()
-                != Some(requested.as_str())
+            && super::desktop_control_account_id(state).as_deref() != Some(requested.as_str())
         {
             return Err(crate::error::AppError::Message(
                 "desktopOfficialAccountUnknown".into(),
@@ -897,6 +1234,56 @@ pub async fn remote_session_summary(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shared_converge_core_records_start_and_finish_without_tauri_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::with_data_dir(temp.path().to_path_buf());
+        let host = format!("missing-{}", ulid::Ulid::new());
+        let (queued, run) = super::prepare_converge(&state, &host, None).unwrap();
+        let finished = run.await;
+        assert_eq!(finished.state, "failed");
+        let events = crate::remote::deploy_log::recent(temp.path(), &host).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation_id, queued.operation_id);
+        assert_eq!(events[0].event, "started");
+        assert_eq!(events[1].event, "finished");
+        assert_eq!(
+            events[1].result,
+            Some(crate::remote::deploy_log::Outcome::Failed)
+        );
+    }
+
+    #[test]
+    fn model_update_refuses_a_running_deployment_before_writing_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::with_data_dir(temp.path().to_path_buf());
+        let id = format!("models-busy-{}", ulid::Ulid::new());
+        let _control = super::super::converge_control::register(&id, &id).unwrap();
+        let _registration = super::super::converge_control::Registration(id.clone());
+        let result = super::start_converge(&state, &id, Some(vec!["official".into()]));
+        assert_eq!(result.unwrap_err().to_string(), "DeploymentAlreadyRunning");
+        assert!(!temp.path().join("remote-desired-state").exists());
+        assert!(!temp.path().join("remote-operations").exists());
+    }
+    #[test]
+    fn deployment_control_refuses_wrong_host_kind_or_finished_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut progress = super::super::operation::RemoteOperationProgress::queued(
+            "control-test".into(),
+            "host".into(),
+            "oneClickBootstrap",
+        );
+        super::super::operation::save(temp.path(), &progress).unwrap();
+        assert!(super::validate_live_deployment(temp.path(), "host", "control-test").is_ok());
+        assert!(super::validate_live_deployment(temp.path(), "another", "control-test").is_err());
+        progress.state = "cancelled".into();
+        super::super::operation::save(temp.path(), &progress).unwrap();
+        assert!(super::validate_live_deployment(temp.path(), "host", "control-test").is_err());
+        progress.state = "running".into();
+        progress.kind = "restore".into();
+        super::super::operation::save(temp.path(), &progress).unwrap();
+        assert!(super::validate_live_deployment(temp.path(), "host", "control-test").is_err());
+    }
     #[test]
     fn sidebar_appears_only_for_managed_hosts_or_explicit_preference() {
         use crate::state::RemoteSidebarMode::{Auto, Hide, Show};

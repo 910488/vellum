@@ -35,6 +35,8 @@ impl Drop for ResolvedBootstrapArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapResult {
+    #[serde(default)]
+    pub preflight: Option<super::preflight::DeploymentPreflight>,
     pub operation_id: String,
     pub state: String,
     pub os: String,
@@ -72,6 +74,10 @@ pub struct OneClickBootstrapResult {
     pub proxy_ready: bool,
     pub native_daemon_running: bool,
     pub detached_ready: bool,
+    #[serde(default)]
+    pub chatgpt_pairing_suggested: bool,
+    #[serde(default)]
+    pub omitted_catalog_ids: Vec<String>,
 }
 
 /// Prepare an SSH host and converge it to its complete native Remote Manager
@@ -81,7 +87,19 @@ pub struct OneClickBootstrapResult {
 pub async fn one_click_bootstrap<F>(
     state: &AppState,
     host_id: &str,
+    progress: F,
+) -> AppResult<OneClickBootstrapResult>
+where
+    F: FnMut(&str, u8, &str),
+{
+    one_click_bootstrap_controlled(state, host_id, progress, None).await
+}
+
+pub(crate) async fn one_click_bootstrap_controlled<F>(
+    state: &AppState,
+    host_id: &str,
     mut progress: F,
+    control: Option<&super::converge_control::DeploymentControl>,
 ) -> AppResult<OneClickBootstrapResult>
 where
     F: FnMut(&str, u8, &str),
@@ -89,15 +107,23 @@ where
     progress(
         "hostPreflight",
         5,
-        "Checking SSH host, Docker and user services",
+        "Checking platform, credentials and bundled deployment artifacts",
     );
-    let mut prepared = bootstrap(state, host_id)?;
+    let mut prepared = prepare_with_control(state, host_id, &mut progress, control).await?;
 
     let native_unavailable = prepared
         .blocked_reasons
         .iter()
         .any(|reason| reason.starts_with("nativeCodexUnavailable:"));
-    if native_unavailable && crate::remote::pinned_install::release_status().ready {
+    let codex_update = prepared.preflight.as_ref().is_some_and(|report| {
+        report
+            .auto_fix
+            .iter()
+            .any(|fix| fix == "codex.installPinned")
+    });
+    if (native_unavailable || codex_update) && crate::remote::pinned_install::release_status().ready
+    {
+        check_cancelled(control)?;
         progress(
             "installCodex",
             20,
@@ -109,7 +135,7 @@ where
             &format!("{}-install-codex", prepared.operation_id),
         )?;
         progress("nativeDaemon", 35, "Enabling durable Codex remote control");
-        prepared = bootstrap(state, host_id)?;
+        prepared = prepare_with_control(state, host_id, &mut progress, control).await?;
     }
     if !prepared.blocked_reasons.is_empty() {
         return Err(AppError::Message(format!(
@@ -120,30 +146,12 @@ where
     }
 
     let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
-    let before = client.host_status()?;
-    let sessions = client.codex_session_status(None)?;
-    let active_session = sessions
-        .get("threads")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|thread| {
-            thread.get("active").and_then(serde_json::Value::as_bool) == Some(true)
-                || thread
-                    .get("activeTurnId")
-                    .is_some_and(|turn_id| !turn_id.is_null())
-        });
-    if before
-        .pointer("/nativeCodex/activeTurn")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || active_session
-    {
-        return Err(AppError::Message(
-            "OneClickBootstrapBlocked: activeTurnInProgress; wait for the current Codex turn to finish"
-                .into(),
-        ));
+    if let Some(control) = control {
+        if wait_for_idle(&client, control, &mut progress).await? {
+            prepared = prepare_with_control(state, host_id, &mut progress, Some(control)).await?;
+        }
     }
+    check_cancelled(control)?;
 
     progress(
         "deploymentPlan",
@@ -151,14 +159,8 @@ where
         "Resolving qualified models and credentials",
     );
     let desired = crate::remote::desired_state::load(&state.data_root(), host_id)?;
-    let plan = crate::remote::deployment::plan(
-        state,
-        host_id,
-        crate::remote::RemoteModelSelection {
-            catalog_ids: desired.selected_catalog_ids,
-            policy: crate::remote::deployment::RemotePolicyOverrides::default(),
-        },
-    )?;
+    let (plan, model_selection) =
+        crate::remote::deployment::plan_for_converge(state, host_id, &desired)?;
     if !plan.blocked_reasons.is_empty() {
         return Err(AppError::Message(format!(
             "OneClickBootstrapBlocked: {}",
@@ -171,32 +173,54 @@ where
         60,
         "Installing proxy, credentials and native catalog",
     );
-    let applied = crate::remote::deployment::apply(state, host_id, &plan.plan_id).await?;
+    check_cancelled(control)?;
+    let mut applied = crate::remote::deployment::apply(state, host_id, &plan.plan_id).await?;
+    check_cancelled(control)?;
 
     progress(
         "verification",
         92,
         "Verifying proxy, native daemon and detach readiness",
     );
-    let verified = RemoteHostManager::aggregate_status(state, host_id)?;
-    let proxy_ready = verified
+    let expected_port = applied_proxy_port(&applied.proxy);
+    let (verified, retried) = verify_with_retry(
+        || RemoteHostManager::aggregate_status(state, host_id),
+        || {
+            check_cancelled(control)?;
+            client
+                .proxy_start(
+                    &format!("{}-verify-start", applied.operation_id),
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        },
+        |status| verify_deployment_status(status, expected_port),
+        || {
+            progress(
+                "verificationRetry",
+                96,
+                "Starting proxy and retrying verification once",
+            )
+        },
+    )?;
+    check_cancelled(control)?;
+    if retried {
+        applied.completed_steps.push("verification.retried".into());
+    }
+    // Return the observed service, rather than the possibly stale apply reply.
+    let observed_proxy = verified
         .agent
         .as_ref()
-        .and_then(|agent| agent.pointer("/proxy/ready"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let native_daemon_running = verified
-        .agent
-        .as_ref()
-        .and_then(|agent| agent.pointer("/nativeCodex/daemonRunning"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let detached_ready = verified.manager_state == "detachedReady" && native_daemon_running;
-    if !proxy_ready || !native_daemon_running || !detached_ready {
-        return Err(AppError::Message(format!(
-            "OneClickBootstrapVerificationFailed: managerState={}, proxyReady={proxy_ready}, nativeDaemonRunning={native_daemon_running}, detachedReady={detached_ready}",
-            verified.manager_state
-        )));
+        .and_then(|agent| agent.get("proxy"))
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Message("OneClickBootstrapVerificationFailed: proxy status missing".into())
+        })?;
+    if let Some(detail) = applied.proxy.get_mut("detail") {
+        *detail = observed_proxy;
+    } else {
+        applied.proxy = observed_proxy;
     }
     progress(
         "verified",
@@ -210,10 +234,72 @@ where
         selected_catalog_ids: plan.selected_catalog_ids,
         apply: applied,
         manager_state: verified.manager_state,
-        proxy_ready,
-        native_daemon_running,
-        detached_ready,
+        proxy_ready: true,
+        native_daemon_running: true,
+        detached_ready: true,
+        chatgpt_pairing_suggested: model_selection.chatgpt_pairing_suggested,
+        omitted_catalog_ids: model_selection.omitted_catalog_ids,
     })
+}
+
+fn applied_proxy_port(proxy: &serde_json::Value) -> Option<u64> {
+    // proxy.start returns an OperationResult; no-op apply returns raw status.
+    proxy
+        .get("detail")
+        .unwrap_or(proxy)
+        .get("hostPort")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// The retry boundary deliberately exposes only observation and idempotent
+/// start. Install, configure, credential sync and takeover cannot run again.
+fn verify_with_retry<T>(
+    mut observe: impl FnMut() -> AppResult<T>,
+    mut start: impl FnMut() -> AppResult<()>,
+    validate: impl Fn(&T) -> AppResult<()>,
+    mut retry_progress: impl FnMut(),
+) -> AppResult<(T, bool)> {
+    let mut read = || -> AppResult<T> {
+        let status = observe()?;
+        validate(&status)?;
+        Ok(status)
+    };
+    if let Ok(status) = read() {
+        return Ok((status, false));
+    }
+    retry_progress();
+    // An SSH reply may be lost after start succeeded. Always observe once
+    // more, even if start returned an error; readiness is the authority.
+    let start_failed = start().is_err();
+    read().map(|status| (status, true)).map_err(|error: AppError| AppError::Message(format!(
+        "OneClickBootstrapVerificationFailed: retryExhausted; retryStartFailed={start_failed}; {error}"
+    )))
+}
+
+fn verify_deployment_status(
+    status: &crate::remote::RemoteHostAggregateStatus,
+    expected_port: Option<u64>,
+) -> AppResult<()> {
+    let agent = status.agent.as_ref();
+    let proxy_ready = agent
+        .and_then(|agent| agent.pointer("/proxy/ready"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let native_running = agent
+        .and_then(|agent| agent.pointer("/nativeCodex/daemonRunning"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let actual_port = agent
+        .and_then(|agent| agent.pointer("/proxy/hostPort"))
+        .and_then(serde_json::Value::as_u64);
+    let port_matches = expected_port.is_some_and(|port| (1..=65535).contains(&port))
+        && actual_port == expected_port;
+    if !proxy_ready || !native_running || status.manager_state != "detachedReady" || !port_matches {
+        return Err(AppError::Message(format!(
+            "OneClickBootstrapVerificationFailed: managerState={}, proxyReady={proxy_ready}, nativeDaemonRunning={native_running}, proxyPortMatches={port_matches}", status.manager_state
+        )));
+    }
+    Ok(())
 }
 
 /// Qualification entry point for a genuinely new Vellum host. It proves the
@@ -275,25 +361,348 @@ where
 }
 
 pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> {
+    bootstrap_with_progress(state, host_id, |_| Ok(()), None)
+}
+
+fn bootstrap_with_progress(
+    state: &AppState,
+    host_id: &str,
+    mut before_write: impl FnMut(&super::preflight::DeploymentPreflight) -> AppResult<()>,
+    control: Option<&super::converge_control::DeploymentControl>,
+) -> AppResult<BootstrapResult> {
+    super::preflight::before_deployment(
+        || inspect_bootstrap(state, host_id),
+        |report, context| {
+            before_write(&report)?;
+            bootstrap_prepared(state, host_id, context, report, control)
+        },
+    )
+}
+
+fn check_cancelled(control: Option<&super::converge_control::DeploymentControl>) -> AppResult<()> {
+    control.map_or(Ok(()), |control| control.check())
+}
+
+struct NativeWaitClient<'a> {
+    client: &'a RemoteAgentClient,
+}
+impl super::converge_control::WaitClient for NativeWaitClient<'_> {
+    fn observe(&self) -> AppResult<(serde_json::Value, Option<serde_json::Value>)> {
+        let status = self.client.host_status()?;
+        let sessions = if status
+            .pointer("/nativeCodex/daemonRunning")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            Some(self.client.codex_session_status(None)?)
+        } else {
+            None
+        };
+        Ok((status, sessions))
+    }
+    fn stop_app_owned(&self, native: &serde_json::Value) -> AppResult<()> {
+        self.client
+            .codex_stop_app_owned_expected(
+                &format!("converge-takeover-{}", ulid::Ulid::new()),
+                native,
+            )
+            .map(|_| ())
+    }
+}
+
+async fn wait_for_idle(
+    client: &RemoteAgentClient,
+    control: &super::converge_control::DeploymentControl,
+    progress: &mut impl FnMut(&str, u8, &str),
+) -> AppResult<bool> {
+    use super::converge_control::{step, ObservationDeadline, WaitStep};
+    let client = NativeWaitClient { client };
+    let started = std::time::Instant::now();
+    let mut deadline = ObservationDeadline::default();
+    loop {
+        let next = step(control, &client)?;
+        deadline.check(&next, started.elapsed())?;
+        match next {
+            WaitStep::Ready => return Ok(false),
+            WaitStep::TookOver => return Ok(true),
+            WaitStep::Observing => progress(
+                "observing",
+                7,
+                "Reading Codex daemon, turn, tool and approval status (up to 30 seconds)",
+            ),
+            WaitStep::WaitingForIdle => progress(
+                "waitingForIdle",
+                7,
+                "Waiting for Codex turns, tools and approvals to finish",
+            ),
+            WaitStep::AwaitingTakeover => progress(
+                "awaitingTakeover",
+                8,
+                "Confirm takeover of the idle Codex App server",
+            ),
+        }
+        control.wait().await;
+    }
+}
+
+async fn prepare_with_control(
+    state: &AppState,
+    host_id: &str,
+    progress: &mut impl FnMut(&str, u8, &str),
+    control: Option<&super::converge_control::DeploymentControl>,
+) -> AppResult<BootstrapResult> {
+    struct Preparation<'a, P> {
+        state: &'a AppState,
+        host_id: &'a str,
+        progress: &'a mut P,
+        control: Option<&'a super::converge_control::DeploymentControl>,
+    }
+    impl<P: FnMut(&str, u8, &str)> super::converge_control::PreparationClient for Preparation<'_, P> {
+        type Output = BootstrapResult;
+        fn prepare(&mut self) -> AppResult<BootstrapResult> {
+            let control = self.control;
+            check_cancelled(control)?;
+            bootstrap_with_progress(
+                self.state,
+                self.host_id,
+                |_| {
+                    check_cancelled(control)?;
+                    (self.progress)("autoFix", 10, "Converging approved deployment repairs");
+                    Ok(())
+                },
+                control,
+            )
+        }
+        async fn wait_for_retry(&mut self) -> AppResult<()> {
+            let control = self
+                .control
+                .ok_or_else(|| AppError::Message("DeploymentControlUnavailable".into()))?;
+            control.check()?;
+            control.wait().await;
+            control.check()?;
+            let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(
+                self.state,
+                self.host_id,
+            )?);
+            wait_for_idle(&client, control, self.progress).await?;
+            Ok(())
+        }
+    }
+    // Non-interactive callers retain the original error without waiting.
+    let mut preparation = Preparation {
+        state,
+        host_id,
+        progress,
+        control,
+    };
+    if control.is_none() {
+        use super::converge_control::PreparationClient;
+        return preparation.prepare();
+    }
+    super::converge_control::prepare_bounded(&mut preparation).await
+}
+
+struct BootstrapContext {
+    probe: BootstrapProbe,
+    target: super::ResolvedAgentTarget,
+    agent_digest: String,
+}
+
+fn inspect_bootstrap(
+    state: &AppState,
+    host_id: &str,
+) -> AppResult<(super::preflight::DeploymentPreflight, BootstrapContext)> {
+    if let Some(code) = crate::process::native_ssh_blocker() {
+        return Err(AppError::Message(format!("OneClickBootstrapBlocked: {code}; repair: enable the Windows OpenSSH Client optional feature")));
+    }
+    inspect_bootstrap_with(state, host_id, &SshBootstrapProbe)
+}
+
+trait BootstrapProbeClient {
+    fn probe(&self, data_root: &Path, alias: &str) -> AppResult<BootstrapProbe>;
+    fn ps(&self, data_root: &Path, alias: &str) -> AppResult<super::preflight::PsProbeOutput>;
+}
+
+struct SshBootstrapProbe;
+impl BootstrapProbeClient for SshBootstrapProbe {
+    fn probe(&self, data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
+        probe(data_root, alias)
+    }
+    fn ps(&self, data_root: &Path, alias: &str) -> AppResult<super::preflight::PsProbeOutput> {
+        super::preflight::PsProcessClient::probe_start_time(&SshPsProcessClient {
+            data_root,
+            alias,
+        })
+    }
+}
+
+fn inspect_bootstrap_with(
+    state: &AppState,
+    host_id: &str,
+    transport: &dyn BootstrapProbeClient,
+) -> AppResult<(super::preflight::DeploymentPreflight, BootstrapContext)> {
     let target = RemoteHostManager::resolve_target(state, host_id)?;
     let alias = target
         .ssh_destination
-        .clone()
+        .as_deref()
         .ok_or_else(|| AppError::Message("bootstrap requires an SSH destination".into()))?;
+    let data_root = state.data_root();
+    let probe = transport.probe(&data_root, alias)?;
+    let mut report = super::preflight::DeploymentPreflight::default();
+    let platform = match super::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch) {
+        Ok(platform) => platform,
+        Err(error) => {
+            report.blockers.push(error.code.into());
+            report
+                .repairs
+                .insert(error.code.into(), error.message.clone());
+            report.repair_commands.push(error.message);
+            return Ok((
+                report,
+                BootstrapContext {
+                    probe,
+                    target,
+                    agent_digest: String::new(),
+                },
+            ));
+        }
+    };
+    struct PsAdapter<'a> {
+        transport: &'a dyn BootstrapProbeClient,
+        root: &'a Path,
+        alias: &'a str,
+    }
+    impl super::preflight::PsProcessClient for PsAdapter<'_> {
+        fn probe_start_time(&self) -> AppResult<super::preflight::PsProbeOutput> {
+            self.transport.ps(self.root, self.alias)
+        }
+    }
+    if let Some(blocker) = check_linux_prerequisites(
+        &probe,
+        &PsAdapter {
+            transport,
+            root: &data_root,
+            alias,
+        },
+    )? {
+        report.blockers.push(blocker.code.into());
+        report
+            .repairs
+            .insert(blocker.code.into(), blocker.repair.into());
+        report.repair_commands.push(blocker.repair.into());
+        return Ok((
+            report,
+            BootstrapContext {
+                probe,
+                target,
+                agent_digest: String::new(),
+            },
+        ));
+    }
+    if platform.service_manager() == super::platform::SERVICE_MANAGER_LAUNCHD
+        && !probe.gui_session_available
+    {
+        report.blockers.push("guiSessionUnavailable".into());
+    }
+    if !report.blockers.is_empty() {
+        return Ok((
+            report,
+            BootstrapContext {
+                probe,
+                target,
+                agent_digest: String::new(),
+            },
+        ));
+    }
+    super::deployment::preflight_models(state, host_id)?;
+    let manifest = super::pinned_install::load_verified_manifest()
+        .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
+    let agent_artifact = super::pinned_install::component_artifact_for_os_arch(
+        &manifest,
+        "vellum-remote-agent",
+        &probe.os,
+        &probe.arch,
+    )?;
+    let proxy_artifact = super::pinned_install::component_artifact_for_os_arch(
+        &manifest,
+        "vellum-proxy-daemon",
+        &probe.os,
+        &probe.arch,
+    )?;
+    let codex_artifact = super::pinned_install::artifact_for_os_arch(
+        &manifest.codex.artifacts,
+        &probe.os,
+        &probe.arch,
+    )?;
+    let mut payload = 0u64;
+    for artifact in [&agent_artifact, &proxy_artifact, codex_artifact] {
+        let size = super::pinned_install::inspect_bundled_artifact(artifact)
+            .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
+        payload = payload.checked_add(size).ok_or_else(|| {
+            AppError::Message("insufficientDiskSpace: release size overflow".into())
+        })?;
+    }
+    let expanded_codex = super::pinned_install::inspect_bundled_codex_package(codex_artifact)
+        .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
+    // A compressed package is much smaller than its installed runtime. Reserve
+    // expanded bytes too, rather than passing the archive size as extraction cost.
+    payload = payload.checked_add(expanded_codex).ok_or_else(|| {
+        AppError::Message("insufficientDiskSpace: expanded release size overflow".into())
+    })?;
+    super::space::gate_replace(probe.disk_free_bytes, payload).map_err(AppError::Message)?;
+    let expected_agent = agent_artifact
+        .sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&agent_artifact.sha256);
+    if !probe.agent_installed || probe.agent_sha256.as_deref() != Some(expected_agent) {
+        report.auto_fix.extend([
+            "agent.update".into(),
+            "native.observeAfterAgentUpdate".into(),
+        ]);
+    } else {
+        let client = RemoteAgentClient::new(target.clone());
+        let status = client.host_status()?;
+        inspect_existing_agent(&client, &status, &manifest, state, host_id, &mut report)?;
+    }
+    report
+        .auto_fix
+        .extend(["credentials.provision".into(), "proxy.converge".into()]);
+    report.auto_fix.sort();
+    report.auto_fix.dedup();
+    Ok((
+        report,
+        BootstrapContext {
+            probe,
+            target,
+            agent_digest: agent_artifact.sha256,
+        },
+    ))
+}
+
+fn bootstrap_prepared(
+    state: &AppState,
+    host_id: &str,
+    context: BootstrapContext,
+    preflight: super::preflight::DeploymentPreflight,
+    control: Option<&super::converge_control::DeploymentControl>,
+) -> AppResult<BootstrapResult> {
+    let BootstrapContext {
+        probe,
+        target,
+        agent_digest,
+    } = context;
+    let alias = target
+        .ssh_destination
+        .clone()
+        .ok_or_else(|| AppError::Message("bootstrap requires SSH".into()))?;
     let operation_id = format!("bootstrap-{}", ulid::Ulid::new());
     let data_root = state.data_root();
-    let probe = probe(&data_root, &alias)?;
-    let platform =
-        match crate::remote::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch) {
-            Ok(platform) => platform,
-            Err(error) => {
-                return Ok(blocked(operation_id, probe, error.code, &error.message));
-            }
-        };
+    let platform = super::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch)
+        .map_err(|error| AppError::Message(error.code.into()))?;
     let normalized_arch = platform.bundle_dir();
-    let remote_agent_sha256 = probe.agent_sha256.clone();
     let remote_broker_sha256 = probe.broker_sha256.clone();
     let mut result = BootstrapResult {
+        preflight: Some(preflight),
         operation_id: operation_id.clone(),
         state: "bootstrapping".into(),
         os: probe.os.clone(),
@@ -314,8 +723,36 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
         managed_codex_home: probe.managed_codex_home.clone(),
     };
 
+    let agent_needs_install = result
+        .preflight
+        .as_ref()
+        .is_some_and(|report| report.auto_fix.iter().any(|fix| fix == "agent.update"));
+    let agent_artifact = if agent_needs_install {
+        let artifact = resolve_bootstrap_artifact(
+            find_artifact("vellum-remote-agent", normalized_arch),
+            "vellum-remote-agent",
+            &probe.os,
+            &probe.arch,
+        )?;
+        if artifact.digest.trim_start_matches("sha256:")
+            != agent_digest.trim_start_matches("sha256:")
+        {
+            return Err(AppError::Message(
+                "bundledReleaseUnavailable: selected agent differs from signed artifact".into(),
+            ));
+        }
+        Some(artifact)
+    } else {
+        None
+    };
+    check_cancelled(control)?;
     match install_managed_ssh_isolation(&data_root, host_id, &alias, &probe) {
         Ok(alias_name) => {
+            if host_id.starts_with("added-") {
+                state
+                    .remote()
+                    .use_added_isolation_alias(host_id, &alias_name)?;
+            }
             result
                 .completed_steps
                 .push(format!("ssh.isolationInstalled:{alias_name}"));
@@ -331,25 +768,14 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
         }
     }
 
-    let agent_artifact = find_artifact("vellum-remote-agent", normalized_arch);
-    let agent_needs_install = !result.agent_installed
-        || agent_artifact
-            .as_deref()
-            .and_then(file_sha256)
-            .is_some_and(|digest| Some(digest) != remote_agent_sha256);
-    if agent_needs_install {
-        let artifact = resolve_bootstrap_artifact(
-            agent_artifact,
-            "vellum-remote-agent",
-            &probe.os,
-            &probe.arch,
-        )?;
+    if let Some(artifact) = agent_artifact {
+        check_cancelled(control)?;
         install_artifact(
             &data_root,
             &alias,
             &artifact.path,
             "vellum-remote-agent",
-            &artifact.digest,
+            &agent_digest,
             probe.disk_free_bytes,
         )?;
         result.agent_installed = true;
@@ -394,37 +820,56 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
     }
 
     let client = RemoteAgentClient::new(target);
+    check_cancelled(control)?;
     client.agent_version()?;
     result.completed_steps.push("agent.compatible".into());
+    // A fresh/updated Agent can now observe the real native state and port.
+    // Recheck before boundary credentials, linger or Codex lifecycle writes.
+    let manifest = super::pinned_install::load_verified_manifest()?;
+    let observed = client.host_status()?;
+    let mut rechecked = super::preflight::DeploymentPreflight::default();
+    inspect_existing_agent(
+        &client,
+        &observed,
+        &manifest,
+        state,
+        host_id,
+        &mut rechecked,
+    )?;
+    super::preflight::before_deployment(
+        || Ok((rechecked, ())),
+        |report, _| {
+            if let Some(preflight) = result.preflight.as_mut() {
+                preflight.auto_fix.extend(report.auto_fix);
+                preflight.auto_fix.sort();
+                preflight.auto_fix.dedup();
+            }
+            Ok(())
+        },
+    )?;
     if platform.docker_is_blocker() && !result.docker_available {
         result.blocked_reasons.push("dockerUnavailable".into());
         result.repair_commands.push(
             "依 Linux 發行版安裝 Docker，並將目前使用者加入可執行 docker 的群組後重新登入。".into(),
         );
     }
+    check_cancelled(control)?;
     if platform.service_manager() == crate::remote::platform::SERVICE_MANAGER_SYSTEMD_USER {
-        if !result.systemd_user_available {
-            result.blocked_reasons.push("systemdUserUnavailable".into());
-            result.repair_commands.push(
-                "確認 systemd user manager 可用，並由系統管理員執行：loginctl enable-linger $USER"
-                    .into(),
-            );
-        } else if !result.linger_enabled {
-            match ensure_linger(&data_root, &alias) {
-                Ok(()) => {
-                    result.linger_enabled = true;
-                    result.completed_steps.push("host.lingerEnabled".into());
-                }
-                Err(error) => {
-                    result
-                        .blocked_reasons
-                        .push(format!("lingerEnableFailed:{error}"));
-                    result.repair_commands.push(
-                        "Enable lingering for the SSH user (loginctl enable-linger $USER), then retry Bootstrap"
-                            .into(),
-                    );
-                }
-            }
+        let (scope, linger) =
+            linux_persistence_scope(result.systemd_user_available, result.linger_enabled, || {
+                ensure_linger(&data_root, &alias).is_ok()
+            });
+        result.persistence_scope = Some(scope.into());
+        result.linger_enabled = linger;
+        if scope == "onDemand" {
+            result.service_manager = Some("agent-supervisor".into());
+            result
+                .completed_steps
+                .push("host.onDemandPersistence".into());
+        } else if scope == "login" {
+            result.completed_steps.push("host.loginPersistence".into());
+        } else if !probe.linger_enabled {
+            result.completed_steps.push("host.lingerEnabled".into());
         }
     } else if !probe.gui_session_available {
         result.blocked_reasons.push("guiSessionUnavailable".into());
@@ -433,10 +878,12 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
                 .into(),
         );
     }
+    check_cancelled(control)?;
     crate::remote::provision_remote_boundary_key(&client, &data_root, host_id, &operation_id)?;
     result
         .completed_steps
         .push("credentials.boundaryReady".into());
+    check_cancelled(control)?;
     match client.codex_bootstrap_native(&format!("{operation_id}-codex")) {
         Ok(native) => {
             crate::remote::confirm_remote_boundary_key_consumers(
@@ -485,7 +932,105 @@ pub fn bootstrap(state: &AppState, host_id: &str) -> AppResult<BootstrapResult> 
     Ok(result)
 }
 
-#[derive(Debug)]
+fn inspect_existing_agent(
+    client: &RemoteAgentClient,
+    status: &serde_json::Value,
+    manifest: &super::pinned_install::ReleaseManifest,
+    state: &AppState,
+    host_id: &str,
+    report: &mut super::preflight::DeploymentPreflight,
+) -> AppResult<()> {
+    let desired = super::desired_state::load(&state.data_root(), host_id)?;
+    client.proxy_select_port(desired.proxy_port)?;
+    let sessions = if status
+        .pointer("/nativeCodex/daemonRunning")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        Some(client.codex_session_status(None)?)
+    } else {
+        None
+    };
+    classify_existing_agent(
+        status,
+        sessions.as_ref(),
+        &manifest.codex.pinned_version,
+        report,
+    );
+    if !report.blockers.is_empty() {
+        return Ok(());
+    }
+    if status
+        .pointer("/nativeCodex/compatible")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        super::deployment::select_for_converge(state, host_id, &desired)?;
+    } else {
+        // Account RPCs need a usable Codex install. Local credential eligibility
+        // was checked already; observe the remote grant after pinned install.
+        report
+            .auto_fix
+            .push("models.observeAfterCodexInstall".into());
+    }
+    Ok(())
+}
+
+fn classify_existing_agent(
+    status: &serde_json::Value,
+    sessions: Option<&serde_json::Value>,
+    pinned_version: &str,
+    report: &mut super::preflight::DeploymentPreflight,
+) {
+    use serde_json::Value;
+    match status
+        .pointer("/configuration/state")
+        .and_then(Value::as_str)
+    {
+        Some("incompatible") => report
+            .blockers
+            .push("proxyConfigurationSchemaTooNew".into()),
+        Some("unreadable") => report.blockers.push("proxyConfigurationUnreadable".into()),
+        Some("current") => {}
+        _ => report.auto_fix.push("proxy.configure".into()),
+    }
+    let native = status.get("nativeCodex");
+    let version_matches = native
+        .and_then(|native| native.get("codexVersion").or_else(|| native.get("version")))
+        .and_then(Value::as_str)
+        .and_then(|version| version.split_whitespace().last())
+        == Some(pinned_version);
+    if !version_matches
+        || native
+            .and_then(|native| native.pointer("/runtimePackage/complete"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        || native
+            .and_then(|native| native.get("compatible"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        report.auto_fix.push("codex.installPinned".into());
+    }
+    if native
+        .and_then(|native| native.get("daemonRunning"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if let Err(code) = super::observation::require_idle_for_destructive_op(sessions, native) {
+            report.blockers.push(code.into());
+        }
+        if native
+            .and_then(|native| native.get("restartSafe"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            report.blockers.push("nativeDaemonAppOwned".into());
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct BootstrapProbe {
     os: String,
     arch: String,
@@ -501,6 +1046,61 @@ struct BootstrapProbe {
     user_home: Option<String>,
     managed_codex_home: Option<String>,
     disk_free_bytes: Option<u64>,
+    distribution: String,
+    distribution_like: String,
+}
+
+struct SshPsProcessClient<'a> {
+    data_root: &'a Path,
+    alias: &'a str,
+}
+
+impl super::preflight::PsProcessClient for SshPsProcessClient<'_> {
+    fn probe_start_time(&self) -> AppResult<super::preflight::PsProbeOutput> {
+        let output = ssh_script(
+            self.data_root,
+            self.alias,
+            super::preflight::PS_PROBE_SCRIPT.as_bytes(),
+            "sh -s --",
+        )?;
+        super::preflight::parse_ps_probe_output(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+fn check_linux_prerequisites(
+    probe: &BootstrapProbe,
+    client: &dyn super::preflight::PsProcessClient,
+) -> AppResult<Option<super::preflight::PrerequisiteBlocker>> {
+    super::preflight::ps_start_time_preflight(
+        &probe.os,
+        &probe.distribution,
+        &probe.distribution_like,
+        client,
+    )
+}
+
+/// Direct apply must enforce the same read-only gate as bootstrap, before any
+/// agent mutation. Local development targets have no SSH host to provision.
+pub(crate) fn preflight_linux_host(state: &AppState, host_id: &str) -> AppResult<()> {
+    let target = RemoteHostManager::resolve_target(state, host_id)?;
+    let Some(alias) = target.ssh_destination else {
+        return Ok(());
+    };
+    let data_root = state.data_root();
+    let probe = probe(&data_root, &alias)?;
+    if let Some(blocker) = check_linux_prerequisites(
+        &probe,
+        &SshPsProcessClient {
+            data_root: &data_root,
+            alias: &alias,
+        },
+    )? {
+        return Err(AppError::Message(format!(
+            "DeploymentPreflightBlocked: {}; repair: {}",
+            blocker.code, blocker.repair
+        )));
+    }
+    Ok(())
 }
 
 fn probe(data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
@@ -508,6 +1108,9 @@ fn probe(data_root: &Path, alias: &str) -> AppResult<BootstrapProbe> {
 printf 'os=%s\n' "$(uname -s)"
 printf 'arch=%s\n' "$(uname -m)"
 printf 'home=%s\n' "$HOME"
+if [ -r /etc/os-release ]; then
+  awk -F= '$1 == "ID" { gsub(/[\042\047]/, "", $2); print "distribution=" $2 } $1 == "ID_LIKE" { gsub(/[\042\047]/, "", $2); print "distributionLike=" $2 }' /etc/os-release
+fi
 digest_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -567,6 +1170,8 @@ fi
             }
         },
         disk_free_bytes: value("diskFree").parse().ok(),
+        distribution: value("distribution"),
+        distribution_like: value("distributionLike"),
     })
 }
 
@@ -581,9 +1186,13 @@ fn install_managed_ssh_isolation(
     let identity_dir = data_root.join("remote-ssh").join(host_id);
     let identity = identity_dir.join("id_ed25519");
     let public_key = ensure_isolation_identity(&identity)?;
-    let ssh_config = dirs::home_dir()
-        .map(|home| home.join(".ssh").join("config"))
-        .ok_or_else(|| AppError::Message("SshConfigHomeMissing".into()))?;
+    let ssh_config = if host_id.starts_with("added-") {
+        super::ssh_added::config_path(data_root)
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join(".ssh").join("config"))
+            .ok_or_else(|| AppError::Message("SshConfigHomeMissing".into()))?
+    };
     let existing_keys = ssh_script(
         data_root,
         alias,
@@ -614,14 +1223,11 @@ fn install_managed_ssh_isolation(
         },
     )
     .map_err(AppError::Message)?;
-    let wrapper_quoted = crate::remote::digest::shell_single_quote(&applied.wrapper_path);
     ssh_script(
         data_root,
         alias,
         applied.wrapper_contents.as_bytes(),
-        &format!(
-            "umask 077; mkdir -p \"$(dirname {wrapper_quoted})\" && cat > {wrapper_quoted} && chmod 0700 {wrapper_quoted}"
-        ),
+        &applied.wrapper_upload_command(),
     )?;
     ssh_script(
         data_root,
@@ -682,11 +1288,26 @@ fn ensure_isolation_identity(path: &Path) -> AppResult<String> {
     fs::read_to_string(&pub_path).map_err(|error| AppError::Message(error.to_string()))
 }
 
+fn linux_persistence_scope(
+    systemd: bool,
+    linger: bool,
+    enable_linger: impl FnOnce() -> bool,
+) -> (&'static str, bool) {
+    if !systemd {
+        return ("onDemand", false);
+    }
+    if linger || enable_linger() {
+        ("linger", true)
+    } else {
+        ("login", false)
+    }
+}
+
 fn ensure_linger(data_root: &Path, alias: &str) -> AppResult<()> {
     let script = r#"set -eu
 user=$(id -un)
 if [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" != yes ]; then
-  loginctl enable-linger "$user"
+  loginctl --no-ask-password enable-linger "$user"
 fi
 [ "$(loginctl show-user "$user" -p Linger --value)" = yes ]
 "#;
@@ -831,13 +1452,16 @@ fn ssh_script(
         "-o".to_string(),
         "ConnectTimeout=10".to_string(),
     ];
-    args.extend(ssh_trust::strict_host_key_args(data_root));
+    args.extend(ssh_trust::strict_host_key_args_for(
+        data_root,
+        &trust_target,
+    ));
     args.push("-T".to_string());
     args.push("--".to_string());
     args.push(alias.to_string());
     args.push(remote_command.to_string());
 
-    let mut child = background_command("ssh")
+    let mut child = super::ssh_added::command(data_root, alias)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -894,39 +1518,385 @@ fn file_sha256(path: &Path) -> Option<String> {
         .map(|bytes| hex::encode(Sha256::digest(bytes)))
 }
 
-fn blocked(
-    operation_id: String,
-    probe: BootstrapProbe,
-    reason: &str,
-    repair: &str,
-) -> BootstrapResult {
-    BootstrapResult {
-        operation_id,
-        state: "recoveryRequired".into(),
-        os: probe.os.clone(),
-        arch: probe.arch.clone(),
-        agent_installed: probe.agent_installed,
-        broker_installed: probe.broker_installed,
-        docker_available: probe.docker_available,
-        systemd_user_available: probe.systemd_user_available,
-        linger_enabled: probe.linger_enabled,
-        native_codex: None,
-        completed_steps: vec!["host.probed".into()],
-        blocked_reasons: vec![reason.into()],
-        repair_commands: vec![repair.into()],
-        platform: crate::remote::platform::RemotePlatform::from_os_arch(&probe.os, &probe.arch)
-            .ok()
-            .map(|item| item.artifact_key().into()),
-        proxy_backend: None,
-        service_manager: None,
-        persistence_scope: None,
-        managed_codex_home: probe.managed_codex_home,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_bootstrap_inspection_on_fresh_unsupported_or_busybox_host_only_reads_transport() {
+        struct FakeTransport {
+            os: &'static str,
+            calls: std::cell::RefCell<Vec<&'static str>>,
+        }
+        impl BootstrapProbeClient for FakeTransport {
+            fn probe(&self, _: &Path, _: &str) -> AppResult<BootstrapProbe> {
+                self.calls.borrow_mut().push("read:probe");
+                Ok(BootstrapProbe {
+                    os: self.os.into(),
+                    arch: "aarch64".into(),
+                    ..Default::default()
+                })
+            }
+            fn ps(&self, _: &Path, _: &str) -> AppResult<super::super::preflight::PsProbeOutput> {
+                self.calls.borrow_mut().push("read:ps");
+                Ok(super::super::preflight::PsProbeOutput {
+                    success: false,
+                    stdout: "BusyBox ps".into(),
+                })
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(temp.path().to_path_buf());
+        state
+            .remote()
+            .import_discovered_host(&super::super::discovery::RemoteHostCandidate {
+                codex_host_id: None,
+                vellum_host_id: "fake-preflight".into(),
+                display_name: "fake".into(),
+                ssh_alias: "fake-only".into(),
+                hostname: None,
+                user: None,
+                port: None,
+                source: "test".into(),
+                validated: false,
+                validation_error: None,
+            })
+            .unwrap();
+        for (os, code, expected) in [
+            (
+                "unsupported",
+                "unsupportedRemotePlatform",
+                vec!["read:probe"],
+            ),
+            (
+                "linux",
+                "psStartTimeUnavailable",
+                vec!["read:probe", "read:ps"],
+            ),
+        ] {
+            let transport = FakeTransport {
+                os,
+                calls: Default::default(),
+            };
+            let result = super::super::preflight::before_deployment(
+                || inspect_bootstrap_with(&state, "fake-preflight", &transport),
+                |_, _| {
+                    transport.calls.borrow_mut().push("write:deployment");
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains(code));
+            assert_eq!(*transport.calls.borrow(), expected);
+        }
+    }
+
+    #[test]
+    fn existing_preflight_classifies_repairs_without_replacing_incompatible_configuration() {
+        for (state, fix, blocker) in [
+            ("current", false, None),
+            ("upgradeRequired", true, None),
+            ("repairRequired", true, None),
+            (
+                "incompatible",
+                false,
+                Some("proxyConfigurationSchemaTooNew"),
+            ),
+            ("unreadable", false, Some("proxyConfigurationUnreadable")),
+        ] {
+            let mut report = super::super::preflight::DeploymentPreflight::default();
+            classify_existing_agent(
+                &serde_json::json!({"configuration": {"state": state}, "nativeCodex": {"codexVersion": "codex-cli pinned", "compatible": true, "runtimePackage": {"complete": true}, "daemonRunning": false}}),
+                None,
+                "pinned",
+                &mut report,
+            );
+            assert_eq!(
+                report.auto_fix.iter().any(|fix| fix == "proxy.configure"),
+                fix
+            );
+            assert!(!report
+                .auto_fix
+                .iter()
+                .any(|fix| fix == "codex.installPinned"));
+            assert_eq!(report.blockers.first().map(String::as_str), blocker);
+        }
+    }
+
+    #[test]
+    fn converge_upgrades_same_version_legacy_and_incomplete_runtimes() {
+        for runtime in [
+            serde_json::Value::Null,
+            serde_json::json!({"complete": false}),
+            serde_json::json!({"complete": true}),
+        ] {
+            let mut report = super::super::preflight::DeploymentPreflight::default();
+            let complete = runtime["complete"] == true;
+            classify_existing_agent(
+                &serde_json::json!({"configuration": {"state": "current"}, "nativeCodex": {
+                    "codexVersion": "codex-cli pinned", "compatible": true, "daemonRunning": false, "runtimePackage": runtime
+                }}),
+                None,
+                "pinned",
+                &mut report,
+            );
+            assert_eq!(
+                report.auto_fix.contains(&"codex.installPinned".into()),
+                !complete
+            );
+            assert!(report.blockers.is_empty());
+        }
+    }
+
+    #[test]
+    fn existing_preflight_requires_complete_idle_observation_before_deployment_writes() {
+        let native = serde_json::json!({"nativeCodex": {"daemonRunning": true, "restartSafe": false, "compatible": false}});
+        let active = serde_json::json!({"observability": "nativeAppServer", "threads": [{"active": true, "activeTools": false, "pendingApprovals": false}]});
+        let mut report = super::super::preflight::DeploymentPreflight::default();
+        classify_existing_agent(&native, Some(&active), "pinned", &mut report);
+        assert!(report.blockers.contains(&"activeWorkInProgress".into()));
+        assert!(report.blockers.contains(&"nativeDaemonAppOwned".into()));
+        assert!(report.auto_fix.contains(&"codex.installPinned".into()));
+        report.blockers.clear();
+        classify_existing_agent(&native, None, "pinned", &mut report);
+        assert!(report.blockers.contains(&"incompleteObservation".into()));
+    }
+
+    #[test]
+    fn verification_reads_the_port_from_start_replies_and_noop_status() {
+        assert_eq!(
+            applied_proxy_port(&serde_json::json!({"hostPort": 15730})),
+            Some(15730)
+        );
+        assert_eq!(
+            applied_proxy_port(&serde_json::json!({"detail": {"hostPort": 15731}})),
+            Some(15731)
+        );
+        assert_eq!(applied_proxy_port(&serde_json::json!({})), None);
+    }
+
+    fn verification_status(
+        manager: &str,
+        proxy_ready: bool,
+        daemon_running: bool,
+        port: u16,
+    ) -> crate::remote::RemoteHostAggregateStatus {
+        crate::remote::RemoteHostAggregateStatus {
+            host_id: "fake-host".into(),
+            manager_state: manager.into(),
+            cached_host: None,
+            agent: Some(serde_json::json!({
+                "proxy": {"ready": proxy_ready, "hostPort": port},
+                "nativeCodex": {"daemonRunning": daemon_running},
+            })),
+            agent_error: None,
+            available_actions: vec![],
+            blocked_reasons: vec![],
+            inventory: None,
+            chatgpt: None,
+        }
+    }
+
+    #[test]
+    fn verification_already_ready_does_not_start_or_retry() {
+        let calls = std::cell::Cell::new(0);
+        let (_, retried) = verify_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(verification_status("detachedReady", true, true, 15730))
+            },
+            || panic!("ready host must not start again"),
+            |status| verify_deployment_status(status, Some(15730)),
+            || panic!("ready host must not report retry"),
+        )
+        .unwrap();
+        assert!(!retried);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn verification_retries_only_observation_and_start_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut observations = std::collections::VecDeque::from([
+            verification_status("drifted", false, true, 15730),
+            verification_status("detachedReady", true, true, 15730),
+        ]);
+        let (_, retried) = verify_with_retry(
+            || {
+                calls.borrow_mut().push("verify");
+                Ok(observations.pop_front().expect("only two observations"))
+            },
+            || {
+                calls.borrow_mut().push("start");
+                Ok(())
+            },
+            |status| verify_deployment_status(status, Some(15730)),
+            || calls.borrow_mut().push("retry-progress"),
+        )
+        .unwrap();
+        assert!(retried);
+        assert_eq!(
+            *calls.borrow(),
+            vec!["verify", "retry-progress", "start", "verify"]
+        );
+    }
+
+    #[test]
+    fn verification_transport_failure_and_lost_start_reply_are_reobserved() {
+        let mut observations = std::collections::VecDeque::from([
+            Err(AppError::Message("SSH reply lost".into())),
+            Ok(verification_status("detachedReady", true, true, 15730)),
+        ]);
+        let starts = std::cell::Cell::new(0);
+        let (_, retried) = verify_with_retry(
+            || observations.pop_front().expect("only two observations"),
+            || {
+                starts.set(starts.get() + 1);
+                Err(AppError::Message("start reply lost".into()))
+            },
+            |status| verify_deployment_status(status, Some(15730)),
+            || {},
+        )
+        .unwrap();
+        assert!(retried);
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[test]
+    fn verification_exhaustion_is_bounded_and_preserves_final_read_failure() {
+        let reads = std::cell::Cell::new(0);
+        let starts = std::cell::Cell::new(0);
+        let result: AppResult<((), bool)> = verify_with_retry(
+            || {
+                reads.set(reads.get() + 1);
+                Err(AppError::Message("host still unreachable".into()))
+            },
+            || {
+                starts.set(starts.get() + 1);
+                Err(AppError::Message("start failed".into()))
+            },
+            |_| Ok(()),
+            || {},
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("OneClickBootstrapVerificationFailed: retryExhausted"));
+        assert!(error.contains("retryStartFailed=true"));
+        assert!(error.contains("host still unreachable"));
+        assert_eq!((reads.get(), starts.get()), (2, 1));
+    }
+
+    #[test]
+    fn verification_requires_detached_daemon_ready_proxy_and_original_port() {
+        for status in [
+            verification_status("nativeActive", true, true, 15730),
+            verification_status("detachedReady", false, true, 15730),
+            verification_status("detachedReady", true, false, 15730),
+            verification_status("detachedReady", true, true, 15731),
+        ] {
+            assert!(verify_deployment_status(&status, Some(15730)).is_err());
+        }
+        let ready = verification_status("detachedReady", true, true, 15730);
+        assert!(verify_deployment_status(&ready, None).is_err());
+        let mut missing = ready;
+        missing.agent = None;
+        assert!(verify_deployment_status(&missing, Some(15730)).is_err());
+    }
+
+    #[test]
+    fn verification_does_not_report_recovery_when_start_picks_a_different_port() {
+        let mut observations = std::collections::VecDeque::from([
+            verification_status("drifted", false, true, 15730),
+            verification_status("detachedReady", true, true, 15731),
+        ]);
+        let result = verify_with_retry(
+            || Ok(observations.pop_front().unwrap()),
+            || Ok(()),
+            |status| verify_deployment_status(status, Some(15730)),
+            || {},
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("proxyPortMatches=false"));
+    }
+
+    #[test]
+    fn persistence_falls_back_without_blocking_or_prompting_for_privileges() {
+        assert_eq!(
+            linux_persistence_scope(false, false, || panic!("no systemd: do not enable linger")),
+            ("onDemand", false)
+        );
+        assert_eq!(
+            linux_persistence_scope(true, true, || panic!("linger already enabled")),
+            ("linger", true)
+        );
+        assert_eq!(
+            linux_persistence_scope(true, false, || false),
+            ("login", false)
+        );
+        assert_eq!(
+            linux_persistence_scope(true, false, || true),
+            ("linger", true)
+        );
+    }
+
+    #[test]
+    fn linux_ps_preflight_is_independent_of_systemd() {
+        struct FakePs {
+            success: bool,
+            stdout: &'static str,
+        }
+        impl super::super::preflight::PsProcessClient for FakePs {
+            fn probe_start_time(&self) -> AppResult<super::super::preflight::PsProbeOutput> {
+                Ok(super::super::preflight::PsProbeOutput {
+                    success: self.success,
+                    stdout: self.stdout.into(),
+                })
+            }
+        }
+        for systemd in [false, true] {
+            let probe = BootstrapProbe {
+                os: "Linux".into(),
+                systemd_user_available: systemd,
+                distribution: "debian".into(),
+                ..Default::default()
+            };
+            for stdout in ["sh: 2: ps: not found", "ps: unrecognized option: p"] {
+                let blocker = check_linux_prerequisites(
+                    &probe,
+                    &FakePs {
+                        success: false,
+                        stdout,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(blocker.code, "psStartTimeUnavailable");
+                assert_eq!(blocker.repair, "apt-get install procps");
+            }
+            assert!(check_linux_prerequisites(
+                &probe,
+                &FakePs {
+                    success: true,
+                    stdout: "Fri Oct 16 10:00:00 2026",
+                }
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn ps_preflight_runs_before_remote_installation() {
+        let source = include_str!("bootstrap.rs");
+        let preflight = source.find("check_linux_prerequisites(").unwrap();
+        let isolation = source
+            .find("install_managed_ssh_isolation(&data_root")
+            .unwrap();
+        assert!(
+            preflight < isolation,
+            "preflight must precede the first remote mutation"
+        );
+    }
 
     #[test]
     fn bootstrap_installs_managed_ssh_isolation_before_agent_copy() {
@@ -1117,34 +2087,88 @@ mod tests {
             .expect("configured Codex/OpenSSH host");
         state.remote().import_discovered_host(&candidate).unwrap();
 
-        let first = one_click_bootstrap(
-            &state,
-            &candidate.vellum_host_id,
-            |phase, percent, message| println!("{percent:3}% {phase}: {message}"),
-        )
-        .await
-        .expect("first one-click bootstrap");
+        let (first_operation, run) =
+            crate::remote::commands::prepare_converge(&state, &candidate.vellum_host_id, None)
+                .unwrap();
+        let first_progress = run.await;
+        assert_eq!(
+            first_progress.state, "completed",
+            "{:?}",
+            first_progress.message
+        );
+        let first: OneClickBootstrapResult =
+            serde_json::from_value(first_progress.result.unwrap()).unwrap();
         assert_eq!(first.state, "detachedReady");
         assert!(first.proxy_ready && first.native_daemon_running && first.detached_ready);
 
-        let second = one_click_bootstrap(
-            &state,
-            &candidate.vellum_host_id,
-            |phase, percent, message| println!("{percent:3}% {phase}: {message}"),
-        )
-        .await
-        .expect("idempotent one-click bootstrap");
+        let (second_operation, run) =
+            crate::remote::commands::prepare_converge(&state, &candidate.vellum_host_id, None)
+                .unwrap();
+        let second_progress = run.await;
+        assert_eq!(
+            second_progress.state, "completed",
+            "{:?}",
+            second_progress.message
+        );
+        let second: OneClickBootstrapResult =
+            serde_json::from_value(second_progress.result.unwrap()).unwrap();
         assert_eq!(second.state, "detachedReady");
-        assert!(second
-            .apply
-            .completed_steps
-            .iter()
-            .any(|step| step == "proxy.alreadyReady"));
-        assert!(second
-            .apply
-            .completed_steps
-            .iter()
-            .any(|step| step == "nativeAdopt.alreadyActive"));
+        assert!(second.proxy_ready && second.native_daemon_running && second.detached_ready);
+        let steps = &second.apply.completed_steps;
+        let has = |name| steps.iter().any(|step| step == name);
+        assert!(
+            has("apply.noop") || (has("proxy.alreadyReady") && has("nativeAdopt.alreadyActive")),
+            "{steps:?}"
+        );
+        for mutation in [
+            "proxy.ready",
+            "proxy.configured",
+            "nativeAdopt.applied",
+            "nativeDaemon.restarted",
+            "proxy.stoppedForConfiguration",
+        ] {
+            assert!(!has(mutation), "unexpected mutation: {mutation}");
+        }
+        let log = fs::read_to_string(
+            state
+                .data_root()
+                .join("remote-deploy-log")
+                .join(format!("{}.jsonl", candidate.vellum_host_id)),
+        )
+        .unwrap();
+        let events: Vec<crate::remote::deploy_log::Event> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for operation in [first_operation, second_operation] {
+            let pair: Vec<_> = events
+                .iter()
+                .filter(|e| e.operation_id == operation.operation_id)
+                .collect();
+            assert_eq!(pair.len(), 2);
+            assert_eq!(pair[0].event, "started");
+            assert_eq!(pair[1].event, "finished");
+            assert_eq!(
+                pair[1].result,
+                Some(crate::remote::deploy_log::Outcome::Succeeded)
+            );
+        }
+        for private in [
+            candidate.hostname.as_deref(),
+            candidate.user.as_deref(),
+            first.bootstrap.managed_codex_home.as_deref(),
+            Some("/home/"),
+            Some("/Users/"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        {
+            assert!(
+                !log.contains(private),
+                "deployment log contains private host data"
+            );
+        }
     }
 
     #[test]

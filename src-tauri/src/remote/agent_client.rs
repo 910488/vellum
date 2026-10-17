@@ -19,7 +19,7 @@ use crate::remote::ssh_trust;
 
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
 const RPC_TIMEOUT_SECS: u64 = 60;
-const SUPPORTED_AGENT_PROTOCOLS: &[u64] = &[1, 2, 3, 4];
+const SUPPORTED_AGENT_PROTOCOLS: &[u64] = &[1, 2, 3, 4, 5];
 
 /// Trusted process target resolved from CachedHost metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,12 +137,15 @@ impl RemoteAgentClient {
         let data_root = ssh_trust::runtime_data_root();
         let trust_target = ssh_trust::resolve_ssh_target(destination)?;
         ssh_trust::require_trust_or_error(&data_root, &trust_target)?;
-        let mut cmd = background_command("ssh");
+        let mut cmd = super::ssh_added::command(&data_root, destination);
         cmd.arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-            .args(ssh_trust::strict_host_key_args(&data_root))
+            .args(ssh_trust::strict_host_key_args_for(
+                &data_root,
+                &trust_target,
+            ))
             .arg("-T")
             .arg(destination)
             .arg("cat")
@@ -180,11 +183,14 @@ impl RemoteAgentClient {
         if ssh_trust::require_trust_or_error(&data_root, &trust_target).is_err() {
             return;
         }
-        let mut cmd = background_command("ssh");
+        let mut cmd = super::ssh_added::command(&data_root, destination);
         cmd.args(["-o", "BatchMode=yes"])
             .arg("-o")
             .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-            .args(ssh_trust::strict_host_key_args(&data_root))
+            .args(ssh_trust::strict_host_key_args_for(
+                &data_root,
+                &trust_target,
+            ))
             .arg("-T")
             .arg(destination)
             .arg("rm")
@@ -204,6 +210,7 @@ impl RemoteAgentClient {
         expected_sha256: &str,
         expected_version: &str,
     ) -> AppResult<Value> {
+        ensure_full_runtime_package(&self.agent_version()?)?;
         self.rpc(json!({
             "method": "codex.installPinned",
             "operationId": operation_id,
@@ -371,6 +378,25 @@ impl RemoteAgentClient {
 
     pub fn proxy_status(&self) -> AppResult<Value> {
         self.rpc(json!({"method": "proxy.status"}))
+    }
+
+    pub fn proxy_migration_commit(&self, operation_id: &str) -> AppResult<Value> {
+        self.rpc(json!({"method": "proxy.migrationCommit", "operationId": operation_id}))
+    }
+
+    pub fn proxy_migration_rollback(&self, operation_id: &str) -> AppResult<Value> {
+        self.rpc(json!({"method": "proxy.migrationRollback", "operationId": operation_id}))
+    }
+
+    pub fn proxy_select_port(&self, preferred_port: Option<u16>) -> AppResult<u16> {
+        let value =
+            self.rpc(json!({"method": "proxy.selectPort", "preferredPort": preferred_port}))?;
+        value
+            .get("hostPort")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| AppError::Message("NativeProxyPortSelectionInvalid".into()))
     }
 
     pub fn proxy_install(
@@ -596,6 +622,33 @@ impl RemoteAgentClient {
         }))
     }
 
+    pub(crate) fn codex_stop_app_owned_expected(
+        &self,
+        operation_id: &str,
+        native: &Value,
+    ) -> AppResult<Value> {
+        if self
+            .agent_version()?
+            .get("confirmedTakeoverIdentity")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(AppError::Message("DeploymentAgentUpgradeRequired".into()));
+        }
+        let pid = native
+            .get("daemonPid")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| AppError::Message("incompleteObservation".into()))?;
+        let identity = native
+            .get("daemonIdentity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Message("incompleteObservation".into()))?;
+        self.rpc(
+            json!({"method": "codex.stopAppOwned", "operationId": operation_id,
+            "expectedDaemonPid": pid, "expectedDaemonIdentity": identity}),
+        )
+    }
+
     pub fn codex_restore_native(&self, operation_id: &str) -> AppResult<Value> {
         self.rpc(json!({
             "method": "codex.restoreNative",
@@ -724,7 +777,7 @@ fn ensure_agent_compatible_for_platform(
     let platform = platform.or_else(|| platform_from_agent_value(value));
     if !crate::remote::platform::desktop_accepts_agent_protocol(protocol, platform) {
         return Err(AppError::Message(format!(
-            "IncompatibleAgentProtocol: macOS features require agent protocol 4, remote={protocol}"
+            "IncompatibleAgentProtocol: native deployment requires Linux agent protocol 5 or macOS agent protocol 4+, remote={protocol}"
         )));
     }
     Ok(())
@@ -774,12 +827,15 @@ fn invoke_ssh_stdin_rpc(
     let trust_target = ssh_trust::resolve_ssh_target(destination)?;
     ssh_trust::require_trust_or_error(&data_root, &trust_target)?;
 
-    let mut cmd = background_command("ssh");
+    let mut cmd = super::ssh_added::command(&data_root, destination);
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-        .args(ssh_trust::strict_host_key_args(&data_root))
+        .args(ssh_trust::strict_host_key_args_for(
+            &data_root,
+            &trust_target,
+        ))
         .arg("-T")
         .arg(destination)
         .arg(remote_command)
@@ -902,9 +958,42 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn ensure_full_runtime_package(version: &Value) -> AppResult<()> {
+    if version
+        .get("fullCodexRuntimePackage")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        Ok(())
+    } else {
+        Err(AppError::Message(
+            "RemoteCodexAgentUpdateRequired: update the Agent before installing a runtime package"
+                .into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_runtime_capability_uses_the_actual_top_level_agent_version_contract() {
+        assert!(ensure_full_runtime_package(
+            &json!({"agentProtocol": 5, "fullCodexRuntimePackage": true})
+        )
+        .is_ok());
+        for response in [
+            json!({}),
+            json!({"fullCodexRuntimePackage": false}),
+            json!({"features": {"fullCodexRuntimePackage": true}}),
+        ] {
+            assert!(ensure_full_runtime_package(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("RemoteCodexAgentUpdateRequired"));
+        }
+    }
 
     #[test]
     fn shell_quote_leaves_safe_tokens() {
@@ -929,7 +1018,10 @@ mod tests {
             "agentProtocol": 3,
             "capabilities": {"os": "linux", "arch": "aarch64"}
         });
-        assert!(ensure_agent_compatible(&linux).is_ok());
+        assert!(ensure_agent_compatible(&linux).is_err());
+        let linux_new =
+            json!({"agentProtocol": 5, "capabilities": {"os": "linux", "arch": "aarch64"}});
+        assert!(ensure_agent_compatible(&linux_new).is_ok());
         let macos_old = json!({
             "agentProtocol": 3,
             "capabilities": {"os": "macos", "arch": "aarch64"}

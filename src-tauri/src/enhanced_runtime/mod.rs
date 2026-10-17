@@ -14,6 +14,7 @@ mod child_reaper;
 pub mod contracts;
 pub(crate) mod desktop_manager;
 pub mod env_lease;
+pub(crate) mod handoff_inject;
 pub mod launch_manifest;
 mod manifest;
 mod model_provider_map;

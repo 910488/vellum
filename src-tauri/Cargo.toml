@@ -49,6 +49,7 @@ tokio = { version = "=1.50.0", features = ["rt-multi-thread", "macros", "time", 
 aes-gcm = "0.10"
 base64 = "0.22"
 hmac = "0.12"
+sha1 = "0.10"
 sha2 = "0.10"
 getrandom = "0.3"
 zeroize = "1"
@@ -81,6 +82,7 @@ hex = "0.4"
 ed25519-dalek = { version = "2.1", features = ["std"] }
 semver = "1"
 vellum-remote-protocol = { path = "../crates/vellum-remote-protocol" }
+vellum-codex-package = { path = "../crates/vellum-codex-package" }
 vellum-proxy-runtime = { path = "../crates/vellum-proxy-runtime" }
 vellum-zcode-desktop = { path = "../crates/vellum-zcode-desktop" }
 vellum-enhanced-codex = { path = "../crates/vellum-enhanced-codex" }

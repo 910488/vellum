@@ -7,8 +7,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::remote::process::background_command;
-
 pub const WRAPPER_MARKER: &str = "# Managed by Vellum Remote Manager";
 pub const AUTH_KEYS_MARKER_PREFIX: &str = "vellum-remote-managed:";
 
@@ -23,6 +21,15 @@ pub struct AppliedIsolation {
     pub wrapper_path: String,
     pub wrapper_contents: String,
     pub authorized_keys: String,
+}
+
+impl AppliedIsolation {
+    /// Converge always uploads the newly rendered wrapper, including when an
+    /// older managed version already exists. stdin is the wrapper payload.
+    pub fn wrapper_upload_command(&self) -> String {
+        let path = shell_single_quote(&self.wrapper_path);
+        format!("set -eu; umask 077; wrapper={path}; mkdir -p \"$(dirname \"$wrapper\")\"; tmp=$(mktemp \"${{wrapper}}.tmp.XXXXXX\"); trap 'rm -f \"$tmp\"' 0; trap 'exit 1' 1 2 15; cat > \"$tmp\"; chmod 0700 \"$tmp\"; mv -f \"$tmp\" \"$wrapper\"; trap - 0 1 2 15")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,14 +61,17 @@ pub struct ManagedSshConfig {
 
 impl ManagedSshConfig {
     pub fn block(&self) -> String {
+        self.block_with_options("")
+    }
+    fn block_with_options(&self, options: &str) -> String {
         format!(
-            "{SSH_BEGIN_PREFIX}{id}\nHost {alias}\n    HostName {host}\n    User {user}\n    Port {port}\n    IdentityFile {identity}\n    IdentitiesOnly yes\n{SSH_END_PREFIX}{id}\n",
+            "{SSH_BEGIN_PREFIX}{id}\nHost {alias}\n    HostName {host}\n    User {user}\n    Port {port}\n    IdentityFile \"{identity}\"\n    IdentitiesOnly yes\n{options}{SSH_END_PREFIX}{id}\n",
             id = self.host_id,
             alias = self.alias,
             host = self.hostname,
             user = self.user,
             port = self.port,
-            identity = self.identity_file,
+            identity = self.identity_file.replace('\\', "/").replace('"', "\\\""),
         )
     }
 }
@@ -115,6 +125,47 @@ pub fn managed_alias(host_id: &str) -> String {
     format!("vellum-remote-{safe}")
 }
 
+/// Only a complete, uniquely marked block for this host authorizes its alias.
+/// An unmarked Host stanza or another host's marker is not managed isolation.
+pub(crate) fn has_managed_alias(contents: &str, host_id: &str) -> bool {
+    let begin = format!("{SSH_BEGIN_PREFIX}{host_id}");
+    let end = format!("{SSH_END_PREFIX}{host_id}");
+    let alias = managed_alias(host_id);
+    let mut inside = false;
+    let mut found = false;
+    let mut matched_host = false;
+    for line in contents.lines().map(str::trim) {
+        if line == begin {
+            if inside || found {
+                return false;
+            }
+            inside = true;
+        } else if line == end {
+            if !inside || !matched_host {
+                return false;
+            }
+            inside = false;
+            found = true;
+        } else if inside {
+            if line.starts_with(SSH_BEGIN_PREFIX) || line.starts_with(SSH_END_PREFIX) {
+                return false;
+            }
+            let mut fields = line.split_whitespace();
+            if fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("Host"))
+            {
+                if matched_host || fields.next() != Some(alias.as_str()) || fields.next().is_some()
+                {
+                    return false;
+                }
+                matched_host = true;
+            }
+        }
+    }
+    found && !inside
+}
+
 pub fn managed_ssh_wrapper_contents(
     codex_home: &str,
     install_dir: &str,
@@ -125,6 +176,9 @@ pub fn managed_ssh_wrapper_contents(
 export CODEX_HOME={home}\n\
 export CODEX_INSTALL_DIR={install}\n\
 export PATH={install}:{extra}:\"$PATH\"\n\
+if [ -x {agent} ]; then\n\
+  {agent} ensure-services </dev/null >/dev/null || printf '%s\\n' 'Vellum service recovery failed; inspect the remote supervisor logs.' >&2\n\
+fi\n\
 case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
   \"\") exec \"${{SHELL:-/bin/bash}}\" -l ;;\n\
   scp\\ *|scp|sftp*|rsync\\ *|/usr/libexec/sftp-server*) exec \"${{SHELL:-/bin/bash}}\" -c \"$SSH_ORIGINAL_COMMAND\" ;;\n\
@@ -132,6 +186,7 @@ case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
         home = shell_single_quote(codex_home),
         install = shell_single_quote(install_dir),
         extra = shell_single_quote(extra_path),
+        agent = shell_single_quote(&remote_posix_join(extra_path, "vellum-remote-agent")),
     )
 }
 
@@ -248,7 +303,7 @@ pub fn parse_user_host_port(destination: &str) -> Result<(String, String, u16), 
 /// configured `User`, `HostName`, or `Port`; inventing `User user` here makes
 /// the dedicated alias unusable even though the original alias works.
 pub fn resolve_user_host_port(destination: &str) -> Result<(String, String, u16), String> {
-    let output = background_command("ssh")
+    let output = super::ssh_added::command(&super::ssh_trust::runtime_data_root(), destination)
         .args(["-G", "--", destination])
         .output()
         .map_err(|error| format!("ssh -G unavailable: {error}"))?;
@@ -305,7 +360,26 @@ pub fn apply_managed_ssh_isolation(
         port: request.port,
         identity_file: request.identity_file.to_string_lossy().into_owned(),
     };
-    // This is the user's own ~/.ssh/config. Only a missing file starts empty:
+    // Added hosts use a Vellum-owned overlay; serialize it with host registration.
+    let _private_guard = if request.host_id.starts_with("added-") {
+        let parent = request
+            .ssh_config_path
+            .parent()
+            .ok_or("SshConfigPathInvalid")?;
+        fs::create_dir_all(parent).map_err(|error| format!("SshConfigDirCreateFailed: {error}"))?;
+        let guard = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.join("config.lock"))
+            .map_err(|error| format!("SshConfigWriteFailed: {error}"))?;
+        fs2::FileExt::lock_exclusive(&guard)
+            .map_err(|error| format!("SshConfigWriteFailed: {error}"))?;
+        Some(guard)
+    } else {
+        None
+    };
+    // For discovered hosts this is the user's own ~/.ssh/config. Only a missing file starts empty:
     // treating a read failure (bytes that are not UTF-8, a lock) the same way
     // would replace every host the user configured with this one block. It is
     // written in place, not renamed over, so a symlinked config stays a link.
@@ -314,12 +388,28 @@ pub fn apply_managed_ssh_isolation(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("SshConfigReadFailed: {error}")),
     };
-    let next = upsert_ssh_config(&existing, &config);
+    let next = if request.host_id.starts_with("added-") {
+        format!(
+            "{}{}",
+            config.block_with_options(&super::ssh_added::isolation_options(
+                &existing,
+                request.host_id
+            )),
+            remove_ssh_config(&existing, request.host_id)
+        )
+    } else {
+        upsert_ssh_config(&existing, &config)
+    };
     if let Some(parent) = request.ssh_config_path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("SshConfigDirCreateFailed: {error}"))?;
     }
-    fs::write(request.ssh_config_path, next.as_bytes())
-        .map_err(|error| format!("SshConfigWriteFailed: {error}"))?;
+    if request.host_id.starts_with("added-") {
+        crate::enhanced_runtime::atomic::write_atomic(request.ssh_config_path, next.as_bytes())
+            .map_err(|error| format!("SshConfigWriteFailed: {error}"))?;
+    } else {
+        fs::write(request.ssh_config_path, next.as_bytes())
+            .map_err(|error| format!("SshConfigWriteFailed: {error}"))?;
+    }
     let wrapper_root =
         remote_posix_parent(request.managed_codex_home).unwrap_or(request.managed_codex_home);
     let wrapper_path = remote_posix_join(wrapper_root, "ssh-wrapper");
@@ -365,6 +455,58 @@ pub fn remove_remote_authorized_keys(existing: &str, host_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn added_host_isolation_stays_private_and_keeps_bootstrap_alias_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("user home");
+        let root = temp.path().join("data");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/config"), "Host personal\n User keep\n").unwrap();
+        let added = super::super::ssh_added::fake_add(&root, "dev@host.test:2222", &home).unwrap();
+        let config = super::super::ssh_added::config_path(&root);
+        let initial = fs::read_to_string(&config).unwrap().replace(
+            "    Port 2222\n",
+            "    Port 2222\n    proxyjump bastion\n    userknownhostsfile ~/.ssh/custom_hosts\n",
+        );
+        fs::write(&config, initial).unwrap();
+        let request = IsolationApplyRequest {
+            ssh_config_path: &config,
+            identity_file: &root.join("identity with spaces"),
+            host_id: &added.candidate.vellum_host_id,
+            hostname: "host.test",
+            user: "dev",
+            port: 2222,
+            public_key: "ssh-ed25519 AAAAMANAGED vellum",
+            managed_codex_home: "/home/dev/.vellum-remote/codex",
+            install_dir: "/home/dev/.vellum-remote/codex/packages/standalone/current",
+            extra_path: "/home/dev/.local/bin",
+            existing_authorized_keys: "",
+        };
+        let applied = apply_managed_ssh_isolation(request.clone()).unwrap();
+        let before = fs::read(&config).unwrap();
+        apply_managed_ssh_isolation(request).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), before);
+        let text = String::from_utf8(before).unwrap();
+        assert!(
+            text.find(&format!("Host {}\n", applied.alias)).unwrap() < text.find("Host *").unwrap()
+        );
+        assert!(text.contains(&format!("Host {}\n", added.candidate.ssh_alias)));
+        assert!(text.contains("IdentityFile \""));
+        assert_eq!(text.matches("proxyjump bastion").count(), 2);
+        assert_eq!(
+            text.matches("userknownhostsfile ~/.ssh/custom_hosts")
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".ssh/config")).unwrap(),
+            "Host personal\n User keep\n"
+        );
+        // The forced command forwards arbitrary commands once the wrapper exists.
+        assert!(applied.authorized_keys.contains("command="));
+        assert!(applied.wrapper_contents.contains("SSH_ORIGINAL_COMMAND"));
+    }
 
     #[test]
     fn ssh_config_add_and_remove_only_touch_marked_blocks() {
@@ -456,6 +598,54 @@ mod tests {
             parse_user_host_port("joshhuang@100.78.101.55").unwrap(),
             ("joshhuang".into(), "100.78.101.55".into(), 22)
         );
+    }
+
+    #[test]
+    fn reapply_refreshes_wrapper_payload_and_reuses_managed_key_and_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let identity = temp.path().join("identity");
+        let request = IsolationApplyRequest {
+            ssh_config_path: &config,
+            identity_file: &identity,
+            host_id: "linux-host",
+            hostname: "example.test",
+            user: "remote",
+            port: 22,
+            public_key: "ssh-ed25519 AAAAMANAGED vellum",
+            managed_codex_home: "/home/remote/.vellum-remote/codex",
+            install_dir: "/home/remote/.vellum-remote/codex/packages/standalone/current",
+            extra_path: "/home/remote/.local/bin/",
+            existing_authorized_keys: "ssh-ed25519 AAAAUSER mine\n",
+        };
+        let first = apply_managed_ssh_isolation(request.clone()).unwrap();
+        let ssh_config = fs::read_to_string(&config).unwrap();
+        // The existing key retains its wrapper path. Converge must still
+        // upload the complete new payload, including the recovery hook.
+        let next = apply_managed_ssh_isolation(IsolationApplyRequest {
+            existing_authorized_keys: &first.authorized_keys,
+            ..request
+        })
+        .unwrap();
+        assert_eq!(next.wrapper_path, first.wrapper_path);
+        assert_eq!(next.alias, first.alias);
+        assert_eq!(next.authorized_keys, first.authorized_keys);
+        assert_eq!(fs::read_to_string(&config).unwrap(), ssh_config);
+        assert!(next.wrapper_contents.contains(
+            "'/home/remote/.local/bin/vellum-remote-agent' ensure-services </dev/null >/dev/null"
+        ));
+        assert!(
+            next.wrapper_contents.find("ensure-services").unwrap()
+                < next.wrapper_contents.find("SSH_ORIGINAL_COMMAND").unwrap()
+        );
+        let upload = next.wrapper_upload_command();
+        assert!(upload.contains("wrapper='/home/remote/.vellum-remote/ssh-wrapper'"));
+        assert!(upload.contains("mktemp \"${wrapper}.tmp.XXXXXX\""));
+        assert!(upload.contains("cat > \"$tmp\"; chmod 0700 \"$tmp\"; mv -f \"$tmp\" \"$wrapper\""));
+        assert!(!upload.contains("cat > \"$wrapper\""));
+        let bootstrap = include_str!("bootstrap.rs");
+        assert!(bootstrap.contains("applied.wrapper_contents.as_bytes(),"));
+        assert!(bootstrap.contains("&applied.wrapper_upload_command(),"));
     }
 
     #[test]
