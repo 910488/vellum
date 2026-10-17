@@ -496,7 +496,6 @@ where
                         "CodexPackageVerificationFailed: {error}; remove corrupt cache: {remove}"
                     ))
                 })?;
-                return Err(error);
             }
         }
     }
@@ -946,20 +945,21 @@ mod tests {
         .unwrap();
         assert_eq!(cached, reused);
         std::fs::write(&cached, "corrupt").unwrap();
-        assert!(
-            cached_codex_package_with(temp.path(), &artifact, |_| async {
-                panic!("corrupt cache cannot be used")
-            })
-            .await
-            .is_err()
-        );
-        assert!(!cached.exists());
-        cached_codex_package_with(temp.path(), &artifact, |dest| async {
+        let downloads = std::cell::Cell::new(0);
+        let repaired = cached_codex_package_with(temp.path(), &artifact, |dest| async {
+            downloads.set(downloads.get() + 1);
+            assert!(
+                !cached.exists(),
+                "corrupt entry must be removed before fetching"
+            );
             std::fs::copy(&source, dest).unwrap();
             Ok(())
         })
         .await
         .unwrap();
+        assert_eq!(downloads.get(), 1);
+        assert_eq!(repaired, cached);
+        verify_codex_package(&repaired, &artifact).unwrap();
     }
 
     #[tokio::test]

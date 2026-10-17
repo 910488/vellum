@@ -426,10 +426,24 @@ pub(super) fn matching_local_core(
     trust: &TrustStore,
     bundled: Option<&Path>,
 ) -> Option<(String, LocalCoreFiles)> {
+    matching_local_core_with(root, target, trust, bundled, |tree, version| {
+        super::core_package::build_slot(tree, version, core, target)
+    })
+}
+
+fn matching_local_core_with(
+    root: &Path,
+    target: &CoreTarget,
+    trust: &TrustStore,
+    bundled: Option<&Path>,
+    mut build_slot: impl FnMut(&Path, &str) -> Result<CoreSlot, String>,
+) -> Option<(String, LocalCoreFiles)> {
     let slots = CoreSlots::load(root);
     for slot in [slots.active, slots.pending].into_iter().flatten() {
         let tree = slot_tree_root(root, &slot.version);
-        let expected = super::core_package::build_slot(&tree, &slot.version, core, target).ok()?;
+        let Ok(expected) = build_slot(&tree, &slot.version) else {
+            continue;
+        };
         let metadata_matches = slot.path == expected.path
             && slot.helpers == expected.helpers
             && slot.files.len() == expected.files.len()
@@ -873,6 +887,51 @@ mod tests {
             feature_profile: "enhanced-mvp-v1".into(),
             launch_id: None,
         }
+    }
+
+    #[test]
+    fn failed_active_slot_build_still_reuses_a_matching_pending_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let trust = TrustStore::from_key("test-key", signing.verifying_key());
+        let (exe, digest) = write_planted_tree(dir.path(), "9.9.9", false);
+        let (raw, sig, manifest) = signed_core_fixture(&signing, false);
+        persist_signed_core_trust(dir.path(), "9.9.9", &raw, &sig).unwrap();
+        let pending = planted_slot(dir.path(), "9.9.9", &exe, &digest);
+        CoreSlots {
+            active: Some(slot("broken")),
+            pending: Some(pending.clone()),
+            ..CoreSlots::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let core = manifest.core.unwrap();
+        let target = &core.targets[0];
+        let mut attempted = Vec::new();
+        // build_slot currently derives metadata from a shared target. Inject
+        // a per-candidate failure to exercise this defensive fallback path.
+        let (source, files) =
+            matching_local_core_with(dir.path(), target, &trust, None, |tree, version| {
+                attempted.push(version.to_string());
+                if version == "broken" {
+                    return Err("active slot build failed".into());
+                }
+                super::super::core_package::build_slot(tree, version, &core, target)
+            })
+            .expect("matching pending files must remain available without downloading");
+        assert_eq!(attempted, ["broken", "9.9.9"]);
+        assert_eq!(source, pending.version);
+        assert_eq!(
+            files,
+            target
+                .files
+                .iter()
+                .map(|file| (
+                    file.path.clone(),
+                    slot_tree_root(dir.path(), "9.9.9").join(&file.path)
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
