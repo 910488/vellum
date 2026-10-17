@@ -20,15 +20,18 @@ export function useRemoteController(props: RemoteProps) {
     failure,
     retry,
     retryOperation,
+    deploy,
   } = accounts;
   function runWorkRemedy(action: WorkRemedy) {
     switch (action) {
       case "stopAppOwned":
       case "installCodex":
       case "updateAgent":
-      case "bootstrap":
       case "syncDesktopCodex":
         setPending(action);
+        return;
+      case "bootstrap":
+        deploy();
         return;
       case "pairChatGpt":
         pairChatGpt();
@@ -37,7 +40,7 @@ export function useRemoteController(props: RemoteProps) {
         activateChatGpt();
         return;
       case "repair":
-        setPending("bootstrap");
+        deploy();
         return;
       case "plan": return;
       case "retry":

@@ -7,12 +7,13 @@ const en: ResourceTree = {
     "blocked": "{{count}} blocked before deployment", "lastFailure": "Latest unsuccessful attempt: {{reason}} ({{code}})",
     "interruptedReason": "Vellum closed before the operation finished", "unavailable": "Local deployment history could not be read. Export a diagnostic bundle to investigate."
   },
-  "remoteModels": { "title": "Models available on this host", "hint": "Changes deploy automatically when the host is idle. Existing host policies are preserved.", "failed": "Could not load or update models. Check the details; the selection has not been confirmed.", "empty": "No qualified models are available yet. Configure a provider locally, then redeploy.", "mandatory": "Required" },
+  "remoteModels": { "title": "Models available on this host", "hint": "Pick models, then Apply. One deployment runs when the host is idle; existing host policies are preserved.", "failed": "Could not load or update models. Check the details; the selection has not been confirmed.", "empty": "No qualified models are available yet. Configure a provider locally, then redeploy.", "mandatory": "Required" , "apply": "Apply", "applying": "Applying…", "discard": "Revert" },
   "remoteWork": {
     "advanced": "Advanced", "details": "Details",
     "redeploy": "Redeploy",
     "label": "Deployment work surface", "pending": "This host is waiting for deployment.",
     "running": "Bringing this host to the desired state.", "failed": "Deployment needs your attention before continuing.",
+    "desktopAhead": "Codex on Desktop was updated. Redeploy to bring this host up to date.",
     "readyOnDemand": "Ready; services recover on SSH connection and are supervised on this host.",
     "progress": "Deployment progress", "retryHint": "The operation did not finish; retry it using the same settings.",
     "inspect": "Check the details below, resolve this condition, then rescan before deploying again.", "nextAction": "Next: {{action}}"

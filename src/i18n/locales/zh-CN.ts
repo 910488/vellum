@@ -7,12 +7,13 @@ const zhCN: ResourceTree = {
     "blocked": "另有 {{count}} 次在部署前阻止", "lastFailure": "最近一次未成功：{{reason}}（{{code}}）",
     "interruptedReason": "Vellum 在操作完成前关闭", "unavailable": "无法读取本机部署记录，请导出诊断包查看。"
   },
-  "remoteModels": { "title": "这台主机可用的模型", "hint": "更改后会等待主机空闲并自动部署，沿用这台主机已有的策略设置。", "failed": "无法读取或更新模型。请查看详细信息；这次选择尚未确认。", "empty": "目前没有合格模型。请先在本机设置提供商，再重新部署。", "mandatory": "必要模型" },
+  "remoteModels": { "title": "这台主机可用的模型", "hint": "勾选完按“应用”，会等主机空闲后一次部署，沿用这台主机已有的策略设置。", "failed": "无法读取或更新模型。请查看详细信息；这次选择尚未确认。", "empty": "目前没有合格模型。请先在本机设置提供商，再重新部署。", "mandatory": "必要模型" , "apply": "应用", "applying": "正在应用……", "discard": "还原" },
   "remoteWork": {
     "advanced": "高级", "details": "详细信息",
     "redeploy": "重新部署",
     "label": "部署工作区", "pending": "这台主机正等待部署。",
     "running": "正在将这台主机收敛到期望状态。", "failed": "部署需要你处理一件事，才能继续。",
+    "desktopAhead": "Desktop 的 Codex 已更新；重新部署会让这台一起跟上。",
     "readyOnDemand": "已就绪；SSH 连接时会恢复服务，并由主机上的监督程序维持运行。",
     "progress": "部署进度", "retryHint": "这次操作未完成，请沿用相同设置重试。",
     "inspect": "查看下方详细信息并处理这个条件，再点击“重新扫描”后部署。", "nextAction": "下一步：{{action}}"

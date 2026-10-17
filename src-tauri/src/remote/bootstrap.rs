@@ -78,6 +78,9 @@ pub struct OneClickBootstrapResult {
     pub chatgpt_pairing_suggested: bool,
     #[serde(default)]
     pub omitted_catalog_ids: Vec<String>,
+    /// Present when this deploy tried to bring the runtime up to Desktop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_codex_sync: Option<serde_json::Value>,
 }
 
 /// Prepare an SSH host and converge it to its complete native Remote Manager
@@ -152,6 +155,26 @@ where
         }
     }
     check_cancelled(control)?;
+
+    // The same deploy brings the runtime up to Desktop, so a Desktop update
+    // never needs a second button. Only after the idle wait, only forward.
+    let desktop_codex_sync = match control {
+        Some(_) => {
+            sync_desktop_codex_if_newer(state, host_id, &prepared.operation_id, &mut progress).await
+        }
+        None => None,
+    };
+    if desktop_codex_sync.is_some() {
+        check_cancelled(control)?;
+        prepared = prepare_with_control(state, host_id, &mut progress, control).await?;
+        if !prepared.blocked_reasons.is_empty() {
+            return Err(AppError::Message(format!(
+                "OneClickBootstrapBlocked: {}; repair: {}",
+                prepared.blocked_reasons.join(", "),
+                prepared.repair_commands.join(" | ")
+            )));
+        }
+    }
 
     progress(
         "deploymentPlan",
@@ -239,6 +262,51 @@ where
         detached_ready: true,
         chatgpt_pairing_suggested: model_selection.chatgpt_pairing_suggested,
         omitted_catalog_ids: model_selection.omitted_catalog_ids,
+        desktop_codex_sync,
+    })
+}
+
+/// Sync is best effort inside a deploy: the agent stages, probes and swaps
+/// atomically, so a failed sync leaves the previous runtime running and the
+/// deploy carries on with it. The outcome is reported, never swallowed.
+async fn sync_desktop_codex_if_newer(
+    state: &AppState,
+    host_id: &str,
+    operation_id: &str,
+    progress: &mut impl FnMut(&str, u8, &str),
+) -> Option<serde_json::Value> {
+    let status = super::desktop_codex::compatibility_status(state, host_id)
+        .await
+        .ok()?;
+    if !super::desktop_codex::deploy_should_sync(&status) {
+        return None;
+    }
+    progress(
+        "resolvingDesktopCodex",
+        40,
+        "Updating remote Codex to the Desktop runtime",
+    );
+    let outcome = super::desktop_codex::update_remote_for_desktop(
+        state,
+        host_id,
+        &format!("{operation_id}-desktop-codex-sync"),
+    )
+    .await;
+    Some(match outcome {
+        Ok(_) => serde_json::json!({
+            "state": "synced",
+            "from": status.remote_version,
+            "to": status.desktop_version,
+        }),
+        Err(error) => {
+            log::warn!("DesktopCodexSyncDuringDeployFailed: {error}");
+            serde_json::json!({
+                "state": "failed",
+                "from": status.remote_version,
+                "to": status.desktop_version,
+                "detail": error.to_string(),
+            })
+        }
     })
 }
 
@@ -951,12 +1019,13 @@ fn inspect_existing_agent(
     } else {
         None
     };
-    classify_existing_agent(
-        status,
-        sessions.as_ref(),
-        &manifest.codex.pinned_version,
-        report,
-    );
+    // A runtime this host was Desktop-synced to is as good as the pinned one;
+    // treating only the pinned version as current would downgrade it here.
+    let qualified = super::desktop_codex::qualified_remote_version(&state.data_root(), host_id);
+    let accepted = std::iter::once(manifest.codex.pinned_version.as_str())
+        .chain(qualified.as_deref())
+        .collect::<Vec<_>>();
+    classify_existing_agent(status, sessions.as_ref(), &accepted, report);
     if !report.blockers.is_empty() {
         return Ok(());
     }
@@ -979,7 +1048,7 @@ fn inspect_existing_agent(
 fn classify_existing_agent(
     status: &serde_json::Value,
     sessions: Option<&serde_json::Value>,
-    pinned_version: &str,
+    accepted_versions: &[&str],
     report: &mut super::preflight::DeploymentPreflight,
 ) {
     use serde_json::Value;
@@ -999,7 +1068,7 @@ fn classify_existing_agent(
         .and_then(|native| native.get("codexVersion").or_else(|| native.get("version")))
         .and_then(Value::as_str)
         .and_then(|version| version.split_whitespace().last())
-        == Some(pinned_version);
+        .is_some_and(|version| accepted_versions.contains(&version));
     if !version_matches
         || native
             .and_then(|native| native.pointer("/runtimePackage/complete"))
@@ -1607,7 +1676,7 @@ mod tests {
             classify_existing_agent(
                 &serde_json::json!({"configuration": {"state": state}, "nativeCodex": {"codexVersion": "codex-cli pinned", "compatible": true, "runtimePackage": {"complete": true}, "daemonRunning": false}}),
                 None,
-                "pinned",
+                &["pinned"],
                 &mut report,
             );
             assert_eq!(
@@ -1636,7 +1705,7 @@ mod tests {
                     "codexVersion": "codex-cli pinned", "compatible": true, "daemonRunning": false, "runtimePackage": runtime
                 }}),
                 None,
-                "pinned",
+                &["pinned"],
                 &mut report,
             );
             assert_eq!(
@@ -1648,16 +1717,30 @@ mod tests {
     }
 
     #[test]
+    fn redeploy_keeps_a_desktop_synced_runtime_instead_of_reinstalling_pinned() {
+        let synced = serde_json::json!({"configuration": {"state": "current"}, "nativeCodex": {
+            "codexVersion": "codex-cli 0.150.0", "compatible": true, "daemonRunning": false,
+            "runtimePackage": {"complete": true}
+        }});
+        let mut report = super::super::preflight::DeploymentPreflight::default();
+        classify_existing_agent(&synced, None, &["pinned"], &mut report);
+        assert!(report.auto_fix.contains(&"codex.installPinned".into()));
+        let mut report = super::super::preflight::DeploymentPreflight::default();
+        classify_existing_agent(&synced, None, &["pinned", "0.150.0"], &mut report);
+        assert!(!report.auto_fix.contains(&"codex.installPinned".into()));
+    }
+
+    #[test]
     fn existing_preflight_requires_complete_idle_observation_before_deployment_writes() {
         let native = serde_json::json!({"nativeCodex": {"daemonRunning": true, "restartSafe": false, "compatible": false}});
         let active = serde_json::json!({"observability": "nativeAppServer", "threads": [{"active": true, "activeTools": false, "pendingApprovals": false}]});
         let mut report = super::super::preflight::DeploymentPreflight::default();
-        classify_existing_agent(&native, Some(&active), "pinned", &mut report);
+        classify_existing_agent(&native, Some(&active), &["pinned"], &mut report);
         assert!(report.blockers.contains(&"activeWorkInProgress".into()));
         assert!(report.blockers.contains(&"nativeDaemonAppOwned".into()));
         assert!(report.auto_fix.contains(&"codex.installPinned".into()));
         report.blockers.clear();
-        classify_existing_agent(&native, None, "pinned", &mut report);
+        classify_existing_agent(&native, None, &["pinned"], &mut report);
         assert!(report.blockers.contains(&"incompleteObservation".into()));
     }
 
