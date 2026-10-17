@@ -177,6 +177,7 @@ pub fn run() {
                     }
                 });
             }
+            crate::commands::launch_steward::spawn((*app.state::<AppState>()).clone());
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
             let boot = crate::boot::record_boot(&data_root);

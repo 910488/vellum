@@ -344,7 +344,20 @@ pub fn desktop_identity() -> AppResult<DesktopCodexIdentity> {
         }
     }
 
-    let output = background_command(&binary)
+    let version = core_version(&binary)?;
+    let schema_sha256 = desktop_schema_hash(&binary)?;
+    let identity = DesktopCodexIdentity {
+        version,
+        schema_sha256,
+        binary: binary.to_string_lossy().to_string(),
+    };
+    *cache.lock().expect("state poisoned") = Some((key, identity.clone()));
+    Ok(identity)
+}
+
+/// The version a Codex core reports for itself, as `desktop_identity` reads it.
+pub fn core_version(binary: &Path) -> AppResult<String> {
+    let output = background_command(binary)
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -361,18 +374,10 @@ pub fn desktop_identity() -> AppResult<DesktopCodexIdentity> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let version = version_token(&text)
+    Ok(version_token(&text)
         .filter(|version| valid_version(version))
         .ok_or_else(|| AppError::Message("Desktop Codex reported an invalid version".into()))?
-        .to_string();
-    let schema_sha256 = desktop_schema_hash(&binary)?;
-    let identity = DesktopCodexIdentity {
-        version,
-        schema_sha256,
-        binary: binary.to_string_lossy().to_string(),
-    };
-    *cache.lock().expect("state poisoned") = Some((key, identity.clone()));
-    Ok(identity)
+        .to_string())
 }
 
 #[cfg(target_os = "windows")]
