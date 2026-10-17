@@ -6,6 +6,7 @@
       }
     },
     "resources": [
+      "resources/remote/**/*",
       "binaries/vellum-codex-app-server*",
       "binaries/vellum-codex-relay*"
     ]
