@@ -878,7 +878,7 @@ const REMOTE_PROVIDER_ID: &str = "vellum";
 /// request time, so the secret never rides along in the deployment plan, the
 /// public diff, or the injection lease JSON this table's value ends up
 /// serialized into (see `BOUNDARY_KEY_ENV_VAR`).
-fn model_providers_table(proxy: &ProxyStatusView) -> Result<TomlValue, String> {
+pub(crate) fn model_providers_table(proxy: &ProxyStatusView) -> Result<TomlValue, String> {
     let mut provider = toml::map::Map::new();
     provider.insert("name".into(), TomlValue::String("OpenAI".into()));
     provider.insert("base_url".into(), TomlValue::String(proxy_base_url(proxy)?));

@@ -10,7 +10,7 @@ function Get-VellumFileSha256([string] $Path) {
 }
 
 function Get-VellumProxySourceFingerprint([string] $Repo) {
-    $tracked = @(& git -C $Repo ls-files -- Cargo.toml Cargo.lock crates src-tauri/Cargo.toml src-tauri/src third_party/codex-0.150 deploy/proxy/Dockerfile deploy/remote-bundle/Dockerfile | Sort-Object)
+    $tracked = @(& git -C $Repo ls-files -- Cargo.toml Cargo.lock crates src-tauri/Cargo.toml src-tauri/src third_party/codex-0.150 deploy/proxy/Dockerfile deploy/remote-bundle/Dockerfile scripts/build-local-release.ps1 scripts/build-local-release.sh scripts/finalize-remote-linux-manifest.mjs | Sort-Object)
     if ($LASTEXITCODE -ne 0 -or $tracked.Count -eq 0) {
         throw "unable to enumerate proxy image source files"
     }
@@ -163,13 +163,11 @@ function Get-VellumRemoteResourceRoot([string] $Repo) {
 function Get-VellumRemoteArtifactLayout {
     [ordered]@{
         "linux-amd64/vellum-remote-agent" = "agent.linux-x64"
-        "linux-amd64/vellum-remote-broker" = "broker.linux-x64"
-        "linux-amd64/codex" = "codex.linux-x64"
-        "linux-amd64/proxy-image.tar" = "proxy.linux-x64"
+        "linux-amd64/vellum-proxy-daemon" = "proxy.linux-x64"
+        "linux-amd64/codex-package.tar.gz" = "codex.linux-x64"
         "linux-arm64/vellum-remote-agent" = "agent.linux-arm64"
-        "linux-arm64/vellum-remote-broker" = "broker.linux-arm64"
-        "linux-arm64/codex" = "codex.linux-arm64"
-        "linux-arm64/proxy-image.tar" = "proxy.linux-arm64"
+        "linux-arm64/vellum-proxy-daemon" = "proxy.linux-arm64"
+        "linux-arm64/codex-package.tar.gz" = "codex.linux-arm64"
     }
 }
 
@@ -205,17 +203,18 @@ function Assert-VellumStagedRemotePayload {
     }
 
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-    if ([int]$manifest.schemaVersion -ne 3) {
-        throw "Remote manifest schemaVersion must be 3; got '$($manifest.schemaVersion)'"
+    if ([int]$manifest.schemaVersion -ne 5) {
+        throw "Remote manifest schemaVersion must be 5; got '$($manifest.schemaVersion)'"
     }
     if ([string]$manifest.releaseVersion -ne $ExpectedVersion) {
         throw "Remote manifest releaseVersion '$($manifest.releaseVersion)' does not match package.json $ExpectedVersion"
     }
-    if ([int]$manifest.protocolVersion -ne 3) {
-        throw "Remote manifest protocolVersion must be 3; got '$($manifest.protocolVersion)'"
+    if ([int]$manifest.protocolVersion -ne 5) {
+        throw "Remote manifest protocolVersion must be 5; got '$($manifest.protocolVersion)'"
     }
-    if ([string]$manifest.proxy.image -ne $ExpectedProxyImage) {
-        throw "Remote proxy image '$($manifest.proxy.image)' does not match this source fingerprint image '$ExpectedProxyImage'. 0.2.2 payloads cannot be reused."
+    if ([string]$manifest.sourceFingerprint -notmatch '^[0-9a-f]{12}$' -or
+        $ExpectedProxyImage -ne "vellum-proxy:${ExpectedVersion}-$($manifest.sourceFingerprint)") {
+        throw "Remote native payload source fingerprint does not match the expected build source"
     }
 
     $hashes = [ordered]@{}
@@ -239,7 +238,7 @@ function Assert-VellumStagedRemotePayload {
         ManifestSha256 = Get-VellumFileSha256 $manifestPath
         ReleaseVersion = [string]$manifest.releaseVersion
         ProtocolVersion = [int]$manifest.protocolVersion
-        ProxyImage = [string]$manifest.proxy.image
+        ProxyImage = $ExpectedProxyImage
         ArtifactSha256 = $hashes
     }
 }
@@ -315,15 +314,13 @@ function New-VellumBuildInfo {
         $info.remoteArtifacts = [ordered]@{
             "linux-amd64" = [ordered]@{
                 agent = $Remote.ArtifactSha256["linux-amd64/vellum-remote-agent"]
-                broker = $Remote.ArtifactSha256["linux-amd64/vellum-remote-broker"]
-                codex = $Remote.ArtifactSha256["linux-amd64/codex"]
-                proxyArchive = $Remote.ArtifactSha256["linux-amd64/proxy-image.tar"]
+                codex = $Remote.ArtifactSha256["linux-amd64/codex-package.tar.gz"]
+                proxyDaemon = $Remote.ArtifactSha256["linux-amd64/vellum-proxy-daemon"]
             }
             "linux-arm64" = [ordered]@{
                 agent = $Remote.ArtifactSha256["linux-arm64/vellum-remote-agent"]
-                broker = $Remote.ArtifactSha256["linux-arm64/vellum-remote-broker"]
-                codex = $Remote.ArtifactSha256["linux-arm64/codex"]
-                proxyArchive = $Remote.ArtifactSha256["linux-arm64/proxy-image.tar"]
+                codex = $Remote.ArtifactSha256["linux-arm64/codex-package.tar.gz"]
+                proxyDaemon = $Remote.ArtifactSha256["linux-arm64/vellum-proxy-daemon"]
             }
         }
     }
@@ -340,16 +337,16 @@ function Assert-VellumResumeFingerprint {
         [string] $ExpectedImage
     )
 
-    foreach ($name in @("vellum-remote-agent", "vellum-remote-broker", "codex", "proxy-image.tar")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
         $artifact = Join-Path $ArchRoot $name
         if (-not (Test-Path -LiteralPath $artifact -PathType Leaf) -or
             (Get-Item -LiteralPath $artifact).Length -eq 0) {
             throw "Resume refused: incomplete cached payload at $artifact (source fingerprint $ExpectedFingerprint)"
         }
     }
-    $imageMarker = Join-Path $ArchRoot "proxy-image.ref"
+    $imageMarker = Join-Path $ArchRoot "native-source.ref"
     if (-not (Test-Path -LiteralPath $imageMarker -PathType Leaf)) {
-        throw "Resume refused: missing proxy-image.ref (source fingerprint $ExpectedFingerprint)"
+        throw "Resume refused: missing native-source.ref (source fingerprint $ExpectedFingerprint)"
     }
     $actual = [IO.File]::ReadAllText($imageMarker, [Text.Encoding]::UTF8).Trim()
     if ($actual -ne $ExpectedImage) {

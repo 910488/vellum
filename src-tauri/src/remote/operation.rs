@@ -63,6 +63,83 @@ pub fn load(root: &Path, operation_id: &str) -> AppResult<RemoteOperationProgres
     serde_json::from_slice(&bytes).map_err(|error| AppError::Message(error.to_string()))
 }
 
+pub(crate) fn load_reconciled(
+    root: &Path,
+    operation_id: &str,
+) -> AppResult<RemoteOperationProgress> {
+    let mut progress = load(root, operation_id)?;
+    if matches!(
+        progress.kind.as_str(),
+        "oneClickBootstrap" | "oneClickRestore" | "applyDeployment"
+    ) && progress.state == "running"
+        && super::converge_control::resolve(operation_id, &progress.host_id).is_err()
+    {
+        progress.state = "failed".into();
+        progress.phase = "failed".into();
+        progress.message = Some("DeploymentControlUnavailable".into());
+        progress.result = None;
+        progress.updated_at = Utc::now();
+        save(root, &progress)?;
+    }
+    Ok(progress)
+}
+
 fn operation_dir(root: &Path) -> PathBuf {
     root.join("remote-operations")
+}
+
+pub(crate) fn for_host(root: &Path, host: &str) -> AppResult<Vec<RemoteOperationProgress>> {
+    let entries = match fs::read_dir(operation_dir(root)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(_) => return Err(AppError::Message("OperationHistoryUnavailable".into())),
+    };
+    let mut result = vec![];
+    for entry in entries.flatten() {
+        if entry.path().extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if let Some(progress) = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RemoteOperationProgress>(&bytes).ok())
+        {
+            if progress.host_id == host {
+                result.push(load_reconciled(root, &progress.operation_id)?);
+            }
+        }
+    }
+    result.sort_by_key(|p| p.updated_at);
+    Ok(result.into_iter().rev().take(500).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn interrupted_deployment_expires_consent_and_becomes_retryable_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = format!("test-{}", ulid::Ulid::new());
+        let mut progress =
+            RemoteOperationProgress::queued(id.clone(), id.clone(), "oneClickBootstrap");
+        progress.phase = "awaitingTakeover".into();
+        progress.result = Some(serde_json::json!({"takeoverToken": "old-token"}));
+        save(temp.path(), &progress).unwrap();
+        let (_, registration) = {
+            let control = super::super::converge_control::register(&id, &id).unwrap();
+            (
+                control,
+                super::super::converge_control::Registration(id.clone()),
+            )
+        };
+        assert_eq!(load_reconciled(temp.path(), &id).unwrap().state, "running");
+        drop(registration);
+        let loaded = load_reconciled(temp.path(), &id).unwrap();
+        assert_eq!(loaded.state, "failed");
+        assert!(loaded.result.is_none());
+        assert_eq!(
+            loaded.message.as_deref(),
+            Some("DeploymentControlUnavailable")
+        );
+        assert_eq!(load(temp.path(), &id).unwrap().state, "failed");
+    }
 }

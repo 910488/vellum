@@ -6,6 +6,7 @@
  * 呼叫端一行都不用改。
  */
 import { EMPTY_OBSERVATIONS, type RuntimeObservations } from "./enhanced";
+import type { RemoteHandoffThread, RemoteHandoffPreflight, RemoteHandoffRecord, RemoteHandoffRequirements } from "./remoteHandoff";
 import type {
   CompactionDetail,
   CompactionTranscript,
@@ -249,6 +250,59 @@ export const api = {
     return call<RemoteHostStatus>("inspect_remote_host", { hostId });
   },
 
+  listRemoteHandoffThreads(): Promise<RemoteHandoffThread[]> {
+    if (!hasTauri()) return delay([]);
+    return call("list_remote_handoff_threads");
+  },
+
+  preflightRemoteHandoff(hostId: string, threadId: string, requirements: RemoteHandoffRequirements = {}): Promise<RemoteHandoffPreflight> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("preflight_remote_handoff", { hostId, threadId, requirements });
+  },
+
+  startRemoteHandoff(hostId: string, threadId: string, brief: string, requirements: RemoteHandoffRequirements = {}): Promise<RemoteHandoffRecord> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("start_remote_handoff", { hostId, threadId, brief, requirements });
+  },
+
+  resumeRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("resume_remote_handoff", { handoffId });
+  },
+
+  pollRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("poll_remote_handoff", { handoffId });
+  },
+
+  listRemoteHandoffs(): Promise<RemoteHandoffRecord[]> {
+    if (!hasTauri()) return delay([]);
+    return call("list_remote_handoffs");
+  },
+
+  getRemoteHandoffThreadLink(handoffId: string): Promise<string | null> {
+    return call("get_remote_handoff_thread_link", { handoffId });
+  },
+  openRemoteHandoffThread(handoffId: string): Promise<void> {
+    return call("open_remote_handoff_thread", { handoffId });
+  },
+
+  captureRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    return call("capture_remote_handoff", { handoffId });
+  },
+  reviewRemoteHandoff(handoffId: string): Promise<import("./remoteHandoff").RemoteHandoffReview> {
+    return call("review_remote_handoff", { handoffId });
+  },
+  settleRemoteHandoff(handoffId: string, branchOnly = false): Promise<RemoteHandoffRecord> {
+    return call("settle_remote_handoff", { handoffId, branchOnly });
+  },
+  discardRemoteHandoff(handoffId: string): Promise<RemoteHandoffRecord> {
+    return call("discard_remote_handoff", { handoffId });
+  },
+  acknowledgeRemoteHandoff(handoffId: string): Promise<void> {
+    return call("acknowledge_remote_handoff", { handoffId });
+  },
+
   getDesktopCodexCompatibility(hostId: string): Promise<DesktopCodexCompatibilityStatus> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call<DesktopCodexCompatibilityStatus>("get_desktop_codex_compatibility", { hostId });
@@ -264,12 +318,32 @@ export const api = {
     return call<RemoteOperationProgress>("bootstrap_remote_host", { hostId });
   },
 
-  /** Resolves the host's SSH alias to an actual (host, port) and reports
-   * whether that resolved target's key is already trusted in Vellum's own
-   * known_hosts file. Never connects; safe to call speculatively. */
+  listRemoteHostModels(hostId: string): Promise<import("@/types").RemoteModelOption[]> {
+    return call<import("@/types").RemoteModelOption[]>("list_remote_host_models", { hostId });
+  },
+
+  updateRemoteHostModels(hostId: string, catalogIds: string[]): Promise<RemoteOperationProgress> {
+    return call<RemoteOperationProgress>("update_remote_host_models", { hostId, catalogIds });
+  },
+
+  cancelRemoteDeployment(hostId: string, operationId: string): Promise<void> {
+    return call<void>("cancel_remote_deployment", { hostId, operationId });
+  },
+
+  confirmRemoteDeploymentTakeover(hostId: string, operationId: string, token: string): Promise<void> {
+    return call<void>("confirm_remote_deployment_takeover", { hostId, operationId, token });
+  },
+
+  /** Resolves effective SSH trust. May scan a host key and reuse matching
+   * user known_hosts trust into Vellum's private store. Never authenticates. */
   getRemoteSshTrustStatus(hostId: string): Promise<SshTrustStatus> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call<SshTrustStatus>("remote_ssh_trust_status", { hostId });
+  },
+
+  addRemoteSshHost(destination: string): Promise<import("@/types").AddedRemoteHost> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("add_remote_ssh_host", { destination });
   },
 
   /** Fetches (without trusting) the key the host is currently offering, via
@@ -316,6 +390,11 @@ export const api = {
   getRemoteOperation(operationId: string): Promise<RemoteOperationProgress> {
     if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
     return call<RemoteOperationProgress>("get_remote_operation", { operationId });
+  },
+
+  getRemoteDeploySummary(hostId: string): Promise<import("@/types").RemoteDeploySummary> {
+    if (!hasTauri()) return Promise.reject(new Error("Remote Manager requires Tauri"));
+    return call("get_remote_deploy_summary", { hostId });
   },
 
   restartRemoteNativeCodex(hostId: string, operationId: string): Promise<unknown> {

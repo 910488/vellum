@@ -163,6 +163,25 @@ impl RemoteClientManager {
     pub fn list_hosts(&self) -> AppResult<Vec<CachedHost>> {
         self.cache.list_hosts()
     }
+    pub(crate) fn use_added_isolation_alias(&self, host_id: &str, alias: &str) -> AppResult<()> {
+        if !host_id.starts_with("added-")
+            || alias != crate::remote::ssh_isolation::managed_alias(host_id)
+        {
+            return Err(crate::error::AppError::Message(
+                "SshManagedAliasInvalid".into(),
+            ));
+        }
+        if let Some(mut host) = self
+            .cache
+            .list_hosts()?
+            .into_iter()
+            .find(|h| h.id == host_id)
+        {
+            host.ssh_alias = alias.into();
+            self.cache.upsert_host(&host)?;
+        }
+        Ok(())
+    }
 
     pub fn has_hosts(&self) -> AppResult<bool> {
         self.cache.has_hosts()

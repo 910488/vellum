@@ -374,8 +374,17 @@ describe("Enhanced survives a Codex Desktop update", () => {
     const sync = managerSource.slice(managerSource.indexOf("pub fn sync_desktop_launch"));
     expect(sync.slice(0, 400)).toContain("adopt_discovered_official(data_root)?");
     // 狀態卡也要修：那個錯誤就是出現在卡片上，而卡片上沒有能修它的控制項。
-    const status = managerSource.slice(managerSource.indexOf("pub fn desktop_runtime_status"));
-    expect(status.slice(0, 400)).toContain("adopt_discovered_official(data_root)");
+    const statusSource = managerSource
+      .slice(managerSource.indexOf("pub fn desktop_runtime_status"))
+      .replace(/\r\n/g, "\n");
+    const statusEnd = statusSource.indexOf("\n}\n");
+    expect(statusEnd).toBeGreaterThan(0);
+    const status = statusSource.slice(0, statusEnd + 2);
+    expect(status).toContain("adopt_discovered_official(data_root)");
+    expect(status).toContain("roll_forward_official_successor(data_root)");
+    expect(status.indexOf("roll_forward_official_successor(data_root)")).toBeLessThan(
+      status.indexOf("adopt_discovered_official(data_root)"),
+    );
   });
 
   /* 這是這次改動的核心：協定不再用整份 schema 的雜湊相等去擋。那個雜湊會

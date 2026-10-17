@@ -18,7 +18,7 @@ function New-FakePayload {
     param(
         [string] $Root,
         [string] $Version = "0.2.3",
-        [string] $ProxyImage = "vellum-proxy:0.2.3-testhash12ab",
+        [string] $ProxyImage = "vellum-proxy:0.2.3-abcdef123456",
         [switch] $SkipManifest,
         [switch] $SkipAmd64Agent,
         [string] $ManifestVersion,
@@ -31,7 +31,7 @@ function New-FakePayload {
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $hashes = @{}
     foreach ($arch in @("linux-amd64", "linux-arm64")) {
-        foreach ($name in @("vellum-remote-agent", "vellum-remote-broker", "codex", "proxy-image.tar")) {
+        foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
             if ($SkipAmd64Agent -and $arch -eq "linux-amd64" -and $name -eq "vellum-remote-agent") {
                 continue
             }
@@ -47,14 +47,15 @@ function New-FakePayload {
         $agentAmd = "0" * 64
     }
     $manifest = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 5
         releaseVersion = $(if ($ManifestVersion) { $ManifestVersion } else { $Version })
+        sourceFingerprint = $(if ($ManifestImage) { "000000000000" } else { "abcdef123456" })
         codex = [ordered]@{
             pinnedVersion = "0.147.0-alpha.6.6"
             compatibleRange = "0.147.0-alpha.6.6"
             artifacts = [ordered]@{
-                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/codex"; sha256 = $hashes["linux-amd64/codex"] }
-                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/codex"; sha256 = $hashes["linux-arm64/codex"] }
+                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/codex-package.tar.gz"; sha256 = $hashes["linux-amd64/codex-package.tar.gz"] }
+                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/codex-package.tar.gz"; sha256 = $hashes["linux-arm64/codex-package.tar.gz"] }
             }
         }
         agent = [ordered]@{
@@ -64,21 +65,13 @@ function New-FakePayload {
                 "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/vellum-remote-agent"; sha256 = $hashes["linux-arm64/vellum-remote-agent"] }
             }
         }
-        broker = [ordered]@{
-            version = "0.1.0"
-            artifacts = [ordered]@{
-                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/vellum-remote-broker"; sha256 = $hashes["linux-amd64/vellum-remote-broker"] }
-                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/vellum-remote-broker"; sha256 = $hashes["linux-arm64/vellum-remote-broker"] }
-            }
-        }
         proxy = [ordered]@{
-            image = $(if ($ManifestImage) { $ManifestImage } else { $ProxyImage })
             artifacts = [ordered]@{
-                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/proxy-image.tar"; sha256 = $hashes["linux-amd64/proxy-image.tar"] }
-                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/proxy-image.tar"; sha256 = $hashes["linux-arm64/proxy-image.tar"] }
+                "linux-x64" = [ordered]@{ url = "bundle://linux-amd64/vellum-proxy-daemon"; sha256 = $hashes["linux-amd64/vellum-proxy-daemon"] }
+                "linux-arm64" = [ordered]@{ url = "bundle://linux-arm64/vellum-proxy-daemon"; sha256 = $hashes["linux-arm64/vellum-proxy-daemon"] }
             }
         }
-        protocolVersion = 3
+        protocolVersion = 5
     }
     [IO.File]::WriteAllText((Join-Path $Root "manifest.json"), ($manifest | ConvertTo-Json -Depth 8), $utf8)
 }
@@ -103,7 +96,7 @@ $temp = Join-Path $env:TEMP "vellum-remote-payload-tests-$PID"
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
 try {
     $version = "0.2.3"
-    $image = "vellum-proxy:0.2.3-testhash12ab"
+    $image = "vellum-proxy:0.2.3-abcdef123456"
 
     $missing = Join-Path $temp "missing-manifest"
     New-FakePayload -Root $missing -SkipManifest
@@ -127,9 +120,9 @@ try {
 
     $oldImage = Join-Path $temp "old-image"
     New-FakePayload -Root $oldImage -ManifestImage "vellum-proxy:0.2.2-5a852db4c27a"
-    Assert-Throws "stale proxy image" {
+    Assert-Throws "stale native source fingerprint" {
         Assert-VellumStagedRemotePayload -ResourceRoot $oldImage -ExpectedVersion $version -ExpectedProxyImage $image
-    } "0.2.2"
+    } "source fingerprint"
 
     $missingArch = Join-Path $temp "missing-arch"
     New-FakePayload -Root $missingArch -SkipAmd64Agent
@@ -152,7 +145,7 @@ try {
 
     $embedded = Join-Path $temp "embedded-mismatch"
     New-FakePayload -Root $embedded
-    [IO.File]::WriteAllText((Join-Path $embedded "linux-amd64\codex"), "mutated", $utf8)
+    [IO.File]::WriteAllText((Join-Path $embedded "linux-amd64\codex-package.tar.gz"), "mutated", $utf8)
     Assert-Throws "embedded artifact drift" {
         Assert-VellumEmbeddedRemotePayload -Staged $staged -EmbeddedRoot $embedded
     } "does not match"

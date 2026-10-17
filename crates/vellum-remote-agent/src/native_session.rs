@@ -1,4 +1,4 @@
-//! Read-only native session observability (M34 P0 fix).
+//! Native session observability and shared daemon control transport.
 //!
 //! Queries the Codex app-server control API (the session authority) at the
 //! daemon control endpoint under `$CODEX_HOME`. The Unix socket accepts a
@@ -244,8 +244,8 @@ fn map_thread(thread: &Value) -> Result<NativeThreadStatus, String> {
     })
 }
 
-/// One JSON-RPC call over the daemon control socket. The caller reports any
-/// failure as `NativeSessionObservabilityUnsupported`.
+/// One JSON-RPC call over the daemon control socket. Observers wrap failures
+/// as `NativeSessionObservabilityUnsupported`; handoff mutations preserve them.
 pub(crate) fn ws_jsonrpc_call(
     codex_home: &Path,
     method: &str,
@@ -267,7 +267,16 @@ fn ws_jsonrpc_call_inner(codex_home: &Path, method: &str, params: Value) -> Resu
         .enable_all()
         .build()
         .map_err(|error| format!("create session observer runtime: {error}"))?;
-    runtime.block_on(ws_jsonrpc_call_async(codex_home, method, params))
+    // Bound the worker itself, not just its receiver. A timed-out mutation
+    // must not leave an unbounded detached thread sending a later request.
+    runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(18),
+            ws_jsonrpc_call_async(codex_home, method, params),
+        )
+        .await
+        .map_err(|_| "native control API timed out".to_string())?
+    })
 }
 
 #[cfg(not(unix))]

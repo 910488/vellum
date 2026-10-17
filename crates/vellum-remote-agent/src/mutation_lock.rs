@@ -6,8 +6,8 @@
 //!
 //! Long docker pulls still hold this lock; ProcessDockerClient bounds
 //! pull waits (see DOCKER_PULL_TIMEOUT) so Desktop RPCs fail closed
-//! instead of hanging forever. A non-blocking try-lock path can be
-//! added later if soft-busy responses are preferred over queueing.
+//! instead of hanging forever. SSH reconnect recovery uses a non-blocking
+//! try-lock so ordinary status RPCs never queue behind a long mutation.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,32 @@ pub struct HostMutationGuard {
 }
 
 impl HostMutationGuard {
+    /// Returns None immediately when another mutation holds the lock.
+    /// Filesystem/permission errors remain errors, rather than looking busy.
+    pub fn try_acquire(lock_path: impl AsRef<Path>) -> Result<Option<Self>, String> {
+        let path = lock_path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!("failed creating lock parent {}: {error}", parent.display())
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("failed opening mutation lock {}: {error}", path.display()))?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file, path })),
+            Err(error) if lock_is_busy(&error) => Ok(None),
+            Err(error) => Err(format!(
+                "failed acquiring mutation lock {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
     pub fn acquire(lock_path: impl AsRef<Path>) -> Result<Self, String> {
         Self::acquire_timeout(lock_path, Duration::from_secs(30))
     }
@@ -85,6 +111,16 @@ impl Drop for HostMutationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_lock_reports_busy_and_recovers_after_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mutation.lock");
+        let held = HostMutationGuard::try_acquire(&path).unwrap().unwrap();
+        assert!(HostMutationGuard::try_acquire(&path).unwrap().is_none());
+        drop(held);
+        assert!(HostMutationGuard::try_acquire(&path).unwrap().is_some());
+    }
 
     #[test]
     fn lock_wait_is_bounded() {

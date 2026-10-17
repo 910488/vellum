@@ -177,6 +177,7 @@ pub fn run() {
                     }
                 });
             }
+            crate::commands::launch_steward::spawn((*app.state::<AppState>()).clone());
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
             let boot = crate::boot::record_boot(&data_root);
@@ -366,12 +367,31 @@ pub fn run() {
             remote::commands::get_desktop_codex_compatibility,
             remote::commands::update_remote_codex_for_desktop,
             remote::commands::discover_remote_connections,
+            remote::commands::add_remote_ssh_host,
             remote::commands::inspect_remote_host,
+            remote::commands::list_remote_handoff_threads,
+            remote::commands::get_remote_handoff_thread_link,
+            remote::commands::open_remote_handoff_thread,
+            remote::commands::preflight_remote_handoff,
+            remote::commands::start_remote_handoff,
+            remote::commands::resume_remote_handoff,
+            remote::commands::poll_remote_handoff,
+            remote::commands::list_remote_handoffs,
+            remote::commands::capture_remote_handoff,
+            remote::commands::review_remote_handoff,
+            remote::commands::settle_remote_handoff,
+            remote::commands::discard_remote_handoff,
+            remote::commands::acknowledge_remote_handoff,
             remote::commands::bootstrap_remote_host,
+            remote::commands::list_remote_host_models,
+            remote::commands::update_remote_host_models,
+            remote::commands::cancel_remote_deployment,
+            remote::commands::confirm_remote_deployment_takeover,
             remote::commands::plan_remote_deployment,
             remote::commands::reapply_remote_deployment,
             remote::commands::apply_remote_deployment,
             remote::commands::get_remote_operation,
+            remote::commands::get_remote_deploy_summary,
             remote::commands::restart_remote_native_codex,
             remote::commands::stop_remote_app_owned_codex,
             remote::commands::restore_remote_host,

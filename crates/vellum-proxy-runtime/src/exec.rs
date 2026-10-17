@@ -224,6 +224,21 @@ pub enum RuntimeResponse {
 /// recognized only to reject a legacy task by name.
 const LOCAL_COMPACTION_PREFIX: &str = crate::replay::CODEX_LOCAL_V0_150_MARKER_PREFIX;
 
+/// Codex mints its own item ids as `<prefix>_<hyphenated uuid>`
+/// (`ResponseItemId::with_suffix`); Official ids use an opaque hex suffix.
+/// Only the former are portable across accounts.
+fn is_client_issued_item_id(id: &str) -> bool {
+    let Some((prefix, suffix)) = id.split_once('_') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && suffix.len() == 36
+        && suffix.char_indices().all(|(index, ch)| match index {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        })
+}
+
 /// Random engine-neutral local compaction id, `cmp_local_<32 hex>`.
 fn new_local_compaction_id() -> Result<String, RuntimeError> {
     let mut random = [0u8; 16];
@@ -805,7 +820,7 @@ pub(crate) struct WebSocketTurnPlan {
 /// turn may reuse an already-open segment; `upstream_model`/`route_id` are
 /// per-turn and never gate reuse on their own.
 pub(crate) struct OfficialWebSocketPlan {
-    request_metadata: crate::request::RequestMetadata,
+    pub(crate) request_metadata: crate::request::RequestMetadata,
     pub connection_key: OfficialWebSocketConnectionKey,
     pub upstream_url: String,
     pub upstream_model: String,
@@ -820,6 +835,10 @@ pub(crate) struct OfficialWebSocketPlan {
     /// The request continues a response owned by another account. It must be
     /// rebuilt as a full-input frame before it reaches this plan's socket.
     pub cross_realm_handoff: bool,
+    /// Set by the socket bridge after it rebuilt this turn as a local
+    /// full-input replay: a redacted summary of how the replay differs from
+    /// Codex's frame, logged if Official rejects the replay.
+    pub handoff_replay: Option<String>,
     managed_auth: Option<OfficialAuthorization>,
     _guard: RequestGuard,
 }
@@ -2534,6 +2553,70 @@ impl ProxyRuntime {
         &self,
         request: &RuntimeRequest,
     ) -> Result<WebSocketTurnPlan, RuntimeError> {
+        self.prepare_websocket_turn_with_auth(request, None).await
+    }
+
+    pub(crate) async fn prepare_websocket_quota_retry(
+        &self,
+        plan: &mut OfficialWebSocketPlan,
+        request: &RuntimeRequest,
+        reset_at: Option<u64>,
+        allow_retry: bool,
+    ) -> Result<Option<OfficialWebSocketPlan>, RuntimeError> {
+        if request.metadata.review_official_account_id.is_some() || plan.managed_auth.is_none() {
+            return Ok(None);
+        }
+        let Some(account_hash) = plan.execution_account_hash.as_deref() else {
+            return Ok(None);
+        };
+        let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
+        let route = snapshot
+            .routes
+            .iter()
+            .map(|s| &s.route)
+            .find(|r| r.route_id == plan.route_id)
+            .ok_or_else(|| RuntimeError::RouteNotFound(plan.route_id.clone()))?;
+        let context = crate::official_auth::OfficialRoutingContext::from_request(route, request);
+        let Some(auth) = self
+            .official_auth
+            .retry_after_quota(
+                &plan.route_id,
+                account_hash,
+                reset_at,
+                &context,
+                allow_retry,
+            )
+            .await
+            .map_err(RuntimeError::AuthenticationFailed)?
+        else {
+            return Ok(None);
+        };
+        let auth = ResolvedAuth::OfficialManaged {
+            token: auth.access_token,
+            account_id: auth.account_id,
+            selection_revision: auth.selection_revision,
+            selection_verified: auth.selection_verified,
+        };
+        match self
+            .prepare_websocket_turn_with_auth(request, Some(auth))
+            .await?
+            .dispatch
+        {
+            WebSocketTurnDispatch::OfficialNative(next)
+                if next.route_id == plan.route_id
+                    && next.execution_account_hash != plan.execution_account_hash =>
+            {
+                Ok(Some(next))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn prepare_websocket_turn_with_auth(
+        &self,
+        request: &RuntimeRequest,
+        override_auth: Option<ResolvedAuth>,
+    ) -> Result<WebSocketTurnPlan, RuntimeError> {
         let guard = self.begin_lifecycle()?;
         let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
         let model = request_model(request)?;
@@ -2561,15 +2644,19 @@ impl ProxyRuntime {
                 },
             });
         }
-        let auth = ResolvedAuth::resolve(
-            &route,
-            request,
-            self.credentials.as_ref(),
-            self.official_auth.as_ref(),
-            self.grok_sessions.as_ref(),
-            Some(self.history.as_ref()),
-        )
-        .await?;
+        let auth = if let Some(auth) = override_auth {
+            auth
+        } else {
+            ResolvedAuth::resolve(
+                &route,
+                request,
+                self.credentials.as_ref(),
+                self.official_auth.as_ref(),
+                self.grok_sessions.as_ref(),
+                Some(self.history.as_ref()),
+            )
+            .await?
+        };
         let managed_auth = match &auth {
             ResolvedAuth::OfficialManaged {
                 token,
@@ -2632,6 +2719,7 @@ impl ProxyRuntime {
                 },
                 continuation_realm,
                 cross_realm_handoff,
+                handoff_replay: None,
                 managed_auth,
                 _guard: guard,
             }),
@@ -7572,11 +7660,21 @@ impl ProxyRuntime {
             .map_err(RuntimeError::History)?;
         if force_portable && route.provider_kind == RuntimeProviderKind::Official {
             // A cache miss must not replay provider-issued item identities from
-            // a different account. call_id is caller-owned tool pairing state.
+            // a different account. call_id is caller-owned tool pairing state,
+            // and so are Codex-minted `<prefix>_<uuid>` ids: Responses Lite
+            // declares the model's reserved tools in an `at_<uuid>`
+            // `additional_tools` item, and Official rejects that declaration
+            // once its id is gone.
             for entry in &mut chain {
                 for item in entry.input_items.iter_mut().chain(&mut entry.output_items) {
                     if let Some(object) = item.as_object_mut() {
-                        object.remove("id");
+                        if !object
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(is_client_issued_item_id)
+                        {
+                            object.remove("id");
+                        }
                     }
                 }
             }
@@ -12041,6 +12139,86 @@ mod tests {
             1,
             "a deterministic rejection must not retry or fail over"
         );
+    }
+
+    #[tokio::test]
+    async fn official_socket_handoff_keeps_codex_minted_responses_lite_prefix() {
+        // Responses Lite (Codex 0.151) sends no top-level tools/instructions:
+        // the reserved collaboration namespace is declared by an `at_<uuid>`
+        // additional_tools item. Official rejects that declaration without
+        // its id ("collaboration.followup_task is reserved ... must match
+        // the configured schema"), while Codex's own full input keeps it.
+        let declaration = json!({"type":"additional_tools","id":"at_be1e849f-26f8-5abb-8519-af20f57eb8d4",
+            "role":"developer","tools":[{"type":"namespace","name":"collaboration","description":"Coordinate agents",
+                "tools":[{"type":"function","name":"followup_task","strict":true,"description":"Continue an agent task",
+                    "parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}}]}]});
+        let base_instructions = json!({"type":"message","id":"msg_9d2e5c1a-0b7f-5e8a-9c4d-3f1e2a6b7c8d",
+            "role":"developer","content":[{"type":"input_text","text":"base instructions"}]});
+        let history = Arc::new(MemoryHistoryStore::new());
+        history
+            .record_exchange_with_context(
+                &json!({"model":"vlm-test","input":[declaration.clone(), base_instructions.clone(),
+                    {"type":"message","id":"msg_01a148ce-f306-7eb3-a3c3-2915d30c9fb9","role":"user","content":[{"type":"input_text","text":"original task"}]}]}),
+                &json!({"id":"resp_lite_old","output":[
+                    {"type":"message","id":"msg_04601cced555c9ac016ad326e8e57c8191b898a9f7c738d881","role":"assistant",
+                        "content":[{"type":"output_text","text":"prior answer"}]},
+                    {"type":"custom_tool_call","id":"ctc_04601cced555c9ac016ad326f9ac1c8191a96b697d72ea70c2",
+                        "call_id":"call_exec","name":"exec","input":"ls"}]}),
+                "route-1",
+                None,
+                Some("old-account-realm"),
+            )
+            .unwrap();
+        let runtime = official_runtime_with_transport(Arc::new(RecordingTransport::new(vec![])))
+            .with_history_store(history);
+        let original = json!({"type":"response.create","model":"vlm-test",
+            "previous_response_id":"resp_lite_old","instructions":"","store":false,
+            "input":[{"type":"custom_tool_call_output","id":"ctco_01a148d0-76c6-7943-8be3-b43ec9e200ff",
+                "call_id":"call_exec","output":"done"}]});
+        let mut req = request(original.clone());
+        req.metadata.force_portable_official_handoff = true;
+        let WebSocketTurnDispatch::OfficialNative(plan) =
+            runtime.prepare_websocket_turn(&req).await.unwrap().dispatch
+        else {
+            panic!("an account handoff stays on the Official socket");
+        };
+        let frame = runtime
+            .hydrate_official_socket_handoff(&plan, &original)
+            .unwrap();
+        let input = frame["input"].as_array().unwrap();
+        assert_eq!(
+            input[0], declaration,
+            "the Lite tool declaration is replayed verbatim"
+        );
+        assert_eq!(input[1], base_instructions);
+        assert_eq!(input[2]["id"], "msg_01a148ce-f306-7eb3-a3c3-2915d30c9fb9");
+        let wire = frame["input"].to_string();
+        assert!(
+            !wire.contains("msg_04601cced555") && !wire.contains("ctc_04601cced555"),
+            "provider-issued ids stay account scoped: {wire}"
+        );
+        assert!(wire.contains("prior answer") && wire.contains("ctco_01a148d0-76c6-7943"));
+        assert!(frame.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn client_issued_item_ids_are_codex_minted_uuids_only() {
+        assert!(is_client_issued_item_id(
+            "at_be1e849f-26f8-5abb-8519-af20f57eb8d4"
+        ));
+        assert!(is_client_issued_item_id(
+            "ctco_01a148d0-76c6-7943-8be3-b43ec9e200ff"
+        ));
+        for provider in [
+            "msg_04601cced555c9ac016ad326e8e57c8191b898a9f7c738d881",
+            "rs_account_a",
+            "fc_be1e849f-26f8-5abb-8519-af20f57eb8d4x",
+            "_be1e849f-26f8-5abb-8519-af20f57eb8d4",
+            "be1e849f-26f8-5abb-8519-af20f57eb8d4",
+            "at_be1e849f_26f8-5abb-8519-af20f57eb8d4",
+        ] {
+            assert!(!is_client_issued_item_id(provider), "{provider}");
+        }
     }
 
     #[tokio::test]

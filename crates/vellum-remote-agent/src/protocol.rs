@@ -27,6 +27,8 @@ pub struct HostCapabilities {
     pub managed_codex_home: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_session_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_ready: Option<bool>,
 }
 
 /// Versioned host inventory (M30). A single-call superset of
@@ -248,6 +250,8 @@ pub enum AgentRequest {
     },
     #[serde(rename = "proxy.status")]
     ProxyStatus,
+    #[serde(rename = "proxy.selectPort")]
+    ProxySelectPort { preferred_port: Option<u16> },
     #[serde(rename = "proxy.install")]
     ProxyInstall {
         operation_id: String,
@@ -269,6 +273,10 @@ pub enum AgentRequest {
     },
     #[serde(rename = "proxy.stop")]
     ProxyStop { operation_id: String },
+    #[serde(rename = "proxy.migrationCommit")]
+    ProxyMigrationCommit { operation_id: String },
+    #[serde(rename = "proxy.migrationRollback")]
+    ProxyMigrationRollback { operation_id: String },
     #[serde(rename = "proxy.restart")]
     ProxyRestart { operation_id: String },
     #[serde(rename = "proxy.configure")]
@@ -364,6 +372,12 @@ pub enum AgentRequest {
     CodexVerifyInstallation { compatible_range: Option<String> },
     #[serde(rename = "codex.sessionStatus")]
     CodexSessionStatus { thread_id: Option<String> },
+    #[serde(rename = "codex.handoffStart")]
+    CodexHandoffStart(crate::handoff::StartRequest),
+    #[serde(rename = "codex.handoffPreflight")]
+    CodexHandoffPreflight,
+    #[serde(rename = "codex.handoffResult")]
+    CodexHandoffResult(crate::handoff::ResultRequest),
     #[serde(rename = "codex.accountStatus")]
     CodexAccountStatus { expected_account_id: Option<String> },
     /// Synchronize the remote daemon's control identity with Desktop. This is
@@ -413,7 +427,13 @@ pub enum AgentRequest {
     #[serde(rename = "codex.restartNative")]
     CodexRestartNative { operation_id: String },
     #[serde(rename = "codex.stopAppOwned")]
-    CodexStopAppOwned { operation_id: String },
+    CodexStopAppOwned {
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_daemon_identity: Option<String>,
+    },
     #[serde(rename = "codex.restoreNative")]
     CodexRestoreNative { operation_id: String },
     #[serde(rename = "codex.status")]
@@ -566,6 +586,21 @@ mod tests {
     }
 
     #[test]
+    fn proxy_port_selection_is_a_read_only_request_without_operation_id() {
+        let request = AgentRequest::ProxySelectPort {
+            preferred_port: Some(15745),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["method"], "proxy.selectPort");
+        assert_eq!(value["preferredPort"], 15745);
+        assert!(value.get("operationId").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentRequest>(value).unwrap(),
+            request
+        );
+    }
+
+    #[test]
     fn proxy_stop_wire_contract_is_camel_case() {
         let value = serde_json::to_value(AgentRequest::ProxyStop {
             operation_id: "op-3".into(),
@@ -659,6 +694,7 @@ mod tests {
                     persistence_scope: None,
                     managed_codex_home: None,
                     gui_session_available: None,
+                    supervisor_ready: None,
                 },
                 proxy: ProxyStatusView::default(),
                 install: None,
@@ -801,6 +837,7 @@ mod tests {
             persistence_scope: None,
             managed_codex_home: None,
             gui_session_available: None,
+            supervisor_ready: None,
         })
         .unwrap();
         let object = value.as_object().unwrap();
@@ -972,16 +1009,21 @@ mod tests {
 
         let stop = serde_json::to_value(AgentRequest::CodexStopAppOwned {
             operation_id: "op-stop-app-owned".into(),
+            expected_daemon_pid: None,
+            expected_daemon_identity: None,
         })
         .unwrap();
         assert_eq!(stop["method"], "codex.stopAppOwned");
+        assert!(stop.get("expectedDaemonPid").is_none());
         assert_eq!(stop["operationId"], "op-stop-app-owned");
         assert!(stop.get("operation_id").is_none());
         let round_tripped: AgentRequest = serde_json::from_value(stop).unwrap();
         assert_eq!(
             round_tripped,
             AgentRequest::CodexStopAppOwned {
-                operation_id: "op-stop-app-owned".into()
+                operation_id: "op-stop-app-owned".into(),
+                expected_daemon_pid: None,
+                expected_daemon_identity: None,
             }
         );
 
@@ -991,5 +1033,25 @@ mod tests {
         .unwrap();
         assert_eq!(reconcile["method"], "services.reconcile");
         assert_eq!(reconcile["operationId"], "op-reconcile");
+    }
+
+    #[test]
+    fn confirmed_takeover_preserves_the_observed_process_identity() {
+        let request = serde_json::json!({"method": "codex.stopAppOwned", "operationId": "confirmed",
+            "expectedDaemonPid": 42, "expectedDaemonIdentity": "boot:start:42"});
+        let parsed: AgentRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        let legacy: AgentRequest = serde_json::from_value(
+            serde_json::json!({"method": "codex.stopAppOwned", "operationId": "old"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AgentRequest::CodexStopAppOwned {
+                expected_daemon_pid: None,
+                expected_daemon_identity: None,
+                ..
+            }
+        ));
     }
 }

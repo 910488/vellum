@@ -1142,6 +1142,14 @@ export interface SshTrustStatus {
   host: string;
   port: number;
   confirmed: boolean;
+  source?: "userKnownHosts" | "explicitConfirmation" | null;
+  fingerprint?: PendingHostFingerprint | null;
+}
+
+export interface AddedRemoteHost {
+  candidate: RemoteHostCandidate;
+  loginCommand: string;
+  keyInstallCommand: string;
 }
 
 /** A host key currently offered by a host, fetched via `ssh-keyscan` without
@@ -1199,6 +1207,7 @@ export interface RemoteHostStatus {
       proxyBackend?: string | null;
       serviceManager?: string | null;
       persistenceScope?: string | null;
+      supervisorReady?: boolean | null;
       managedCodexHome?: string | null;
       guiSessionAvailable?: boolean | null;
     };
@@ -1494,13 +1503,15 @@ export interface RemoteSessionSummary {
   }>;
 }
 
+export type RemoteModelOption = RemoteDeploymentPlan["selectedModels"][number];
+
 export interface RemoteOperationProgress {
   operationId: string;
   hostId: string;
   kind: string;
   phase: string;
   percent: number;
-  state: "running" | "completed" | "failed";
+  state: "running" | "completed" | "failed" | "cancelled";
   message: string | null;
   result: unknown | null;
   updatedAt: string;
@@ -1603,4 +1614,13 @@ export interface UpdateOperation {
   component: UpdateComponent;
   phase: UpdatePhase;
   targetVersion: string | null;
+}
+
+export interface RemoteDeploySummary {
+  total: number;
+  succeeded: number;
+  failed: number;
+  interrupted: number;
+  blocked: number;
+  lastFailureCode: string | null;
 }

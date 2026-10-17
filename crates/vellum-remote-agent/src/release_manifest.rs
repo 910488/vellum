@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexArtifact {
     pub url: String,
@@ -23,19 +23,23 @@ pub struct CodexManifestEntry {
     pub artifacts: ArtifactSet,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactSet {
     #[serde(rename = "linux-x64")]
     pub linux_x64: CodexArtifact,
     #[serde(rename = "linux-arm64")]
     pub linux_arm64: CodexArtifact,
-    #[serde(rename = "darwin-arm64", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "darwin-arm64",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub darwin_arm64: Option<CodexArtifact>,
 }
 
 /// Component pin with per-arch artifacts (agent / broker self-update).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentManifestEntry {
     pub version: String,
@@ -45,8 +49,12 @@ pub struct ComponentManifestEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyManifestEntry {
+    #[serde(default)]
     pub image: String,
+    #[serde(default)]
     pub digest: String,
+    #[serde(default)]
+    pub artifacts: ArtifactSet,
 }
 
 /// Canonical release schema shared with the Desktop.
@@ -57,6 +65,7 @@ pub struct ReleaseManifest {
     pub release_version: String,
     pub codex: CodexManifestEntry,
     pub agent: ComponentManifestEntry,
+    #[serde(default)]
     pub broker: ComponentManifestEntry,
     pub proxy: ProxyManifestEntry,
     pub protocol_version: u32,
@@ -158,6 +167,27 @@ pub fn version_in_range(version: &str, range: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn schema5_native_manifest_loads_without_diagnostic_broker_or_docker_image() {
+        let artifacts = json!({
+            "linux-x64": {"url": "bundle://linux-amd64/codex", "sha256": "a".repeat(64)},
+            "linux-arm64": {"url": "bundle://linux-arm64/codex", "sha256": "b".repeat(64)}
+        });
+        let value = json!({
+            "schemaVersion": 5, "releaseVersion": "0.2.3", "protocolVersion": 5,
+            "codex": {"pinnedVersion": "0.147.0", "compatibleRange": "0.147.0", "artifacts": artifacts},
+            "agent": {"version": "0.3.0", "artifacts": artifacts},
+            "proxy": {"artifacts": artifacts}
+        });
+        let manifest: ReleaseManifest = serde_json::from_value(value).unwrap();
+        assert!(manifest.broker.version.is_empty());
+        assert!(manifest.proxy.image.is_empty());
+        assert_eq!(
+            select_artifact(&manifest, "aarch64").unwrap().sha256,
+            "b".repeat(64)
+        );
+    }
 
     #[test]
     fn manifest_parses_from_json_and_selects_arch() -> Result<(), String> {

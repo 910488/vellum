@@ -1,6 +1,38 @@
 import type { ResourceTree } from "../resources";
 
 const zhCN: ResourceTree = {
+  "remoteSsh": { "nativeMissing": "找不到 Windows OpenSSH 客户端。请启用“OpenSSH 客户端”可选功能，再重新部署。" },
+  "remoteHistory": {
+    "label": "部署记录", "counts": "最近 {{count}} 次部署：成功 {{succeeded}}／失败 {{failed}}／中断 {{interrupted}}",
+    "blocked": "另有 {{count}} 次在部署前阻止", "lastFailure": "最近一次未成功：{{reason}}（{{code}}）",
+    "interruptedReason": "Vellum 在操作完成前关闭", "unavailable": "无法读取本机部署记录，请导出诊断包查看。"
+  },
+  "remoteModels": { "title": "这台主机可用的模型", "hint": "更改后会等待主机空闲并自动部署，沿用这台主机已有的策略设置。", "failed": "无法读取或更新模型。请查看详细信息；这次选择尚未确认。", "empty": "目前没有合格模型。请先在本机设置提供商，再重新部署。", "mandatory": "必要模型" },
+  "remoteWork": {
+    "advanced": "高级", "details": "详细信息",
+    "redeploy": "重新部署",
+    "label": "部署工作区", "pending": "这台主机正等待部署。",
+    "running": "正在将这台主机收敛到期望状态。", "failed": "部署需要你处理一件事，才能继续。",
+    "readyOnDemand": "已就绪；SSH 连接时会恢复服务，并由主机上的监督程序维持运行。",
+    "progress": "部署进度", "retryHint": "这次操作未完成，请沿用相同设置重试。",
+    "inspect": "查看下方详细信息并处理这个条件，再点击“重新扫描”后部署。", "nextAction": "下一步：{{action}}"
+  },
+  "remoteAdd": { "title": "新增 SSH 主机", "description": "输入现有 SSH 登录地址。Vellum 只保存私有 alias；你的 ssh config 与 known_hosts 保持原样。", "destination": "SSH 登录地址", "add": "新增主机", "adding": "新增中……", "saving": "正在保存私有 SSH alias……", "failed": "无法新增主机，请使用 user@host[:port] 格式并查看详细信息。", "saved": "主机已新增，确认信任后即可部署。", "loginHint": "首次安装需要你原有的 SSH key。如果目前只能用密码登录，请打开终端配置自己的公钥登录；Vellum 不会接收密码。", "keyHint": "终端有 ssh-copy-id 时（例如 Unix 终端），可运行此命令安装你自己的默认公钥；否则请用常用 SSH 工具配置密钥登录，然后刷新主机。isolation key 会在部署创建 wrapper 后安装。", "copyInstall": "复制密钥配置命令", "copyLogin": "复制登录命令", "copyFailed": "无法复制，请选中命令后手动复制。", "trustReused": "沿用你先前的信任", "trustReusedHint": "扫描到的主机 key 与你的 known_hosts 完全相同，仅此 key 已保存到 Vellum 私有文件，无需再次确认。" },
+  "handoff": {
+    "refreshThreads": "刷新对话列表", "noAutoWriteback": "结果不会自动写回这个对话，完成后请在这里取回。", "writebackDelivered": "已写回对话", "writebackUnsupported": "此对话不支持自动写回", "providerFailed": "供应商 {{provider}} 请求失败（HTTP {{status}}）", "excludedCaches": "已跳过 {{count}} 个缓存文件", "recapture": "重新获取",
+    "openCodexApp": "在 Codex App 打开", "addHostToCodex": "请先在 Codex App 添加这台主机，仍可复制远端 thread ID。", "threadLinkFailed": "无法确认 Codex App 的连接配置，仍可复制 thread ID。", "openThreadFailed": "无法打开此 thread，请确认主机仍在 Codex App 的列表中再重试。", "copyFailed": "无法复制，请选中文字后手动复制。", "copySummary": "复制摘要", "summaryStatus": "结果状态", "summaryUnapplied": "结果尚未应用到本机文件", "summaryMissing": "目前暂无摘要。", "summaryDiffstat": "文件变更", "summaryDiffPending": "尚未取回文件变更。",
+    "draftBackground": "所选对话的背景", "draftOriginal": "原始需求", "draftProgress": "最后的 Agent 进度", "draftCaution": "第一段是本次交接的任务。以下摘录仅供背景参考；发送前请确认旧有的暂缓指示本次是否仍适用。",
+    "requiredOs": "任务需要的操作系统", "detectOs": "根据仓库判断",
+    "hostRepair": "请先部署或修复此主机，再交出工作。", "gitRepair": "请先安装 Git 2.29 或更高版本，再交出工作。", "pairRepair": "请先在此主机配对并启用 ChatGPT。", "copyThread": "复制远端 thread ID", "openThreadHint": "在 Codex App 选择此主机，再用此 ID 打开远端 thread。",
+    "title": "把本机的工作交给 {{host}}", "lede": "远端会从目前的进度接着做，包括尚未 commit 的改动。本机文件保持原样。",
+    "chooseThread": "选择一个本机 thread", "noThreads": "目前没有可接手的近期 Git thread。", "handedOff": "已交出", "changed": "改过的文件", "staged": "已 staged", "untracked": "未跟踪的新文件",
+    "transferNote": "直接通过受管 SSH 传到这台主机，不经过 GitHub；忽略的文件不会传输。", "brief": "远端要做的事", "briefPlaceholder": "完成……接着验证……\n\n背景：本机已经完成……", "briefHint": "第一段写清楚本次任务；需求与进度放在背景。旧需求若说过暂不执行，请说明本次是否改为执行。",
+    "toolWarning": "远端缺少 {{tool}}。请调整命令或安装工具；这条提醒会附在交代末尾。", "preflightReady": "主机、runtime 与模型检查通过。", "refNotice": "交出时会建立 refs/vellum-handoff/<id> 固定快照，Git 历史工具也能看到。结果应用、存为分支或丢弃后清除。",
+    "start": "交给远端", "reset": "重新选择", "checking": "正在检查所选 thread 与主机……", "checkFailed": "此操作未完成，请查看详细信息后重试。", "local": "本机", "remoteThread": "远端 thread", "partialCapture": "这是部分进度，并非完成结果；远端可能仍在执行。", "binary": "二进制", "noChanges": "没有文件变更。", "drift": "本机 HEAD、相关文件已变动，或无法干净应用。请将结果存为分支；本机工作树保持原样。",
+    "apply": "应用到本机工作区", "branch": "存为分支", "fetch": "取回结果", "fetchPartial": "先取回当前进度", "resume": "继续这份交接", "fullDiff": "查看完整 diff", "discard": "丢弃结果", "discardConfirm": "丢弃这份已停止的交接并清除本机快照 ref。本机文件与远端工作树会保留。", "detached": "关闭 Vellum 也会继续执行。", "retryCleanup": "重试清理 ref", "ledger": "交接记录", "new": "交出另一份工作", "noRecords": "这台主机还没有交接记录。", "review": "查看结果", "dismiss": "知道了", "completedNotice": "远端已完成：{{name}}", "partialNotice": "远端已停止，可能有部分结果可回收：{{name}}", "hostCounts": "{{running}} 份进行中 · {{ready}} 份待取回",
+    "states": { "applied": "已应用", "branched": "已存为分支", "discarded": "已丢弃", "back": "可以取回", "partial": "已停止・部分进度", "running": "远端进行中", "uncertain": "等待对账" },
+    "errors": { "HandoffPlatformMismatch": "这份工作需要其他操作系统，请选择兼容的主机。", "HandoffLfsUnsupported": "目前尚不支持接手 LFS 仓库。", "HandoffThreadAlreadyHandedOff": "此 thread 已有未结束的交接，请先查看原记录。", "activeWorkInProgress": "请先完成或中断本机 turn。", "incompleteObservation": "无法确认本机活动，请重试后再交出。", "HandoffThreadSettingsUnavailable": "无法从所选 thread 读取模型与推理强度。", "HandoffRuntimeIncomplete": "Codex runtime 不完整，请先重新部署主机。", "HandoffModelUnavailable": "请先在此主机部署所选 thread 的模型与 provider。", "HandoffManagedSshRequired": "请先部署此主机的受管 SSH。", "HandoffLocalDrift": "本机工作已变动，请重试将结果存为分支。", "HandoffStillRunning": "远端仍在执行或状态不明，请等它停止。", "HandoffBranchExists": "结果分支已存在且内容不同，已保留原分支。", "HandoffResultUnavailable": "目前还没有可用的结果快照。", "HandoffOperationBusy": "另一个交接操作正在执行，请稍后重试。" }
+  },
   "requestErrors": {"quota": "额度用完或请求被限流。", "auth": "登录验证被拒绝，请重新登录。", "cancelled": "请求已取消或连接已关闭。", "protocol": "无法读取上游响应。", "rejected": "请求被上游拒绝。", "unavailable": "上游服务暂时故障。", "other": "请求失败，请查看技术资料。", "retryAfter": "至少等待 {{time}} 后再重试。", "retries": "已重试 {{count}} 次。", "reasons": {"unsupported": "包含不支持的请求选项。", "tools": "工具定义不符合要求的格式。", "continuation": "找不到上一条响应。", "context": "对话超出上下文限制。", "policy": "内容被上游政策拒绝。"}},
   "quotaActions": {"resetCount": "重置次数：{{count}}", "resetHint": "展开可用的重置券；查看列表不会消耗券。", "fiveHourHint": "切换 5 小时窗口自动管理；不会立即消耗重置券。"},
   "bridgeFallback": { "active": "Enhanced core 缺失，发送按钮保护与账号切换仍通过官方 bridge 生效。", "prepared": "Enhanced core 缺失。官方 bridge 已准备好，Codex 接入后保护才会生效。", "failed": "Enhanced core 缺失，bridge 保护未生效。请查看详细信息并修复安装。" },
@@ -175,7 +207,7 @@ const zhCN: ResourceTree = {
     "requestsTokens_one": "{{count}} 次请求 · {{tokens}} tokens",
     "requestsTokens_other": "{{count}} 次请求 · {{tokens}} tokens"
   },
-  "runtime": {"notice": {"codexConfigStillPointedAtVellum": "Codex 的配置仍指向 Vellum。启动 Proxy 后重新启动 Codex App 即可继续使用。", "codexRunning": "Codex 正在运行；请重新启动以载入 Proxy 与模型菜单", "proxyStoppedCodexRestartRequired": "Proxy 已停止并还原设置；请重新启动 Codex 以离开旧的 Proxy／Bridge 连接", "codexRestartDetected": "已检测到 Codex 重新启动；Proxy 与模型菜单已载入", "routesAndCatalogUpdated": "Provider 设置与模型菜单已更改；重新启动 Vellum Proxy 与 Codex 后生效", "catalogRestored": "已还原模型菜单；Codex 需要重新启动", "catalogUpdated": "模型菜单已更新", "enhancedDesktopRuntimeChanged": "Enhanced Codex Runtime 设置已更改；请重启 Codex 以应用", "enhancedLaunchCoreRepaired": "Codex Desktop 已更新内核，Vellum 已自动重启 Proxy 并准备好新的启动配置；请重新启动 Codex（原启动 {{launchId}}）", "enhancedLaunchCoreRepairFailed": "Codex Desktop 更新后，Vellum 无法自动重启 Proxy：{{reason}}。请手动重启 Proxy，再重新启动 Codex。", "remoteOfficialAccountSwitchNotFollowed": "远程主机 {{host}} 没有跟着切换账号。请打开 Remote Manager 进行配对或同步。原因：{{detail}}", "officialAccountSwitchNativePlane": "Official GPT 仍使用未修改的 Codex 核心；只要 Enhanced bridge 在运行，Vellum 的账号切换就不会取代 Codex Desktop 的登录身份", "enhancedDesktopBridgeReady": "Codex 已重新启动，并改走 Enhanced bridge（启动 {{launchId}}）", "enhancedDesktopBridgeFailed": "Codex 已重新启动，但 Enhanced bridge 失败：{{reason}}", "enhancedDesktopRuntimeNotArmed": "Proxy 已启动，但 Enhanced Codex 没有生效：第三方 Provider 的对话会由原生 Codex 执行。原因：{{detail}}", "enhancedDesktopBridgeNotObserved": "Codex 已重新打开，但没有任何 Enhanced bridge 回报启动 {{launchId}}；Enhanced 并未运行", "routeHotSwapped": "路由已即时切换", "slotSwitched": "{{slot}} 已切换至 {{model}}", "restartSucceeded": "Codex 已安全重新启动；新的运行时设置已加载", "restartNotDetected": "已发出启动 Codex 的请求，但 5 秒内没有检测到 App；请手动打开", "restartProcessStillRunning": "Codex 尚未完全退出（退出代码 {{exitCode}}）；已取消重新启动", "restartBlockedByActiveRequests_one": "仍有 {{count}} 个请求执行中", "restartBlockedByActiveRequests_other": "仍有 {{count}} 个请求执行中", "restartBlockedByCodexTurn_one": "Codex Desktop 有 {{count}} 个对话正在进行；现在重启会丢失它还没写入磁盘的内容", "restartBlockedByCodexTurn_other": "Codex Desktop 有 {{count}} 个对话正在进行；现在重启会丢失它们还没写入磁盘的内容", "restartBlockedByLifecycle": "另一项 Proxy 或 Enhanced Runtime 变更仍在进行，请稍后再试", "restartTimedOut": "重启在 3 分钟内没有完成，已放弃；已恢复接受新请求", "restartExecutableMissing": "找不到可验证的 Codex App 执行文件", "restartExecutableInvalid": "Codex App 执行文件不存在或不是绝对路径", "restartUnavailableInPreview": "浏览器预览不会重新启动 Codex", "usageOAuthNotConfigured": "Vellum 尚未配置 OpenAI OAuth；OpenAI 的用量暂以 Proxy 记录推算", "usageProfileUnavailable_one": "{{count}} 个 OpenAI OAuth 账号的 Codex Token 统计暂时无法读取", "usageProfileUnavailable_other": "{{count}} 个 OpenAI OAuth 账号的 Codex Token 统计暂时无法读取", "webSearchDisabledMissingBraveKey": "由于未设置 Brave Search API 密钥，第三方网页搜索已被停用。请在设置中添加密钥以重新启用。"}, "alerts": {"label": "运行时警告"}},
+  "runtime": {"notice": {"codexConfigStillPointedAtVellum": "Codex 的配置仍指向 Vellum。启动 Proxy 后重新启动 Codex App 即可继续使用。", "codexRunning": "Codex 正在运行；请重新启动以载入 Proxy 与模型菜单", "proxyStoppedCodexRestartRequired": "Proxy 已停止并还原设置；请重新启动 Codex 以离开旧的 Proxy／Bridge 连接", "codexRestartDetected": "已检测到 Codex 重新启动；Proxy 与模型菜单已载入", "routesAndCatalogUpdated": "Provider 设置与模型菜单已更改；重新启动 Vellum Proxy 与 Codex 后生效", "catalogRestored": "已还原模型菜单；Codex 需要重新启动", "catalogUpdated": "模型菜单已更新", "enhancedDesktopRuntimeChanged": "Enhanced Codex Runtime 设置已更改；请重启 Codex 以应用", "enhancedLaunchCoreRepaired": "Codex Desktop 已更新内核，Vellum 已自动重启 Proxy 并准备好新的启动配置；请重新启动 Codex（原启动 {{launchId}}）", "enhancedLaunchCoreRepairFailed": "Codex Desktop 更新后，Vellum 无法自动重启 Proxy：{{reason}}。请手动重启 Proxy，再重新启动 Codex。", "remoteOfficialAccountSwitchNotFollowed": "远程主机 {{host}} 没有跟着切换账号。请打开 Remote Manager 进行配对或同步。原因：{{detail}}", "officialAccountSwitchNativePlane": "Official GPT 仍使用未修改的 Codex 核心；只要 Enhanced bridge 在运行，Vellum 的账号切换就不会取代 Codex Desktop 的登录身份", "enhancedDesktopBridgeReady": "Codex 已重新启动，并改走 Enhanced bridge（启动 {{launchId}}）", "enhancedDesktopBridgeFailed": "Codex 已重新启动，但 Enhanced bridge 失败：{{reason}}", "enhancedDesktopRuntimeNotArmed": "Proxy 已启动，但 Enhanced Codex 没有生效：第三方 Provider 的对话会由原生 Codex 执行。原因：{{detail}}", "enhancedDesktopBridgeNotObserved": "Codex 已重新打开，但没有任何 Enhanced bridge 回报启动 {{launchId}}；Enhanced 并未运行", "routeHotSwapped": "路由已即时切换", "slotSwitched": "{{slot}} 已切换至 {{model}}", "restartSucceeded": "Codex 已安全重新启动；新的运行时设置已加载", "restartNotDetected": "已发出启动 Codex 的请求，但 5 秒内没有检测到 App；请手动打开", "restartProcessCloseTimedOut": "Codex 未在 {{seconds}} 秒内完全关闭；已取消重新启动。选择「仍要重启」会强制结束 Codex，可能丢失尚未写入磁盘的内容。", "restartProcessStillRunning": "Codex 尚未完全退出（退出代码 {{exitCode}}）；已取消重新启动。选择「仍要重新启动」会强制结束 Codex，可能丢失尚未写入磁盘的内容。", "restartBlockedByActiveRequests_one": "仍有 {{count}} 个请求执行中", "restartBlockedByActiveRequests_other": "仍有 {{count}} 个请求执行中", "restartBlockedByCodexTurn_one": "Codex Desktop 有 {{count}} 个对话正在进行；现在重启会丢失它还没写入磁盘的内容", "restartBlockedByCodexTurn_other": "Codex Desktop 有 {{count}} 个对话正在进行；现在重启会丢失它们还没写入磁盘的内容", "restartBlockedByLifecycle": "另一项 Proxy 或 Enhanced Runtime 变更仍在进行，请稍后再试", "restartTimedOut": "重启在 3 分钟内没有完成，已放弃；已恢复接受新请求", "restartExecutableMissing": "找不到可验证的 Codex App 执行文件", "restartExecutableInvalid": "Codex App 执行文件不存在或不是绝对路径", "restartUnavailableInPreview": "浏览器预览不会重新启动 Codex", "usageOAuthNotConfigured": "Vellum 尚未配置 OpenAI OAuth；OpenAI 的用量暂以 Proxy 记录推算", "usageProfileUnavailable_one": "{{count}} 个 OpenAI OAuth 账号的 Codex Token 统计暂时无法读取", "usageProfileUnavailable_other": "{{count}} 个 OpenAI OAuth 账号的 Codex Token 统计暂时无法读取", "webSearchDisabledMissingBraveKey": "由于未设置 Brave Search API 密钥，第三方网页搜索已被停用。请在设置中添加密钥以重新启用。"}, "alerts": {"label": "运行时警告"}},
   "settings": {
     "remoteSidebar": {"label":"侧栏的远程管理器","mode":{"auto":"自动","show":"始终显示","hide":"隐藏"},"hint":{"auto":"有受管远程主机时才显示。","show":"一直显示，方便还没设置主机时使用。","hide":"即使有受管主机也不显示。主机与部署都会保留。"}},
     "language": {
@@ -508,6 +540,7 @@ const zhCN: ResourceTree = {
     },
     "act": {
       "bootstrap": "部署此主机",
+      "cancelDeployment": "取消部署",
       "reconverge": "重新同步",
       "plan": "变更模型…",
       "replan": "更新预览",
@@ -614,7 +647,12 @@ const zhCN: ResourceTree = {
       "dockerUnavailable": "主机上没有可用的 Docker，Proxy 无法启动。",
       "intelMacUnsupported": "Intel Mac 尚未支持。第一版 Remote Manager 只支持 Apple Silicon。",
       "guiSessionUnavailable": "没有可用的 macOS 登录会话。Proxy 是登录后常驻，不会改电源或自动登录。",
-      "proxyPortConflict": "远程 Proxy 默认端口被占用。请在部署计划指定其他端口，或释放 127.0.0.1:15722。",
+      "proxyPortConflict": "15721–15799 的 Proxy 备用端口全部被占用。请释放其中一个端口，再重新部署。",
+      "proxyPortOccupied": "Proxy 原来的端口已被其他进程占用。重新部署会自动选择空闲端口，并更新 Codex 的连接设置。",
+      "proxyMigrationRolledBack": "原生 Proxy 迁移失败，已恢复原来受管理的 Docker Proxy。可重新部署再试一次。",
+      "proxyMigrationRecoveryFailed": "迁移失败，且无法安全恢复原来的 Docker Proxy。请导出支持资料、检查主机后，再重新部署。",
+      "proxyMigrationAgentUpgradeRequired": "请先更新远端 Agent，再迁移 Docker Proxy，才能在迁移失败时恢复原来的服务。",
+      "deploymentVerificationFailed": "自动重试一次后，主机仍未就绪。请查看失败详情后重新部署；若 Proxy 端口已改变，重新部署会一并更新连接设置。",
       "insufficientDiskSpace": "可用空间不足以容纳下载、解压与回滚保留，替换操作已停止。不会自动删除用户数据。",
       "incompleteObservation": "无法完整观察受管理 runtime 的 turn、工具或批准，已阻止破坏性操作。",
       "hostNotConfigured": "此主机尚未写入 Vellum 的配置。",
@@ -624,13 +662,24 @@ const zhCN: ResourceTree = {
       "nativeCodexVersionMismatch": "主机上的 Codex CLI 版本不符合，需要安装 pinned 版本。",
       "nativeDaemonAppOwned": "Codex App 目前直接占用此主机的 app-server，Vellum 无法接管。",
       "noModelsSelected": "尚未选择任何模型，没有可同步的内容。",
+      "noDeployableModels": "所选模型中，目前没有同时通过资格检查且具备桌面端可用凭证的模型。请启用并验证模型、补上凭证后再部署。",
+      "bundledReleaseUnavailable": "内附部署文件缺少或未通过验证。请先安装完整的 Vellum 发行版本，再部署。",
+      "codexRuntimeIncomplete": "远端 Codex 缺少执行所需的 helper 或资源。请先重新部署这台主机，再交出工作。",
+      "DeploymentAgentUpgradeRequired": "请先更新远端 Agent，再确认接手。当前 Agent 无法将确认绑定到已观察的进程。",
+      "DeploymentAlreadyRunning": "这台主机已有部署正在进行。请查看该操作，或取消后再开始。",
+      "DeploymentControlUnavailable": "这笔部署已不在当前 Vellum 会话执行。请重新部署以继续。",
+      "DeploymentConfirmationExpired": "已观察的进程或等待操作已改变。请查看当前接手提示，再确认一次。",
+      "activeWorkInProgress": "Codex 仍有进行中的 turn、工具或待批准操作。请等当前工作结束后再部署。",
+      "unsupportedRemotePlatform": "这台主机的操作系统或架构不在支持的部署范围内。",
+      "officialAccountStatusUnavailable": "无法确认桌面端当前账号在这台主机上的授权状态。请恢复连接后重新部署。",
       "officialAccountActivationRequired": "远程的 ChatGPT 账号已配对，但尚未启用。",
       "officialAccountReauthenticationRequired": "远程 ChatGPT 凭证已过期，请重新登录。",
       "officialAccountPairingRequired": "远程尚未与桌面端选定的 ChatGPT 账号配对。",
       "proxyConfigurationMissing": "主机上尚无 Proxy 配置。",
       "proxyConfigurationSchemaTooNew": "主机上的 Proxy 配置格式比此 Vellum 版本能理解的更新，为避免覆盖已阻止部署——请先更新 Vellum。",
       "proxyConfigurationUnreadable": "无法读取主机上的 Proxy 配置（权限或 I/O 问题），为避免误判为可安全覆盖已阻止部署。",
-      "systemdUserUnavailable": "主机上没有可用的 user systemd，daemon 无法常驻。",
+      "systemdUserUnavailable": "主机没有可用的 user systemd，将使用 Agent supervisor；主机重启后需重新连接一次。",
+      "psStartTimeUnavailable": "主机的 ps 无法查询进程启动时间，无法启动 Codex daemon。请按照修复命令安装兼容的 ps，再重新部署。",
       "versionMismatch": "主机上的 Agent 版本与此 Vellum 不相符。"
     },
     "configuration": {
@@ -642,7 +691,12 @@ const zhCN: ResourceTree = {
     "phase": {
       "queued": "排入队列",
       "cleanHostPreflight": "检查内置套件与干净主机基准",
-      "hostPreflight": "检查 SSH、Docker 与用户服务",
+      "hostPreflight": "检查平台、凭证与部署文件",
+      "autoFix": "应用部署修复",
+      "waitingForIdle": "等待 Codex 当前这轮、工具与批准操作结束",
+      "observing": "正在读取 Codex 状态；连续 30 秒无法读取就会停止部署",
+      "awaitingTakeover": "Codex 已空闲，确认接手后会继续部署",
+      "cancelled": "已取消部署",
       "resolvingDesktopCodex": "解析并验证与 Desktop 相符的 Codex runtime",
       "installCodex": "安装内置的 pinned Codex CLI",
       "nativeDaemon": "开启可常驻的 Codex 远程控制",
@@ -650,6 +704,7 @@ const zhCN: ResourceTree = {
       "deploymentApply": "安装 Proxy、凭证与模型菜单",
       "applying": "应用部署计划",
       "verification": "验证 Proxy、daemon 与脱离准备状态",
+      "verificationRetry": "启动 Proxy 并重试验证一次",
       "verified": "已就绪",
       "restorePreflight": "检查进行中的 turn 与受管理状态",
       "restoreLease": "还原 Codex 配置与模型菜单",
@@ -660,6 +715,7 @@ const zhCN: ResourceTree = {
       "failed": "失败"
     },
     "operation": {
+      "cancelled": "已取消部署。已完成的安装会保留；重新部署即可继续。",
       "bootstrap": "正在部署",
       "apply": "正在同步",
       "restore": "正在解除管理",
@@ -707,6 +763,7 @@ const zhCN: ResourceTree = {
       "persistence": "常驻范围",
       "loginResident": "登录后常驻",
       "lingerResident": "systemd linger 常驻",
+      "onDemandResident": "Agent supervisor 常驻；主机重启后需重新连接一次",
       "managedHome": "受管理的 CODEX_HOME",
       "isolationLabel": "隔离",
       "isolation": "远程设置与本机 Vellum／Enhanced／~/.codex 隔离。"
@@ -742,6 +799,7 @@ const zhCN: ResourceTree = {
       "grokPartial": "已安装凭证，但远程 CLI 或 refresh token 尚未符合资格",
       "grokAbsent": "未配置",
       "pairingHint": "请使用桌面端选定的账号登录：",
+      "optionalAfterDeploy": "已使用可用模型完成部署。要在这台使用 ChatGPT？请配对桌面端当前选定的账号，再重新部署。",
       "pairingRemaining": "还剩 {{remaining}} 个",
       "pairingActive": "这台主机正在使用",
       "pairingPaired": "已配对，未使用",

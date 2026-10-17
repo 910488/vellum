@@ -60,17 +60,32 @@ pub(crate) fn install_binary(
     let parent = target
         .parent()
         .ok_or_else(|| "agent executable has no parent".to_string())?;
+    // Native proxy bootstrap shares this installer with agent self-update.
+    // Only an existing target can supply a rollback; treat other metadata
+    // errors as failures rather than mistaking them for a first install.
+    let had_target = match fs::symlink_metadata(target) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("inspect current binary for rollback: {error}")),
+    };
     let temporary = parent.join(format!(".vellum-agent-update-{}", ulid::Ulid::new()));
     copy_private_executable(staged, &temporary)?;
     let rollback = rollback_path(target);
-    if rollback.exists() {
-        fs::remove_file(&rollback)
-            .map_err(|error| format!("remove previous rollback binary: {error}"))?;
+    if had_target {
+        if rollback.exists() {
+            fs::remove_file(&rollback)
+                .map_err(|error| format!("remove previous rollback binary: {error}"))?;
+        }
+        fs::rename(target, &rollback)
+            .map_err(|error| format!("stage current agent for rollback: {error}"))?;
     }
-    fs::rename(target, &rollback)
-        .map_err(|error| format!("stage current agent for rollback: {error}"))?;
     if let Err(error) = fs::rename(&temporary, target) {
-        let rollback_error = fs::rename(&rollback, target).err();
+        let rollback_error = if had_target {
+            fs::rename(&rollback, target).err()
+        } else {
+            None
+        };
+        let _ = fs::remove_file(&temporary);
         return Err(format!(
             "publish agent update failed: {error}; rollback={rollback_error:?}"
         ));
@@ -172,19 +187,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_install_is_digest_pinned_and_does_not_create_a_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("vellum-proxy-daemon");
+        let staged = temp.path().join("proxy-staged");
+        fs::write(&staged, b"first native proxy").unwrap();
+        let digest = sha256_file(&staged).unwrap();
+
+        assert!(install_binary(&staged, &target, "wrong").is_err());
+        assert!(!target.exists());
+        assert!(!rollback_path(&target).exists());
+
+        let result = install_binary(&staged, &target, &digest).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first native proxy");
+        assert_eq!(result.sha256, digest);
+        assert!(!Path::new(&result.rollback_path).exists());
+        assert!(rollback_binary(&target)
+            .unwrap_err()
+            .contains("AgentRollbackUnavailable"));
+        assert_eq!(fs::read(&target).unwrap(), b"first native proxy");
+    }
+
+    #[test]
     fn update_is_digest_pinned_and_rollback_restores_previous_binary() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("agent");
         let staged = temp.path().join("agent-new");
         fs::write(&target, b"old").unwrap();
         fs::write(&staged, b"new").unwrap();
+        fs::write(rollback_path(&target), b"previous rollback").unwrap();
         let digest = sha256_file(&staged).unwrap();
         assert!(install_binary(&staged, &target, "wrong").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(
+            fs::read(rollback_path(&target)).unwrap(),
+            b"previous rollback"
+        );
 
         let result = install_binary(&staged, &target, &digest).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
         assert!(Path::new(&result.rollback_path).is_file());
+        assert_eq!(fs::read(&result.rollback_path).unwrap(), b"old");
         rollback_binary(&target).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"old");
     }

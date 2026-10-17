@@ -24,6 +24,7 @@ use vellum_enhanced_codex::{AblationProfile, EnhancedEventKind, EnhancedRuntimeF
 use super::attestation::{AttestationWriter, BridgeAttestationV1, ChildAttestation};
 use super::launch_manifest::{LaunchManifestError, LaunchManifestV1, RuntimeBinaryIdentity};
 use super::observations::RuntimeObservations;
+use super::official_drift::OfficialSource;
 use super::qualification::{
     parse_enhanced_event, parse_enhanced_identity, QualificationJournal,
     ENHANCED_EVENT_NOTIFICATION, ENHANCED_IDENTITY_NOTIFICATION,
@@ -150,7 +151,13 @@ pub struct BridgeConfig {
 
 impl BridgeConfig {
     pub fn load(manifest_path: &Path, child_args: Vec<String>) -> Result<Self, BridgeError> {
-        let manifest = LaunchManifestV1::read(manifest_path)?;
+        Self::from_manifest(LaunchManifestV1::read(manifest_path)?, child_args)
+    }
+
+    fn from_manifest(
+        manifest: LaunchManifestV1,
+        child_args: Vec<String>,
+    ) -> Result<Self, BridgeError> {
         manifest.verify_on_disk()?;
         let model_provider_map = TrustedModelProviderMap::read(&manifest.model_provider_map_path)?;
         Ok(Self {
@@ -199,16 +206,64 @@ pub fn run_from_env() -> Result<(), BridgeError> {
         return wait_for_delegated_command(native_tool_app_server_command(&official, &child_args));
     }
     if bridge_is_started_by_codex_desktop() {
-        let manifest = LaunchManifestV1::read(&manifest_path)?;
-        // Desktop replaced its core after this launch was prepared. Serving
-        // plain Official keeps Desktop usable until Vellum rebuilds the launch;
-        // exiting here is what left it with no app-server at all.
-        let (official, drifted) = super::official_drift::resolve_official(&manifest)?;
-        if drifted || enhanced_lease_released() {
-            return wait_for_delegated_command(released_app_server_command(&official, &child_args));
+        let mut manifest = LaunchManifestV1::read(&manifest_path)?;
+        let (official, source) = super::official_drift::resolve_official(&manifest)?;
+        manifest.official_helpers =
+            super::official_drift::expected_helpers(&manifest, &official.artifact_sha256);
+        // Desktop replaced its core with one this launch never checked, or
+        // Vellum gave the lease back. Serving plain Official keeps Desktop
+        // usable until Vellum rebuilds the launch; exiting here is what left it
+        // with no app-server at all.
+        let fallback = match source {
+            OfficialSource::Drifted => Some("officialDrift"),
+            _ if enhanced_lease_released() => Some("leaseReleased"),
+            _ => None,
+        };
+        if let Some(reason) = fallback {
+            return run_fallback(manifest, official, child_args, reason);
         }
+        // A successor was checked against this launch before Desktop moved to
+        // it, so it gets the same Enhanced plane the pinned core would have.
+        manifest.official = official;
+        return run(BridgeConfig::from_manifest(manifest, child_args)?);
     }
     run(BridgeConfig::load(&manifest_path, child_args)?)
+}
+
+/// Plain Official for Desktop, still through the bridge. The delegated command
+/// this replaced inherited Desktop's stdio outright, which left Vellum blind to
+/// the turns running on it: it could neither tell when replacing it was safe
+/// nor see that it was there at all. Routed through the bridge with no
+/// Enhanced core and no relay, every thread goes to Official exactly as before
+/// and the attestation keeps an honest count.
+fn run_fallback(
+    manifest: LaunchManifestV1,
+    official: RuntimeBinaryIdentity,
+    child_args: Vec<String>,
+    reason: &'static str,
+) -> Result<(), BridgeError> {
+    let config = TrustedModelProviderMap::read(&manifest.model_provider_map_path)
+        .map_err(BridgeError::from)
+        .and_then(|model_provider_map| {
+            let config = BridgeConfig {
+                manifest: LaunchManifestV1 {
+                    official: official.clone(),
+                    enhanced: None,
+                    relay: None,
+                    ..manifest
+                },
+                model_provider_map,
+                child_args: child_args.clone(),
+            };
+            config.validate()?;
+            Ok(config)
+        });
+    match config {
+        Ok(config) => run_with(config, Some(reason)),
+        // Without a usable provider map or binding store there is nothing to
+        // track turns with; plain Official is still better than no app-server.
+        Err(_) => wait_for_delegated_command(released_app_server_command(&official, &child_args)),
+    }
 }
 
 /// True once Vellum has given `CODEX_CLI_PATH` back (it exited, or Enhanced
@@ -315,6 +370,10 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
     if config.manifest.relay.is_some() {
         return multiplex::run(config);
     }
+    run_with(config, None)
+}
+
+fn run_with(config: BridgeConfig, fallback: Option<&str>) -> Result<(), BridgeError> {
     let manifest = config.manifest.clone();
     let adopted_by_desktop = bridge_is_started_by_codex_desktop();
     let state_paths = bridge_state_paths(&manifest.attestation_path, adopted_by_desktop)?;
@@ -330,6 +389,13 @@ pub fn run(config: BridgeConfig) -> Result<(), BridgeError> {
         },
         enhanced_child_attestation(&manifest),
     );
+    attestation.set_incomplete_official(super::launch_manifest::missing_official_helpers(
+        &manifest.official.executable,
+        &manifest.official_helpers,
+    ));
+    if let Some(reason) = fallback {
+        attestation.set_fallback(reason);
+    }
     let _ = attestation.flush();
 
     let store = match ThreadRuntimeBindingStore::open(&manifest.binding_db) {
@@ -1475,8 +1541,9 @@ impl BridgeState {
 
 /// Desktop now includes `thread_context`, which its Official core explicitly
 /// ignores. The pinned Enhanced core rejects that unknown field before loading
-/// any feature config. Translate only this deprecated field at the RPC boundary;
-/// do not disable Guardian or discard active/future review settings.
+/// any feature config. At the same thread RPC boundary, downgrade the known
+/// boolean-only features too. Do not disable Guardian, flatten arbitrary feature
+/// maps or discard active/future review settings.
 fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value) {
     if plane != ExecutionPlane::EnhancedCodex
         || !matches!(
@@ -1492,6 +1559,7 @@ fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value
     else {
         return;
     };
+    normalize_enhanced_boolean_features(config);
     config.remove("features.guardianv2.thread_context");
     if let Some(guardian) = config
         .get_mut("features.guardianv2")
@@ -1505,6 +1573,43 @@ fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value
         .and_then(Value::as_object_mut)
     {
         guardian.remove("thread_context");
+    }
+}
+
+// Desktop negotiates against Official's version. Enhanced 0.2.10 still
+// accepts only booleans for these features. Do not flatten arbitrary maps:
+// guardianv2 and multi_agent_v2 support structured configuration on both cores.
+const ENHANCED_BOOLEAN_FEATURES: &[&str] = &["async_compaction"];
+
+fn normalize_enhanced_boolean_features(config: &mut serde_json::Map<String, Value>) {
+    for feature in ENHANCED_BOOLEAN_FEATURES {
+        let key = format!("features.{feature}");
+        let prefix = format!("{key}.");
+        let direct_boolean = config.get(&key).is_some_and(Value::is_boolean);
+        let enabled = config
+            .get(&format!("{key}.enabled"))
+            .and_then(Value::as_bool);
+        config.retain(|name, _| !name.starts_with(&prefix));
+        if let Some(value) = config.get_mut(&key) {
+            if let Some(map) = value.as_object() {
+                *value = Value::Bool(map.get("enabled").and_then(Value::as_bool) == Some(true));
+            }
+        }
+        if let Some(value) = config
+            .get_mut("features")
+            .and_then(|features| features.get_mut(*feature))
+        {
+            if let Some(map) = value.as_object() {
+                *value = Value::Bool(map.get("enabled").and_then(Value::as_bool) == Some(true));
+            }
+        }
+        // A direct boolean is already valid: preserve it even if obsolete
+        // child keys coexist. Otherwise retain a boolean .enabled override.
+        if !direct_boolean {
+            if let Some(enabled) = enabled {
+                config.insert(key, Value::Bool(enabled));
+            }
+        }
     }
 }
 

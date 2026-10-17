@@ -22,12 +22,7 @@ if [[ "$bundle" != "stage-only" ]]; then
   bash "$repo/scripts/check-main-ancestry.sh"
 fi
 
-# Docker Desktop's default `docker` buildx driver cannot export
-# `type=docker,dest=...` archives unless its containerd image store is enabled.
-# Use an isolated container builder per architecture so local macOS builds and
-# CI produce the same loadable proxy-image.tar without mutating the user's
-# local image tags. Removing each builder immediately also bounds disk usage on
-# developer Macs instead of retaining both architecture caches until the end.
+# Build native musl payloads on the builder's architecture; no target QEMU compilation.
 builder=""
 cleanup_builder() {
   if [[ -n "$builder" ]]; then
@@ -60,7 +55,7 @@ proxy_source_fingerprint() {
     printf '%s\0%s\n' "$relative" "$(sha256 "$repo/$relative")"
   done < <(git -C "$repo" ls-files -- \
     Cargo.toml Cargo.lock crates src-tauri/Cargo.toml src-tauri/src \
-    third_party/codex-0.150 deploy/proxy/Dockerfile deploy/remote-bundle/Dockerfile | sort)
+    third_party/codex-0.150 deploy/proxy/Dockerfile deploy/remote-bundle/Dockerfile scripts/build-local-release.ps1 scripts/build-local-release.sh scripts/finalize-remote-linux-manifest.mjs | sort)
 }
 
 proxy_fingerprint="$(proxy_source_fingerprint | sha256_stdin | cut -c1-12)"
@@ -70,11 +65,11 @@ proxy_image="vellum-proxy:$version-$proxy_fingerprint"
 complete_arch() {
   local arch_root="$1"
   local name
-  for name in vellum-remote-agent vellum-remote-broker codex proxy-image.tar; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     [[ -s "$arch_root/$name" ]] || return 1
   done
-  [[ -s "$arch_root/proxy-image.ref" ]] || return 1
-  [[ "$(tr -d '\r\n' < "$arch_root/proxy-image.ref")" == "$proxy_image" ]] || return 1
+  [[ -s "$arch_root/native-source.ref" ]] || return 1
+  [[ "$(tr -d '\r\n' < "$arch_root/native-source.ref")" == "$proxy_image:$codex_version" ]] || return 1
 }
 
 if [[ "$resume" != "1" ]]; then
@@ -94,10 +89,10 @@ for arch in amd64 arm64; do
   docker buildx create --name "$builder" --driver docker-container >/dev/null
   docker buildx inspect "$builder" --bootstrap >/dev/null
 
-  echo "==> Build Linux $arch Agent and Broker"
+  echo "==> Cross-compile Linux $arch musl Agent and native Proxy"
   docker buildx build \
     --builder "$builder" \
-    --platform "linux/$arch" \
+    --build-arg "REMOTE_ARCH=$arch" \
     --file "$repo/deploy/remote-bundle/Dockerfile" \
     --target export \
     --output "type=local,dest=$arch_root" \
@@ -108,23 +103,10 @@ for arch in amd64 arm64; do
   else
     codex_target="x86_64-unknown-linux-musl"
   fi
-  codex_archive="$arch_root/codex.tar.gz"
-  codex_url="https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-$codex_target.tar.gz"
-  echo "==> Download pinned Codex $codex_version for $arch"
-  curl -fsSL --proto '=https' --tlsv1.2 "$codex_url" -o "$codex_archive"
-  tar -xzf "$codex_archive" -C "$arch_root" "codex-$codex_target"
-  mv "$arch_root/codex-$codex_target" "$arch_root/codex"
-  rm "$codex_archive"
+  echo "==> Download digest-verified Codex runtime package $codex_version for $arch"
+  node "$repo/scripts/download-codex-package.mjs" "$codex_version" "$codex_target" "$arch_root/codex-package.tar.gz"
 
-  echo "==> Build Proxy image archive for $arch"
-  docker buildx build \
-    --builder "$builder" \
-    --platform "linux/$arch" \
-    --file "$repo/deploy/proxy/Dockerfile" \
-    --tag "$proxy_image" \
-    --output "type=docker,dest=$arch_root/proxy-image.tar" \
-    "$repo"
-  printf '%s\n' "$proxy_image" > "$arch_root/proxy-image.ref"
+  printf '%s\n' "$proxy_image:$codex_version" > "$arch_root/native-source.ref"
   cleanup_builder
 done
 
@@ -135,65 +117,13 @@ for arch in amd64 arm64; do
   destination="$resource_root/linux-$arch"
   rm -rf "$destination"
   mkdir -p "$destination"
-  for name in vellum-remote-agent vellum-remote-broker codex proxy-image.tar; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     cp "$scratch_root/$arch/$name" "$destination/$name"
   done
 done
 
-export VELLUM_RELEASE_REPO="$repo"
-export VELLUM_RELEASE_RESOURCES="$resource_root"
-export VELLUM_RELEASE_VERSION="$version"
-export VELLUM_RELEASE_CODEX_VERSION="$codex_version"
-export VELLUM_RELEASE_PROXY_IMAGE="$proxy_image"
-export VELLUM_RELEASE_AGENT_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/crates/vellum-remote-agent/Cargo.toml" | head -1)"
-export VELLUM_RELEASE_BROKER_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/crates/vellum-remote-broker/Cargo.toml" | head -1)"
-
-node <<'NODE'
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-
-const root = process.env.VELLUM_RELEASE_RESOURCES;
-const artifact = (relative) => ({
-  url: `bundle://${relative}`,
-  sha256: crypto.createHash('sha256').update(fs.readFileSync(path.join(root, relative))).digest('hex'),
-});
-const manifest = {
-  schemaVersion: 3,
-  releaseVersion: process.env.VELLUM_RELEASE_VERSION,
-  codex: {
-    pinnedVersion: process.env.VELLUM_RELEASE_CODEX_VERSION,
-    compatibleRange: process.env.VELLUM_RELEASE_CODEX_VERSION,
-    artifacts: {
-      'linux-x64': artifact('linux-amd64/codex'),
-      'linux-arm64': artifact('linux-arm64/codex'),
-    },
-  },
-  agent: {
-    version: process.env.VELLUM_RELEASE_AGENT_VERSION,
-    artifacts: {
-      'linux-x64': artifact('linux-amd64/vellum-remote-agent'),
-      'linux-arm64': artifact('linux-arm64/vellum-remote-agent'),
-    },
-  },
-  broker: {
-    version: process.env.VELLUM_RELEASE_BROKER_VERSION,
-    artifacts: {
-      'linux-x64': artifact('linux-amd64/vellum-remote-broker'),
-      'linux-arm64': artifact('linux-arm64/vellum-remote-broker'),
-    },
-  },
-  proxy: {
-    image: process.env.VELLUM_RELEASE_PROXY_IMAGE,
-    artifacts: {
-      'linux-x64': artifact('linux-amd64/proxy-image.tar'),
-      'linux-arm64': artifact('linux-arm64/proxy-image.tar'),
-    },
-  },
-  protocolVersion: 3,
-};
-fs.writeFileSync(path.join(root, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-NODE
+agent_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/crates/vellum-remote-agent/Cargo.toml" | head -1)"
+node "$repo/scripts/finalize-remote-linux-manifest.mjs" "$resource_root" "$version" "$codex_version" "$agent_version" "$proxy_fingerprint"
 
 if [[ "$(uname -s)" == Darwin ]]; then
   echo "==> Build Darwin ARM64 Agent and native Proxy"
@@ -207,30 +137,24 @@ if [[ "$(uname -s)" == Darwin ]]; then
   darwin_root="$resource_root/darwin-arm64"
   rm -rf "$darwin_root"
   mkdir -p "$darwin_root"
-  cp "$repo/target/aarch64-apple-darwin/release/vellum-remote-agent" \
+  cp "${CARGO_TARGET_DIR:-$repo/target}/aarch64-apple-darwin/release/vellum-remote-agent" \
     "$darwin_root/vellum-remote-agent"
-  cp "$repo/target/aarch64-apple-darwin/release/vellum-proxy-daemon" \
+  cp "${CARGO_TARGET_DIR:-$repo/target}/aarch64-apple-darwin/release/vellum-proxy-daemon" \
     "$darwin_root/vellum-proxy-daemon"
-  codex_archive="$scratch_root/codex-darwin-arm64.tar.gz"
-  curl -fsSL --proto '=https' --tlsv1.2 \
-    "https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-aarch64-apple-darwin.tar.gz" \
-    -o "$codex_archive"
-  tar -xzf "$codex_archive" -C "$scratch_root" codex-aarch64-apple-darwin
-  mv "$scratch_root/codex-aarch64-apple-darwin" "$darwin_root/codex"
-  rm "$codex_archive"
+  node "$repo/scripts/download-codex-package.mjs" "$codex_version" aarch64-apple-darwin "$darwin_root/codex-package.tar.gz"
   node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root"
 fi
 
 echo "==> Embedded remote payload"
 du -sh "$resource_root"
 for arch in amd64 arm64; do
-  for name in vellum-remote-agent vellum-remote-broker codex proxy-image.tar; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     test -s "$resource_root/linux-$arch/$name"
   done
 done
 test -s "$resource_root/manifest.json"
 if [[ "$(uname -s)" == Darwin ]]; then
-  for name in vellum-remote-agent vellum-proxy-daemon codex; do
+  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
     test -s "$resource_root/darwin-arm64/$name"
   done
 fi
