@@ -79,10 +79,7 @@ pub async fn get_enhanced_desktop_runtime_status(
 /// so this used to surface only as a restart badge, and following it dropped
 /// Desktop onto native Codex. Re-acquiring needs no restart and no consent: an
 /// absent value has no other owner. A foreign value is left alone.
-fn restore_cleared_lease(
-    state: &AppState,
-    status: &crate::enhanced_runtime::DesktopRuntimeStatus,
-) {
+fn restore_cleared_lease(state: &AppState, status: &crate::enhanced_runtime::DesktopRuntimeStatus) {
     if !status.enabled
         || status.environment_state != "leaseValueMissing"
         || !state.proxy_status().running
@@ -132,7 +129,9 @@ async fn read_desktop_runtime_status(
         let guard = state.lifecycle_lock().try_lock();
         let status = crate::enhanced_runtime::desktop_runtime_status(&data_root);
         if guard.is_ok() {
-            state.reconcile_enhanced_adoption((status.ready || status.bridge_protection_active) && !status.restart_required);
+            state.reconcile_enhanced_adoption(
+                (status.ready || status.bridge_protection_active) && !status.restart_required,
+            );
         }
         status
     })
@@ -455,7 +454,9 @@ async fn shared_restart_codex(state: &AppState, force: bool) -> AppResult<Manage
                         "[Restart] managed restart exceeded {}s and was abandoned",
                         RESTART_FLIGHT_TIMEOUT.as_secs()
                     );
-                    Ok(ManagedRestart::refused(RuntimeNotice::new("restartTimedOut")))
+                    Ok(ManagedRestart::refused(RuntimeNotice::new(
+                        "restartTimedOut",
+                    )))
                 }
             };
             let encoded = RestartFlight::Done(std::sync::Arc::new(match result {
@@ -507,10 +508,7 @@ pub(crate) async fn restart_codex_managed(
     outcome
 }
 
-async fn restart_codex_managed_inner(
-    state: &AppState,
-    force: bool,
-) -> AppResult<ManagedRestart> {
+async fn restart_codex_managed_inner(state: &AppState, force: bool) -> AppResult<ManagedRestart> {
     let Ok(_lifecycle) =
         tokio::time::timeout(RESTART_LIFECYCLE_WAIT, state.lifecycle_lock().lock()).await
     else {
@@ -544,18 +542,27 @@ async fn restart_codex_managed_inner(
     let active = state.active_requests();
     let process = discover_codex_process()?;
     let executable = process.as_ref().map(|target| target.executable.as_path());
-    if let Err(notice) = crate::runtime::restart_precondition(active, executable) {
+    #[cfg(target_os = "windows")]
+    let app_id = discover_codex_app_id();
+    let precondition = crate::runtime::restart_precondition(active, executable);
+    #[cfg(target_os = "windows")]
+    let precondition = match precondition {
+        Err(_) if active == 0 && process.is_none() && app_id.is_some() => Ok(()),
+        other => other,
+    };
+    if let Err(notice) = precondition {
         state.set_draining(false);
         return Ok(ManagedRestart::refused(notice));
     }
+    let previous_identity = process.as_ref().map(launch_target_identity);
+    #[cfg(not(target_os = "windows"))]
     let target = process.expect("precondition verified process");
     #[cfg(target_os = "windows")]
     let target = {
-        let mut target = target;
-        target.app_id = discover_codex_app_id();
+        let mut target = process.unwrap_or_else(|| aumid_only_target(app_id.clone().unwrap()));
+        target.app_id = app_id;
         target
     };
-    let previous_identity = launch_target_identity(&target);
 
     // Prepare and verify before changing launch leases or stopping the app.
     // Keep the original target/PID for the stop; only alter the next launch.
@@ -564,7 +571,11 @@ async fn restart_codex_managed_inner(
         let root = state.data_root();
         let current = target.executable.clone();
         let next = match off_main_thread(move || {
-            crate::enhanced_runtime::steer_repair::launch_executable(&root, &current)
+            if current.as_os_str().is_empty() {
+                current
+            } else {
+                crate::enhanced_runtime::steer_repair::launch_executable(&root, &current)
+            }
         })
         .await
         {
@@ -628,13 +639,45 @@ async fn restart_codex_managed_inner(
         }
     };
 
-    let stopped = match stop_codex_and_wait(&target, force).await {
+    #[cfg(target_os = "windows")]
+    let stop_attestation = crate::enhanced_runtime::live_bridge_attestation(&state.data_root());
+    #[cfg(target_os = "windows")]
+    if target.pid != 0 {
+        // Launch preparation can take time; check again immediately before
+        // sending WM_CLOSE so a newly opened Official turn is also protected.
+        if let Some(notice) = codex_turn_refusal(stop_attestation.as_ref(), force) {
+            state.set_draining(false);
+            return Ok(ManagedRestart::refused(notice));
+        }
+    }
+    let stopped = match if target.pid == 0 {
+        Ok(StopObservation::not_running())
+    } else {
+        #[cfg(target_os = "windows")]
+        let result = stop_windows_codex_and_wait(
+            &target,
+            force,
+            &state.data_root(),
+            stop_attestation.as_ref(),
+        )
+        .await;
+        #[cfg(not(target_os = "windows"))]
+        let result = stop_codex_and_wait(&target, force).await;
+        result
+    } {
         Ok(stopped) => stopped,
         Err(error) => {
             state.set_draining(false);
             return Err(AppError::Message(format!("無法關閉 Codex 程序：{error}")));
         }
     };
+    log::info!(
+        "[Restart] stop method={} exited={} exit_code={:?} force_used={}",
+        stopped.stop_method,
+        stopped.exited,
+        stopped.exit_code,
+        stopped.force_used
+    );
     if !stopped.exited {
         state.set_draining(false);
         return Ok(ManagedRestart::refused(stopped.notice()));
@@ -657,12 +700,13 @@ async fn restart_codex_managed_inner(
         // No Enhanced runtime configured, so a new Codex process is the whole
         // claim being made and a new PID is the right evidence for it.
         for _ in 0..50 {
-            if codex_process_identity().is_some_and(|identity| identity != previous_identity) {
+            if codex_process_identity().is_some_and(|identity| Some(identity) != previous_identity)
+            {
                 state.clear_restart_required();
                 state.set_draining(false);
                 return Ok(ManagedRestart {
                     restarted: true,
-                    notice: RuntimeNotice::new("restartSucceeded"),
+                    notice: stopped.annotate(RuntimeNotice::new("restartSucceeded")),
                     launch: None,
                     attestation: None,
                 });
@@ -670,9 +714,9 @@ async fn restart_codex_managed_inner(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         state.set_draining(false);
-        return Ok(ManagedRestart::refused(RuntimeNotice::new(
-            "restartNotDetected",
-        )));
+        return Ok(ManagedRestart::refused(
+            stopped.annotate(RuntimeNotice::new("restartNotDetected")),
+        ));
     };
 
     let observed = await_bridge_ready(&launch).await;
@@ -686,8 +730,10 @@ async fn restart_codex_managed_inner(
             state.clear_restart_required();
             Ok(ManagedRestart {
                 restarted: true,
-                notice: RuntimeNotice::new("enhancedDesktopBridgeReady")
-                    .with("launchId", launch.launch_id.clone()),
+                notice: stopped.annotate(
+                    RuntimeNotice::new("enhancedDesktopBridgeReady")
+                        .with("launchId", launch.launch_id.clone()),
+                ),
                 launch: Some(launch),
                 attestation: Some(attestation),
             })
@@ -703,15 +749,19 @@ async fn restart_codex_managed_inner(
                 .unwrap_or_else(|| attestation.state.as_str().to_string());
             Ok(ManagedRestart {
                 restarted: false,
-                notice: RuntimeNotice::new("enhancedDesktopBridgeFailed").with("reason", reason),
+                notice: stopped.annotate(
+                    RuntimeNotice::new("enhancedDesktopBridgeFailed").with("reason", reason),
+                ),
                 launch: Some(launch),
                 attestation: Some(attestation),
             })
         }
         BridgeObservation::NotObserved(attestation) => Ok(ManagedRestart {
             restarted: false,
-            notice: RuntimeNotice::new("enhancedDesktopBridgeNotObserved")
-                .with("launchId", launch.launch_id.clone()),
+            notice: stopped.annotate(
+                RuntimeNotice::new("enhancedDesktopBridgeNotObserved")
+                    .with("launchId", launch.launch_id.clone()),
+            ),
             launch: Some(launch),
             attestation,
         }),
@@ -821,6 +871,11 @@ fn select_codex_desktop_root(candidates: Vec<(u32, u32, PathBuf)>) -> Option<(u3
 
 #[cfg(target_os = "windows")]
 fn codex_process_snapshot() -> Option<Vec<(u32, u32, PathBuf)>> {
+    windows_process_snapshot(true)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_snapshot(query_desktop_paths: bool) -> Option<Vec<(u32, u32, PathBuf)>> {
     use std::mem::size_of;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -841,14 +896,16 @@ fn codex_process_snapshot() -> Option<Vec<(u32, u32, PathBuf)>> {
         let mut processes = Vec::new();
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
+                let mut path = PathBuf::new();
                 let end = entry
                     .szExeFile
                     .iter()
                     .position(|value| *value == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if name.eq_ignore_ascii_case("ChatGPT.exe")
-                    || name.eq_ignore_ascii_case("Codex.exe")
+                if query_desktop_paths
+                    && (name.eq_ignore_ascii_case("ChatGPT.exe")
+                        || name.eq_ignore_ascii_case("Codex.exe"))
                 {
                     let process =
                         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
@@ -858,15 +915,15 @@ fn codex_process_snapshot() -> Option<Vec<(u32, u32, PathBuf)>> {
                         if QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length)
                             != 0
                         {
-                            processes.push((
-                                entry.th32ProcessID,
-                                entry.th32ParentProcessID,
-                                PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize])),
-                            ));
+                            path =
+                                PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]));
                         }
                         CloseHandle(process);
                     }
                 }
+                // Retain even inaccessible processes: ancestry must not depend
+                // on whether their executable path can be queried.
+                processes.push((entry.th32ProcessID, entry.th32ParentProcessID, path));
                 if Process32NextW(snapshot, &mut entry) == 0 {
                     break;
                 }
@@ -933,15 +990,43 @@ fn discover_codex_process() -> AppResult<Option<CodexLaunchTarget>> {
 
 #[cfg(target_os = "windows")]
 fn discover_codex_app_id() -> Option<String> {
-    let script = "Get-StartApps | Where-Object { $_.Name -match 'Codex|ChatGPT' -or $_.AppID -match 'OpenAI.Codex' } | Select-Object -First 1 -ExpandProperty AppID";
+    let script = "Get-StartApps | Select-Object -ExpandProperty AppID";
     let mut command = crate::process::background_command("powershell");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     let output = command.output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|value| is_codex_app_id(value))
+        .map(str::to_owned)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_codex_app_id(value: &str) -> bool {
+    value
+        .strip_prefix("OpenAI.Codex_")
+        .and_then(|value| value.strip_suffix("!App"))
+        .is_some_and(|publisher| {
+            publisher.len() == 13
+                && publisher
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// PID zero and an empty executable represent an installed, stopped MSIX app.
+#[cfg(any(target_os = "windows", test))]
+fn aumid_only_target(app_id: String) -> CodexLaunchTarget {
+    CodexLaunchTarget {
+        pid: 0,
+        #[cfg(target_os = "macos")]
+        started_at: None,
+        executable: PathBuf::new(),
+        app_id: Some(app_id),
+    }
 }
 
 // The durable user environment lease lets later user launches keep Enhanced,
@@ -987,7 +1072,10 @@ fn windows_launch_spec(
 
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn use_direct_desktop_launch(executable: &std::path::Path, has_bridge: bool) -> bool {
-    has_bridge || crate::enhanced_runtime::steer_repair::is_verified_copy(executable)
+    // A stopped MSIX app uses AUMID activation and the HKCU lease prepared by
+    // sync_desktop_launch. await_bridge_ready still verifies actual adoption.
+    !executable.as_os_str().is_empty()
+        && (has_bridge || crate::enhanced_runtime::steer_repair::is_verified_copy(executable))
 }
 
 #[cfg(target_os = "macos")]
@@ -1070,22 +1158,66 @@ pub(crate) struct StopObservation {
     pub exit_code: Option<i32>,
     pub stderr: String,
     pub force_used: bool,
+    pub can_force: bool,
+    pub stop_method: &'static str,
 }
 
 impl StopObservation {
-    pub fn notice(&self) -> RuntimeNotice {
-        let mut notice = RuntimeNotice::new("restartProcessStillRunning")
-            .with(
-                "exitCode",
-                self.exit_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "none".into()),
-            )
-            .with("stderr", truncate_stop_stderr(&self.stderr));
-        if self.force_used {
-            notice = notice.with("forceUsed", "true");
+    fn not_running() -> Self {
+        Self {
+            exited: true,
+            exit_code: None,
+            stderr: String::new(),
+            force_used: false,
+            can_force: false,
+            stop_method: "notRunning",
         }
-        notice
+    }
+
+    fn annotate(&self, notice: RuntimeNotice) -> RuntimeNotice {
+        let mut notice = notice.with("stopMethod", self.stop_method);
+        if let Some(code) = self.exit_code {
+            notice = notice.with("exitCode", code.to_string());
+        }
+        if self.force_used {
+            notice.with("forceUsed", "true")
+        } else {
+            notice
+        }
+    }
+
+    pub fn notice(&self) -> RuntimeNotice {
+        let notice = if self.exit_code.is_some() {
+            RuntimeNotice::new("restartProcessStillRunning")
+        } else {
+            RuntimeNotice::new("restartProcessCloseTimedOut")
+                .with("seconds", if self.force_used { "12" } else { "10" })
+        }
+        .with("stderr", truncate_stop_stderr(&self.stderr))
+        .with("canForce", self.can_force.to_string());
+        self.annotate(notice)
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum OpenProcessFailure {
+    Abort,
+    Gone,
+    Skip,
+}
+
+/// Only an unobservable original root prevents shutdown from starting.
+/// Later failures must not abandon a tree whose windows may already be closing.
+#[cfg(any(target_os = "windows", test))]
+fn open_process_failure(is_root: bool, attempt: usize, code: Option<i32>) -> OpenProcessFailure {
+    if is_root && attempt == 0 {
+        OpenProcessFailure::Abort
+    } else if code == Some(87) {
+        // ERROR_INVALID_PARAMETER: the snapshot raced with process exit.
+        OpenProcessFailure::Gone
+    } else {
+        OpenProcessFailure::Skip
     }
 }
 
@@ -1102,21 +1234,26 @@ fn truncate_stop_stderr(stderr: &str) -> String {
 pub(crate) enum StopAction {
     Done,
     ForceKill,
-    Refuse,
+    Refuse { can_force: bool },
 }
 
-/// Force-kill is only allowed when the user overrode the turn guard.
-/// A packaged Desktop surviving a graceful taskkill is not idle evidence.
-pub(crate) fn next_stop_action(force: bool, still_running: bool) -> StopAction {
+/// Escalation requires explicit consent or a live bridge proving zero open turns.
+/// A graceful-close timeout alone provides no evidence that Desktop is idle.
+pub(crate) fn next_stop_action(
+    force: bool,
+    open_turns: Option<u32>,
+    still_running: bool,
+) -> StopAction {
     if !still_running {
         return StopAction::Done;
     }
-    if force {
+    if force || open_turns == Some(0) {
         return StopAction::ForceKill;
     }
-    StopAction::Refuse
+    StopAction::Refuse { can_force: true }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 pub(crate) fn stop_observation_from_output(
     output: &std::process::Output,
     still_running: bool,
@@ -1127,21 +1264,172 @@ pub(crate) fn stop_observation_from_output(
         exit_code: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         force_used,
+        // Keep the existing macOS refusal UI; only Windows adds timeout consent.
+        can_force: cfg!(target_os = "windows") && !force_used && still_running,
+        stop_method: if force_used { "forced" } else { "graceful" },
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn descendant_pids(root: u32, processes: &[(u32, u32, PathBuf)]) -> Vec<u32> {
+    let mut tree = vec![root];
+    loop {
+        let previous = tree.len();
+        for (pid, parent, _) in processes {
+            if tree.contains(parent) && !tree.contains(pid) {
+                tree.push(*pid);
+            }
+        }
+        if tree.len() == previous {
+            return tree;
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
-fn stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::Output> {
-    let mut command = crate::process::background_command("taskkill");
-    command.args(["/PID", &target.pid.to_string(), "/T"]);
-    command.output()
-}
+async fn stop_windows_codex_and_wait(
+    target: &CodexLaunchTarget,
+    force: bool,
+    data_root: &std::path::Path,
+    initial_attestation: Option<&BridgeAttestationV1>,
+) -> std::io::Result<StopObservation> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+    };
 
-#[cfg(target_os = "windows")]
-fn force_stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::Output> {
-    let mut command = crate::process::background_command("taskkill");
-    command.args(["/PID", &target.pid.to_string(), "/T", "/F"]);
-    command.output()
+    unsafe extern "system" fn close_window(window: HWND, context: LPARAM) -> i32 {
+        let pids = &*(context as *const Vec<u32>);
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, &mut pid);
+        if pids.contains(&pid) && IsWindowVisible(window) != 0 {
+            PostMessageW(window, WM_CLOSE, 0, 0);
+        }
+        1
+    }
+
+    fn exit_code(handle: &OwnedHandle) -> std::io::Result<Option<i32>> {
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((code != 259).then_some(code as i32))
+    }
+
+    // Hold handles throughout shutdown: even if Windows reuses a PID, force
+    // escalation can only terminate the processes we actually observed.
+    let mut handles: Vec<(u32, OwnedHandle)> = Vec::new();
+    let mut reported_failures = std::collections::HashSet::new();
+    // WM_CLOSE can stop the bridge before Desktop's remaining helpers exit.
+    // Preserve the live evidence collected before sending the first close.
+    let mut observation = StopObservation::not_running();
+    observation.stop_method = "graceful";
+    for attempt in 0..=120 {
+        let snapshot = windows_process_snapshot(false).ok_or_else(std::io::Error::last_os_error)?;
+        let roots = if attempt == 0 {
+            vec![target.pid]
+        } else {
+            let mut roots = Vec::new();
+            for (pid, handle) in &handles {
+                if exit_code(handle)?.is_none() {
+                    roots.push(*pid);
+                }
+            }
+            roots
+        };
+        for root in roots {
+            for pid in descendant_pids(root, &snapshot) {
+                if handles.iter().any(|(known, _)| *known == pid) {
+                    continue;
+                }
+                let raw = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                        0,
+                        pid,
+                    )
+                };
+                if raw.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    match open_process_failure(pid == target.pid, attempt, error.raw_os_error()) {
+                        OpenProcessFailure::Abort => return Err(error),
+                        OpenProcessFailure::Gone => {}
+                        OpenProcessFailure::Skip => {
+                            if reported_failures.insert(pid) {
+                                observation.stderr = truncate_stop_stderr(&format!(
+                                    "{} OpenProcess PID {pid} skipped: {error};",
+                                    observation.stderr
+                                ));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                handles.push((pid, unsafe { OwnedHandle::from_raw_handle(raw) }));
+            }
+        }
+        let mut alive = Vec::new();
+        for (pid, handle) in &handles {
+            match exit_code(handle)? {
+                None => alive.push(*pid),
+                Some(code) if *pid == target.pid => observation.exit_code = Some(code),
+                Some(_) => {}
+            }
+        }
+        if alive.is_empty() {
+            observation.exited = true;
+            return Ok(observation);
+        }
+        observation.exited = false;
+        if attempt < 100 {
+            // Include windows belonging to children created during shutdown.
+            unsafe {
+                EnumWindows(Some(close_window), &alive as *const Vec<u32> as LPARAM);
+            }
+        } else if attempt == 100 {
+            let attestation = crate::enhanced_runtime::live_bridge_attestation(data_root);
+            match next_stop_action(
+                force,
+                attestation
+                    .as_ref()
+                    .or(initial_attestation)
+                    .map(|a| a.open_turns),
+                true,
+            ) {
+                StopAction::Refuse { can_force } => {
+                    observation.can_force = can_force;
+                    return Ok(observation);
+                }
+                StopAction::ForceKill => {
+                    observation.force_used = true;
+                    observation.stop_method = "forced";
+                }
+                StopAction::Done => unreachable!(),
+            }
+        }
+        if observation.force_used {
+            // Children first; retained handles also cover orphaned children
+            // after the original root has already exited gracefully.
+            for (pid, handle) in handles.iter().rev() {
+                if alive.contains(pid)
+                    && unsafe { TerminateProcess(handle.as_raw_handle(), 1) } == 0
+                {
+                    observation.stderr = truncate_stop_stderr(&format!(
+                        "{} TerminateProcess PID {pid}: {};",
+                        observation.stderr,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(observation)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1151,6 +1439,7 @@ fn stop_codex(target: &CodexLaunchTarget) -> std::io::Result<std::process::Outpu
     command.output()
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn stop_codex_and_wait(
     target: &CodexLaunchTarget,
     force: bool,
@@ -1166,9 +1455,9 @@ async fn stop_codex_and_wait(
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        match next_stop_action(force, true) {
+        match next_stop_action(force, None, true) {
             StopAction::Done => Ok(stop_observation_from_output(&output, false, false)),
-            StopAction::Refuse => Ok(stop_observation_from_output(&output, true, false)),
+            StopAction::Refuse { .. } => Ok(stop_observation_from_output(&output, true, false)),
             StopAction::ForceKill => {
                 let mut command = crate::process::background_command("kill");
                 command.args(["-KILL", &target.pid.to_string()]);
@@ -1184,22 +1473,6 @@ async fn stop_codex_and_wait(
                     process_is_alive(target.pid),
                     true,
                 ))
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if wait_for_codex_pid_exit(target.pid, 50).await {
-            return Ok(stop_observation_from_output(&output, false, false));
-        }
-        match next_stop_action(force, true) {
-            StopAction::Done => Ok(stop_observation_from_output(&output, false, false)),
-            StopAction::Refuse => Ok(stop_observation_from_output(&output, true, false)),
-            StopAction::ForceKill => {
-                let forced = force_stop_codex(target)?;
-                let still = !wait_for_codex_pid_exit(target.pid, 20).await;
-                Ok(stop_observation_from_output(&forced, still, true))
             }
         }
     }
@@ -1252,7 +1525,7 @@ async fn quiesce_macos_codex_relaunches(original_pid: u32) -> std::io::Result<()
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 async fn wait_for_codex_pid_exit(pid: u32, attempts: usize) -> bool {
     for _ in 0..attempts {
         if !crate::enhanced_runtime::process_info::pid_is_alive(pid) {
@@ -1385,6 +1658,52 @@ mod restart_guard_tests {
     use super::*;
     use crate::enhanced_runtime::{BridgeLifecycle, ChildAttestation};
 
+    #[test]
+    fn open_process_failures_only_abort_for_the_initial_root() {
+        use OpenProcessFailure::{Abort, Gone, Skip};
+        for code in [Some(5), Some(87), Some(6), None] {
+            assert_eq!(open_process_failure(true, 0, code), Abort);
+            for (is_root, attempt) in [(false, 0), (false, 1), (true, 1), (false, 100)] {
+                assert_eq!(
+                    open_process_failure(is_root, attempt, code),
+                    if code == Some(87) { Gone } else { Skip }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn close_timeout_without_exit_code_reports_seconds_and_consent() {
+        let mut observation = StopObservation::not_running();
+        observation.exited = false;
+        observation.stop_method = "graceful";
+        observation.can_force = true;
+        observation.stderr = "OpenProcess PID 123 skipped: Access denied;".into();
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessCloseTimedOut");
+        assert_eq!(notice.params["seconds"], "10");
+        assert_eq!(notice.params["canForce"], "true");
+        assert_eq!(notice.params["stopMethod"], "graceful");
+        assert!(notice.params["stderr"].contains("PID 123"));
+        assert!(!notice.params.contains_key("exitCode"));
+
+        observation.force_used = true;
+        observation.stop_method = "forced";
+        observation.can_force = false;
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessCloseTimedOut");
+        assert_eq!(notice.params["seconds"], "12");
+        assert_eq!(notice.params["forceUsed"], "true");
+        assert_eq!(notice.params["canForce"], "false");
+        assert!(!notice.params.contains_key("exitCode"));
+
+        observation.exit_code = Some(1);
+        let notice = observation.notice();
+        assert_eq!(notice.code, "restartProcessStillRunning");
+        assert_eq!(notice.params["exitCode"], "1");
+        assert!(!notice.params.contains_key("seconds"));
+    }
+
     fn attestation(open_turns: u32) -> BridgeAttestationV1 {
         BridgeAttestationV1 {
             schema_version: 1,
@@ -1461,7 +1780,10 @@ mod restart_guard_tests {
         let repaired = macos_repaired_open_args(bundle, Some(&launch));
         assert_eq!(
             &repaired[..2],
-            &[std::ffi::OsString::from("-a"), bundle.as_os_str().to_owned()]
+            &[
+                std::ffi::OsString::from("-a"),
+                bundle.as_os_str().to_owned()
+            ]
         );
         assert_eq!(&repaired[2..], &args[2..]);
         assert_eq!(macos_repaired_open_args(bundle, None), repaired[..2]);
@@ -1494,10 +1816,73 @@ mod restart_guard_tests {
     }
 
     #[test]
-    fn graceful_stop_does_not_force_kill_without_user_override() {
-        assert_eq!(next_stop_action(false, true), StopAction::Refuse);
-        assert_eq!(next_stop_action(true, true), StopAction::ForceKill);
-        assert_eq!(next_stop_action(false, false), StopAction::Done);
+    fn stop_decision_truth_table() {
+        use StopAction::{Done, ForceKill, Refuse};
+        for (force, open_turns, still_running, expected) in [
+            (false, None, false, Done),
+            (false, None, true, Refuse { can_force: true }),
+            (false, Some(0), false, Done),
+            (false, Some(0), true, ForceKill),
+            (false, Some(1), false, Done),
+            (false, Some(1), true, Refuse { can_force: true }),
+            (false, Some(3), false, Done),
+            (false, Some(3), true, Refuse { can_force: true }),
+            (true, None, false, Done),
+            (true, None, true, ForceKill),
+            (true, Some(0), false, Done),
+            (true, Some(0), true, ForceKill),
+            (true, Some(1), false, Done),
+            (true, Some(1), true, ForceKill),
+            (true, Some(3), false, Done),
+            (true, Some(3), true, ForceKill),
+        ] {
+            assert_eq!(
+                next_stop_action(force, open_turns, still_running),
+                expected,
+                "force={force}, turns={open_turns:?}, running={still_running}"
+            );
+        }
+    }
+
+    #[test]
+    fn aumid_matching_excludes_other_openai_apps() {
+        assert!(is_codex_app_id("OpenAI.Codex_2p2nqsd0c76g0!App"));
+        for value in [
+            "",
+            "OpenAI.CodexThirdPartyAPI_2p2nqsd0c76g0!App",
+            "OpenAI.ChatGPT_2p2nqsd0c76g0!App",
+            "OpenAI.Codex_!App",
+            "OpenAI.Codex_2p2nqsd0c76g0!Other",
+            "OpenAI.Codex_2p2nqsd0c76g0!App extra",
+        ] {
+            assert!(!is_codex_app_id(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn stopped_msix_launch_uses_aumid_even_with_enhanced_lease() {
+        let target = aumid_only_target("OpenAI.Codex_2p2nqsd0c76g0!App".into());
+        let launch = DesktopRuntimeLaunch {
+            bridge_executable: PathBuf::from("bridge.exe"),
+            launch_id: "launch".into(),
+            manifest_path: PathBuf::from("launch.json"),
+            attestation_path: PathBuf::from("attestation.json"),
+        };
+        for launch in [None, Some(&launch)] {
+            let (program, args, bridge) = windows_launch_spec(&target, launch);
+            assert_eq!(program, PathBuf::from("explorer.exe"));
+            assert_eq!(args, [r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App"]);
+            assert!(bridge.is_none());
+        }
+    }
+
+    #[test]
+    fn process_tree_includes_orphans_helpers_and_unordered_descendants() {
+        let rows = [(4, 3), (99, 98), (3, 2), (2, 1), (1, 0)]
+            .map(|(pid, parent)| (pid, parent, PathBuf::new()));
+        let mut pids = descendant_pids(1, &rows);
+        pids.sort();
+        assert_eq!(pids, [1, 2, 3, 4]);
     }
 
     #[test]
@@ -1520,6 +1905,39 @@ mod restart_guard_tests {
             .params
             .get("stderr")
             .is_some_and(|value| value.contains("Access denied")));
+        assert_eq!(
+            notice.params.get("stopMethod").map(String::as_str),
+            Some("graceful")
+        );
+        assert_eq!(
+            notice.params.get("canForce").map(String::as_str),
+            Some(if cfg!(target_os = "windows") {
+                "true"
+            } else {
+                "false"
+            })
+        );
+        assert!(!notice.params.contains_key("forceUsed"));
+
+        let forced = stop_observation_from_output(&output, true, true).notice();
+        assert_eq!(
+            forced.params.get("stopMethod").map(String::as_str),
+            Some("forced")
+        );
+        assert_eq!(
+            forced.params.get("forceUsed").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            forced.params.get("canForce").map(String::as_str),
+            Some("false")
+        );
+        let skipped =
+            StopObservation::not_running().annotate(RuntimeNotice::new("restartSucceeded"));
+        assert_eq!(
+            skipped.params.get("stopMethod").map(String::as_str),
+            Some("notRunning")
+        );
     }
 
     fn dummy_exit(code: i32) -> std::process::ExitStatus {
