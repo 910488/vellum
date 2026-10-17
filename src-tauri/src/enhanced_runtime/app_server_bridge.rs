@@ -1475,8 +1475,9 @@ impl BridgeState {
 
 /// Desktop now includes `thread_context`, which its Official core explicitly
 /// ignores. The pinned Enhanced core rejects that unknown field before loading
-/// any feature config. Translate only this deprecated field at the RPC boundary;
-/// do not disable Guardian or discard active/future review settings.
+/// any feature config. At the same thread RPC boundary, downgrade the known
+/// boolean-only features too. Do not disable Guardian, flatten arbitrary feature
+/// maps or discard active/future review settings.
 fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value) {
     if plane != ExecutionPlane::EnhancedCodex
         || !matches!(
@@ -1492,6 +1493,7 @@ fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value
     else {
         return;
     };
+    normalize_enhanced_boolean_features(config);
     config.remove("features.guardianv2.thread_context");
     if let Some(guardian) = config
         .get_mut("features.guardianv2")
@@ -1505,6 +1507,43 @@ fn normalize_enhanced_guardian_config(plane: ExecutionPlane, request: &mut Value
         .and_then(Value::as_object_mut)
     {
         guardian.remove("thread_context");
+    }
+}
+
+// Desktop negotiates against Official's version. Enhanced 0.2.10 still
+// accepts only booleans for these features. Do not flatten arbitrary maps:
+// guardianv2 and multi_agent_v2 support structured configuration on both cores.
+const ENHANCED_BOOLEAN_FEATURES: &[&str] = &["async_compaction"];
+
+fn normalize_enhanced_boolean_features(config: &mut serde_json::Map<String, Value>) {
+    for feature in ENHANCED_BOOLEAN_FEATURES {
+        let key = format!("features.{feature}");
+        let prefix = format!("{key}.");
+        let direct_boolean = config.get(&key).is_some_and(Value::is_boolean);
+        let enabled = config
+            .get(&format!("{key}.enabled"))
+            .and_then(Value::as_bool);
+        config.retain(|name, _| !name.starts_with(&prefix));
+        if let Some(value) = config.get_mut(&key) {
+            if let Some(map) = value.as_object() {
+                *value = Value::Bool(map.get("enabled").and_then(Value::as_bool) == Some(true));
+            }
+        }
+        if let Some(value) = config
+            .get_mut("features")
+            .and_then(|features| features.get_mut(*feature))
+        {
+            if let Some(map) = value.as_object() {
+                *value = Value::Bool(map.get("enabled").and_then(Value::as_bool) == Some(true));
+            }
+        }
+        // A direct boolean is already valid: preserve it even if obsolete
+        // child keys coexist. Otherwise retain a boolean .enabled override.
+        if !direct_boolean {
+            if let Some(enabled) = enabled {
+                config.insert(key, Value::Bool(enabled));
+            }
+        }
     }
 }
 
