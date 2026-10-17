@@ -53,6 +53,7 @@ struct DeferredOfficialTurn {
     runtime_request: RuntimeRequest,
     request_id: String,
     execution_id: String,
+    quota_retried: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -103,6 +104,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
     let mut previous_metadata: Option<crate::request::RequestMetadata> = None;
     let mut queued: VecDeque<Value> = VecDeque::new();
     let mut deferred_official: VecDeque<DeferredOfficialTurn> = VecDeque::new();
+    let mut quota_retries: VecDeque<DeferredOfficialTurn> = VecDeque::new();
     let mut deferred_account_handoffs: VecDeque<Value> = VecDeque::new();
     let mut cancelled_response_ids: VecDeque<String> = VecDeque::new();
     let mut portable_warmup: Option<PortableWarmup> = None;
@@ -122,6 +124,9 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                 .as_ref()
                 .is_none_or(|segment| segment.pending.is_empty())
             {
+                if let Some(turn) = quota_retries.pop_front() {
+                    break WebSocketWork::Deferred(turn);
+                }
                 if let Some(request) = deferred_account_handoffs.pop_front() {
                     break WebSocketWork::New(request);
                 }
@@ -182,6 +187,13 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         }
                         OfficialEvent::Retry => {}
                         OfficialEvent::Frame(upstream_message) => {
+                            if let Some(turn) = prepare_quota_retry(
+                                &state, &headers, runtime.as_ref(), &mut official,
+                                &connection_id, upstream_message.as_ref(),
+                            ).await {
+                                quota_retries.push_back(turn);
+                                continue;
+                            }
                             if !handle_official_upstream_frame(
                                 &mut client,
                                 runtime.as_ref(),
@@ -201,16 +213,22 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
             }
         };
 
-        let (mut request, preplanned_runtime_request, preplanned_plan, preplanned_execution_id) =
-            match work {
-                WebSocketWork::New(request) => (request, None, None, None),
-                WebSocketWork::Deferred(turn) => (
-                    turn.request,
-                    Some(turn.runtime_request),
-                    Some(turn.plan),
-                    Some(turn.execution_id),
-                ),
-            };
+        let (
+            mut request,
+            preplanned_runtime_request,
+            preplanned_plan,
+            preplanned_execution_id,
+            mut quota_retried,
+        ) = match work {
+            WebSocketWork::New(request) => (request, None, None, None, false),
+            WebSocketWork::Deferred(turn) => (
+                turn.request,
+                Some(turn.runtime_request),
+                Some(turn.plan),
+                Some(turn.execution_id),
+                turn.quota_retried,
+            ),
+        };
 
         // A bare Responses body carried over the WebSocket upgrade has no
         // `type` discriminator of its own -- that tag is a WebSocket-only
@@ -448,6 +466,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 execution_id,
                                 conversation_key,
                                 &connection_id,
+                                quota_retried,
                             )
                             .await
                             {
@@ -472,6 +491,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 runtime_request,
                                 request_id,
                                 execution_id,
+                                quota_retried,
                             });
                         } else {
                             close_official_segment(&mut official).await;
@@ -484,6 +504,9 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 &request_id,
                                 &execution_id,
                                 &mut official_plan,
+                                &mut runtime_request,
+                                &mut request,
+                                &mut quota_retried,
                             )
                             .await
                             {
@@ -510,6 +533,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                         execution_id,
                                         conversation_key,
                                         &connection_id,
+                                        quota_retried,
                                     )
                                     .await;
                                     official = Some(segment);
@@ -737,7 +761,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
         }
     }
 
-    for turn in deferred_official.drain(..) {
+    for turn in quota_retries.drain(..).chain(deferred_official.drain(..)) {
         finish_deferred_official_outcome(
             runtime.as_ref(),
             &turn,
@@ -1057,6 +1081,9 @@ async fn open_official_segment(
     request_id: &str,
     execution_id: &str,
     plan: &mut OfficialWebSocketPlan,
+    runtime_request: &mut RuntimeRequest,
+    frame: &mut Value,
+    quota_retried: &mut bool,
 ) -> Option<OfficialSegment> {
     let started = std::time::Instant::now();
     let mut refreshed = false;
@@ -1094,6 +1121,42 @@ async fn open_official_segment(
         .await
         {
             Bounded::Ready(Ok(socket)) => break socket,
+            Bounded::Ready(Err(error))
+                if matches!(error.as_ref(), tokio_tungstenite::tungstenite::Error::Http(response)
+                    if response.status().as_u16() == 429) =>
+            {
+                let tokio_tungstenite::tungstenite::Error::Http(response) = *error else {
+                    unreachable!()
+                };
+                let reset = response
+                    .body()
+                    .as_deref()
+                    .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                    .and_then(|body| quota_failure_reset(&body));
+                if let Some(next) =
+                    prepare_quota_handoff(runtime, plan, runtime_request, reset, !*quota_retried)
+                        .await
+                {
+                    *frame = runtime_request.body.clone();
+                    *plan = next;
+                    *quota_retried = true;
+                    refreshed = false;
+                    continue;
+                }
+                let error = websocket_handshake_error(response);
+                record_official_handshake_failure(
+                    runtime,
+                    plan,
+                    request_id,
+                    execution_id,
+                    connection_id,
+                    started,
+                    &error,
+                    &handshake_stages,
+                );
+                let _ = send_runtime_failure(client, &error).await;
+                return None;
+            }
             Bounded::Ready(Err(error))
                 if !refreshed
                     && matches!(
@@ -1244,6 +1307,7 @@ async fn send_official_turn(
     execution_id: String,
     conversation_key: String,
     connection_id: &str,
+    quota_retried: bool,
 ) -> SendOfficialTurnOutcome {
     // Register in the shared cancel registry *before* anything reaches
     // upstream, and check it right away: a parent-tree cancel that lands
@@ -1307,6 +1371,7 @@ async fn send_official_turn(
         send_started,
     );
     turn.request_forwarded_ms = Some(forwarded_ms);
+    turn.quota_retried = quota_retried;
     segment.pending.push_back(turn);
     SendOfficialTurnOutcome::Sent
 }
@@ -1326,6 +1391,96 @@ fn official_turn_frame(
 /// A control/cancel frame forwarded to Official verbatim (no field rewrite).
 fn text_frame(value: &Value) -> TungsteniteMessage {
     TungsteniteMessage::Text(value.to_string().into())
+}
+
+fn quota_failure_reset(failed: &Value) -> Option<u64> {
+    failed
+        .pointer("/response/error/resets_at")
+        .or_else(|| failed.pointer("/error/resets_at"))
+        .and_then(Value::as_u64)
+        .map(|seconds| seconds.saturating_mul(1000))
+}
+
+async fn prepare_quota_handoff(
+    runtime: &ProxyRuntime,
+    plan: &mut OfficialWebSocketPlan,
+    request: &mut RuntimeRequest,
+    reset_at: Option<u64>,
+    allow_retry: bool,
+) -> Option<OfficialWebSocketPlan> {
+    if allow_retry {
+        match runtime.hydrate_official_socket_handoff(plan, &request.body) {
+            Ok(body) => request.body = body,
+            Err(_) => {
+                let _ = runtime
+                    .prepare_websocket_quota_retry(plan, request, reset_at, false)
+                    .await;
+                return None;
+            }
+        }
+    }
+    let next = match runtime
+        .prepare_websocket_quota_retry(plan, request, reset_at, allow_retry)
+        .await
+    {
+        Ok(Some(next)) if allow_retry => next,
+        Ok(_) => return None,
+        Err(error) => {
+            log::warn!("[QuotaPool] socket retry unavailable: {}", error.category());
+            return None;
+        }
+    };
+    request.body = runtime
+        .hydrate_official_socket_handoff(&next, &request.body)
+        .ok()?;
+    request.body["type"] = json!("response.create");
+    request.metadata.official_socket_affinity = None;
+    Some(next)
+}
+
+/// Intercept quota failures before the first application frame reaches Codex.
+/// Keep the same logical execution and queue its one retry ahead of new turns,
+/// allowing any already-pipelined work on the old segment to drain first.
+async fn prepare_quota_retry<S: ProxyRuntimeState>(
+    state: &Arc<S>,
+    headers: &HeaderMap,
+    runtime: &ProxyRuntime,
+    official: &mut Option<OfficialSegment>,
+    connection_id: &str,
+    message: Option<&Result<TungsteniteMessage, tokio_tungstenite::tungstenite::Error>>,
+) -> Option<DeferredOfficialTurn> {
+    let failed = failed_websocket_response(message?.as_ref().ok()?)?;
+    if official_websocket_failure_category(&failed) != "provider_quota" {
+        return None;
+    }
+    let segment = official.as_mut()?;
+    let turn = segment.pending.front_mut()?;
+    let plan = turn.plan.as_mut()?;
+    let allow_retry = !turn.quota_retried
+        && turn.first_downstream_ms.is_none()
+        && !turn.recorded
+        && !turn.cancel_rx.as_ref().is_some_and(|rx| *rx.borrow());
+    let mut request = runtime_request_from_body(state, headers, &turn.request, connection_id);
+    request.metadata = plan.request_metadata.clone();
+    let next = prepare_quota_handoff(
+        runtime,
+        plan,
+        &mut request,
+        quota_failure_reset(&failed),
+        allow_retry,
+    )
+    .await?;
+    segment.quota_exhausted = true;
+    log::info!("[QuotaPool] retrying pre-output Official quota failure on another socket connection={connection_id}");
+    let turn = segment.pending.pop_front()?;
+    Some(DeferredOfficialTurn {
+        plan: next,
+        request: request.body.clone(),
+        runtime_request: request,
+        request_id: turn.request_id,
+        execution_id: turn.execution_id,
+        quota_retried: true,
+    })
 }
 
 /// Handle one frame read from the currently open Official upstream socket.
@@ -1964,6 +2119,19 @@ fn official_websocket_failure_category(event: &Value) -> &str {
     let error = event
         .pointer("/response/error")
         .or_else(|| event.get("error"));
+    if event.get("status").and_then(Value::as_u64) == Some(429)
+        || error
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    "usage_limit_reached" | "usage_limit_exceeded" | "insufficient_quota"
+                )
+            })
+    {
+        return "provider_quota";
+    }
     if error.is_some_and(crate::error::is_upstream_server_error) {
         return "provider_unavailable";
     }
@@ -1979,6 +2147,7 @@ fn official_websocket_failure_category(event: &Value) -> &str {
     }
     if let Some(category) = event
         .pointer("/response/error/category")
+        .or_else(|| event.pointer("/error/category"))
         .and_then(Value::as_str)
     {
         return category;
@@ -2532,6 +2701,7 @@ struct OfficialPendingTurn {
     /// A model-output frame of this turn already reached Codex.
     output_forwarded: bool,
     cancelled_at: Option<std::time::Instant>,
+    quota_retried: bool,
 }
 
 impl OfficialPendingTurn {
@@ -2562,6 +2732,7 @@ impl OfficialPendingTurn {
             recorded: false,
             output_forwarded: false,
             cancelled_at: None,
+            quota_retried: false,
         }
     }
 }
@@ -3201,6 +3372,7 @@ mod tests {
             recorded: false,
             output_forwarded: false,
             cancelled_at: None,
+            quota_retried: false,
         };
         let second = OfficialPendingTurn {
             plan: None,
@@ -3218,6 +3390,7 @@ mod tests {
             recorded: false,
             output_forwarded: false,
             cancelled_at: None,
+            quota_retried: false,
         };
         let stages = OfficialStageTimes {
             client_accept_ms: 0,
@@ -4132,6 +4305,274 @@ mod tests {
             insecure_http_policy: Default::default(),
             access_mode: None,
         }
+    }
+
+    #[tokio::test]
+    async fn pooled_pre_output_quota_retries_on_other_socket_once() {
+        run_pool_quota_retry("success").await;
+        run_pool_quota_retry("twice").await;
+        run_pool_quota_retry("handshake").await;
+        run_pool_quota_retry("continuation").await;
+    }
+
+    #[tokio::test]
+    async fn pooled_quota_after_output_is_forwarded_without_retry() {
+        run_pool_quota_retry("after_output").await;
+    }
+
+    #[tokio::test]
+    async fn pooled_quota_without_fitting_alternative_is_forwarded() {
+        run_pool_quota_retry("no_fit").await;
+    }
+
+    async fn run_pool_quota_retry(mode: &'static str) {
+        use crate::config::ProxyRuntimeIdentity;
+        use crate::credentials::{CredentialProvider, MemoryCredentialProvider};
+        use crate::diagnostics::RuntimeDiagnostics;
+        use crate::environment::ExecutionEnvironment;
+        use crate::official_auth::{
+            OfficialAuthDecision, OfficialAuthProvider, OfficialAuthorization,
+            OfficialRoutingContext,
+        };
+        use crate::state::{ModelRouteView, StaticRouteCatalog};
+
+        struct PoolAuth {
+            mode: &'static str,
+            calls: Arc<Mutex<Vec<(String, bool)>>>,
+        }
+        fn authorization(id: &str) -> OfficialAuthorization {
+            OfficialAuthorization {
+                access_token: format!("test-{id}"),
+                account_id: Some(id.into()),
+                selection_revision: Some(1),
+                selection_verified: true,
+            }
+        }
+        #[async_trait::async_trait]
+        impl OfficialAuthProvider for PoolAuth {
+            async fn authorize(&self, _: &str) -> Result<OfficialAuthDecision, String> {
+                Ok(OfficialAuthDecision::Managed(authorization("account-a")))
+            }
+            async fn refresh_after_rejection(
+                &self,
+                _: &str,
+                _: &OfficialAuthorization,
+            ) -> Result<OfficialAuthorization, String> {
+                Err("unexpected refresh".into())
+            }
+            async fn retry_after_quota(
+                &self,
+                _: &str,
+                hash: &str,
+                reset: Option<u64>,
+                context: &OfficialRoutingContext,
+                allow: bool,
+            ) -> Result<Option<OfficialAuthorization>, String> {
+                assert_eq!(reset, Some(1_900_000_000_000));
+                assert!(context.estimated_input_tokens > 0);
+                self.calls.lock().unwrap().push((hash.into(), allow));
+                Ok((allow && self.mode != "no_fit").then(|| authorization("account-b")))
+            }
+        }
+        struct PoolState {
+            base: StaticProxyState,
+            runtime: Arc<ProxyRuntime>,
+        }
+        #[async_trait::async_trait]
+        impl ProxyRuntimeState for PoolState {
+            fn identity(&self) -> ProxyRuntimeIdentity {
+                self.base.identity()
+            }
+            fn active_model_routes(&self) -> Vec<ModelRouteView> {
+                self.base.active_model_routes()
+            }
+            fn route_for_model(&self, id: &str) -> Option<ModelRouteView> {
+                self.base.route_for_model(id)
+            }
+            fn diagnostics(&self) -> RuntimeDiagnostics {
+                self.base.diagnostics()
+            }
+            async fn credentials(&self) -> Arc<dyn CredentialProvider> {
+                self.base.credentials().await
+            }
+            fn proxy_runtime(&self) -> Arc<ProxyRuntime> {
+                self.runtime.clone()
+            }
+            fn execution_environment(&self) -> ExecutionEnvironment {
+                self.base.execution_environment()
+            }
+        }
+        let accounts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let frames = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_accounts = accounts.clone();
+        let captured_frames = frames.clone();
+        let upstream = Router::new().route("/backend-api/codex/responses", get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
+            let accounts = captured_accounts.clone();
+            let frames = captured_frames.clone();
+            async move {
+                let account = headers["chatgpt-account-id"].to_str().unwrap().to_owned();
+                accounts.lock().unwrap().push(account.clone());
+                if mode == "handshake" && account == "account-a" {
+                    return axum::response::IntoResponse::into_response((axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(json!({"error":{"type":"usage_limit_reached", "resets_at":1_900_000_000_u64}}))));
+                }
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
+                        let body: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(body["type"], "response.create");
+                        assert_eq!(body["model"], "gpt-upstream");
+                        assert_eq!(body["tools"], json!([{"type":"function", "name":"test_tool", "parameters":{"type":"object"}}]));
+                        let attempt = {
+                            let mut frames = frames.lock().unwrap();
+                            frames.push(body);
+                            frames.len()
+                        };
+                        if mode == "after_output" {
+                            socket.send(AxumWsMessage::Text(json!({"type":"response.output_text.delta", "delta":"started"}).to_string().into())).await.unwrap();
+                        }
+                        let event = if mode == "continuation" && attempt == 1 {
+                            json!({"type":"response.completed", "response":{"id":"resp_before_quota", "status":"completed",
+                                "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"prior answer"}]}]}})
+                        } else if account == "account-b" && matches!(mode, "success" | "handshake" | "continuation") {
+                            json!({"type":"response.completed", "response":{"id":"resp_retry", "status":"completed", "output":[]}})
+                        } else {
+                            json!({"type":"error", "status":429, "error":{"type":"usage_limit_reached", "code":"usage_limit_reached", "message":"The usage limit has been reached", "resets_at":1_900_000_000_u64}})
+                        };
+                        socket.send(AxumWsMessage::Text(event.to_string().into())).await.unwrap();
+                    }
+                })
+            }
+        }).post(|| async { panic!("quota retry must stay on WebSocket"); #[allow(unreachable_code)] axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let mut route = official_route_config(format!("http://{address}/backend-api/codex"));
+        route.auth_kind = RuntimeAuthKind::ChatGpt;
+        let config = ProxyRuntimeConfig {
+            models: vec![route],
+            ..Default::default()
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(ProxyRuntime::new(
+            Arc::new(StaticRouteCatalog::from_config(&config)),
+            Arc::new(MemoryCredentialProvider::new()),
+            Arc::new(PoolAuth {
+                mode,
+                calls: calls.clone(),
+            }),
+            Arc::new(crate::lifecycle::CountingRequestLifecycle::new()),
+            Arc::new(crate::transport::ReqwestTransport::new()),
+        ));
+        let mut base = StaticProxyState::from_config(config).unwrap();
+        base.mark_listener_ready();
+        let state = Arc::new(PoolState {
+            base,
+            runtime: runtime.clone(),
+        });
+        let proxy = build_headless_router(state, InboundAccessPolicy::test_only_disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(listener, proxy).await.unwrap();
+        });
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/v1/responses"))
+                .await
+                .unwrap();
+        let mut request = json!({"type":"response.create", "model":"vellum-official",
+            "input":[{"role":"user","content":"same turn"}], "stream":true,
+            "tools":[{"type":"function", "name":"test_tool", "parameters":{"type":"object"}}]
+        });
+        if mode == "continuation" {
+            let mut first = request.clone();
+            first["input"][0]["content"] = json!("prior question");
+            client
+                .send(TungsteniteMessage::Text(first.to_string().into()))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                websocket_event(&frame).unwrap()["response"]["id"],
+                "resp_before_quota"
+            );
+            request["previous_response_id"] = json!("resp_before_quota");
+        }
+        client
+            .send(TungsteniteMessage::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let TungsteniteMessage::Text(text) = frame {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let terminal =
+                    matches!(event["type"].as_str(), Some("error" | "response.completed"));
+                received.push(event);
+                if terminal {
+                    break;
+                }
+            }
+        }
+        let retries = matches!(mode, "success" | "twice" | "handshake" | "continuation");
+        assert_eq!(
+            *accounts.lock().unwrap(),
+            if retries {
+                vec!["account-a", "account-b"]
+            } else {
+                vec!["account-a"]
+            }
+        );
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            if mode == "continuation" {
+                3
+            } else if matches!(mode, "success" | "twice") {
+                2
+            } else {
+                1
+            }
+        );
+        if frames.len() == 2 {
+            assert_eq!(frames[0]["input"], frames[1]["input"]);
+        }
+        if mode == "continuation" {
+            let replay = &frames[2];
+            assert!(replay.get("previous_response_id").is_none());
+            let text = replay["input"].to_string();
+            for expected in ["prior question", "prior answer", "same turn"] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert_eq!(received.len(), if mode == "after_output" { 2 } else { 1 });
+        assert_eq!(
+            received.last().unwrap()["type"],
+            if matches!(mode, "success" | "handshake" | "continuation") {
+                "response.completed"
+            } else {
+                "error"
+            }
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), if mode == "twice" { 2 } else { 1 });
+        assert_eq!(calls[0].1, mode != "after_output");
+        if mode == "twice" {
+            assert!(!calls[1].1, "second 429 must not retry");
+        }
+        let _ = client.close(None).await;
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]

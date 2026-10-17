@@ -820,7 +820,7 @@ pub(crate) struct WebSocketTurnPlan {
 /// turn may reuse an already-open segment; `upstream_model`/`route_id` are
 /// per-turn and never gate reuse on their own.
 pub(crate) struct OfficialWebSocketPlan {
-    request_metadata: crate::request::RequestMetadata,
+    pub(crate) request_metadata: crate::request::RequestMetadata,
     pub connection_key: OfficialWebSocketConnectionKey,
     pub upstream_url: String,
     pub upstream_model: String,
@@ -2553,6 +2553,70 @@ impl ProxyRuntime {
         &self,
         request: &RuntimeRequest,
     ) -> Result<WebSocketTurnPlan, RuntimeError> {
+        self.prepare_websocket_turn_with_auth(request, None).await
+    }
+
+    pub(crate) async fn prepare_websocket_quota_retry(
+        &self,
+        plan: &mut OfficialWebSocketPlan,
+        request: &RuntimeRequest,
+        reset_at: Option<u64>,
+        allow_retry: bool,
+    ) -> Result<Option<OfficialWebSocketPlan>, RuntimeError> {
+        if request.metadata.review_official_account_id.is_some() || plan.managed_auth.is_none() {
+            return Ok(None);
+        }
+        let Some(account_hash) = plan.execution_account_hash.as_deref() else {
+            return Ok(None);
+        };
+        let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
+        let route = snapshot
+            .routes
+            .iter()
+            .map(|s| &s.route)
+            .find(|r| r.route_id == plan.route_id)
+            .ok_or_else(|| RuntimeError::RouteNotFound(plan.route_id.clone()))?;
+        let context = crate::official_auth::OfficialRoutingContext::from_request(route, request);
+        let Some(auth) = self
+            .official_auth
+            .retry_after_quota(
+                &plan.route_id,
+                account_hash,
+                reset_at,
+                &context,
+                allow_retry,
+            )
+            .await
+            .map_err(RuntimeError::AuthenticationFailed)?
+        else {
+            return Ok(None);
+        };
+        let auth = ResolvedAuth::OfficialManaged {
+            token: auth.access_token,
+            account_id: auth.account_id,
+            selection_revision: auth.selection_revision,
+            selection_verified: auth.selection_verified,
+        };
+        match self
+            .prepare_websocket_turn_with_auth(request, Some(auth))
+            .await?
+            .dispatch
+        {
+            WebSocketTurnDispatch::OfficialNative(next)
+                if next.route_id == plan.route_id
+                    && next.execution_account_hash != plan.execution_account_hash =>
+            {
+                Ok(Some(next))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn prepare_websocket_turn_with_auth(
+        &self,
+        request: &RuntimeRequest,
+        override_auth: Option<ResolvedAuth>,
+    ) -> Result<WebSocketTurnPlan, RuntimeError> {
         let guard = self.begin_lifecycle()?;
         let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
         let model = request_model(request)?;
@@ -2580,15 +2644,19 @@ impl ProxyRuntime {
                 },
             });
         }
-        let auth = ResolvedAuth::resolve(
-            &route,
-            request,
-            self.credentials.as_ref(),
-            self.official_auth.as_ref(),
-            self.grok_sessions.as_ref(),
-            Some(self.history.as_ref()),
-        )
-        .await?;
+        let auth = if let Some(auth) = override_auth {
+            auth
+        } else {
+            ResolvedAuth::resolve(
+                &route,
+                request,
+                self.credentials.as_ref(),
+                self.official_auth.as_ref(),
+                self.grok_sessions.as_ref(),
+                Some(self.history.as_ref()),
+            )
+            .await?
+        };
         let managed_auth = match &auth {
             ResolvedAuth::OfficialManaged {
                 token,
