@@ -762,15 +762,19 @@ pub(crate) fn result_with(
     if request.capture {
         // A later turn in the same thread may still be editing. Never label its
         // snapshot final just because our original turn has completed.
-        let active = thread.pointer("/status/type").and_then(Value::as_str) != Some("idle")
-            || thread
-                .get("turns")
-                .and_then(Value::as_array)
-                .is_some_and(|turns| {
-                    turns
-                        .iter()
-                        .any(|t| t.get("status").and_then(Value::as_str) == Some("inProgress"))
-                });
+        // Unknown or missing thread statuses may represent ongoing edits in a
+        // newer app-server, so conservatively keep those snapshots partial.
+        let active = !matches!(
+            thread.pointer("/status/type").and_then(Value::as_str),
+            Some("idle" | "notLoaded" | "systemError")
+        ) || thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .is_some_and(|turns| {
+                turns
+                    .iter()
+                    .any(|t| t.get("status").and_then(Value::as_str) == Some("inProgress"))
+            });
         let operation = request
             .operation_id
             .as_deref()
@@ -818,6 +822,7 @@ mod tests {
         wrong_model: Cell<bool>,
         wrong_read_identity: Cell<bool>,
         turn_status: RefCell<String>,
+        thread_status: RefCell<Option<String>>,
         other_active: Cell<bool>,
         captures: RefCell<Vec<bool>>,
         fail_capture: Cell<bool>,
@@ -835,6 +840,7 @@ mod tests {
                 wrong_model: Cell::new(false),
                 wrong_read_identity: Cell::new(false),
                 turn_status: RefCell::new("inProgress".into()),
+                thread_status: Default::default(),
                 other_active: Cell::new(false),
                 captures: Default::default(),
                 fail_capture: Cell::new(false),
@@ -933,8 +939,16 @@ mod tests {
                     if self.other_active.get() {
                         turns.push(json!({"id": "later-turn", "status": "inProgress"}));
                     }
+                    let thread_status = self.thread_status.borrow();
+                    let thread_status = thread_status.as_deref().unwrap_or_else(|| {
+                        if self.other_active.get() || *self.turn_status.borrow() == "inProgress" {
+                            "active"
+                        } else {
+                            "idle"
+                        }
+                    });
                     Ok(
-                        json!({"thread": {"id": if self.wrong_read_identity.get() { "another-thread" } else { "remote-thread" }, "cwd": cwd, "status": {"type": if self.other_active.get() || *self.turn_status.borrow() == "inProgress" { "active" } else { "idle" }}, "turns": turns}}),
+                        json!({"thread": {"id": if self.wrong_read_identity.get() { "another-thread" } else { "remote-thread" }, "cwd": cwd, "status": {"type": thread_status}, "turns": turns}}),
                     )
                 }
                 _ => panic!("unexpected RPC: {method}"),
@@ -1438,6 +1452,34 @@ mod tests {
             fake.other_active.set(later);
             let result = result_with(&paths, result_request(true), &fake).unwrap();
             assert_eq!(result.capture.unwrap().partial, later);
+        }
+    }
+
+    #[test]
+    fn capture_activity_handles_unloaded_threads_and_unknown_statuses() {
+        for (status, turn_status, later, partial) in [
+            ("notLoaded", "completed", false, false),
+            ("idle", "completed", false, false),
+            ("systemError", "completed", false, false),
+            ("active", "completed", false, true),
+            ("idle", "inProgress", false, true),
+            ("notLoaded", "completed", true, true),
+            ("systemError", "completed", true, true),
+            ("futureStatus", "completed", false, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AgentPaths::from_root(temp.path().join("state"));
+            let fake = Fake::new();
+            start_with(&paths, request(), &fake).unwrap();
+            *fake.turn_status.borrow_mut() = turn_status.into();
+            *fake.thread_status.borrow_mut() = Some(status.into());
+            fake.other_active.set(later);
+            let result = result_with(&paths, result_request(true), &fake).unwrap();
+            assert_eq!(
+                result.capture.unwrap().partial,
+                partial,
+                "thread status {status}, turn status {turn_status}, later turn active {later}"
+            );
         }
     }
 
