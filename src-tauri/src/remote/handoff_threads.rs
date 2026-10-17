@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use super::handoff_git::Git;
+use super::handoff_git::{git_path, Git};
 use crate::error::{AppError, AppResult};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,20 @@ fn message_text(payload: &Value, limit: usize) -> String {
 
 fn error(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
+}
+
+fn injected_user_message(text: &str) -> bool {
+    let text = text.trim_start().to_ascii_lowercase();
+    [
+        "<environment_context",
+        "<user_instructions",
+        "<instructions>",
+        "<agents_md",
+        "<agents.md",
+        "# agents.md",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
 }
 
 pub(crate) fn discover(home: &Path, data_root: &Path) -> AppResult<Vec<LocalThread>> {
@@ -169,7 +183,9 @@ fn discover_with(
                 let top = Git::new(&cwd, data_root)
                     .run(&["rev-parse", "--show-toplevel"], None)
                     .ok()?;
-                fs::canonicalize(top.trim()).ok()
+                fs::canonicalize(top.trim())
+                    .ok()
+                    .map(|path| git_path(&path))
             });
             let Some(repo) = repo.clone() else {
                 continue;
@@ -250,7 +266,7 @@ fn read_settings(
         };
         if !text.is_empty() {
             match role {
-                "user" => {
+                "user" if !injected_user_message(&text) => {
                     if first_user.is_empty() {
                         first_user = text.clone();
                     }
@@ -465,10 +481,14 @@ mod tests {
         };
         let events = [
             serde_json::json!({"type":"session_meta","payload":{"id":"selected","cwd":temp.path()}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>C:/private/home</cwd>\n</environment_context>"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"<user_instructions>Automatic instructions</user_instructions>"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for C:/repo\n<INSTRUCTIONS>Project rules</INSTRUCTIONS>"}]}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"First request"}]}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"任務".repeat(4000)}]}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"進度".repeat(5000)}]}}),
             serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","output":"Not an agent message"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"  <environment_context>refreshed context</environment_context>"}}),
         ];
         fs::write(
             &rollout,

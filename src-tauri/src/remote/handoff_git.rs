@@ -8,9 +8,41 @@ use std::time::{Duration, Instant};
 use super::{process::background_command, ssh_trust};
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
+#[cfg(all(test, windows))]
+#[path = "handoff_git_windows_tests.rs"]
+mod windows_tests;
 
 fn error(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
+}
+
+/// Git for Windows cannot consume std::fs::canonicalize's verbatim paths.
+/// Normalize only Windows drive/UNC prefixes, preserving non-UTF-8 names and
+/// leaving Unix paths (including backslashes in filenames) untouched.
+pub(crate) fn git_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            let mut normal = match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    std::ffi::OsString::from(format!("{}:", drive as char))
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut normal = std::ffi::OsString::from(r"\\");
+                    normal.push(server);
+                    normal.push(r"\");
+                    normal.push(share);
+                    normal
+                }
+                _ => return path.into(),
+            };
+            normal.push(components.as_path().as_os_str());
+            return PathBuf::from(normal);
+        }
+    }
+    path.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,8 +71,8 @@ pub(crate) struct Git {
 impl Git {
     pub fn new(repo: &Path, data_root: &Path) -> Self {
         Self {
-            repo: repo.into(),
-            hooks: data_root.join("remote-handoffs/empty-hooks"),
+            repo: git_path(repo),
+            hooks: git_path(&data_root.join("remote-handoffs/empty-hooks")),
             #[cfg(test)]
             system_config: None,
         }
@@ -79,7 +111,7 @@ impl Git {
         if inherit {
             if let Some(path) = &self.system_config {
                 cmd.env_remove("GIT_CONFIG_NOSYSTEM")
-                    .env("GIT_CONFIG_SYSTEM", path)
+                    .env("GIT_CONFIG_SYSTEM", git_path(path))
                     .env(
                         "GIT_CONFIG_GLOBAL",
                         if cfg!(windows) { "NUL" } else { "/dev/null" },
@@ -116,7 +148,7 @@ impl Git {
         let mut cmd = self.command();
         cmd.args(args);
         if let Some(index) = index {
-            cmd.env("GIT_INDEX_FILE", index);
+            cmd.env("GIT_INDEX_FILE", git_path(index));
         }
         let output = run(cmd)?;
         String::from_utf8(output.stdout).map_err(|e| error(format!("HandoffGitInvalidUtf8: {e}")))
@@ -230,7 +262,7 @@ impl Git {
         // attributes. stdin avoids argv limits and preserves unusual names.
         let mut command = self.command();
         if let Some(index) = index {
-            command.env("GIT_INDEX_FILE", index);
+            command.env("GIT_INDEX_FILE", git_path(index));
         }
         command.args(["check-attr", "-z", "--stdin", "filter"]);
         let output = run_command_with_input(&mut command, Some(files.into_bytes()))?;
@@ -305,14 +337,14 @@ impl Git {
             "sha1"
         };
         let mut initialize = self.command_with_config(false);
-        initialize.args([
-            "init",
-            "--bare",
-            "--template=",
-            &format!("--object-format={format}"),
-            bare.to_str()
-                .ok_or_else(|| error("HandoffGitInvalidUtf8"))?,
-        ]);
+        initialize
+            .args([
+                "init",
+                "--bare",
+                "--template=",
+                &format!("--object-format={format}"),
+            ])
+            .arg(git_path(&bare));
         run(initialize)?;
         let objects = self.run(&["rev-parse", "--git-path", "objects"], None)?;
         let objects = std::fs::canonicalize(self.repo.join(objects.trim()))
@@ -398,8 +430,9 @@ impl Git {
         {
             return Err(error("HandoffTransportTargetInvalid"));
         }
+        let data_root = git_path(data_root);
         let mut ssh_args = vec![
-            crate::process::resolve_ssh_tool("ssh")
+            git_path(&crate::process::resolve_ssh_tool("ssh"))
                 .to_string_lossy()
                 .replace('\\', "/"),
             "-T".into(),
@@ -412,8 +445,8 @@ impl Git {
             "-o".into(),
             "ServerAliveCountMax=2".into(),
         ];
-        ssh_args.extend(super::ssh_added::config_args(data_root, destination));
-        ssh_args.extend(ssh_trust::strict_host_key_args(data_root));
+        ssh_args.extend(super::ssh_added::config_args(&data_root, destination));
+        ssh_args.extend(ssh_trust::strict_host_key_args(&data_root));
         let ssh = ssh_args
             .iter()
             .map(|arg| quote(arg))
@@ -421,9 +454,7 @@ impl Git {
             .join(" ");
         let mut cmd = self.command_with_config(false);
         if let Some((directory, objects)) = isolation {
-            cmd.arg("--git-dir")
-                .arg(directory)
-                .env("GIT_OBJECT_DIRECTORY", objects);
+            self.isolate_objects(&mut cmd, directory, objects);
         }
         cmd.env("GIT_SSH_COMMAND", ssh)
             .env("GIT_SSH_VARIANT", "ssh")
@@ -479,7 +510,7 @@ impl Git {
                 "--object-format=sha1"
             },
         ])
-        .arg(&bare);
+        .arg(git_path(&bare));
         run(init)?;
         let objects = self.run(&["rev-parse", "--git-path", "objects"], None)?;
         let objects = std::fs::canonicalize(self.repo.join(objects.trim()))
@@ -502,15 +533,18 @@ impl Git {
         pin_transport_target(&mut cmd, &target)?;
         run_command(&mut cmd)?;
         let mut verify = self.command_with_config(false);
-        verify
-            .arg("--git-dir")
-            .arg(&bare)
-            .env("GIT_OBJECT_DIRECTORY", &objects)
-            .args(["rev-parse", "--verify", "refs/result^{commit}"]);
+        self.isolate_objects(&mut verify, &bare, &objects);
+        verify.args(["rev-parse", "--verify", "refs/result^{commit}"]);
         if String::from_utf8_lossy(&run(verify)?.stdout).trim() != commit {
             return Err(error("HandoffResultIdentityMismatch"));
         }
         Ok(())
+    }
+
+    fn isolate_objects(&self, cmd: &mut Command, directory: &Path, objects: &Path) {
+        cmd.arg("--git-dir")
+            .arg(git_path(directory))
+            .env("GIT_OBJECT_DIRECTORY", git_path(objects));
     }
 
     pub fn result_ref(&self, id: &str, commit: &str, expected: Option<&str>) -> AppResult<()> {
@@ -568,7 +602,7 @@ impl Git {
         self.verify_result(snapshot, commit)?;
         let (_temporary, index) = self.copied_index()?;
         let mut cmd = self.command();
-        cmd.env("GIT_INDEX_FILE", index);
+        cmd.env("GIT_INDEX_FILE", git_path(&index));
         cmd.args([
             "diff",
             "--binary",
@@ -673,7 +707,7 @@ impl Git {
             return Ok(true);
         }
         let mut cmd = self.command();
-        cmd.env("GIT_INDEX_FILE", &index);
+        cmd.env("GIT_INDEX_FILE", git_path(&index));
         cmd.args(["apply", "--check", "--binary", "--whitespace=nowarn", "-"]);
         Ok(run_command_with_input(&mut cmd, Some(patch)).is_ok())
     }
@@ -685,7 +719,7 @@ impl Git {
         if !patch.is_empty() {
             let (_temporary, index) = self.copied_index()?;
             let mut cmd = self.command();
-            cmd.env("GIT_INDEX_FILE", index);
+            cmd.env("GIT_INDEX_FILE", git_path(&index));
             cmd.args(["apply", "--binary", "--whitespace=nowarn", "-"]);
             run_command_with_input(&mut cmd, Some(patch))?;
         }
