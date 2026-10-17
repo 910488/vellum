@@ -2,7 +2,8 @@
 useDefault = true
 
 [allowlist]
-description = "Published RFC 6455 WebSocket handshake example, not a credential"
+description = "Published examples, not credentials: RFC 6455 WebSocket handshake nonce; ULID spec sample id used as a test fixture"
 regexes = [
   '''dGhlIHNhbXBsZSBub25jZQ==''',
+  '''01ARZ3NDEKTSV4RRFFQ69G5FAV''',
 ]
