@@ -91,19 +91,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Build Darwin remote binaries
-        run: |
-          cargo build -p vellum-remote-agent -p vellum-proxy-daemon --release --target aarch64-apple-darwin
-          mkdir -p src-tauri/resources/remote/darwin-arm64
-          cp target/aarch64-apple-darwin/release/vellum-remote-agent src-tauri/resources/remote/darwin-arm64/vellum-remote-agent
-          cp target/aarch64-apple-darwin/release/vellum-proxy-daemon src-tauri/resources/remote/darwin-arm64/vellum-proxy-daemon
-          CODEX_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/resources/remote/manifest.json', 'utf8')).codex.pinnedVersion")"
-          curl -fsSL --proto '=https' --tlsv1.2 \
-            "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-aarch64-apple-darwin.tar.gz" \
-            -o target/codex-darwin-arm64.tar.gz
-          tar -xzf target/codex-darwin-arm64.tar.gz -C target codex-aarch64-apple-darwin
-          mv target/codex-aarch64-apple-darwin src-tauri/resources/remote/darwin-arm64/codex
-          node scripts/finalize-remote-darwin-manifest.mjs src-tauri/resources/remote
+      - name: Build Darwin remote payload
+        run: bash scripts/stage-remote-darwin-payload.sh
 
       - name: Upload Darwin payload
         uses: actions/upload-artifact@v4
