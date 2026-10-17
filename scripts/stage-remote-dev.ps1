@@ -15,7 +15,8 @@
 param(
     [ValidateSet("amd64", "arm64")]
     [string[]] $Arch = @("amd64"),
-    [string] $CodexVersion = "0.147.0-alpha.6.6"
+    [string] $CodexVersion = "0.147.0-alpha.6.6",
+    [switch] $BundleCodex
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,7 +50,7 @@ function Copy-Into([string] $Source, [string] $Destination) {
 
 function Get-CachedCodex([string] $Architecture) {
     $target = if ($Architecture -eq "arm64") { "aarch64-unknown-linux-musl" } else { "x86_64-unknown-linux-musl" }
-    $cached = Join-Path $cacheRoot "codex\$CodexVersion\$target\codex-package.tar.gz"
+    $cached = Join-Path $cacheRoot "codex\$CodexVersion\linux-$Architecture\codex-package.tar.gz"
     if (Test-Path -LiteralPath $cached -PathType Leaf) {
         Write-Host "==> Reuse cached Codex $CodexVersion ($Architecture)"
         return $cached
@@ -81,7 +82,6 @@ foreach ($architecture in $Arch) {
     }
     Copy-Into (Join-Path $scratch "vellum-remote-agent") (Join-Path $destination "vellum-remote-agent")
     Copy-Into (Join-Path $scratch "vellum-proxy-daemon") (Join-Path $destination "vellum-proxy-daemon")
-    Copy-Into (Get-CachedCodex $architecture) (Join-Path $destination "codex-package.tar.gz")
 
 }
 
@@ -91,7 +91,7 @@ foreach ($architecture in $Arch) {
 $carried = @()
 foreach ($architecture in $allArch) {
     if ($Arch -contains $architecture) { continue }
-    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon")) {
         $artifact = Join-Path $resourceRoot "linux-$architecture\$name"
         if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
             throw "linux-$architecture/$name is not staged. Stage it once with -Arch $architecture, or run scripts/build-local-release.ps1 -Mode stage-only."
@@ -102,8 +102,16 @@ foreach ($architecture in $allArch) {
 
 $agentVersion = (Select-String -Path (Join-Path $repo "crates\vellum-remote-agent\Cargo.toml") -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
 $manifestPath = Join-Path $resourceRoot "manifest.json"
+foreach ($architecture in $allArch) {
+    $package = Get-CachedCodex $architecture
+    $bundled = Join-Path $resourceRoot "linux-$architecture\codex-package.tar.gz"
+    if ($BundleCodex) { Copy-Into $package $bundled }
+    elseif (Test-Path -LiteralPath $bundled) { Remove-Item -LiteralPath $bundled -Force }
+}
+$packageRoot = Join-Path $cacheRoot "codex\$CodexVersion"
+$packageMode = if ($BundleCodex) { "bundle" } else { "https" }
 Invoke-Checked "Finalize schema 5 native development manifest" {
-    node (Join-Path $repo "scripts\finalize-remote-linux-manifest.mjs") $resourceRoot "$version+dev.$fingerprint" $CodexVersion $agentVersion $fingerprint
+    node (Join-Path $repo "scripts\finalize-remote-linux-manifest.mjs") $resourceRoot "$version+dev.$fingerprint" $CodexVersion $agentVersion $fingerprint $packageRoot $packageMode
 }
 
 Write-Host ""

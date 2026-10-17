@@ -117,13 +117,18 @@ for arch in amd64 arm64; do
   destination="$resource_root/linux-$arch"
   rm -rf "$destination"
   mkdir -p "$destination"
-  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
+  for name in vellum-remote-agent vellum-proxy-daemon; do
     cp "$scratch_root/$arch/$name" "$destination/$name"
   done
 done
 
 agent_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/crates/vellum-remote-agent/Cargo.toml" | head -1)"
-node "$repo/scripts/finalize-remote-linux-manifest.mjs" "$resource_root" "$version" "$codex_version" "$agent_version" "$proxy_fingerprint"
+# Finalizer reads packages from scratch, never from installer resources.
+mkdir -p "$scratch_root/codex/linux-amd64" "$scratch_root/codex/linux-arm64"
+for arch in amd64 arm64; do
+  cp "$scratch_root/$arch/codex-package.tar.gz" "$scratch_root/codex/linux-$arch/codex-package.tar.gz"
+done
+node "$repo/scripts/finalize-remote-linux-manifest.mjs" "$resource_root" "$version" "$codex_version" "$agent_version" "$proxy_fingerprint" "$scratch_root/codex"
 
 if [[ "$(uname -s)" == Darwin ]]; then
   echo "==> Build Darwin ARM64 Agent and native Proxy"
@@ -141,23 +146,25 @@ if [[ "$(uname -s)" == Darwin ]]; then
     "$darwin_root/vellum-remote-agent"
   cp "${CARGO_TARGET_DIR:-$repo/target}/aarch64-apple-darwin/release/vellum-proxy-daemon" \
     "$darwin_root/vellum-proxy-daemon"
-  node "$repo/scripts/download-codex-package.mjs" "$codex_version" aarch64-apple-darwin "$darwin_root/codex-package.tar.gz"
-  node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root"
+  node "$repo/scripts/download-codex-package.mjs" "$codex_version" aarch64-apple-darwin "$scratch_root/darwin-codex-package.tar.gz"
+  node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root" "$scratch_root/darwin-codex-package.tar.gz"
 fi
 
 echo "==> Embedded remote payload"
 du -sh "$resource_root"
 for arch in amd64 arm64; do
-  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
+  for name in vellum-remote-agent vellum-proxy-daemon; do
     test -s "$resource_root/linux-$arch/$name"
   done
 done
 test -s "$resource_root/manifest.json"
 if [[ "$(uname -s)" == Darwin ]]; then
-  for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
+  for name in vellum-remote-agent vellum-proxy-daemon; do
     test -s "$resource_root/darwin-arm64/$name"
   done
 fi
+
+node "$repo/scripts/remote-codex-artifact.mjs" "$resource_root"
 
 if [[ "$bundle" != stage-only ]]; then
   command -v pnpm >/dev/null || { echo "pnpm is required to bundle the desktop app" >&2; exit 1; }

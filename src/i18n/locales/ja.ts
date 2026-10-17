@@ -665,6 +665,8 @@ const ja: ResourceTree = {
       "noModelsSelected": "モデルが 1 つも選ばれていないため、同期するものがありません。",
       "noDeployableModels": "選択したモデルに、資格確認済みでデスクトップの認証情報も利用できるものがありません。モデルを有効化・検証し、認証情報を追加してから再デプロイしてください。",
       "bundledReleaseUnavailable": "同梱のデプロイファイルが不足しているか、検証に失敗しました。完全な Vellum リリースをインストールしてからデプロイしてください。",
+      "CodexPackageDownloadFailed": "Codex runtime のダウンロードに失敗しました。GitHub の OpenAI リリースに接続できることを確認し、デプロイを再試行してください。",
+      "CodexPackageVerificationFailed": "Codex runtime パッケージの検証に失敗したため、キャッシュを削除しました。デプロイを再試行してダウンロードし直してください。",
       "codexRuntimeIncomplete": "リモート Codex のヘルパーまたはリソースが不足しています。作業を引き継ぐ前に、このホストを再デプロイしてください。",
       "DeploymentAgentUpgradeRequired": "引き継ぎを確認する前にリモート Agent を更新してください。この Agent は確認を観測済みプロセスに結び付けられません。",
       "DeploymentAlreadyRunning": "このホストではデプロイが実行中です。その操作を確認するか、キャンセルしてから開始してください。",

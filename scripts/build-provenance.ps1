@@ -220,12 +220,22 @@ function Assert-VellumStagedRemotePayload {
     $hashes = [ordered]@{}
     foreach ($pair in (Get-VellumRemoteArtifactLayout).GetEnumerator()) {
         $relative = $pair.Key
+        $parts = $pair.Value.Split('.', 2)
+        $declaration = $manifest.($parts[0]).artifacts.($parts[1])
+        if ($parts[0] -eq "codex" -and ([string]$declaration.url).StartsWith("https://")) {
+            $expected = Get-VellumManifestArtifactSha256 $manifest $parts[0] $parts[1]
+            if (([string]$declaration.url) -notmatch '^https://github\.com/openai/codex/releases/download/rust-v[^/]+/codex-package-[^/]+\.tar\.gz$' -or
+                [long]$declaration.size -le 0 -or [long]$declaration.uncompressedSize -le 0) {
+                throw "Remote Codex package must declare an official HTTPS URL and build-time sizes"
+            }
+            $hashes[$relative] = $expected
+            continue
+        }
         $path = Join-Path $ResourceRoot ($relative -replace '/', '\')
         if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
             throw "Remote payload missing or empty artifact $relative"
         }
         $actual = Get-VellumFileSha256 $path
-        $parts = $pair.Value.Split('.', 2)
         $expected = Get-VellumManifestArtifactSha256 $manifest $parts[0] $parts[1]
         if ($actual -ne $expected) {
             throw "Remote artifact $relative sha256 $actual does not match manifest $expected"

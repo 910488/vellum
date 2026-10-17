@@ -1,11 +1,12 @@
 //! M31: desktop-side pinned Codex installation.
 //!
 //! Flow: verify that the resource manifest matches the hash embedded into the
-//! Vellum binary at compile time, resolve the bundled artifact for the host
+//! Vellum binary at compile time, resolve the pinned artifact for the host
 //! architecture, verify its SHA-256 and complete runtime layout, stage the
 //! archive over SSH stdin, then ask the
 //! agent to perform the digest-verified atomic install.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -25,7 +26,17 @@ const LEGACY_RELEASE_SCHEMA_VERSION: u32 = 3;
 pub struct CodexArtifact {
     pub url: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncompressed_size: u64,
 }
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+const MAX_CODEX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -373,10 +384,11 @@ pub(crate) fn proxy_artifact_for_arch<'a>(
 }
 
 fn sha256_file(path: &Path) -> AppResult<String> {
-    let bytes = std::fs::read(path)
+    let mut file = std::fs::File::open(path)
         .map_err(|error| AppError::Message(format!("read artifact {}: {error}", path.display())))?;
-    let digest = Sha256::digest(&bytes);
-    Ok(hex::encode(digest))
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest).map_err(|error| AppError::Message(error.to_string()))?;
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn bundled_artifact(relative: &str) -> AppResult<PathBuf> {
@@ -410,6 +422,139 @@ pub(crate) fn inspect_bundled_codex_package(artifact: &CodexArtifact) -> AppResu
     })?;
     let path = bundled_artifact(relative)?;
     vellum_codex_package::verify_archive(&path).map_err(AppError::Message)
+}
+
+/// Preflight remains read-only and offline. HTTPS packages carry build-time
+/// sizes in the same manifest whose digest is embedded into Desktop.
+pub(crate) fn inspect_codex_package_sizes(artifact: &CodexArtifact) -> AppResult<(u64, u64)> {
+    if artifact.url.starts_with("bundle://") {
+        return Ok((
+            inspect_bundled_artifact(artifact)?,
+            inspect_bundled_codex_package(artifact)?,
+        ));
+    }
+    if !artifact.url.starts_with("https://")
+        || artifact.size == 0
+        || artifact.size > MAX_CODEX_ARCHIVE_BYTES
+        || artifact.uncompressed_size == 0
+        || artifact.uncompressed_size > 1024 * 1024 * 1024
+    {
+        return Err(AppError::Message(
+            "ReleaseManifestInvalid: HTTPS Codex package needs signed archive and expanded sizes"
+                .into(),
+        ));
+    }
+    Ok((artifact.size, artifact.uncompressed_size))
+}
+
+fn verify_codex_package(path: &Path, artifact: &CodexArtifact) -> AppResult<()> {
+    let size = inspect_artifact_file(path, &artifact.sha256).map_err(|error|
+        AppError::Message(format!("CodexPackageVerificationFailed: {error}; retry deployment to download a verified package")))?;
+    if size > MAX_CODEX_ARCHIVE_BYTES || (artifact.size != 0 && size != artifact.size) {
+        return Err(AppError::Message(
+            "CodexPackageVerificationFailed: archive size mismatch".into(),
+        ));
+    }
+    let expanded = vellum_codex_package::verify_archive(path)
+        .map_err(|error| AppError::Message(format!("CodexPackageVerificationFailed: {error}")))?;
+    if artifact.uncompressed_size != 0 && expanded > artifact.uncompressed_size {
+        return Err(AppError::Message(
+            "CodexPackageVerificationFailed: expanded size exceeds signed reserve".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn cached_codex_package_with<F, Fut>(
+    root: &Path,
+    artifact: &CodexArtifact,
+    download: F,
+) -> AppResult<PathBuf>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
+    let digest = artifact
+        .sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&artifact.sha256)
+        .to_ascii_lowercase();
+    if !valid_sha256(&digest) {
+        return Err(AppError::Message(
+            "ReleaseManifestInvalid: invalid Codex package digest".into(),
+        ));
+    }
+    let dir = root.join("remote-cache").join("codex");
+    std::fs::create_dir_all(&dir).map_err(|error| AppError::Message(error.to_string()))?;
+    let cached = dir.join(format!("{digest}.tar.gz"));
+    if cached.exists() {
+        match verify_codex_package(&cached, artifact) {
+            Ok(()) => return Ok(cached),
+            Err(error) => {
+                std::fs::remove_file(&cached).map_err(|remove| {
+                    AppError::Message(format!(
+                        "CodexPackageVerificationFailed: {error}; remove corrupt cache: {remove}"
+                    ))
+                })?;
+            }
+        }
+    }
+    // A cancelled/failed transfer leaves no cache entry. Each retry gets its
+    // own temporary file, and only a fully verified archive is published.
+    let staged = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    download(staged.path().to_path_buf()).await?;
+    verify_codex_package(staged.path(), artifact)?;
+    match staged.persist_noclobber(&cached) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Err(error) = verify_codex_package(&cached, artifact) {
+                let _ = std::fs::remove_file(&cached);
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(AppError::Message(format!("cache Codex package: {error}"))),
+    }
+    Ok(cached)
+}
+
+async fn cached_codex_package(
+    root: &Path,
+    artifact: &CodexArtifact,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> AppResult<PathBuf> {
+    cached_codex_package_with(root, artifact, |path| async move {
+        if let Some(relative) = artifact.url.strip_prefix("bundle://") {
+            let source = bundled_artifact(relative)?;
+            std::fs::copy(source, path).map_err(|error| AppError::Message(error.to_string()))?;
+            return Ok(());
+        }
+        inspect_codex_package_sizes(artifact)?;
+        let result = async {
+            let mut response = super::desktop_codex::http_client()?.get(&artifact.url).send().await
+                .map_err(|error| AppError::Message(error.to_string()))?
+                .error_for_status().map_err(|error| AppError::Message(error.to_string()))?;
+            if response.content_length().is_some_and(|size| size > MAX_CODEX_ARCHIVE_BYTES) {
+                return Err(AppError::Message("archive too large".into()));
+            }
+            let mut output = std::fs::File::create(path).map_err(|error| AppError::Message(error.to_string()))?;
+            let mut bytes = 0u64;
+            let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            progress(0, Some(artifact.size));
+            while let Some(chunk) = response.chunk().await.map_err(|error| AppError::Message(error.to_string()))? {
+                bytes += chunk.len() as u64;
+                if bytes > MAX_CODEX_ARCHIVE_BYTES || bytes > artifact.size { return Err(AppError::Message("archive exceeds signed size".into())); }
+                output.write_all(&chunk).map_err(|error| AppError::Message(error.to_string()))?;
+                if last.elapsed() >= std::time::Duration::from_millis(500) || bytes == artifact.size {
+                    progress(bytes, Some(artifact.size));
+                    last = std::time::Instant::now();
+                }
+            }
+            output.sync_all().map_err(|error| AppError::Message(error.to_string()))?;
+            Ok(())
+        }.await;
+        result.map_err(|error: AppError| AppError::Message(format!("CodexPackageDownloadFailed: {error}; check access to GitHub OpenAI releases and retry deployment")))
+    }).await
 }
 
 fn inspect_artifact_file(path: &Path, expected: &str) -> AppResult<u64> {
@@ -490,6 +635,20 @@ pub fn install_pinned_codex(
     host_id: &str,
     operation_id: &str,
 ) -> AppResult<serde_json::Value> {
+    tauri::async_runtime::block_on(install_pinned_codex_with_progress(
+        state,
+        host_id,
+        operation_id,
+        |_, _| {},
+    ))
+}
+
+pub(crate) async fn install_pinned_codex_with_progress(
+    state: &AppState,
+    host_id: &str,
+    operation_id: &str,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> AppResult<serde_json::Value> {
     let manifest = load_verified_manifest()?;
     let target = crate::remote::RemoteHostManager::resolve_target(state, host_id)?;
     let client = RemoteAgentClient::new(target.clone());
@@ -497,9 +656,8 @@ pub fn install_pinned_codex(
     let artifact = codex_artifact_from_inventory(&manifest, &inventory)?;
 
     // Download + local digest verification.
-    let local_staged = download_artifact(artifact)?;
+    let local_staged = cached_codex_package(&state.data_root(), artifact, &mut progress).await?;
     let result = (|| -> AppResult<serde_json::Value> {
-        vellum_codex_package::verify_archive(&local_staged).map_err(AppError::Message)?;
         let bytes = std::fs::read(&local_staged)
             .map_err(|error| AppError::Message(format!("read staged artifact: {error}")))?;
         let remote_path = format!("/tmp/vellum-codex-stage-{}.bin", ulid::Ulid::new());
@@ -519,7 +677,6 @@ pub fn install_pinned_codex(
         client.remove_remote_file(&remote_path);
         install
     })();
-    let _ = std::fs::remove_file(&local_staged);
     let result = result?;
     crate::remote::confirm_remote_boundary_key_consumers(
         &client,
@@ -725,6 +882,152 @@ pub(crate) fn native_proxy_component_update_needed(
 mod tests {
     use super::*;
 
+    fn package_fixture(path: &Path, omit_helper: bool) -> CodexArtifact {
+        let gzip = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(gzip);
+        for dir in ["bin", "codex-resources", "codex-path"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, dir, std::io::empty())
+                .unwrap();
+        }
+        for (name, body) in [
+            ("bin/codex", "runtime"),
+            ("bin/codex-code-mode-host", "helper"),
+            ("codex-path/rg", "rg"),
+            ("codex-resources/bwrap", "sandbox"),
+            (
+                "codex-package.json",
+                r#"{"layoutVersion":1,"version":"0.147.0","target":"x86_64-unknown-linux-musl","entrypoint":"bin/codex","resourcesDir":"codex-resources","pathDir":"codex-path"}"#,
+            ),
+        ] {
+            if omit_helper && name == "bin/codex-code-mode-host" {
+                continue;
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, body.as_bytes())
+                .unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap();
+        CodexArtifact { url: "https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package-x86_64-unknown-linux-musl.tar.gz".into(), sha256: sha256_file(path).unwrap(), size: std::fs::metadata(path).unwrap().len(), uncompressed_size: 4096 }
+    }
+
+    #[tokio::test]
+    async fn codex_cache_verifies_once_per_use_and_reuses_without_downloading() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.tgz");
+        let artifact = package_fixture(&source, false);
+        let cached = cached_codex_package_with(temp.path(), &artifact, |dest| async {
+            std::fs::copy(&source, dest).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cached.file_name().unwrap().to_str().unwrap(),
+            format!("{}.tar.gz", artifact.sha256)
+        );
+        let reused = cached_codex_package_with(temp.path(), &artifact, |_| async {
+            panic!("cache hit must not fetch")
+        })
+        .await
+        .unwrap();
+        assert_eq!(cached, reused);
+        std::fs::write(&cached, "corrupt").unwrap();
+        let downloads = std::cell::Cell::new(0);
+        let repaired = cached_codex_package_with(temp.path(), &artifact, |dest| async {
+            downloads.set(downloads.get() + 1);
+            assert!(
+                !cached.exists(),
+                "corrupt entry must be removed before fetching"
+            );
+            std::fs::copy(&source, dest).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(downloads.get(), 1);
+        assert_eq!(repaired, cached);
+        verify_codex_package(&repaired, &artifact).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_or_invalid_package_never_enters_cache_and_deployment_can_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.tgz");
+        let artifact = package_fixture(&source, false);
+        let error = cached_codex_package_with(temp.path(), &artifact, |dest| async {
+            std::fs::write(dest, "interrupted").unwrap();
+            Err(AppError::Message(
+                "CodexPackageDownloadFailed: retry deployment".into(),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("CodexPackageDownloadFailed"));
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("remote-cache/codex"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            cached_codex_package_with(temp.path(), &artifact, |dest| async {
+                std::fs::write(dest, "wrong digest").unwrap();
+                Ok(())
+            })
+            .await
+            .is_err()
+        );
+        let incomplete = package_fixture(&source, true);
+        let error = cached_codex_package_with(temp.path(), &incomplete, |dest| async {
+            std::fs::copy(&source, dest).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("CodexPackageVerificationFailed"));
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("remote-cache/codex"))
+                .unwrap()
+                .count(),
+            0
+        );
+        package_fixture(&source, false);
+        cached_codex_package_with(temp.path(), &artifact, |dest| async {
+            std::fs::copy(&source, dest).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn https_package_preflight_uses_signed_sizes_without_fetching() {
+        let mut artifact = CodexArtifact {
+            url: "https://example.invalid/codex-package.tar.gz".into(),
+            sha256: "a".repeat(64),
+            size: 100,
+            uncompressed_size: 1000,
+        };
+        assert_eq!(inspect_codex_package_sizes(&artifact).unwrap(), (100, 1000));
+        artifact.uncompressed_size = 0;
+        assert!(inspect_codex_package_sizes(&artifact).is_err());
+        artifact.url = "http://example.invalid/package".into();
+        assert!(inspect_codex_package_sizes(&artifact).is_err());
+    }
+
     #[test]
     fn local_artifact_inspection_checks_digest_before_deployment_and_never_stages() {
         let temp = tempfile::tempdir().unwrap();
@@ -739,7 +1042,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
         assert!(inspect_bundled_artifact(&CodexArtifact {
             url: "https://example.invalid/artifact".into(),
-            sha256: digest
+            sha256: digest,
+            ..CodexArtifact::default()
         })
         .unwrap_err()
         .to_string()
@@ -799,14 +1103,17 @@ mod tests {
         manifest.codex.artifacts.darwin_arm64 = Some(CodexArtifact {
             url: "bundle://darwin-arm64/codex".into(),
             sha256: "a".repeat(64),
+            ..CodexArtifact::default()
         });
         manifest.agent.artifacts.darwin_arm64 = Some(CodexArtifact {
             url: "bundle://darwin-arm64/vellum-remote-agent".into(),
             sha256: "b".repeat(64),
+            ..CodexArtifact::default()
         });
         manifest.proxy.artifacts.darwin_arm64 = Some(CodexArtifact {
             url: "bundle://darwin-arm64/vellum-proxy-daemon".into(),
             sha256: "c".repeat(64),
+            ..CodexArtifact::default()
         });
         let decoded: ReleaseManifest =
             serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -830,10 +1137,12 @@ mod tests {
                     linux_x64: CodexArtifact {
                         url: "https://example.invalid/x64".into(),
                         sha256: "a".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     linux_arm64: CodexArtifact {
                         url: "https://example.invalid/arm64".into(),
                         sha256: "b".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     darwin_arm64: None,
                 },
@@ -844,10 +1153,12 @@ mod tests {
                     linux_x64: CodexArtifact {
                         url: "https://example.invalid/agent-x64".into(),
                         sha256: "c".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     linux_arm64: CodexArtifact {
                         url: "https://example.invalid/agent-arm64".into(),
                         sha256: "c".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     darwin_arm64: None,
                 },
@@ -858,10 +1169,12 @@ mod tests {
                     linux_x64: CodexArtifact {
                         url: "https://example.invalid/broker-x64".into(),
                         sha256: "d".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     linux_arm64: CodexArtifact {
                         url: "https://example.invalid/broker-arm64".into(),
                         sha256: "d".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     darwin_arm64: None,
                 },
@@ -872,10 +1185,12 @@ mod tests {
                     linux_x64: CodexArtifact {
                         url: "bundle://linux-amd64/proxy-image.tar".into(),
                         sha256: "e".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     linux_arm64: CodexArtifact {
                         url: "bundle://linux-arm64/proxy-image.tar".into(),
                         sha256: "f".repeat(64),
+                        ..CodexArtifact::default()
                     },
                     darwin_arm64: None,
                 },
@@ -915,6 +1230,7 @@ mod tests {
         manifest.codex.artifacts.darwin_arm64 = Some(CodexArtifact {
             url: "bundle://darwin-arm64/codex".into(),
             sha256: "1".repeat(64),
+            ..CodexArtifact::default()
         });
         assert_eq!(
             artifact_for_os_arch(&manifest.codex.artifacts, "darwin", "arm64")

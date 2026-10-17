@@ -415,6 +415,83 @@ pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
         })
 }
 
+/// Compare signed metadata first, and verify a matching source exactly once.
+/// Full relative paths matter: two helpers with the same basename are distinct.
+pub(super) type LocalCoreFiles = Vec<(String, PathBuf)>;
+
+pub(super) fn matching_local_core(
+    root: &Path,
+    core: &super::manifest::CoreManifest,
+    target: &CoreTarget,
+    trust: &TrustStore,
+    bundled: Option<&Path>,
+) -> Option<(String, LocalCoreFiles)> {
+    matching_local_core_with(root, target, trust, bundled, |tree, version| {
+        super::core_package::build_slot(tree, version, core, target)
+    })
+}
+
+fn matching_local_core_with(
+    root: &Path,
+    target: &CoreTarget,
+    trust: &TrustStore,
+    bundled: Option<&Path>,
+    mut build_slot: impl FnMut(&Path, &str) -> Result<CoreSlot, String>,
+) -> Option<(String, LocalCoreFiles)> {
+    let slots = CoreSlots::load(root);
+    for slot in [slots.active, slots.pending].into_iter().flatten() {
+        let tree = slot_tree_root(root, &slot.version);
+        let Ok(expected) = build_slot(&tree, &slot.version) else {
+            continue;
+        };
+        let metadata_matches = slot.path == expected.path
+            && slot.helpers == expected.helpers
+            && slot.files.len() == expected.files.len()
+            && slot.files.iter().all(|file| {
+                expected.files.iter().any(|other| {
+                    file.path == other.path
+                        && file.size == other.size
+                        && file
+                            .sha256
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&file.sha256)
+                            .eq_ignore_ascii_case(
+                                other
+                                    .sha256
+                                    .strip_prefix("sha256:")
+                                    .unwrap_or(&other.sha256),
+                            )
+                })
+            });
+        if metadata_matches && verified_slot(root, &slot, trust) {
+            return Some((
+                slot.version,
+                target
+                    .files
+                    .iter()
+                    .map(|file| (file.path.clone(), tree.join(&file.path)))
+                    .collect(),
+            ));
+        }
+    }
+    let bundled = bundled?;
+    let sources = target
+        .files
+        .iter()
+        .map(|file| {
+            let path = if file.path == target.executable {
+                bundled.to_path_buf()
+            } else {
+                bundled.parent()?.join(&file.path)
+            };
+            (std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == file.size)
+                && file_matches_digest(&path, &file.sha256))
+            .then(|| (file.path.clone(), path))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(("bundled".into(), sources))
+}
+
 /// Nightly releases re-label one core build, so a "new" core is often the
 /// running one under another version: same signed files, same protocol.
 /// Switching to it changes no byte that runs, so it needs no restart.
@@ -810,6 +887,51 @@ mod tests {
             feature_profile: "enhanced-mvp-v1".into(),
             launch_id: None,
         }
+    }
+
+    #[test]
+    fn failed_active_slot_build_still_reuses_a_matching_pending_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let trust = TrustStore::from_key("test-key", signing.verifying_key());
+        let (exe, digest) = write_planted_tree(dir.path(), "9.9.9", false);
+        let (raw, sig, manifest) = signed_core_fixture(&signing, false);
+        persist_signed_core_trust(dir.path(), "9.9.9", &raw, &sig).unwrap();
+        let pending = planted_slot(dir.path(), "9.9.9", &exe, &digest);
+        CoreSlots {
+            active: Some(slot("broken")),
+            pending: Some(pending.clone()),
+            ..CoreSlots::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let core = manifest.core.unwrap();
+        let target = &core.targets[0];
+        let mut attempted = Vec::new();
+        // build_slot currently derives metadata from a shared target. Inject
+        // a per-candidate failure to exercise this defensive fallback path.
+        let (source, files) =
+            matching_local_core_with(dir.path(), target, &trust, None, |tree, version| {
+                attempted.push(version.to_string());
+                if version == "broken" {
+                    return Err("active slot build failed".into());
+                }
+                super::super::core_package::build_slot(tree, version, &core, target)
+            })
+            .expect("matching pending files must remain available without downloading");
+        assert_eq!(attempted, ["broken", "9.9.9"]);
+        assert_eq!(source, pending.version);
+        assert_eq!(
+            files,
+            target
+                .files
+                .iter()
+                .map(|file| (
+                    file.path.clone(),
+                    slot_tree_root(dir.path(), "9.9.9").join(&file.path)
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -64,6 +64,8 @@ describe("remote deployment presentation", () => {
     ["ProxyMigrationRolledBack", "bootstrap"],
     ["OneClickBootstrapVerificationFailed", "bootstrap"],
     ["SSH connection timed out", "retry"],
+    ["CodexPackageDownloadFailed", "bootstrap"],
+    ["CodexPackageVerificationFailed", "bootstrap"],
     ["unknown_nativeDaemonAppOwned_suffix", "retry"],
   ])("selects one remedy for %s", (code, action) => {
     const model = remoteWorkSurface({ ...pending, error: `OneClickBootstrapBlocked: ${code}` });

@@ -6,6 +6,12 @@ fn main() {
         std::env::var("TARGET").unwrap_or_default()
     );
     let manifest = std::path::PathBuf::from("resources/remote/manifest.json");
+    println!("cargo:rerun-if-changed=resources/remote");
+    if std::env::var("PROFILE").as_deref() == Ok("release") && manifest.exists() {
+        let bytes = remote_payload_bytes(std::path::Path::new("resources/remote"))
+            .expect("inspect remote installer payload");
+        assert!(bytes <= 80 * 1024 * 1024, "resources/remote exceeds 80 MiB: {bytes} bytes; keep Codex packages outside installer resources");
+    }
     println!("cargo:rerun-if-changed={}", manifest.display());
     if let Ok(bytes) = std::fs::read(&manifest) {
         let digest = Sha256::digest(bytes);
@@ -42,6 +48,25 @@ fn main() {
     println!("cargo:rustc-env=VELLUM_BUNDLED_RELAY_SHA256={relay_digest}");
     println!("cargo:rustc-env=VELLUM_BUNDLED_RELAY_RELATIVE_PATH={relay}");
     tauri_build::build()
+}
+
+fn remote_payload_bytes(root: &std::path::Path) -> std::io::Result<u64> {
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.path().symlink_metadata()?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other("remote payload contains a symlink"));
+        }
+        bytes = bytes
+            .checked_add(if metadata.is_dir() {
+                remote_payload_bytes(&entry.path())?
+            } else {
+                metadata.len()
+            })
+            .ok_or_else(|| std::io::Error::other("remote payload size overflow"))?;
+    }
+    Ok(bytes)
 }
 
 /// Records the identity of the packaged App Server bridge.

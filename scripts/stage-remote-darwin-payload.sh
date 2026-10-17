@@ -26,9 +26,11 @@ rm -rf "$darwin_root"
 mkdir -p "$darwin_root"
 cp "$target_dir/aarch64-apple-darwin/release/vellum-remote-agent" "$darwin_root/vellum-remote-agent"
 cp "$target_dir/aarch64-apple-darwin/release/vellum-proxy-daemon" "$darwin_root/vellum-proxy-daemon"
-node "$repo/scripts/download-codex-package.mjs" "$codex_version" aarch64-apple-darwin "$darwin_root/codex-package.tar.gz"
-node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root"
+package_path="$target_dir/remote-dev-cache/codex/$codex_version/darwin-arm64/codex-package.tar.gz"
+node "$repo/scripts/download-codex-package.mjs" "$codex_version" aarch64-apple-darwin "$package_path"
+node "$repo/scripts/finalize-remote-darwin-manifest.mjs" "$resource_root" "$package_path"
 
-for name in vellum-remote-agent vellum-proxy-daemon codex-package.tar.gz; do
+for name in vellum-remote-agent vellum-proxy-daemon; do
   test -s "$darwin_root/$name"
 done
+node "$repo/scripts/remote-codex-artifact.mjs" "$resource_root"

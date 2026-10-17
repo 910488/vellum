@@ -27,6 +27,7 @@ const BLOCKER_CODES = [
   "desktopOfficialAccountMissing", "dockerUnavailable", "intelMacUnsupported",
   "guiSessionUnavailable", "proxyPortConflict", "proxyPortOccupied", "insufficientDiskSpace",
   "incompleteObservation", "hostNotConfigured",
+  "CodexPackageDownloadFailed", "CodexPackageVerificationFailed",
   "injectionRequiresReadyProxy", "invalidCompactionThreshold",
   "managedRuntimeRecoveryRequired", "nativeCodexVersionMismatch",
   "nativeDaemonAppOwned", "noModelsSelected", "officialAccountActivationRequired",

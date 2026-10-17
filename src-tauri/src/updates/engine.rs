@@ -816,6 +816,31 @@ impl UpdateEngine {
             self.save(&state)?;
             return Ok(op);
         };
+        if component == UpdateComponent::Core && target == AssetTarget::local() {
+            if let Some((slot, source)) = self.reuse_local_core(&manifest)? {
+                set_pending(&self.root, slot.clone())
+                    .map_err(|error| AppError::Message(error.to_string()))?;
+                record.phase = UpdatePhase::Applied;
+                record.download_total = 0;
+                record.download_bytes = 0;
+                record.staged_asset = None;
+                record.staged_target = None;
+                self.save(&state)?;
+                let slots = CoreSlots::load(&self.root);
+                let keep_previous = slots.previous.as_ref().is_some_and(|previous| {
+                    launched_core_version(&self.root) == Some(previous.version.clone())
+                });
+                self.settle_pending_core(
+                    slot,
+                    &format!("core tree identical to {source}; download skipped"),
+                    keep_previous,
+                )?;
+                return Ok(UpdateOperation {
+                    phase: UpdatePhase::Applied,
+                    ..op
+                });
+            }
+        }
         record.download_total = asset.size;
         record.download_bytes = 0;
         self.save(&state)?;
@@ -969,6 +994,54 @@ impl UpdateEngine {
             }
         }
         Ok(op)
+    }
+
+    fn reuse_local_core(
+        &self,
+        manifest: &UpdateManifest,
+    ) -> AppResult<Option<(super::core_slots::CoreSlot, String)>> {
+        // State is only an index. Recheck the original signed bytes before
+        // trusting the new file list, just as archive staging does.
+        let (raw, sig) =
+            load_checked_manifest(&self.root, UpdateComponent::Core, &manifest.version)
+                .map_err(AppError::Message)?;
+        let checked = verify_signed_manifest(&raw, &sig, &self.trust)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        if checked != *manifest {
+            return Err(AppError::Message(
+                "persisted core manifest does not match the selected release".into(),
+            ));
+        }
+        let core = manifest
+            .core
+            .as_ref()
+            .ok_or_else(|| AppError::Message("missingCoreManifest".into()))?;
+        let Some(target) = core.target(current_platform(), current_arch()) else {
+            return Ok(None);
+        };
+        let bundled =
+            crate::enhanced_runtime::desktop_manager::packaged_enhanced_executable(&self.root);
+        let Some((source, files)) = super::core_slots::matching_local_core(
+            &self.root,
+            core,
+            target,
+            &self.trust,
+            bundled.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let slot = super::core_package::stage_local_core(
+            &self.root,
+            &manifest.version,
+            core,
+            target,
+            &files,
+            |from, to| std::fs::hard_link(from, to),
+        )
+        .map_err(AppError::Message)?;
+        super::core_slots::persist_signed_core_trust(&self.root, &manifest.version, &raw, &sig)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        Ok(Some((slot, source)))
     }
 
     pub fn cancel(&self, component: UpdateComponent) -> AppResult<UpdateOperation> {
@@ -3059,6 +3132,110 @@ mod tests {
             &active,
             &other_protocol
         ));
+    }
+
+    #[tokio::test]
+    async fn identical_active_or_pending_core_skips_every_asset_fetch() {
+        struct CountFetch {
+            inner: SharedSource,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl super::super::github::ReleaseSource for CountFetch {
+            fn list_releases(
+                &self,
+                repo: &str,
+                etag: Option<&str>,
+            ) -> Result<ListedReleases, String> {
+                self.inner.list_releases(repo, etag)
+            }
+            fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.fetch_bytes(url)
+            }
+        }
+        for (active, changed_helper) in [(true, false), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (first, currents) = fixture_engine(
+                dir.path(),
+                UpdateComponent::Core,
+                "0.3.1",
+                &core_archive(),
+                Arc::new(RecordingExecutor::default()),
+            );
+            first
+                .check(Some(UpdateComponent::Core), currents)
+                .await
+                .unwrap();
+            first
+                .download(UpdateComponent::Core, currents, Vec::new())
+                .await
+                .unwrap();
+            if active {
+                super::super::core_slots::promote_pending(dir.path()).unwrap();
+            }
+            let (mut next, currents) = fixture_engine(
+                dir.path(),
+                UpdateComponent::Core,
+                "0.3.2",
+                &core_archive(),
+                Arc::new(RecordingExecutor::default()),
+            );
+            let currents = Currents {
+                core: "0.3.1",
+                ..currents
+            };
+            next.check(Some(UpdateComponent::Core), currents)
+                .await
+                .unwrap();
+            if changed_helper {
+                let mut state = next.load();
+                let record = state.layers.get_mut("core").unwrap();
+                let manifest = record.manifest.as_mut().unwrap();
+                manifest.core.as_mut().unwrap().targets[0].files[1].sha256 =
+                    hex::encode(Sha256::digest(b"Helper"));
+                let raw = serde_json::to_vec(manifest).unwrap();
+                let sig = sign_raw(&raw, &SigningKey::from_bytes(&[7u8; 32]));
+                persist_checked_manifest(dir.path(), UpdateComponent::Core, "0.3.2", &raw, &sig)
+                    .unwrap();
+                next.save(&state).unwrap();
+            }
+            let source = Arc::new(CountFetch {
+                inner: next.source.clone(),
+                calls: Default::default(),
+            });
+            next.source = source.clone();
+            let operation = next
+                .download(UpdateComponent::Core, currents, Vec::new())
+                .await
+                .unwrap();
+            let calls = source.calls.load(std::sync::atomic::Ordering::SeqCst);
+            if changed_helper {
+                assert_eq!(calls, 1, "a different signed helper must download");
+                continue;
+            }
+            assert_eq!(calls, 0);
+            assert_eq!(operation.phase, UpdatePhase::Applied);
+            let slots = CoreSlots::load(dir.path());
+            let slot = slots.active.unwrap();
+            assert_eq!(slot.version, "0.3.2");
+            assert!(slots.pending.is_none());
+            assert!(super::super::core_slots::verified_slot(
+                dir.path(),
+                &slot,
+                &next.trust
+            ));
+            let state = next.load();
+            assert_eq!(state.layers["core"].phase, UpdatePhase::Applied);
+            assert_eq!(state.layers["core"].download_total, 0);
+            assert!(state.layers["core"].staged_version.is_none());
+            assert!(Journal::load(dir.path())
+                .by_id(&operation.operation_id)
+                .unwrap()
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("download skipped"));
+        }
     }
 
     #[test]
