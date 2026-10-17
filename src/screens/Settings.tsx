@@ -616,9 +616,9 @@ export function Settings({
     }
   }
 
-  /// Codex Desktop 有對話在跑時，重新啟動會被擋下來。擋下來的唯一出路是使用者
-  /// 自己說「我知道，還是要重啟」——所以那顆按鈕只在被擋時出現。
-  const restartBlockedByTurn = restart?.notice.code === "restartBlockedByCodexTurn";
+  // 進行中的對話，或無法確認閒置而未能關閉時，讓使用者看過警告後明確覆寫。
+  const restartCanForce = restart?.notice.code === "restartBlockedByCodexTurn"
+    || (restart?.notice.code === "restartProcessStillRunning" && restart.notice.params.canForce === "true");
 
   /// 這顆按鈕就是交接本身：寫 launch manifest、取得 CODEX_CLI_PATH 的 lease、
   /// 關掉並重開 Codex Desktop，然後最多等 90 秒看 bridge 有沒有回報 attestation。
@@ -1481,7 +1481,7 @@ export function Settings({
               >
                 {codexRestarting ? t("settings.page.advanced.restartingAction") : t("settings.page.advanced.restartAction")}
               </Btn>
-              {restartBlockedByTurn ? (
+              {restartCanForce ? (
                 <Btn soft disabled={codexRestarting} onClick={() => void restartCodex(true)}>
                   {t("settings.page.advanced.restartAnyway")}
                 </Btn>

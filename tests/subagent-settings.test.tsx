@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   listRoutes: vi.fn(),
   listReviewModelRoutes: vi.fn(),
   getRuntimeStatus: vi.fn(),
+  restartCodexSafely: vi.fn(),
   getEnhancedDesktopRuntimeStatus: vi.fn(),
   getProxyStatus: vi.fn(),
   listCatalogVersions: vi.fn(),
@@ -146,6 +147,29 @@ function deferredSubagentSave() {
 }
 
 describe("sub-agent default settings", () => {
+  it.each([
+    ["restartBlockedByCodexTurn", { count: "1" }, true],
+    ["restartProcessStillRunning", { exitCode: "none", canForce: "true" }, true],
+    ["restartProcessStillRunning", { exitCode: "1", canForce: "false" }, false],
+    ["restartSucceeded", {}, false],
+  ])("restart override for %s (%j)", async (code, params, canForce) => {
+    apiMocks.restartCodexSafely.mockResolvedValue({ restarted: false, notice: { code, params } });
+    renderSettings();
+    const restartButton = await screen.findByRole("button", { name: t("settings.page.advanced.restartAction") });
+    expect(screen.queryByRole("button", { name: t("settings.page.advanced.restartAnyway") })).toBeNull();
+    fireEvent.click(restartButton);
+    await waitFor(() => expect(apiMocks.restartCodexSafely).toHaveBeenCalledWith(false));
+    await waitFor(() => expect((restartButton as HTMLButtonElement).disabled).toBe(false));
+    const override = screen.queryByRole("button", { name: t("settings.page.advanced.restartAnyway") });
+    if (canForce) {
+      expect(override).not.toBeNull();
+      fireEvent.click(override!);
+      await waitFor(() => expect(apiMocks.restartCodexSafely).toHaveBeenLastCalledWith(true));
+    } else {
+      expect(override).toBeNull();
+    }
+  });
+
   beforeAll(async () => {
     await i18n.changeLanguage("en");
   });
