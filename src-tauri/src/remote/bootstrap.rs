@@ -1021,7 +1021,12 @@ fn inspect_existing_agent(
     };
     // A runtime this host was Desktop-synced to is as good as the pinned one;
     // treating only the pinned version as current would downgrade it here.
-    let qualified = super::desktop_codex::qualified_remote_version(&state.data_root(), host_id);
+    // An older sync does not count, or a newer pin would never reach the host.
+    let qualified = super::desktop_codex::qualified_remote_version_at_least(
+        &state.data_root(),
+        host_id,
+        &manifest.codex.pinned_version,
+    );
     let accepted = std::iter::once(manifest.codex.pinned_version.as_str())
         .chain(qualified.as_deref())
         .collect::<Vec<_>>();

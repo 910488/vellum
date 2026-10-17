@@ -606,18 +606,32 @@ pub(crate) fn qualified_remote_version(root: &Path, host_id: &str) -> Option<Str
         .map(|record| record.remote_version)
 }
 
+/// The qualified version, but only while it is at least the bundled pinned
+/// one. Once a Vellum update pins a newer runtime, an older sync stops counting
+/// as current, so the deploy upgrades the host instead of leaving it behind.
+pub(crate) fn qualified_remote_version_at_least(
+    root: &Path,
+    host_id: &str,
+    pinned: &str,
+) -> Option<String> {
+    let qualified = qualified_remote_version(root, host_id)?;
+    match (parse_codex_version(&qualified), parse_codex_version(pinned)) {
+        (Some(synced), Some(floor)) if synced >= floor => Some(qualified),
+        _ => None,
+    }
+}
+
+fn parse_codex_version(value: &str) -> Option<semver::Version> {
+    version_token(value).and_then(|token| semver::Version::parse(token.split('+').next()?).ok())
+}
+
 /// A deploy brings the remote runtime to the Desktop version on its own only
 /// when that is a strict upgrade. Downgrades stay a deliberate manual sync.
 pub(crate) fn deploy_should_sync(status: &DesktopCodexCompatibilityStatus) -> bool {
     if status.state != "updateAvailable" || !status.can_update {
         return false;
     }
-    let parse = |value: &Option<String>| {
-        value
-            .as_deref()
-            .and_then(version_token)
-            .and_then(|token| semver::Version::parse(token.split('+').next()?).ok())
-    };
+    let parse = |value: &Option<String>| value.as_deref().and_then(parse_codex_version);
     match (
         parse(&status.desktop_version),
         parse(&status.remote_version),
@@ -809,6 +823,19 @@ mod tests {
             qualified_remote_version(root.path(), "jetson").as_deref(),
             Some("0.150.0")
         );
+        // Counts as current only while it is not behind the bundled pin.
+        for (pinned, expected) in [
+            ("0.147.0-alpha.6.6", Some("0.150.0")),
+            ("0.150.0", Some("0.150.0")),
+            ("0.151.0", None),
+            ("not-a-version", None),
+        ] {
+            assert_eq!(
+                qualified_remote_version_at_least(root.path(), "jetson", pinned).as_deref(),
+                expected,
+                "pinned {pinned}"
+            );
+        }
     }
 
     #[test]
