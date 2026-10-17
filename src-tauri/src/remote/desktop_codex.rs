@@ -596,6 +596,51 @@ pub(crate) fn http_client() -> AppResult<reqwest::Client> {
         .map_err(|error| AppError::Message(format!("build update client: {error}")))
 }
 
+/// The remote Codex version this host last passed Desktop protocol
+/// qualification with. A deploy accepts it beside the bundled pinned version,
+/// so redeploying never reinstalls an older pinned runtime over a sync.
+pub(crate) fn qualified_remote_version(root: &Path, host_id: &str) -> Option<String> {
+    load_record(root, host_id)
+        .ok()
+        .flatten()
+        .map(|record| record.remote_version)
+}
+
+/// The qualified version, but only while it is at least the bundled pinned
+/// one. Once a Vellum update pins a newer runtime, an older sync stops counting
+/// as current, so the deploy upgrades the host instead of leaving it behind.
+pub(crate) fn qualified_remote_version_at_least(
+    root: &Path,
+    host_id: &str,
+    pinned: &str,
+) -> Option<String> {
+    let qualified = qualified_remote_version(root, host_id)?;
+    match (parse_codex_version(&qualified), parse_codex_version(pinned)) {
+        (Some(synced), Some(floor)) if synced >= floor => Some(qualified),
+        _ => None,
+    }
+}
+
+fn parse_codex_version(value: &str) -> Option<semver::Version> {
+    version_token(value).and_then(|token| semver::Version::parse(token.split('+').next()?).ok())
+}
+
+/// A deploy brings the remote runtime to the Desktop version on its own only
+/// when that is a strict upgrade. Downgrades stay a deliberate manual sync.
+pub(crate) fn deploy_should_sync(status: &DesktopCodexCompatibilityStatus) -> bool {
+    if status.state != "updateAvailable" || !status.can_update {
+        return false;
+    }
+    let parse = |value: &Option<String>| value.as_deref().and_then(parse_codex_version);
+    match (
+        parse(&status.desktop_version),
+        parse(&status.remote_version),
+    ) {
+        (Some(desktop), Some(remote)) => desktop > remote,
+        _ => false,
+    }
+}
+
 fn record_path(root: &Path, host_id: &str) -> PathBuf {
     let id = hex::encode(Sha256::digest(host_id.as_bytes()));
     root.join("remote-codex-qualifications")
@@ -701,6 +746,96 @@ mod tests {
         );
         assert!(valid_version("0.147.0-alpha.6.5"));
         assert!(!valid_version("../../0.147.0"));
+    }
+
+    fn status(state: &str, desktop: &str, remote: Option<&str>) -> DesktopCodexCompatibilityStatus {
+        DesktopCodexCompatibilityStatus {
+            state: state.into(),
+            desktop_version: Some(desktop.into()),
+            desktop_schema_sha256: None,
+            remote_version: remote.map(str::to_owned),
+            required_remote_version: Some(desktop.into()),
+            remote_arch: Some("aarch64".into()),
+            agent_protocol: Some(3),
+            can_update: state == "updateAvailable",
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn deploy_syncs_only_forward_to_a_newer_desktop_runtime() {
+        assert!(deploy_should_sync(&status(
+            "updateAvailable",
+            "0.150.0",
+            Some("codex-cli 0.147.0-alpha.6.6")
+        )));
+        assert!(deploy_should_sync(&status(
+            "updateAvailable",
+            "0.147.0-alpha.6.7",
+            Some("0.147.0-alpha.6.6")
+        )));
+        // Never an automatic downgrade, re-install or guess.
+        assert!(!deploy_should_sync(&status(
+            "updateAvailable",
+            "0.147.0-alpha.6.5",
+            Some("0.147.0-alpha.6.6")
+        )));
+        assert!(!deploy_should_sync(&status(
+            "qualificationRequired",
+            "0.150.0",
+            Some("0.150.0")
+        )));
+        assert!(!deploy_should_sync(&status(
+            "current",
+            "0.150.0",
+            Some("0.147.0")
+        )));
+        assert!(!deploy_should_sync(&status(
+            "updateAvailable",
+            "0.150.0",
+            None
+        )));
+        assert!(!deploy_should_sync(&status(
+            "updateAvailable",
+            "0.150.0",
+            Some("unknown")
+        )));
+    }
+
+    #[test]
+    fn qualified_remote_version_reads_the_last_sync() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(qualified_remote_version(root.path(), "jetson"), None);
+        save_record(
+            root.path(),
+            &QualificationRecord {
+                schema_version: 1,
+                host_id: "jetson".into(),
+                desktop_version: "0.150.0".into(),
+                desktop_schema_sha256: "a".repeat(64),
+                remote_version: "0.150.0".into(),
+                remote_binary_sha256: "b".repeat(64),
+                qualified_at: "2026-10-17T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            qualified_remote_version(root.path(), "jetson").as_deref(),
+            Some("0.150.0")
+        );
+        // Counts as current only while it is not behind the bundled pin.
+        for (pinned, expected) in [
+            ("0.147.0-alpha.6.6", Some("0.150.0")),
+            ("0.150.0", Some("0.150.0")),
+            ("0.151.0", None),
+            ("not-a-version", None),
+        ] {
+            assert_eq!(
+                qualified_remote_version_at_least(root.path(), "jetson", pinned).as_deref(),
+                expected,
+                "pinned {pinned}"
+            );
+        }
     }
 
     #[test]

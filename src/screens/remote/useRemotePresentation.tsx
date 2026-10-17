@@ -1,5 +1,5 @@
 import { remoteWorkSurface } from "@/lib/remoteWorkSurface";
-import { configurationStateKey, hostVerdict, deploymentWaitControls, visibleBlockers } from "@/lib/remoteVocabulary";
+import { configurationStateKey, hostVerdict, deploymentWaitControls, desktopRuntimeAhead, visibleBlockers } from "@/lib/remoteVocabulary";
 import { useRemoteConnection } from './useRemoteConnection';
 export function useRemotePresentation(context: ReturnType<typeof useRemoteConnection>) {
   const {
@@ -50,6 +50,7 @@ export function useRemotePresentation(context: ReturnType<typeof useRemoteConnec
     error: failure?.raw,
     blockers: blockers.map((blocker) => blocker.code),
     desktopCodexState: desktopCodex?.state,
+    desktopRuntimeAhead: desktopRuntimeAhead(desktopCodex),
   });
   const primaryActionKey = workSurface.primaryKey;
   const workRemedy = workSurface.remedy?.action;

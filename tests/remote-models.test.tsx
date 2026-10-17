@@ -21,6 +21,9 @@ describe("host model catalogue", () => {
     expect(api.updateRemoteHostModels).not.toHaveBeenCalled();
     expect(onCatalog).toHaveBeenCalledWith({ hostId: "host", models });
     fireEvent.click(screen.getByRole("checkbox", { name: /Other/ }));
+    // Ticking edits a draft; nothing deploys until Apply.
+    expect(api.updateRemoteHostModels).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     await waitFor(() => expect(api.updateRemoteHostModels).toHaveBeenCalledWith("host", ["official"]));
     expect(api.updateRemoteHostModels).toHaveBeenCalledOnce();
     expect(onOperation).toHaveBeenCalledWith(operation);
@@ -31,10 +34,28 @@ describe("host model catalogue", () => {
     render(<RemoteModels hostId="host" disabled={false} revision={1} onOperation={onOperation} onCatalog={() => {}} />);
     const other = await screen.findByRole<HTMLInputElement>("checkbox", { name: /Other/ });
     fireEvent.click(other);
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     expect(await screen.findByText(i18n.t("remoteModels.failed"))).toBeTruthy();
     expect(other.checked).toBe(true);
     expect(onOperation).not.toHaveBeenCalled();
     expect(screen.getByText(/DeploymentAlreadyRunning/)).toBeTruthy();
+  });
+  it("batches several ticks into one converge and can revert the draft", async () => {
+    const many = [...models, { catalogId: "third", displayName: "Third", upstreamModel: "third", routeId: "third", selected: false, mandatory: false }];
+    api.listRemoteHostModels.mockResolvedValue(many);
+    render(<RemoteModels hostId="host" disabled={false} revision={1} onOperation={() => {}} onCatalog={() => {}} />);
+    fireEvent.click(await screen.findByRole("checkbox", { name: /Third/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Third/ }));
+    // Back to the confirmed selection: nothing to apply.
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Other/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Revert" }));
+    expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /Other/ }).checked).toBe(true);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Other/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Third/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(api.updateRemoteHostModels).toHaveBeenCalledWith("host", ["official", "third"]));
+    expect(api.updateRemoteHostModels).toHaveBeenCalledOnce();
   });
   it("disables changes during an existing operation and refetches read-only on refresh", async () => {
     const props = { hostId: "host", disabled: true, revision: 1, onOperation: vi.fn(), onCatalog: vi.fn() };

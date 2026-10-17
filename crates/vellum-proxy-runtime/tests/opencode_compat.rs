@@ -1,6 +1,7 @@
-//! OpenCode Zen compatibility: public auth, identity headers, MiMo Chat
-//! Completions, and 429 cooldown. Normal tests use a scripted gateway; the
-//! explicit ignored gate exercises one real public MiMo request.
+//! OpenCode Zen compatibility: API-key auth, identity headers, MiMo Chat
+//! Completions, 429 cooldown, and refusal of the free tier. Normal tests use
+//! a scripted gateway; the explicit ignored gates exercise real requests and
+//! need `VELLUM_OPENCODE_API_KEY`.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,22 +26,22 @@ use vellum_proxy_runtime::transport::{
     ReqwestTransport, TransportError, UpstreamRequest, UpstreamResponse, UpstreamStream,
     UpstreamTransport,
 };
-use vellum_proxy_runtime::{OPENCODE_PUBLIC_TOKEN, OPENCODE_ZEN_BASE_URL};
+use vellum_proxy_runtime::OPENCODE_ZEN_BASE_URL;
 
 fn mimo_route() -> RuntimeModelRoute {
     RuntimeModelRoute {
         route_id: "opencode-zen".into(),
-        catalog_id: "vlm-mimo-v2-5-free".into(),
+        catalog_id: "vlm-mimo-v2-5".into(),
         name: "OpenCode Zen".into(),
         base_url: OPENCODE_ZEN_BASE_URL.into(),
         provider_kind: RuntimeProviderKind::OpenAiCompatible,
-        auth_kind: RuntimeAuthKind::None,
+        auth_kind: RuntimeAuthKind::Bearer,
         wire: RuntimeWireFormat::Chat,
         server_side_resume: false,
         streaming: true,
         reasoning: true,
         vision: false,
-        upstream_model: "mimo-v2.5-free".into(),
+        upstream_model: "mimo-v2.5".into(),
         context_window: Some(200_000),
         reasoning_capabilities: RuntimeReasoningCapabilities {
             supports_persisted_reasoning: false,
@@ -56,21 +57,42 @@ fn mimo_route() -> RuntimeModelRoute {
         },
         compaction_policy: RuntimeCompactionPolicy::default(),
         tool_capabilities: RuntimeToolCapabilities { tool_calling: true },
-        credential_id: None,
+        credential_id: Some("zen-key".into()),
         insecure_http_policy: vellum_proxy_runtime::InsecureHttpPolicy::Deny,
         provider_profile: Some(RuntimeProviderProfile::OpenCodeZen),
-        access_mode: Some(RuntimeAccessMode::AnonymousFree),
+        access_mode: Some(RuntimeAccessMode::Credentialed),
         chat_capabilities: vellum_proxy_runtime::route::RuntimeChatCapabilities::default(),
     }
 }
 
-fn laguna_route() -> RuntimeModelRoute {
+fn glm_route() -> RuntimeModelRoute {
     let mut route = mimo_route();
-    route.catalog_id = "vlm-laguna-s-2-1-free".into();
-    route.upstream_model = "laguna-s-2.1-free".into();
-    route.name = "OpenCode Laguna".into();
+    route.catalog_id = "vlm-glm-5-1".into();
+    route.upstream_model = "glm-5.1".into();
+    route.name = "OpenCode GLM".into();
     route.reasoning = false;
     route
+}
+
+fn free_route() -> RuntimeModelRoute {
+    let mut route = mimo_route();
+    route.catalog_id = "vlm-deepseek-v4-1-flash-free".into();
+    route.upstream_model = "deepseek-v4.1-flash-free".into();
+    route
+}
+
+fn credentials() -> Arc<MemoryCredentialProvider> {
+    let store = MemoryCredentialProvider::new();
+    store.insert("zen-key", "sk-zen-test");
+    Arc::new(store)
+}
+
+fn live_credentials() -> Arc<MemoryCredentialProvider> {
+    let key = std::env::var("VELLUM_OPENCODE_API_KEY")
+        .expect("live OpenCode gates need VELLUM_OPENCODE_API_KEY");
+    let store = MemoryCredentialProvider::new();
+    store.insert("zen-key", key.trim());
+    Arc::new(store)
 }
 
 fn live_inconclusive(error: &RuntimeError) -> bool {
@@ -169,9 +191,9 @@ impl UpstreamTransport for RecordingTransport {
 fn runtime_with(transport: Arc<RecordingTransport>) -> ProxyRuntime {
     ProxyRuntime::new(
         Arc::new(FixedCatalog {
-            routes: vec![mimo_route()],
+            routes: vec![mimo_route(), free_route()],
         }),
-        Arc::new(MemoryCredentialProvider::new()),
+        credentials(),
         Arc::new(UnconfiguredOfficialAuthProvider),
         Arc::new(CountingRequestLifecycle::new()),
         transport,
@@ -213,7 +235,7 @@ fn chat_ok(body: Value) -> UpstreamResponse {
 }
 
 #[tokio::test]
-async fn zen_free_mimo_uses_public_token_and_redacted_identity_headers() {
+async fn zen_mimo_uses_the_api_key_and_redacted_identity_headers() {
     let transport = Arc::new(RecordingTransport::new(vec![chat_ok(json!({
         "id": "chatcmpl-mimo-1",
         "object": "chat.completion",
@@ -228,7 +250,7 @@ async fn zen_free_mimo_uses_public_token_and_redacted_identity_headers() {
     runtime
         .execute(
             request(json!({
-                "model": "vlm-mimo-v2-5-free",
+                "model": "vlm-mimo-v2-5",
                 "prompt_cache_key": "codex-thread-secret",
                 "metadata": {"thread_id": "thread_raw"},
                 "input": "hi"
@@ -243,11 +265,7 @@ async fn zen_free_mimo_uses_public_token_and_redacted_identity_headers() {
         "MiMo must stay on Chat Completions, got {}",
         upstream.url
     );
-    let expected_auth = format!("Bearer {OPENCODE_PUBLIC_TOKEN}");
-    assert_eq!(
-        header(&upstream, "authorization"),
-        Some(expected_auth.as_str())
-    );
+    assert_eq!(header(&upstream, "authorization"), Some("Bearer sk-zen-test"));
     assert_eq!(header(&upstream, "x-opencode-client"), Some("vellum"));
     let ua = header(&upstream, "user-agent").unwrap();
     assert!(ua.starts_with("opencode/vellum-"), "{ua}");
@@ -260,7 +278,7 @@ async fn zen_free_mimo_uses_public_token_and_redacted_identity_headers() {
     assert!(body.get("prompt_cache_key").is_none());
     assert!(body.get("previous_response_id").is_none());
     assert!(body.get("store").is_none());
-    assert_eq!(body["model"], "mimo-v2.5-free");
+    assert_eq!(body["model"], "mimo-v2.5");
     assert!(body.get("messages").is_some());
 }
 
@@ -274,12 +292,12 @@ async fn session_is_stable_across_turns_and_retries_reuse_request_id() {
     }))]));
     let runtime = runtime_with(transport.clone());
     let turn_one = request(json!({
-        "model": "vlm-mimo-v2-5-free",
+        "model": "vlm-mimo-v2-5",
         "prompt_cache_key": "thread-abc",
         "input": "one"
     }));
     let turn_two = request(json!({
-        "model": "vlm-mimo-v2-5-free",
+        "model": "vlm-mimo-v2-5",
         "prompt_cache_key": "thread-abc",
         "input": "two"
     }));
@@ -329,7 +347,7 @@ async fn mimo_streaming_tool_call_round_trip_does_not_leak_thread_identity() {
     let response = runtime
         .execute(
             request(json!({
-                "model": "vlm-mimo-v2-5-free",
+                "model": "vlm-mimo-v2-5",
                 "prompt_cache_key": "codex-thread-secret",
                 "stream": true,
                 "tools": [{
@@ -380,7 +398,7 @@ async fn mimo_streaming_tool_call_round_trip_does_not_leak_thread_identity() {
     assert_eq!(records[0].output_tokens, 25);
     assert!(records.iter().any(|record| {
         record.outcome.as_deref() == Some("success")
-            && record.auth_mode.as_deref() == Some("anonymousFree")
+            && record.auth_mode.as_deref() == Some("credentialed")
             && record.provider_profile.as_deref() == Some("openCodeZen")
             && record.upstream_attempted == Some(true)
     }));
@@ -398,7 +416,7 @@ async fn quota_cooldown_turns_later_retries_into_local_errors() {
     }]));
     let runtime = runtime_with(transport.clone());
     let body = json!({
-        "model": "vlm-mimo-v2-5-free",
+        "model": "vlm-mimo-v2-5",
         "prompt_cache_key": "thread-abc",
         "input": "hi"
     });
@@ -418,14 +436,14 @@ async fn quota_cooldown_turns_later_retries_into_local_errors() {
     assert_eq!(second.upstream_attempted(), Some(false));
     assert_eq!(transport.call_count(), 1);
 
-    runtime.expire_opencode_cooldown("opencode-zen", "mimo-v2.5-free");
+    runtime.expire_opencode_cooldown("opencode-zen", "mimo-v2.5");
     let third = runtime.execute(request(body), "exec-3").await.unwrap_err();
     assert_eq!(third.upstream_attempted(), Some(true));
     assert_eq!(transport.call_count(), 2);
 
     let records = runtime.usage_records().unwrap();
     assert!(records.iter().any(|record| {
-        record.auth_mode.as_deref() == Some("anonymousFree")
+        record.auth_mode.as_deref() == Some("credentialed")
             && record.provider_profile.as_deref() == Some("openCodeZen")
             && record.upstream_attempted == Some(false)
             && record.retry_after.is_some()
@@ -433,13 +451,13 @@ async fn quota_cooldown_turns_later_retries_into_local_errors() {
 }
 
 #[tokio::test]
-#[ignore = "live OpenCode public quota; run explicitly during release qualification"]
-async fn live_zen_free_mimo_accepts_a_codex_streaming_request() {
+#[ignore = "live OpenCode Zen; needs VELLUM_OPENCODE_API_KEY; run explicitly during release qualification"]
+async fn live_zen_mimo_accepts_a_codex_streaming_request() {
     let runtime = ProxyRuntime::new(
         Arc::new(FixedCatalog {
             routes: vec![mimo_route()],
         }),
-        Arc::new(MemoryCredentialProvider::new()),
+        live_credentials(),
         Arc::new(UnconfiguredOfficialAuthProvider),
         Arc::new(CountingRequestLifecycle::new()),
         Arc::new(ReqwestTransport::new()),
@@ -447,7 +465,7 @@ async fn live_zen_free_mimo_accepts_a_codex_streaming_request() {
     let response = runtime
         .execute(
             request(json!({
-                "model": "vlm-mimo-v2-5-free",
+                "model": "vlm-mimo-v2-5",
                 "prompt_cache_key": "vellum-opencode-live-gate",
                 "store": false,
                 "stream": true,
@@ -482,7 +500,7 @@ async fn live_zen_free_mimo_accepts_a_codex_streaming_request() {
         .iter()
         .find(|record| {
             record.outcome.as_deref() == Some("success")
-                && record.auth_mode.as_deref() == Some("anonymousFree")
+                && record.auth_mode.as_deref() == Some("credentialed")
                 && record.provider_profile.as_deref() == Some("openCodeZen")
                 && record.upstream_attempted == Some(true)
         })
@@ -494,25 +512,25 @@ async fn live_zen_free_mimo_accepts_a_codex_streaming_request() {
 /// Provider-routing live gate: proves the shared runtime's tool-call
 /// continuation contract (function_call round-trip, historical prompt
 /// dedupe, tail-role placement) against a real OpenCode Zen upstream. Not an
-/// Auto Review test -- no Guardian is ever invoked here; Laguna is only the
+/// Auto Review test -- no Guardian is ever invoked here; GLM is only the
 /// provider under test. See
 /// `live_guardian_provider_routing_gate_follow_origin_and_exact_assessment`
 /// for the Guardian routing/accounting live gate (also not a Codex task
 /// E2E -- see its own doc comment for what a real E2E still needs).
 #[tokio::test]
-#[ignore = "live OpenCode public quota; provider-routing gate (Laguna two-turn tool continuation)"]
-async fn live_provider_routing_gate_laguna_two_turn_tool_continuation() {
+#[ignore = "live OpenCode Zen; needs VELLUM_OPENCODE_API_KEY; provider-routing gate (two-turn tool continuation)"]
+async fn live_provider_routing_gate_two_turn_tool_continuation() {
     let transport = Arc::new(RecordingLiveTransport::new());
     let runtime = ProxyRuntime::new(
         Arc::new(FixedCatalog {
-            routes: vec![laguna_route()],
+            routes: vec![glm_route()],
         }),
-        Arc::new(MemoryCredentialProvider::new()),
+        live_credentials(),
         Arc::new(UnconfiguredOfficialAuthProvider),
         Arc::new(CountingRequestLifecycle::new()),
         transport.clone(),
     );
-    let user = "Call echo_marker with text=VELLUM_LAGUNA_TOOL.";
+    let user = "Call echo_marker with text=VELLUM_GLM_TOOL.";
     let tools = json!([{
         "type": "function",
         "name": "echo_marker",
@@ -526,24 +544,24 @@ async fn live_provider_routing_gate_laguna_two_turn_tool_continuation() {
     let first = match runtime
         .execute(
             request(json!({
-                "model": "vlm-laguna-s-2-1-free",
-                "prompt_cache_key": "vellum-laguna-live-gate",
+                "model": "vlm-glm-5-1",
+                "prompt_cache_key": "vellum-glm-live-gate",
                 "store": false,
                 "stream": false,
                 "tool_choice": "required",
                 "tools": tools,
                 "input": user
             })),
-            "live_laguna_turn_1",
+            "live_glm_turn_1",
         )
         .await
     {
         Ok(RuntimeResponse::Json(body)) => body,
-        Ok(_) => panic!("Laguna turn 1 must be a buffered JSON completion"),
+        Ok(_) => panic!("GLM turn 1 must be a buffered JSON completion"),
         Err(error) if live_inconclusive(&error) => {
-            panic!("INCONCLUSIVE: Laguna turn 1 {}: {error}", error.category());
+            panic!("INCONCLUSIVE: GLM turn 1 {}: {error}", error.category());
         }
-        Err(error) => panic!("Laguna turn 1 failed: {} {error}", error.category()),
+        Err(error) => panic!("GLM turn 1 failed: {} {error}", error.category()),
     };
     let calls: Vec<Value> = first
         .get("output")
@@ -554,7 +572,7 @@ async fn live_provider_routing_gate_laguna_two_turn_tool_continuation() {
         .cloned()
         .collect();
     if calls.is_empty() {
-        panic!("Laguna turn 1 did not emit a function_call: {first}");
+        panic!("GLM turn 1 did not emit a function_call: {first}");
     }
     let mut continuation_input = vec![json!({
         "type": "message",
@@ -566,33 +584,33 @@ async fn live_provider_routing_gate_laguna_two_turn_tool_continuation() {
         continuation_input.push(json!({
             "type": "function_call_output",
             "call_id": call["call_id"],
-            "output": "VELLUM_LAGUNA_TOOL"
+            "output": "VELLUM_GLM_TOOL"
         }));
     }
     let second = match runtime
         .execute(
             request(json!({
-                "model": "vlm-laguna-s-2-1-free",
-                "prompt_cache_key": "vellum-laguna-live-gate",
+                "model": "vlm-glm-5-1",
+                "prompt_cache_key": "vellum-glm-live-gate",
                 "store": false,
                 "stream": false,
                 "tools": tools,
                 "input": continuation_input
             })),
-            "live_laguna_turn_2",
+            "live_glm_turn_2",
         )
         .await
     {
         Ok(RuntimeResponse::Json(body)) => body,
-        Ok(_) => panic!("Laguna turn 2 must be a buffered JSON completion"),
+        Ok(_) => panic!("GLM turn 2 must be a buffered JSON completion"),
         Err(error) if live_inconclusive(&error) => {
-            panic!("INCONCLUSIVE: Laguna turn 2 {}: {error}", error.category());
+            panic!("INCONCLUSIVE: GLM turn 2 {}: {error}", error.category());
         }
-        Err(error) => panic!("Laguna turn 2 failed: {} {error}", error.category()),
+        Err(error) => panic!("GLM turn 2 failed: {} {error}", error.category()),
     };
     assert!(
         second.get("output").is_some(),
-        "Laguna continuation must return Responses output: {second}"
+        "GLM continuation must return Responses output: {second}"
     );
     let chat = transport.chat_messages(1);
     let messages = chat["messages"].as_array().expect("Chat messages");
@@ -607,9 +625,9 @@ async fn live_provider_routing_gate_laguna_two_turn_tool_continuation() {
     assert_eq!(
         messages.last().and_then(|message| message["role"].as_str()),
         Some("tool"),
-        "Laguna default continuation keeps the tool result as the tail: {messages:?}"
+        "Default continuation keeps the tool result as the tail: {messages:?}"
     );
-    eprintln!("QUALIFIED: provider-routing gate (Laguna two-turn tool continuation)");
+    eprintln!("QUALIFIED: provider-routing gate (two-turn tool continuation)");
 }
 
 #[tokio::test]
@@ -617,12 +635,12 @@ async fn cooldown_does_not_switch_models_or_invent_a_generic_error() {
     let transport = Arc::new(RecordingTransport::new(vec![UpstreamResponse {
         status: 429,
         headers: vec![("retry-after".into(), "12".into())],
-        body: serde_json::to_vec(&json!({"error": {"message": "FreeUsageLimitError"}})).unwrap(),
+        body: serde_json::to_vec(&json!({"error": {"message": "UsageLimitError"}})).unwrap(),
     }]));
     let runtime = runtime_with(transport);
     let error = runtime
         .execute(
-            request(json!({"model": "vlm-mimo-v2-5-free", "input": "hi"})),
+            request(json!({"model": "vlm-mimo-v2-5", "input": "hi"})),
             "exec",
         )
         .await
@@ -633,10 +651,26 @@ async fn cooldown_does_not_switch_models_or_invent_a_generic_error() {
             retry_after_secs,
             upstream_attempted,
         } => {
-            assert!(message.contains("FreeUsageLimitError"), "{message}");
+            assert!(message.contains("UsageLimitError"), "{message}");
             assert_eq!(retry_after_secs, Some(12));
             assert!(upstream_attempted);
         }
         other => panic!("expected structured quota error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn free_tier_models_are_refused_without_reaching_opencode() {
+    let transport = Arc::new(RecordingTransport::new(vec![chat_ok(json!({}))]));
+    let runtime = runtime_with(transport.clone());
+    let error = runtime
+        .execute(
+            request(json!({"model": "vlm-deepseek-v4-1-flash-free", "input": "hi"})),
+            "exec",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RuntimeError::UnsupportedMode(_)), "{error:?}");
+    assert!(error.to_string().contains("free"), "{error}");
+    assert_eq!(transport.call_count(), 0);
 }

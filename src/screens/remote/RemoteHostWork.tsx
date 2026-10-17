@@ -19,7 +19,6 @@ export function RemoteHostWork({ model }: {
     chatgptLogin,
     pairings,
     setTakeoverPrompt,
-    setPending,
     sshTrust,
     operationStartedAt,
     host,
@@ -34,6 +33,7 @@ export function RemoteHostWork({ model }: {
     confirmSshTrust,
     pairChatGpt,
     waitControls,
+    deploy,
   } = model;
   return <><div className="worktop">
     <div className="worktop__head">
@@ -52,7 +52,7 @@ export function RemoteHostWork({ model }: {
       </div>
     </div>
 
-    <RemoteWorkSurface model={workSurface} disabled={!selectedHostId || busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed} remedyDisabled={workRemedyDisabled} onDeploy={() => setPending("bootstrap")} onRemedy={runWorkRemedy} elapsed={ownOperation?.state === "running" ? t("remote.operation.elapsed", {
+    <RemoteWorkSurface model={workSurface} disabled={!selectedHostId || busy !== null || operationRunning || sshTrust?.hostId !== selectedHostId || !sshTrust?.confirmed} remedyDisabled={workRemedyDisabled} onDeploy={deploy} onRemedy={runWorkRemedy} elapsed={ownOperation?.state === "running" ? t("remote.operation.elapsed", {
       clock: elapsedLabel(operationStartedAt.current.get(ownOperation.operationId) ?? Date.now(), Date.now()),
     }) : undefined} details={failure || ownOperation?.state === "failed" || blockers.length ? <details className="remote-work-details">
       <summary>{t("remoteWork.details")}</summary>

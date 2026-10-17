@@ -210,7 +210,6 @@ fn prepare_request_with_wire(
         context_window: Some(128_000),
         model_capabilities: Vec::new(),
         insecure_http_policy: Default::default(),
-        catalog_scope: Default::default(),
     };
     let model = ModelRoute {
         catalog_id: "vlm-replay".into(),

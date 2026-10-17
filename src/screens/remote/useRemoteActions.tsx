@@ -17,6 +17,7 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
     primaryActionKey,
     trackOperation,
     ownOperation,
+    workSurface,
   } = context;
   async function run(actionKey: string, work: () => Promise<void>) {
     if (busyRef.current !== null) return;
@@ -108,9 +109,17 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
     if (!selectedHostId) return;
     void run("remote.act.bundle", async () => { await api.createRemoteSupportBundle(selectedHostId); });
   }
+  /**
+   * 重新部署是收斂：可重複執行、會等主機閒置、隨時可以取消，所以不再每次跳確認。
+   * 只有第一次部署會先列出「會改／不動」，讓人知道這台主機上會多出什麼。
+   */
+  function deploy() {
+    if (workSurface.primaryKey === "remoteWork.redeploy") return runPending("bootstrap");
+    return setPending("bootstrap");
+  }
   function retryOperation() {
     if (ownOperation?.kind === "oneClickRestore") return setPending("restore");
-    return setPending("bootstrap");
+    return deploy();
   }
   return {
     ...context,
@@ -118,6 +127,7 @@ export function useRemoteActions(context: ReturnType<typeof useRemotePresentatio
     confirmSshTrust,
     runPending,
     exportBundle,
+    deploy,
     retryOperation,
   };
 }

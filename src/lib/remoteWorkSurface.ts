@@ -17,6 +17,8 @@ export interface WorkSurfaceInput {
   error?: string | null;
   blockers: string[];
   desktopCodexState?: string | null;
+  /** Desktop's Codex is newer; a redeploy carries this host forward. */
+  desktopRuntimeAhead?: boolean;
 }
 
 export interface WorkSurfaceModel {
@@ -74,6 +76,7 @@ export function remoteWorkSurface(input: WorkSurfaceInput): WorkSurfaceModel {
     };
   }
   if (input.agentReachable && (input.managerState === "detachedReady" || input.managerState === "nativeActive")) {
+    if (input.desktopRuntimeAhead) return { ...base, state: "ready", statusKey: "remoteWork.desktopAhead" };
     return { ...base, state: "ready", statusKey: input.persistenceScope === "onDemand" ? "remoteWork.readyOnDemand" : verdict.verdictKey };
   }
   return { ...base, statusKey: input.agentReachable ? "remoteWork.pending" : verdict.verdictKey };

@@ -5,6 +5,7 @@ import "@/i18n";
 import { assertResourceParity } from "@/i18n/resources";
 import { RemoteWorkSurface } from "@/components/RemoteWorkSurface";
 import { remoteWorkSurface, type WorkSurfaceInput } from "@/lib/remoteWorkSurface";
+import { compareVersions, desktopRuntimeAhead, resumeConvergeAfterAccount } from "@/lib/remoteVocabulary";
 import type { RemoteOperationProgress } from "@/types";
 
 const pending: WorkSurfaceInput = { managerState: "unmanaged", agentReachable: true, blockers: [], operation: null };
@@ -153,5 +154,39 @@ describe("work surface in all four languages", () => {
       }
       cleanup();
     }
+  });
+});
+
+describe("keeping a host in step without a second button", () => {
+  const ahead = { state: "updateAvailable", canUpdate: true, desktopVersion: "0.150.0", remoteVersion: "codex-cli 0.147.0-alpha.6.6" };
+
+  it("orders Codex versions the way the backend deploy does", () => {
+    expect(compareVersions("0.150.0", "0.147.0-alpha.6.6")).toBeGreaterThan(0);
+    expect(compareVersions("0.147.0-alpha.6.7", "0.147.0-alpha.6.6")).toBeGreaterThan(0);
+    expect(compareVersions("0.147.0-alpha.6.10", "0.147.0-alpha.6.9")).toBeGreaterThan(0);
+    expect(compareVersions("0.147.0", "0.147.0-alpha.6.6")).toBeGreaterThan(0);
+    expect(compareVersions("0.147.0-alpha.6.5", "0.147.0-alpha.6.6")).toBeLessThan(0);
+    expect(compareVersions("0.147.0", "codex-cli 0.147.0")).toBe(0);
+    expect(compareVersions("unknown", "0.147.0")).toBeNull();
+  });
+
+  it("says a redeploy catches up only when Desktop is strictly newer", () => {
+    expect(desktopRuntimeAhead(ahead)).toBe(true);
+    expect(desktopRuntimeAhead({ ...ahead, desktopVersion: "0.147.0-alpha.6.5" })).toBe(false);
+    expect(desktopRuntimeAhead({ ...ahead, canUpdate: false })).toBe(false);
+    expect(desktopRuntimeAhead({ ...ahead, state: "current" })).toBe(false);
+    expect(desktopRuntimeAhead(null)).toBe(false);
+    const ready = { ...pending, managerState: "nativeActive" };
+    expect(remoteWorkSurface({ ...ready, desktopRuntimeAhead: true })).toMatchObject({ state: "ready", statusKey: "remoteWork.desktopAhead", primaryKey: "remoteWork.redeploy", remedy: null });
+    expect(remoteWorkSurface(ready).statusKey).toBe("remote.verdict.nativeActive");
+  });
+
+  it("finishes the deferred models once the account is paired", () => {
+    const done = { hostId: "host", kind: "oneClickBootstrap", state: "completed", message: null };
+    expect(resumeConvergeAfterAccount({ ...done, result: { chatgptPairingSuggested: true } }, "host")).toBe(true);
+    expect(resumeConvergeAfterAccount({ ...done, result: { chatgptPairingSuggested: false } }, "host")).toBe(false);
+    expect(resumeConvergeAfterAccount({ ...done, result: { chatgptPairingSuggested: true } }, "other")).toBe(false);
+    expect(resumeConvergeAfterAccount({ ...done, state: "failed", message: "officialAccountPairingRequired" }, "host")).toBe(true);
+    expect(resumeConvergeAfterAccount({ ...done, kind: "oneClickRestore", result: { chatgptPairingSuggested: true } }, "host")).toBe(false);
   });
 });
