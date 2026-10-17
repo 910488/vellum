@@ -7098,6 +7098,7 @@ mod tests {
             recorded: false,
             output_forwarded: false,
             cancelled_at: None,
+            quota_retried: false,
         };
         assert!(
             rejected_handoff_replay(&turn, &failed).is_none(),
