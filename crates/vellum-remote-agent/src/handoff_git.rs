@@ -154,6 +154,16 @@ impl Client for NativeClient {
         partial: bool,
     ) -> Result<Capture, String> {
         verify_worktree(layout)?;
+        let untracked = git(
+            layout,
+            &layout.worktree,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            None,
+        )?;
+        let excluded: Vec<_> = untracked
+            .split('\0')
+            .filter(|p| !p.is_empty() && cache_file(p))
+            .collect();
         let probe = git_output(
             layout,
             &layout.repo,
@@ -182,6 +192,14 @@ impl Client for NativeClient {
                 &["add", "-A", "--", "."],
                 Some(&index),
             )?;
+            for path in &excluded {
+                git(
+                    layout,
+                    &layout.worktree,
+                    &["update-index", "--force-remove", "--", path],
+                    Some(&index),
+                )?;
+            }
             let tree = git(layout, &layout.worktree, &["write-tree"], Some(&index))?;
             let commit = git(
                 layout,
@@ -243,6 +261,7 @@ impl Client for NativeClient {
             return Err(git_error(&stat));
         }
         Ok(Capture {
+            excluded_cache_files: excluded.len(),
             result_ref: result_ref.into(),
             commit,
             snapshot_commit: snapshot.into(),
@@ -250,6 +269,15 @@ impl Client for NativeClient {
             diffstat: parse_diffstat(&stat.stdout)?,
         })
     }
+}
+
+fn cache_file(path: &str) -> bool {
+    path.split('/').any(|part| {
+        matches!(
+            part,
+            "__pycache__" | "node_modules" | ".pytest_cache" | "target" | ".DS_Store"
+        )
+    }) || path.ends_with(".pyc")
 }
 
 fn posix(path: &Path) -> Result<&str, String> {
@@ -552,6 +580,26 @@ mod tests {
         git(&layout, &layout.worktree, &["add", "--", "file.txt"], None).unwrap();
         fs::write(layout.worktree.join("file.txt"), "unstaged\n").unwrap();
         fs::write(layout.worktree.join("new.txt"), "untracked\n").unwrap();
+        for file in [
+            "__pycache__/fizz.pyc",
+            "cache.pyc",
+            "node_modules/pkg/cache",
+            ".pytest_cache/cache",
+            "target/cache",
+            ".DS_Store",
+        ] {
+            let path = layout.worktree.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "untracked cache").unwrap();
+        }
+        fs::write(layout.worktree.join("tracked.pyc"), "tracked cache").unwrap();
+        git(
+            &layout,
+            &layout.worktree,
+            &["add", "--", "tracked.pyc"],
+            None,
+        )
+        .unwrap();
         fs::write(layout.worktree.join("ignored.secret"), "never transfer\n").unwrap();
         let index_path = git(
             &layout,
@@ -571,6 +619,15 @@ mod tests {
         let result_ref = "refs/vellum-handoff-results/handoff/capture";
         let before_index = fs::read(&index_path).unwrap();
         let capture = client.capture(&layout, base, result_ref, false).unwrap();
+        assert_eq!(capture.excluded_cache_files, 6);
+        assert!(capture
+            .diffstat
+            .iter()
+            .any(|file| file.path == "tracked.pyc"));
+        assert!(!capture
+            .diffstat
+            .iter()
+            .any(|file| file.path != "tracked.pyc" && cache_file(&file.path)));
         assert_eq!(fs::read(&index_path).unwrap(), before_index);
         assert_eq!(
             git(

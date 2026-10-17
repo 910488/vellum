@@ -47,6 +47,8 @@ pub struct Requirements {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preflight {
+    #[serde(default)]
+    pub auto_writeback: bool,
     pub thread: LocalThread,
     pub changes: Vec<Change>,
     pub blockers: Vec<String>,
@@ -58,6 +60,8 @@ pub struct Preflight {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
+    #[serde(default)]
+    pub writeback: Option<crate::enhanced_runtime::handoff_inject::WritebackStatus>,
     pub id: String,
     pub host_id: String,
     pub source: LocalThread,
@@ -209,16 +213,20 @@ pub fn preflight(
     if !local.blockers.is_empty() {
         return Ok(local);
     }
-    inspect(
+    let mut report = inspect(
         local.thread,
         local.changes,
         requirements,
         &transport(state, host)?,
-    )
+    )?;
+    report.auto_writeback =
+        crate::enhanced_runtime::handoff_inject::supports_thread(&state.data_root(), thread);
+    Ok(report)
 }
 
 fn new_report(source: LocalThread, changes: Vec<Change>) -> Preflight {
     Preflight {
+        auto_writeback: false,
         thread: source, changes, blockers: Vec::new(), warnings: Vec::new(), remote_os: None,
         local_ref_notice: "Handoff creates refs/vellum-handoff/<id> in this repository. The ref keeps the snapshot reachable until the result is safely applied or saved as a branch, or you discard the handoff.".into(),
     }
@@ -489,6 +497,7 @@ fn begin(
         "snapshotCommit": snapshot.commit, "sourceThreadId": source.thread_id, "brief": brief,
         "model": source.model, "modelProvider": source.model_provider, "effort": source.effort, "prepareOnly": true});
     let mut record = Record {
+        writeback: None,
         id,
         host_id: host.into(),
         source,
@@ -715,7 +724,8 @@ fn list_at(root: &Path) -> AppResult<Vec<Record>> {
                 .and_then(|id| id.to_str())
                 .ok_or_else(|| error("HandoffRecordInvalid"))?
                 .to_owned();
-            let record = load(root, &id)?;
+            let mut record = load(root, &id)?;
+            record.writeback = crate::enhanced_runtime::handoff_inject::writeback_status(root, &id);
             if record
                 .remote
                 .as_ref()

@@ -5,6 +5,8 @@ use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capture {
+    #[serde(default)]
+    pub excluded_cache_files: usize,
     pub result_ref: String,
     pub commit: String,
     pub snapshot_commit: String,
@@ -46,11 +48,14 @@ pub fn capture(state: &AppState, id: &str) -> AppResult<Record> {
         return Ok(record);
     }
     let client = transport(state, &record.host_id)?;
-    if record.result.fetched && record.result.capture.as_ref().is_some_and(|c| c.partial) {
+    request_capture_with(&root, &mut record, &client)?;
+    Ok(record)
+}
+fn request_capture_with(root: &Path, record: &mut Record, client: &dyn Transport) -> AppResult<()> {
+    if record.result.fetched && record.result.capture.is_some() {
         record.result.capture_operation = None;
     }
-    capture_with(&root, &mut record, &client)?;
-    Ok(record)
+    capture_with(root, record, client)
 }
 fn capture_with(root: &Path, record: &mut Record, client: &dyn Transport) -> AppResult<()> {
     // A failed fetch retries the SAME capture, including partial captures.
@@ -360,6 +365,7 @@ mod tests {
         let remote = json!({"handoffId":"return-test", "sourceThreadId":"source", "state":"completed", "phase":"running", "threadId":"thread", "turnId":"turn",
             "repoPath":"/state/handoffs/repos/repo.git", "worktree":"/state/handoffs/work/return-test", "snapshotRef":"refs/vellum-handoff/return-test", "snapshotCommit":snapshot.commit});
         let record = Record {
+            writeback: None,
             id: "return-test".into(),
             host_id: "host".into(),
             source: LocalThread {
@@ -392,15 +398,36 @@ mod tests {
         (temp, record, client)
     }
     #[test]
+    fn explicit_recapture_uses_a_new_operation_after_a_successful_fetch() {
+        let (temp, mut record, client) = fixture();
+        let index = fs::read(record.source.repo.join(".git/index")).unwrap();
+        request_capture_with(temp.path(), &mut record, &client).unwrap();
+        let first_operation = record.result.capture_operation.clone();
+        record.result.capture.as_mut().unwrap().partial = true;
+        request_capture_with(temp.path(), &mut record, &client).unwrap();
+        assert_ne!(record.result.capture_operation, first_operation);
+        assert!(!record.result.capture.as_ref().unwrap().partial);
+        let second_operation = record.result.capture_operation.clone();
+        request_capture_with(temp.path(), &mut record, &client).unwrap();
+        assert_ne!(record.result.capture_operation, second_operation);
+        assert_eq!(client.captures.get(), 3);
+        assert_eq!(client.fetches.get(), 3);
+        assert_eq!(
+            fs::read(record.source.repo.join(".git/index")).unwrap(),
+            index
+        );
+    }
+
+    #[test]
     fn fetch_failure_retries_same_capture_and_apply_cleans_refs_without_changing_index() {
         let (temp, mut record, client) = fixture();
         let index = fs::read(record.source.repo.join(".git/index")).unwrap();
         client.fail_fetch.set(true);
-        assert!(capture_with(temp.path(), &mut record, &client).is_err());
+        assert!(request_capture_with(temp.path(), &mut record, &client).is_err());
         let operation = record.result.capture_operation.clone();
         record = load(temp.path(), &record.id).unwrap();
         client.fail_fetch.set(false);
-        capture_with(temp.path(), &mut record, &client).unwrap();
+        request_capture_with(temp.path(), &mut record, &client).unwrap();
         assert_eq!(record.result.capture_operation, operation);
         assert_eq!(client.captures.get(), 1);
         assert_eq!(client.fetches.get(), 2);

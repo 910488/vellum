@@ -65,6 +65,8 @@ pub struct FileStat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Capture {
+    #[serde(default)]
+    pub excluded_cache_files: usize,
     pub result_ref: String,
     pub commit: String,
     pub snapshot_commit: String,
@@ -75,6 +77,8 @@ pub struct Capture {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffStatus {
+    #[serde(default)]
+    pub provider_error: Option<Value>,
     pub handoff_id: String,
     pub source_thread_id: String,
     pub state: String,
@@ -246,6 +250,7 @@ fn save(paths: &AgentPaths, record: &Record) -> Result<(), String> {
 }
 fn status(record: &Record, layout: &Layout) -> HandoffStatus {
     HandoffStatus {
+        provider_error: None,
         handoff_id: record.request.operation_id.clone(),
         source_thread_id: record.request.source_thread_id.clone(),
         state: match record.phase {
@@ -469,7 +474,7 @@ pub(crate) fn start_with(
             "cwd": layout.worktree, "model": record.request.model, "effort": record.request.effort,
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [layout.worktree], "networkAccess": false, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true},
-            "input": [{"type": "text", "text": record.request.brief, "text_elements": []}],
+            "input": [{"type": "text", "text": format!("Do not commit or create branches; Vellum captures worktree changes.\n\n{}", record.request.brief), "text_elements": []}],
         }))?;
         record.turn_id = Some(
             response
@@ -711,6 +716,18 @@ pub(crate) fn result_with(
         .filter(|s| matches!(*s, "inProgress" | "completed" | "interrupted" | "failed"))
         .ok_or("incompleteObservation: unknown handoff turn status")?;
     result.turn_status = Some(turn_status.into());
+    if turn_status == "failed" {
+        if let Some(error) = turn.get("error").filter(|e| !e.is_null()) {
+            result.provider_error = Some(json!({
+                "provider": record.request.model_provider,
+                "route": record.request.model,
+                "status": error["codexErrorInfo"].get("httpStatusCode")
+                    .or_else(|| error["codexErrorInfo"].as_object()?.values().find_map(|detail| detail.get("httpStatusCode")))
+                    .or_else(|| error.get("httpStatusCode")).cloned().unwrap_or(Value::Null),
+                "message": error.get("message").and_then(Value::as_str).unwrap_or("Provider request failed").lines().next().unwrap_or_default().chars().take(512).collect::<String>(),
+            }));
+        }
+    }
     result.state = if turn_status == "inProgress" {
         "running"
     } else {
@@ -910,6 +927,9 @@ mod tests {
                             {"type": "agentMessage", "text": "Completed the task"}
                         ]}),
                     ];
+                    if *self.turn_status.borrow() == "failed" {
+                        turns[0]["error"] = json!({"message": "Provider subscription rejected\ninternal detail", "codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":401}}});
+                    }
                     if self.other_active.get() {
                         turns.push(json!({"id": "later-turn", "status": "inProgress"}));
                     }
@@ -932,6 +952,7 @@ mod tests {
                 return Err("injected snapshot failure".into());
             }
             Ok(Capture {
+                excluded_cache_files: 0,
                 result_ref: result_ref.into(),
                 commit: "b".repeat(40),
                 snapshot_commit: snapshot.into(),
@@ -1050,7 +1071,11 @@ mod tests {
         assert_eq!(rpc[1].1["effort"], "medium");
         assert_eq!(rpc[1].1["model"], "selected-model");
         assert_eq!(rpc[1].1["sandboxPolicy"]["networkAccess"], false);
-        assert_eq!(rpc[1].1["input"][0]["text"], request().brief);
+        let prompt = rpc[1].1["input"][0]["text"].as_str().unwrap();
+        assert!(prompt.starts_with(
+            "Do not commit or create branches; Vellum captures worktree changes.\n\n"
+        ));
+        assert!(prompt.ends_with(&request().brief));
         drop(rpc);
         let mut changed = request();
         changed.brief = "different task".into();
@@ -1432,6 +1457,23 @@ mod tests {
         assert!(result_with(&paths, result_request(true), &fake)
             .unwrap_err()
             .contains("HandoffResponseInvalid"));
+        assert!(fake.captures.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_turn_exposes_provider_http_status_and_only_first_message_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentPaths::from_root(temp.path().join("state"));
+        let fake = Fake::new();
+        start_with(&paths, request(), &fake).unwrap();
+        *fake.turn_status.borrow_mut() = "failed".into();
+        let result = result_with(&paths, result_request(false), &fake).unwrap();
+        assert_eq!(result.state, "failed");
+        let error = result.provider_error.unwrap();
+        assert_eq!(error["provider"], request().model_provider);
+        assert_eq!(error["route"], request().model);
+        assert_eq!(error["status"], 401);
+        assert_eq!(error["message"], "Provider subscription rejected");
         assert!(fake.captures.borrow().is_empty());
     }
 

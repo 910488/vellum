@@ -35,6 +35,7 @@ export interface RemoteHandoffChange {
 }
 
 export interface RemoteHandoffPreflight {
+  autoWriteback?: boolean;
   thread: RemoteHandoffThread;
   changes: RemoteHandoffChange[];
   blockers: string[];
@@ -44,6 +45,7 @@ export interface RemoteHandoffPreflight {
 }
 
 export interface RemoteHandoffRecord {
+  writeback?: { state: string; reason: string } | null;
   id: string;
   hostId: string;
   source: RemoteHandoffThread;
@@ -61,12 +63,14 @@ export interface RemoteHandoffRecord {
     recentOutput: string;
     summary: string;
     capture: unknown;
+    providerError?: { provider: string; route?: string; status: number | null; message: string } | null;
   } | null;
   error: string | null;
   result: {
     captureOperation: string | null;
     capture: {
       resultRef: string; commit: string; snapshotCommit: string; partial: boolean;
+      excludedCacheFiles?: number;
       diffstat: { path: string; added: number | null; deleted: number | null }[];
     } | null;
     fetched: boolean;

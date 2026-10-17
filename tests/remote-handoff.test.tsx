@@ -28,6 +28,56 @@ beforeEach(async () => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 const view = () => render(<RemoteHandoff hostId="host" hostName="Jetson" active />);
 describe("remote handoff", () => {
+  it("shows writeback eligibility and refreshes threads while the form is open", async () => {
+    view();
+    expect(await screen.findByText(i18n.t("handoff.noAutoWriteback"))).toBeTruthy();
+    vi.mocked(api.listRemoteHandoffThreads).mockResolvedValue([thread, { ...thread, threadId: "new-local", name: "New Desktop thread" }]);
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("handoff.refreshThreads") }));
+    expect(await screen.findByText("New Desktop thread")).toBeTruthy();
+  });
+  it("reloads the list when opening another handoff form", async () => {
+    store.records = [record()];
+    view();
+    await waitFor(() => expect(api.listRemoteHandoffThreads).toHaveBeenCalledTimes(1));
+    vi.mocked(api.listRemoteHandoffThreads).mockResolvedValue([{ ...thread, name: "Just opened thread" }]);
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("handoff.new") }));
+    expect(await screen.findByText("Just opened thread")).toBeTruthy();
+    expect(api.listRemoteHandoffThreads).toHaveBeenCalledTimes(2);
+  });
+  it("shows delivered and Official skipped statuses alongside excluded caches and provider errors", async () => {
+    const row = record("failed");
+    row.writeback = { state: "delivered", reason: "acknowledged" };
+    row.remote!.providerError = { provider: "Grok CLI", route: "grok-route", status: 426, message: "Client upgrade required" };
+    row.result.capture!.excludedCacheFiles = 6;
+    store.records = [row];
+    const instance = view();
+    expect(await screen.findByText(i18n.t("handoff.writebackDelivered"))).toBeTruthy();
+    expect(screen.getByText("Client upgrade required")).toBeTruthy();
+    expect(screen.getByText("grok-route")).toBeTruthy();
+    expect(screen.getByText(i18n.t("handoff.providerFailed", { provider: "Grok CLI", status: 426 }))).toBeTruthy();
+    expect(screen.getByText(i18n.t("handoff.excludedCaches", { count: 6 }))).toBeTruthy();
+    store.records = [{ ...row, writeback: { state: "skipped", reason: "officialThread" } }];
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    expect(await screen.findByText(i18n.t("handoff.writebackUnsupported"))).toBeTruthy();
+  });
+  it("captures again when a partial terminal record later completes and supports manual recapture", async () => {
+    const partial = record("failed"); partial.result.capture!.partial = true;
+    const capture = vi.spyOn(api, "captureRemoteHandoff").mockResolvedValue(partial);
+    store.records = [partial];
+    const instance = view();
+    await waitFor(() => expect(capture).toHaveBeenCalledTimes(1));
+    const completed = record(); completed.result.capture!.partial = true;
+    const final = record(); capture.mockResolvedValue(final);
+    store.records = [completed];
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    await waitFor(() => expect(capture).toHaveBeenCalledTimes(2));
+    store.records = [final];
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    const button = await screen.findByRole("button", { name: i18n.t("handoff.recapture") });
+    await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(button);
+    await waitFor(() => expect(capture).toHaveBeenCalledTimes(3));
+  });
   it("opens through Rust by handoff ID and keeps thread-ID copying secondary", async () => {
     store.records = [record()];
     const copy = vi.fn().mockResolvedValue(undefined);

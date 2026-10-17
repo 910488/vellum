@@ -1,6 +1,53 @@
 use super::*;
 use crate::enhanced_runtime::ThreadRuntimeBinding;
 
+#[test]
+fn writeback_metadata_is_read_only_and_reports_delivered_and_official_skip() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(!supports_thread(temp.path(), "local"));
+    assert!(!temp.path().join("enhanced-runtime").exists());
+    let dir = directory(temp.path());
+    fs::create_dir_all(&dir).unwrap();
+    for (id, state, reason) in [
+        ("done", "delivered", "acknowledged"),
+        ("official", "skipped", "officialThread"),
+    ] {
+        fs::write(
+            dir.join(format!("{id}.{state}")),
+            serde_json::to_vec(&json!({"reason":reason})).unwrap(),
+        )
+        .unwrap();
+        let status = writeback_status(temp.path(), id).unwrap();
+        assert_eq!(status.state, state);
+        assert_eq!(status.reason, reason);
+    }
+    assert!(writeback_status(temp.path(), "../escape").is_none());
+    let db = ThreadRuntimeBindingStore::open(
+        temp.path().join("enhanced-runtime/thread-bindings.sqlite3"),
+    )
+    .unwrap();
+    for (thread, plane) in [
+        ("enhanced", ExecutionPlane::EnhancedCodex),
+        ("official", ExecutionPlane::OfficialCodex),
+    ] {
+        db.insert_immutable(&ThreadRuntimeBinding::new(
+            thread,
+            plane,
+            "digest",
+            "provider",
+            "model",
+            &format!("native-{thread}"),
+            1,
+        ))
+        .unwrap();
+    }
+    assert!(supports_thread(temp.path(), "enhanced"));
+    assert!(!supports_thread(temp.path(), "official"));
+    assert!(!supports_thread(temp.path(), "unknown"));
+    // Match the same source-thread key as delivery, not a native-id alias.
+    assert!(!supports_thread(temp.path(), "native-enhanced"));
+}
+
 fn fixture() -> (tempfile::TempDir, ThreadRuntimeBindingStore, Inbox) {
     let temp = tempfile::tempdir().unwrap();
     let bindings = ThreadRuntimeBindingStore::open(temp.path().join("bindings.db")).unwrap();

@@ -23,6 +23,45 @@ fn directory(root: &Path) -> PathBuf {
     root.join("enhanced-runtime/handoff-inject")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WritebackStatus {
+    pub state: String,
+    pub reason: String,
+}
+
+pub(crate) fn writeback_status(root: &Path, handoff: &str) -> Option<WritebackStatus> {
+    if !valid_id(handoff) {
+        return None;
+    }
+    for state in ["delivered", "skipped", "uncertain"] {
+        if let Ok(value) =
+            read_json::<Value>(&directory(root).join(format!("{handoff}.{state}")), 4096)
+        {
+            let reason = value["reason"].as_str().unwrap_or("unknown");
+            return Some(WritebackStatus {
+                state: state.into(),
+                reason: reason.chars().take(80).collect(),
+            });
+        }
+    }
+    None
+}
+
+pub(crate) fn supports_thread(root: &Path, thread: &str) -> bool {
+    let path = root.join("enhanced-runtime/thread-bindings.sqlite3");
+    let Ok(db) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return false;
+    };
+    db.query_row(
+        "SELECT plane FROM thread_runtime_bindings WHERE thread_id = ?1",
+        [thread],
+        |row| row.get::<_, String>(0),
+    )
+    .is_ok_and(|plane| plane == "enhanced-codex")
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {

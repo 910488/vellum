@@ -74,12 +74,24 @@ fn error(message: impl Into<String>) -> AppError {
 
 fn injected_user_message(text: &str) -> bool {
     let text = text.trim_start().to_ascii_lowercase();
+    // Older rollouts encode injected context as user messages. Recognize a
+    // whole wrapper, not arbitrary user text that happens to mention markup.
+    if let Some((tag, _)) = text.strip_prefix('<').and_then(|v| v.split_once('>')) {
+        if !tag.is_empty()
+            && tag.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            && text.trim_end().ends_with(&format!("</{tag}>"))
+        {
+            return true;
+        }
+    }
     [
         "<environment_context",
         "<user_instructions",
         "<instructions>",
         "<agents_md",
         "<agents.md",
+        "<recommended_plugins",
+        "<external_codex_apps_open_page",
         "# agents.md",
     ]
     .iter()
@@ -239,6 +251,8 @@ fn read_settings(
     let mut active = true;
     let mut first_user = String::new();
     let mut last_user = String::new();
+    let mut first_completed_user = String::new();
+    let mut last_completed_user = String::new();
     let mut last_agent = String::new();
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|e| error(e.to_string()))?;
@@ -246,6 +260,18 @@ fn read_settings(
             continue;
         };
         let payload = &value["payload"];
+        if value["type"] == "event_msg"
+            && payload["type"] == "item_completed"
+            && payload["item"]["type"] == "UserMessage"
+        {
+            let text = message_text(&payload["item"], 4000);
+            if !text.is_empty() {
+                if first_completed_user.is_empty() {
+                    first_completed_user = text.clone();
+                }
+                last_completed_user = text;
+            }
+        }
         let (role, text) = match value["type"].as_str() {
             Some("response_item") if payload["type"] == "message" => {
                 let role = payload["role"].as_str().unwrap_or_default();
@@ -322,9 +348,14 @@ fn read_settings(
     thread.effort = effort;
     thread.model_provider = provider;
     thread.active = Some(active);
-    thread.draft = (!last_user.is_empty()).then_some(BriefDraft {
-        task: last_user,
-        original_request: first_user,
+    let (task, original_request) = if first_completed_user.is_empty() {
+        (last_user, first_user)
+    } else {
+        (last_completed_user, first_completed_user)
+    };
+    thread.draft = (!task.is_empty()).then_some(BriefDraft {
+        task,
+        original_request,
         last_progress: last_agent,
     });
     Ok(())
@@ -481,6 +512,8 @@ mod tests {
         };
         let events = [
             serde_json::json!({"type":"session_meta","payload":{"id":"selected","cwd":temp.path()}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"<recommended_plugins>Plugin context</recommended_plugins>"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<external_codex_apps_open_page>Page context</external_codex_apps_open_page>"}]}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>C:/private/home</cwd>\n</environment_context>"}]}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"<user_instructions>Automatic instructions</user_instructions>"}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for C:/repo\n<INSTRUCTIONS>Project rules</INSTRUCTIONS>"}]}}),
@@ -507,5 +540,26 @@ mod tests {
         assert!(draft.task.ends_with('…'));
         assert!(draft.last_progress.ends_with('…'));
         assert!(!draft.last_progress.contains("Not an agent"));
+        let mut rows = events.to_vec();
+        rows.push(serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"input_text","text":"Actual first user task"}]}}}));
+        rows.push(serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"Actual latest task"},{"type":"input_text","text":"Verify it"}]}}}));
+        fs::write(
+            &rollout,
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        read_settings(temp.path(), &rollout, temp.path(), &mut thread).unwrap();
+        let draft = thread.draft.as_ref().unwrap();
+        assert_eq!(draft.original_request, "Actual first user task");
+        assert_eq!(draft.task, "Actual latest task\nVerify it");
+        assert!(injected_user_message(
+            "<future_context>unknown future injection</future_context>"
+        ));
+        assert!(!injected_user_message(
+            "<example>Use this as my task, with further text"
+        ));
     }
 }
