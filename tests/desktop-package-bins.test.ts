@@ -9,8 +9,14 @@ import stageDarwin from "../scripts/stage-remote-darwin-payload.sh?raw";
 import finalizeDarwinManifest from "../scripts/finalize-remote-darwin-manifest.mjs?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 import workspaceToml from "../Cargo.toml?raw";
+import buildRust from "../src-tauri/build.rs?raw";
 
 describe("daily Desktop package", () => {
+  it("refuses release installers whose remote resources exceed 80 MiB", () => {
+    expect(buildRust).toMatch(/remote_payload_bytes/);
+    expect(buildRust).toMatch(/bytes <= 80 \* 1024 \* 1024/);
+    expect(buildRust).toMatch(/PROFILE.*Ok\("release"\)/);
+  });
   it("does not declare eval, app-server, or gate-child bins", () => {
     expect(desktopToml).not.toMatch(/name = "vellum-eval"/);
     expect(desktopToml).not.toMatch(/name = "vellum-codex-app-server"/);
@@ -89,12 +95,13 @@ describe("daily Desktop package", () => {
     );
     expect(darwinJob).toMatch(/needs: remote-payload/);
     expect(darwinJob).toMatch(/stage-remote-darwin-payload\.sh/);
-    expect(stageDarwin).toMatch(/download-codex-package\.mjs.*aarch64-apple-darwin.*codex-package\.tar\.gz/);
+    expect(stageDarwin).toMatch(/download-codex-package\.mjs.*aarch64-apple-darwin.*\$package_path/);
+    expect(stageDarwin).toMatch(/remote-dev-cache\/codex/);
     expect(stageDarwin).toMatch(/finalize-remote-darwin-manifest\.mjs/);
     expect(buildLocalRelease).toMatch(/aarch64-apple-darwin/);
     expect(buildLocalRelease).toMatch(/finalize-remote-darwin-manifest\.mjs/);
     expect(finalizeDarwinManifest).toMatch(/schemaVersion === 5 \? 5 : 4/);
-    expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/codex/);
+    expect(finalizeDarwinManifest).toMatch(/codexArtifact\(packagePath/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-remote-agent/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-proxy-daemon/);
 

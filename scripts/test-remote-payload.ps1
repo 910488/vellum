@@ -143,6 +143,28 @@ try {
     if (-not $staged.ManifestSha256) { throw "valid payload missing manifest hash" }
     Write-Host "PASS valid payload"
 
+    $online = Join-Path $temp "online-codex"
+    New-FakePayload -Root $online
+    $onlineManifest = Get-Content -LiteralPath (Join-Path $online "manifest.json") -Raw -Encoding utf8 | ConvertFrom-Json
+    foreach ($entry in @(@("linux-x64", "linux-amd64", "x86_64"), @("linux-arm64", "linux-arm64", "aarch64"))) {
+        $artifact = $onlineManifest.codex.artifacts.($entry[0])
+        $artifact.url = "https://github.com/openai/codex/releases/download/rust-v0.147.0-alpha.6.6/codex-package-$($entry[2])-unknown-linux-musl.tar.gz"
+        $artifact | Add-Member -NotePropertyName size -NotePropertyValue 100
+        $artifact | Add-Member -NotePropertyName uncompressedSize -NotePropertyValue 1000
+        Remove-Item -LiteralPath (Join-Path $online "$($entry[1])/codex-package.tar.gz")
+    }
+    [IO.File]::WriteAllText((Join-Path $online "manifest.json"), ($onlineManifest | ConvertTo-Json -Depth 8), $utf8)
+    $onlineStaged = Assert-VellumStagedRemotePayload -ResourceRoot $online -ExpectedVersion $version -ExpectedProxyImage $image
+    if ($onlineStaged.ArtifactSha256["linux-amd64/codex-package.tar.gz"] -ne $onlineManifest.codex.artifacts.'linux-x64'.sha256) {
+        throw "HTTPS Codex digest must come from the embedded manifest"
+    }
+    Write-Host "PASS HTTPS Codex needs no bundled archive"
+    $onlineManifest.codex.artifacts.'linux-x64'.uncompressedSize = 0
+    [IO.File]::WriteAllText((Join-Path $online "manifest.json"), ($onlineManifest | ConvertTo-Json -Depth 8), $utf8)
+    Assert-Throws "HTTPS Codex missing signed size" {
+        Assert-VellumStagedRemotePayload -ResourceRoot $online -ExpectedVersion $version -ExpectedProxyImage $image
+    } "build-time sizes"
+
     $embedded = Join-Path $temp "embedded-mismatch"
     New-FakePayload -Root $embedded
     [IO.File]::WriteAllText((Join-Path $embedded "linux-amd64\codex-package.tar.gz"), "mutated", $utf8)

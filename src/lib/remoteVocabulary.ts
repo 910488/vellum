@@ -173,6 +173,8 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   DeploymentControlUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   DeploymentConfirmationExpired: { remedy: null, expectedBeforeBootstrap: false },
   bundledReleaseUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  CodexPackageDownloadFailed: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  CodexPackageVerificationFailed: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   activeWorkInProgress: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   unsupportedRemotePlatform: { remedy: null, expectedBeforeBootstrap: false },
   agentUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: true },

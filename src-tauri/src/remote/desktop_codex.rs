@@ -586,7 +586,7 @@ async fn download_package(archive: &OfficialCodexArchive) -> AppResult<tempfile:
     Ok(output)
 }
 
-fn http_client() -> AppResult<reqwest::Client> {
+pub(crate) fn http_client() -> AppResult<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("vellum-desktop-codex-compatibility")
         .connect_timeout(Duration::from_secs(15))

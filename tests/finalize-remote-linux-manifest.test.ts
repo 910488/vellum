@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { finalizeRemoteLinuxManifest } from "../scripts/finalize-remote-linux-manifest.mjs";
 import { finalizeRemoteDarwinManifest } from "../scripts/finalize-remote-darwin-manifest.mjs";
@@ -14,7 +15,8 @@ describe("native Linux remote manifest", () => {
       for (const arch of ["linux-amd64", "linux-arm64", "darwin-arm64"]) {
         mkdirSync(join(root, arch));
         for (const file of ["codex-package.tar.gz", "vellum-remote-agent", "vellum-proxy-daemon"]) {
-          writeFileSync(join(root, arch, file), `${arch}/${file}`);
+          const body = `${arch}/${file}`;
+          writeFileSync(join(root, arch, file), file.endsWith(".gz") ? gzipSync(body) : body);
         }
       }
       const manifest = finalizeRemoteLinuxManifest(root, "0.2.3", "0.147.0-alpha.6.6", "0.3.0", "abcdef123456");
@@ -23,8 +25,10 @@ describe("native Linux remote manifest", () => {
       expect(manifest.broker).toBeUndefined();
       expect(manifest.proxy.image).toBeUndefined();
       expect(manifest.codex.artifacts["linux-arm64"]).toEqual({
-        url: "bundle://linux-arm64/codex-package.tar.gz",
-        sha256: createHash("sha256").update("linux-arm64/codex-package.tar.gz").digest("hex"),
+        url: "https://github.com/openai/codex/releases/download/rust-v0.147.0-alpha.6.6/codex-package-aarch64-unknown-linux-musl.tar.gz",
+        sha256: createHash("sha256").update(gzipSync("linux-arm64/codex-package.tar.gz")).digest("hex"),
+        size: gzipSync("linux-arm64/codex-package.tar.gz").length,
+        uncompressedSize: "linux-arm64/codex-package.tar.gz".length,
       });
       expect(manifest.proxy.artifacts["linux-arm64"]).toEqual({
         url: "bundle://linux-arm64/vellum-proxy-daemon",

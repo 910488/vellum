@@ -127,13 +127,22 @@ where
         progress(
             "installCodex",
             20,
-            "Installing the bundled pinned Codex CLI",
+            "Preparing the pinned Codex runtime package",
         );
-        crate::remote::pinned_install::install_pinned_codex(
+        crate::remote::pinned_install::install_pinned_codex_with_progress(
             state,
             host_id,
             &format!("{}-install-codex", prepared.operation_id),
-        )?;
+            |bytes, total| {
+                let total = total.unwrap_or(1).max(1);
+                progress(
+                    "installCodex",
+                    20 + (bytes.saturating_mul(10) / total).min(10) as u8,
+                    &format!("Downloading Codex runtime: {bytes} / {total} bytes"),
+                );
+            },
+        )
+        .await?;
         progress("nativeDaemon", 35, "Enabling durable Codex remote control");
         prepared = prepare_with_control(state, host_id, &mut progress, control).await?;
     }
@@ -635,20 +644,24 @@ fn inspect_bootstrap_with(
         &probe.arch,
     )?;
     let mut payload = 0u64;
-    for artifact in [&agent_artifact, &proxy_artifact, codex_artifact] {
+    for artifact in [&agent_artifact, &proxy_artifact] {
         let size = super::pinned_install::inspect_bundled_artifact(artifact)
             .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
         payload = payload.checked_add(size).ok_or_else(|| {
             AppError::Message("insufficientDiskSpace: release size overflow".into())
         })?;
     }
-    let expanded_codex = super::pinned_install::inspect_bundled_codex_package(codex_artifact)
-        .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
+    let (compressed_codex, expanded_codex) =
+        super::pinned_install::inspect_codex_package_sizes(codex_artifact)
+            .map_err(|error| AppError::Message(format!("bundledReleaseUnavailable: {error}")))?;
     // A compressed package is much smaller than its installed runtime. Reserve
     // expanded bytes too, rather than passing the archive size as extraction cost.
-    payload = payload.checked_add(expanded_codex).ok_or_else(|| {
-        AppError::Message("insufficientDiskSpace: expanded release size overflow".into())
-    })?;
+    payload = payload
+        .checked_add(compressed_codex)
+        .and_then(|size| size.checked_add(expanded_codex))
+        .ok_or_else(|| {
+            AppError::Message("insufficientDiskSpace: expanded release size overflow".into())
+        })?;
     super::space::gate_replace(probe.disk_free_bytes, payload).map_err(AppError::Message)?;
     let expected_agent = agent_artifact
         .sha256

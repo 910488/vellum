@@ -46,6 +46,7 @@ if ($Mode -ne "stage-only" -and -not (Get-Command pnpm -ErrorAction SilentlyCont
 
 New-Item -ItemType Directory -Force -Path $scratchRoot | Out-Null
 $staged = @{}
+$packageRoot = Join-Path $scratchRoot "codex"
 foreach ($arch in @("amd64", "arm64")) {
     $archRoot = Join-Path $scratchRoot $arch
     if ($Resume) {
@@ -93,14 +94,17 @@ foreach ($arch in @("amd64", "arm64")) {
         Remove-Item -LiteralPath $resolvedDestination -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon", "codex-package.tar.gz")) {
+    foreach ($name in @("vellum-remote-agent", "vellum-proxy-daemon")) {
         Copy-Item -LiteralPath (Join-Path $staged[$arch] $name) -Destination (Join-Path $destination $name) -Force
     }
+    $packageDir = Join-Path $packageRoot "linux-$arch"
+    New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $staged[$arch] "codex-package.tar.gz") -Destination (Join-Path $packageDir "codex-package.tar.gz") -Force
 }
 
 $agentVersion = (Select-String -Path (Join-Path $repo "crates\vellum-remote-agent\Cargo.toml") -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
 Invoke-Checked "Finalize schema 5 native remote manifest" {
-    node (Join-Path $repo "scripts\finalize-remote-linux-manifest.mjs") $resourceRoot $version $CodexVersion $agentVersion $proxyFingerprint
+    node (Join-Path $repo "scripts\finalize-remote-linux-manifest.mjs") $resourceRoot $version $CodexVersion $agentVersion $proxyFingerprint $packageRoot
 }
 
 $staged = Assert-VellumStagedRemotePayload `
