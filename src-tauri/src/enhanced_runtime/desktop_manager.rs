@@ -10,7 +10,7 @@ use crate::model::{ModelRoute, ProviderKind, Route};
 use super::attestation::BridgeAttestationV1;
 use super::env_lease::{self, ReleaseOutcome};
 use super::launch_manifest::{
-    sha256_file, LaunchManifestV1, RuntimeBinaryIdentity, ATTESTATION_FILE,
+    sha256_file, LaunchManifestV1, OfficialSuccessor, RuntimeBinaryIdentity, ATTESTATION_FILE,
     LAUNCH_MANIFEST_SCHEMA_VERSION, QUALIFICATION_JOURNAL_FILE,
 };
 use super::protocol_compat::{
@@ -479,30 +479,10 @@ pub fn sync_desktop_launch(
 /// absent costs nothing until someone turns it on. The list is reported rather
 /// than ranked here; the wording that goes with it is the UI's to get right.
 fn missing_enhanced_helpers(official: &Path, enhanced: &Path) -> Vec<String> {
-    /// Codex's own name for the sibling folder it also searches.
-    const RESOURCES_DIRNAME: &str = "resources";
-
-    let (Some(official_dir), Some(enhanced_dir)) = (official.parent(), enhanced.parent()) else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(official_dir) else {
-        return Vec::new();
-    };
-    let reachable = |name: &std::ffi::OsStr| {
-        enhanced_dir.join(name).is_file()
-            || enhanced_dir.join(RESOURCES_DIRNAME).join(name).is_file()
-    };
-    let mut missing = entries
-        .flatten()
-        .map(|entry| entry.file_name())
-        .filter(|name| {
-            let text = name.to_string_lossy().to_ascii_lowercase();
-            text.ends_with(".exe") && text != "codex.exe" && !reachable(name)
-        })
-        .map(|name| name.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    missing.sort();
-    missing
+    super::launch_manifest::missing_official_helpers(
+        enhanced,
+        &super::launch_manifest::official_helpers(official),
+    )
 }
 
 fn adopt_packaged_bridge(data_root: &Path) -> Result<(), DesktopRuntimeManagerError> {
@@ -530,6 +510,7 @@ pub fn desktop_runtime_status(data_root: &Path) -> DesktopRuntimeStatus {
     // show a stale-path blocker on a card with no control that could fix it.
     // Ignored on failure: this is a repair, and a status read that cannot
     // repair should still report.
+    let _ = roll_forward_official_successor(data_root);
     let _ = adopt_discovered_official(data_root);
     match read_settings(data_root) {
         Ok(Some(settings)) => status_for_settings(data_root, &settings),
@@ -752,8 +733,33 @@ fn prepare_desktop_launch_guarded<G>(
         attestation_path: data_root.join(ATTESTATION_FILE),
         qualification_journal_path: data_root.join(QUALIFICATION_JOURNAL_FILE),
         relay: packaged_relay(),
+        official_successors: Vec::new(),
+        official_helpers: super::launch_manifest::official_helpers(
+            &settings.official_codex_executable,
+        ),
     };
     let manifest_path = LaunchManifestV1::path_in(data_root);
+    // Approvals carry over only to a launch with the same Enhanced core: they
+    // are verdicts on that pairing. Fresh ones come from the steward.
+    let mut manifest = manifest;
+    if let Ok(existing) = LaunchManifestV1::read(&manifest_path) {
+        // Re-arming a partially cleaned directory must not forget its helpers.
+        if existing.official.artifact_sha256 == manifest.official.artifact_sha256 {
+            manifest
+                .official_helpers
+                .extend(existing.official_helpers.clone());
+            manifest.official_helpers.sort();
+            manifest.official_helpers.dedup();
+        }
+        if existing.enhanced == manifest.enhanced {
+            let pinned = manifest.official.artifact_sha256.clone();
+            manifest.official_successors = existing
+                .official_successors
+                .into_iter()
+                .filter(|successor| successor.artifact_sha256 != pinned)
+                .collect();
+        }
+    }
 
     let _commit_guard = commit_guard()?;
     if save_settings {
@@ -853,8 +859,13 @@ fn same_launch_content(left: &LaunchManifestV1, right: &LaunchManifestV1) -> boo
         attestation_path,
         qualification_journal_path,
         relay,
+        // Approvals for cores Desktop may move to later. They describe no
+        // process that is running now, and they are refreshed in place.
+        official_successors: _,
+        official_helpers,
     } = left;
-    *schema_version == right.schema_version
+    *official_helpers == right.official_helpers
+        && *schema_version == right.schema_version
         && *official == right.official
         && *enhanced == right.enhanced
         && *model_provider_map_path == right.model_provider_map_path
@@ -952,13 +963,16 @@ type BinaryStamp = (PathBuf, u64, std::time::SystemTime);
 
 /// The pinned core and the Desktop core, in that order.
 type ProtocolCacheKey = (BinaryStamp, BinaryStamp);
-type ProtocolCache = std::sync::Mutex<Option<(ProtocolCacheKey, ProtocolCompatibility)>>;
+/// Keyed per pair rather than holding one entry: successor checks compare the
+/// Enhanced core against cores Desktop has not switched to yet, and a single
+/// slot would make each status refresh re-probe the pair it is actually on.
+type ProtocolCache = std::sync::Mutex<HashMap<ProtocolCacheKey, ProtocolCompatibility>>;
 
 static PROTOCOL_CACHE: std::sync::OnceLock<ProtocolCache> = std::sync::OnceLock::new();
 
 pub fn invalidate_protocol_cache() {
     if let Some(cache) = PROTOCOL_CACHE.get() {
-        *cache.lock().expect("state poisoned") = None;
+        cache.lock().expect("state poisoned").clear();
     }
 }
 
@@ -1004,19 +1018,220 @@ fn protocol_compatibility(
     official: &Path,
 ) -> Result<ProtocolCompatibility, DesktopRuntimeManagerError> {
     let key = (binary_stamp(enhanced)?, binary_stamp(official)?);
-    let cache = PROTOCOL_CACHE.get_or_init(|| std::sync::Mutex::new(None));
-    if let Some((cached_key, cached)) = cache.lock().expect("state poisoned").as_ref() {
-        if cached_key == &key {
-            return Ok(cached.clone());
-        }
+    let cache = PROTOCOL_CACHE.get_or_init(Default::default);
+    if let Some(cached) = cache.lock().expect("state poisoned").get(&key) {
+        return Ok(cached.clone());
     }
     let pinned = ProtocolSurface::probe(enhanced)
         .map_err(|error| DesktopRuntimeManagerError::ProtocolProbe(error.to_string()))?;
     let desktop = ProtocolSurface::probe(official)
         .map_err(|error| DesktopRuntimeManagerError::ProtocolProbe(error.to_string()))?;
     let result = protocol_compat::compare(&pinned, &desktop);
-    *cache.lock().expect("state poisoned") = Some((key, result.clone()));
+    cache
+        .lock()
+        .expect("state poisoned")
+        .insert(key, result.clone());
     Ok(result)
+}
+
+/// `(Enhanced core, candidate digest)` pairs that failed a successor check.
+/// A failed check is a property of the two files, so it is not asked again;
+/// a probe that merely errored is, since that can be a file still being
+/// written.
+static REJECTED_SUCCESSORS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<(PathBuf, String)>>> =
+    std::sync::OnceLock::new();
+
+/// Official cores a launch may move to without Vellum rebuilding it.
+///
+/// The check is the same one arming applies to Desktop's current core: the
+/// Enhanced core's protocol must still serve the candidate, and a signed core
+/// must cover its version. A bridge-only launch has no Enhanced core to
+/// disagree with, so any core Desktop ships qualifies.
+fn qualify_official_successors(
+    data_root: &Path,
+    manifest: &LaunchManifestV1,
+    known: &[OfficialSuccessor],
+) -> Vec<OfficialSuccessor> {
+    qualify_official_successors_with(
+        data_root,
+        manifest,
+        known,
+        super::official_drift::successor_candidates(),
+    )
+}
+
+fn qualify_official_successors_with(
+    data_root: &Path,
+    manifest: &LaunchManifestV1,
+    known: &[OfficialSuccessor],
+    candidates: Vec<PathBuf>,
+) -> Vec<OfficialSuccessor> {
+    let enhanced = manifest
+        .enhanced
+        .as_ref()
+        .map(|enhanced| enhanced.executable.as_path());
+    // An approval is about bytes, not the continued existence of its source
+    // path. Dropping it while Desktop cleans/unpacks a directory would also
+    // forget its helper inventory and approve a partial tree on the next pass.
+    let mut accepted = known
+        .iter()
+        .filter(|successor| successor.artifact_sha256 != manifest.official.artifact_sha256)
+        .cloned()
+        .collect::<Vec<OfficialSuccessor>>();
+    for candidate in candidates {
+        let Ok(sha256) = sha256_file(&candidate) else {
+            continue;
+        };
+        let expected = super::official_drift::expected_helpers(manifest, &sha256);
+        if !super::launch_manifest::missing_official_helpers(&candidate, &expected).is_empty() {
+            continue;
+        }
+        if sha256 == manifest.official.artifact_sha256
+            || accepted
+                .iter()
+                .any(|successor| successor.artifact_sha256 == sha256)
+        {
+            continue;
+        }
+        let qualified = enhanced.is_none_or(|enhanced| {
+            official_successor_qualifies(data_root, enhanced, &candidate, &sha256)
+        });
+        if qualified {
+            accepted.push(OfficialSuccessor {
+                artifact_sha256: sha256,
+                helpers: super::launch_manifest::official_helpers(&candidate),
+                source: candidate,
+            });
+        }
+    }
+    accepted
+}
+
+fn official_successor_qualifies(
+    data_root: &Path,
+    enhanced: &Path,
+    candidate: &Path,
+    sha256: &str,
+) -> bool {
+    let rejected = REJECTED_SUCCESSORS.get_or_init(Default::default);
+    let key = (enhanced.to_path_buf(), sha256.to_string());
+    if rejected.lock().expect("state poisoned").contains(&key) {
+        return false;
+    }
+    match enhanced_serves_official(data_root, enhanced, candidate) {
+        Ok(true) => true,
+        Ok(false) => {
+            log::info!(
+                "[Enhanced] Official successor rejected core={} sha={sha256}",
+                candidate.display()
+            );
+            rejected.lock().expect("state poisoned").insert(key);
+            false
+        }
+        Err(error) => {
+            log::warn!(
+                "[Enhanced] Official successor check failed core={} kind={error:?}",
+                candidate.display()
+            );
+            false
+        }
+    }
+}
+
+fn enhanced_serves_official(
+    data_root: &Path,
+    enhanced: &Path,
+    official: &Path,
+) -> Result<bool, DesktopRuntimeManagerError> {
+    if !protocol_compatibility(enhanced, official)?
+        .verdict
+        .may_arm()
+    {
+        return Ok(false);
+    }
+    let enhanced_hash = format!("sha256:{}", hex_sha256_file(enhanced)?);
+    if let Some(signed) = crate::updates::signed_core_identity(data_root, enhanced, &enhanced_hash)
+    {
+        let version = crate::remote::desktop_codex::core_version(official)
+            .map_err(|error| DesktopRuntimeManagerError::DesktopProbe(error.to_string()))?;
+        return Ok(crate::updates::CompatRange::new(&signed.protocol_compat).matches(&version));
+    }
+    Ok(true)
+}
+
+/// Re-checks which Official cores the current launch may move to, in place.
+///
+/// Desktop stages an update whenever the Store delivers one, which is never
+/// when a launch is being prepared. Adding successors changes nothing about
+/// what runs now, so the launch keeps its id; the next bridge Desktop starts
+/// simply finds its new core already approved.
+pub fn refresh_official_successors(data_root: &Path) -> Result<bool, DesktopRuntimeManagerError> {
+    let path = LaunchManifestV1::path_in(data_root);
+    let Ok(mut manifest) = LaunchManifestV1::read(&path) else {
+        return Ok(false);
+    };
+    let successors =
+        qualify_official_successors(data_root, &manifest, &manifest.official_successors);
+    if successors == manifest.official_successors {
+        return Ok(false);
+    }
+    manifest.official_successors = successors;
+    manifest.write(&path)?;
+    Ok(true)
+}
+
+/// Makes the manifest name the Official core its live bridge actually runs,
+/// once that is one of the launch's approved successors.
+///
+/// Everything that reads the launch afterwards -- the drift check against the
+/// adopted settings, reuse when the Proxy re-arms -- compares against the
+/// manifest's own core. Left on the old one, a successor that is working
+/// exactly as intended would read as a superseded launch and be "repaired"
+/// with the restart this exists to avoid.
+pub fn roll_forward_official_successor(
+    data_root: &Path,
+) -> Result<bool, DesktopRuntimeManagerError> {
+    let path = LaunchManifestV1::path_in(data_root);
+    let Ok(mut manifest) = LaunchManifestV1::read(&path) else {
+        return Ok(false);
+    };
+    let Ok(attestation) = BridgeAttestationV1::read(&manifest.attestation_path) else {
+        return Ok(false);
+    };
+    let running = attestation.official.binary_sha256.clone();
+    if !attestation.matches_launch(&manifest.launch_id)
+        || !attestation.is_live()
+        || attestation.fallback.is_some()
+        || running == manifest.official.artifact_sha256
+        || !manifest.accepts_official_successor(&running)
+    {
+        return Ok(false);
+    }
+    let Ok((official, super::official_drift::OfficialSource::Successor)) =
+        super::official_drift::observe_official(&manifest)
+    else {
+        return Ok(false);
+    };
+    if official.artifact_sha256 != running {
+        return Ok(false);
+    }
+    log::info!(
+        "[Enhanced] launch {} follows Desktop to Official core {}",
+        manifest.launch_id,
+        official.executable.display()
+    );
+    manifest.official_helpers = manifest
+        .official_successors
+        .iter()
+        .find(|successor| successor.artifact_sha256 == running)
+        .map(|successor| successor.helpers.clone())
+        .unwrap_or_default();
+    manifest.official = official;
+    manifest
+        .official_successors
+        .retain(|successor| successor.artifact_sha256 != running);
+    manifest.write(&path)?;
+    Ok(true)
 }
 
 /// Points the stored settings at the Codex core Desktop actually has.
@@ -1040,6 +1255,19 @@ fn adopt_discovered_official(data_root: &Path) -> Result<(), DesktopRuntimeManag
         return Ok(());
     };
     let discovered = PathBuf::from(&identity.binary);
+    if let Ok(manifest) = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)) {
+        let Ok(sha) = sha256_file(&discovered) else {
+            return Ok(());
+        };
+        if !super::launch_manifest::missing_official_helpers(
+            &discovered,
+            &super::official_drift::expected_helpers(&manifest, &sha),
+        )
+        .is_empty()
+        {
+            return Ok(());
+        }
+    }
     let recovered = settings
         .bridge_only
         .then(|| crate::updates::resolve_enhanced_runtime(data_root))
@@ -1086,10 +1314,39 @@ fn status_for_settings(
     status.missing_helpers = if settings.bridge_only {
         Vec::new()
     } else {
-        missing_enhanced_helpers(
-            &settings.official_codex_executable,
-            &settings.enhanced_codex_executable,
-        )
+        let manifest = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)).ok();
+        let configured_complete = manifest.as_ref().is_none_or(|manifest| {
+            sha256_file(&settings.official_codex_executable)
+                .ok()
+                .is_some_and(|sha| {
+                    super::launch_manifest::missing_official_helpers(
+                        &settings.official_codex_executable,
+                        &super::official_drift::expected_helpers(manifest, &sha),
+                    )
+                    .is_empty()
+                })
+        });
+        let reference = if configured_complete {
+            settings.official_codex_executable.clone()
+        } else {
+            manifest
+                .as_ref()
+                .and_then(|manifest| super::official_drift::observe_official(manifest).ok())
+                .map(|(official, _)| official.executable)
+                .unwrap_or_else(|| settings.official_codex_executable.clone())
+        };
+        let mut missing = missing_enhanced_helpers(&reference, &settings.enhanced_codex_executable);
+        // A half-cleaned Official directory is not a reliable inventory.
+        // Preserve its recorded requirements even before a replacement exists.
+        if let Some(manifest) = &manifest {
+            missing.extend(super::launch_manifest::missing_official_helpers(
+                &settings.enhanced_codex_executable,
+                &manifest.official_helpers,
+            ));
+        }
+        missing.sort();
+        missing.dedup();
+        missing
     };
     status.launch_core_drift = apply_observed_launch(data_root, settings, &mut status)
         || apply_official_drift(data_root, &mut status);
@@ -1344,7 +1601,11 @@ fn apply_observed_launch(
                 && identity.repetition_notice == manifest.feature_profile.repetition_notice
                 && identity.intent_continuation == manifest.feature_profile.intent_continuation
         });
-    let digests_match = attestation.official.runtime_digest == manifest.official.runtime_digest
+    // A bridge on an approved successor is running this launch as intended;
+    // the manifest catches up on the next status read.
+    let official_matches = attestation.official.runtime_digest == manifest.official.runtime_digest
+        || manifest.accepts_official_successor(&attestation.official.binary_sha256);
+    let digests_match = official_matches
         && manifest
             .enhanced
             .as_ref()
@@ -1365,12 +1626,17 @@ fn apply_observed_launch(
         && status.bridge_observed
         && attestation.official.initialized
         && !attestation.official.exited
-        && attestation.official.runtime_digest == manifest.official.runtime_digest
+        && official_matches
+        && attestation.fallback.is_none()
+        && attestation.incomplete_official.is_empty()
         && attestation
             .official
             .pid
             .is_some_and(super::process_info::pid_is_alive);
-    status.bridge_protection_active &= super::backend_relay::live_relay_origin(&super::backend_relay::advertisement_path(data_root)).is_some();
+    status.bridge_protection_active &= super::backend_relay::live_relay_origin(
+        &super::backend_relay::advertisement_path(data_root),
+    )
+    .is_some();
     if !status.active
         && !status.bridge_protection_active
         && (status.enabled || attestation.is_live())
@@ -1429,7 +1695,13 @@ fn apply_observed_launch(
             &settings.enhanced_codex_executable,
         )
     }))
-    .filter(|(_, launched, configured)| canonical(launched) != canonical(configured))
+    .filter(|(_, launched, configured)| {
+        canonical(launched) != canonical(configured)
+            && !sha256_file(launched)
+                .ok()
+                .zip(sha256_file(configured).ok())
+                .is_some_and(|(left, right)| left == right)
+    })
     .map(|(plane, launched, configured)| {
         format!(
             "the live launch runs the {plane} core from {}, not the configured {}",
@@ -1461,6 +1733,12 @@ fn apply_official_drift(data_root: &Path, status: &mut DesktopRuntimeStatus) -> 
     let Some(record) = super::official_drift::OfficialDriftRecord::for_launch(&manifest) else {
         return false;
     };
+    // The record says a bridge once had to fall back. If the launch has since
+    // approved the core it fell back to, the next bridge runs Enhanced on it
+    // and there is nothing left to rebuild.
+    if !super::official_drift::would_drift(&manifest) {
+        return false;
+    }
     status.launch_id.get_or_insert(manifest.launch_id);
     status.blockers.push(format!(
         "Codex Desktop replaced its Official core ({} -> {}); the bridge is serving it without Enhanced until the launch is rebuilt",
@@ -2004,6 +2282,82 @@ mod tests {
         assert!(!missing_enhanced_helpers(&official, &enhanced).contains(&"codex.exe".to_string()));
     }
 
+    #[test]
+    fn successor_refresh_never_forgets_a_previously_required_helper() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manifest = write_minimal_launch(temp.path());
+        manifest.enhanced = None;
+        manifest.official_helpers = vec!["codex-code-mode-host.exe".into()];
+        let candidate = temp.path().join("next/codex.exe");
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, "next core").unwrap();
+        // A hashable executable alone cannot qualify while helpers unpack.
+        assert!(qualify_official_successors_with(
+            temp.path(),
+            &manifest,
+            &[],
+            vec![candidate.clone()]
+        )
+        .is_empty());
+        let host = candidate.parent().unwrap().join("codex-code-mode-host.exe");
+        let extra = candidate.parent().unwrap().join("codex-extra.exe");
+        std::fs::write(&host, "host").unwrap();
+        std::fs::write(&extra, "extra").unwrap();
+        let approved =
+            qualify_official_successors_with(temp.path(), &manifest, &[], vec![candidate.clone()]);
+        assert_eq!(approved.len(), 1);
+        assert!(approved[0].helpers.contains(&"codex-extra.exe".into()));
+        manifest.official_successors = approved.clone();
+        std::fs::remove_file(extra).unwrap();
+        // Neither a partial tree nor a disappearing source can erase the
+        // inventory. The resolver will continue rejecting this partial copy.
+        assert_eq!(
+            qualify_official_successors_with(temp.path(), &manifest, &approved, vec![candidate]),
+            approved
+        );
+        assert_eq!(
+            qualify_official_successors_with(temp.path(), &manifest, &approved, Vec::new()),
+            approved
+        );
+    }
+
+    #[test]
+    fn helper_inventory_survives_official_cleanup_and_searches_both_resources_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let official = temp.path().join("official/codex.exe");
+        let enhanced = temp.path().join("enhanced/codex.exe");
+        std::fs::create_dir_all(official.parent().unwrap().join("resources")).unwrap();
+        std::fs::create_dir_all(enhanced.parent().unwrap().join("resources")).unwrap();
+        std::fs::write(&official, "official").unwrap();
+        std::fs::write(&enhanced, "enhanced").unwrap();
+        let helper = official
+            .parent()
+            .unwrap()
+            .join("resources/codex-code-mode-host.exe");
+        std::fs::write(&helper, "host").unwrap();
+        let inventory = super::super::launch_manifest::official_helpers(&official);
+        assert_eq!(missing_enhanced_helpers(&official, &enhanced), inventory);
+        std::fs::write(
+            enhanced
+                .parent()
+                .unwrap()
+                .join("resources/codex-code-mode-host.exe"),
+            "host",
+        )
+        .unwrap();
+        std::fs::remove_file(helper).unwrap();
+        // The cleaned Official tree cannot erase the recorded requirement,
+        // nor can it produce a false warning for an Enhanced tree with it.
+        assert_eq!(
+            super::super::launch_manifest::missing_official_helpers(&official, &inventory),
+            inventory
+        );
+        assert!(
+            super::super::launch_manifest::missing_official_helpers(&enhanced, &inventory)
+                .is_empty()
+        );
+    }
+
     /// The stored bridge path goes stale on its own: every build stages a new
     /// sidecar under a new hash-named file. Since the bridge is not a choice —
     /// the UI states it, and only the packaged one can ever verify — a stale
@@ -2135,9 +2489,15 @@ mod tests {
         status.active = true;
         status.environment_state = "leased".into();
         status.pending_core = true;
-        assert!(restart_would_fix(&status), "a pending core is applied by a restart");
+        assert!(
+            restart_would_fix(&status),
+            "a pending core is applied by a restart"
+        );
         status.environment_state = "released".into();
-        assert!(!restart_would_fix(&status), "without the lease a restart cannot apply it");
+        assert!(
+            !restart_would_fix(&status),
+            "without the lease a restart cannot apply it"
+        );
         status.environment_state = "leased".into();
         status.pending_core = false;
         status.active = false;
@@ -2660,6 +3020,8 @@ mod tests {
             attestation_path: root.join(ATTESTATION_FILE),
             qualification_journal_path: root.join(QUALIFICATION_JOURNAL_FILE),
             relay: None,
+            official_successors: Vec::new(),
+            official_helpers: Vec::new(),
         };
         manifest.write(&LaunchManifestV1::path_in(root)).unwrap();
 

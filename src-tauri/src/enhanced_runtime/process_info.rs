@@ -185,15 +185,7 @@ pub fn bundled_sidecars() -> Vec<ProcessImage> {
 pub fn terminate_bundled_sidecars() -> Vec<ProcessImage> {
     let sidecars = bundled_sidecars();
     for image in &sidecars {
-        #[cfg(target_os = "windows")]
-        let result = crate::process::background_command("taskkill")
-            .args(["/PID", &image.pid.to_string(), "/T", "/F"])
-            .output();
-        #[cfg(not(target_os = "windows"))]
-        let result = crate::process::background_command("kill")
-            .args(["-TERM", &image.pid.to_string()])
-            .output();
-        if let Err(error) = result {
+        if let Err(error) = terminate_tree(image.pid) {
             log::warn!(
                 "[Enhanced] cannot stop sidecar pid {} ({}): {error}",
                 image.pid,
@@ -202,6 +194,24 @@ pub fn terminate_bundled_sidecars() -> Vec<ProcessImage> {
         }
     }
     sidecars
+}
+
+/// Stops one process and, on Windows, everything it started.
+pub fn terminate_tree(pid: u32) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let result = crate::process::background_command("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+    #[cfg(not(target_os = "windows"))]
+    let result = crate::process::background_command("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output();
+    let output = result?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("process termination failed: {}", output.status)))
+    }
 }
 
 fn process_images() -> Vec<ProcessImage> {

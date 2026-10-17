@@ -393,6 +393,12 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         },
         enhanced_child_attestation(m),
     );
+    attestation.set_incomplete_official(
+        crate::enhanced_runtime::launch_manifest::missing_official_helpers(
+            &m.official.executable,
+            &m.official_helpers,
+        ),
+    );
     attestation.set_child_pid(
         ExecutionPlane::OfficialCodex,
         official.process.id().unwrap(),
