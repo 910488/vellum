@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import i18n from "i18next";
 import "@/i18n";
 import { api } from "@/lib/api";
@@ -77,6 +77,57 @@ describe("remote handoff", () => {
     await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false));
     fireEvent.click(button);
     await waitFor(() => expect(capture).toHaveBeenCalledTimes(3));
+  });
+  it("reloads review for the new commit once recapture finishes fetching", async () => {
+    store.records = [record()];
+    const reviewedCommits: (string | undefined)[] = [];
+    vi.mocked(api.reviewRemoteHandoff).mockImplementation(async () => {
+      const commit = store.records[0]?.result.capture?.commit;
+      reviewedCommits.push(commit);
+      return { canApply: true, patch: `+ ${commit}` };
+    });
+    let finishCapture!: (value: RemoteHandoffRecord) => void;
+    const capture = vi.spyOn(api, "captureRemoteHandoff").mockImplementation(() => new Promise<RemoteHandoffRecord>((resolve) => { finishCapture = resolve; }));
+    const instance = view();
+    await screen.findByRole("button", { name: i18n.t("handoff.apply") });
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("handoff.recapture") }));
+    expect(capture).toHaveBeenCalledWith("handoff");
+
+    // The backend saves the new capture before fetching its commit locally.
+    const pending = record();
+    pending.result.capture!.commit = "d".repeat(40);
+    pending.result.fetched = false;
+    store.records = [pending];
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    expect(screen.queryByRole("button", { name: i18n.t("handoff.fullDiff") })).toBeNull();
+    expect(reviewedCommits).toEqual(["c".repeat(40)]);
+
+    const fetched = { ...pending, result: { ...pending.result, fetched: true } };
+    store.records = [fetched];
+    await act(async () => { finishCapture(fetched); });
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    const apply = await screen.findByRole("button", { name: i18n.t("handoff.apply") });
+    await waitFor(() => expect(apply.hasAttribute("disabled")).toBe(false));
+    expect(api.reviewRemoteHandoff).toHaveBeenCalledTimes(2);
+    expect(reviewedCommits).toEqual(["c".repeat(40), "d".repeat(40)]);
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("handoff.fullDiff") }));
+    expect(screen.getByText(`+ ${"d".repeat(40)}`)).toBeTruthy();
+  });
+  it("shows a review failure when the new capture finishes fetching", async () => {
+    store.records = [record()];
+    const instance = view();
+    await screen.findByRole("button", { name: i18n.t("handoff.apply") });
+    const pending = record();
+    pending.result.capture!.commit = "d".repeat(40);
+    pending.result.fetched = false;
+    store.records = [pending];
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    vi.mocked(api.reviewRemoteHandoff).mockRejectedValue("HandoffResultUnavailable: review failed");
+    store.records = [{ ...pending, result: { ...pending.result, fetched: true } }];
+    instance.rerender(<RemoteHandoff hostId="host" hostName="Jetson" active />);
+    expect(await screen.findByText(i18n.t("handoff.errors.HandoffResultUnavailable"))).toBeTruthy();
+    expect(api.reviewRemoteHandoff).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: i18n.t("handoff.apply") })).toBeNull();
   });
   it("opens through Rust by handoff ID and keeps thread-ID copying secondary", async () => {
     store.records = [record()];

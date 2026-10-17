@@ -67,7 +67,7 @@ export function RemoteHandoff({ hostId, hostName, active }: { hostId: string; ho
     void Promise.resolve().then(() => api.reviewRemoteHandoff(record.id)).then((value) => { if (live) setReview(value); })
       .catch((e: unknown) => { if (live) setFailure(String(e)); });
     return () => { live = false; };
-  }, [record?.id, record?.result.capture?.commit, record?.result.outcome, active]);
+  }, [record?.id, record?.result.capture?.commit, record?.result.fetched, record?.result.outcome, active]);
   useEffect(() => {
     if (!active || !record || !terminal || record.result.outcome || busy || inFlight.current) return;
     if (record.result.fetched && !record.result.capture?.partial) return;
