@@ -5491,6 +5491,7 @@ html[data-performance="low"] .card {
 }
 .official-account-list .resets { grid-column: 1 / -1; }
 .quota-pool__head > label { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.quota-pool__head > label > .input { width: auto; }
 .empty-inline { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--ink-soft); }
 .acct-menu { position: relative; justify-self: end; }
 .acct-menu > summary { list-style: none; cursor: pointer; padding: 4px 10px; border-radius: var(--r-pill); background: var(--surface-sunk); font-size: 20px; line-height: 1; }
