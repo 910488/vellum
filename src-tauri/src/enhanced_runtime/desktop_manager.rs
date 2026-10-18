@@ -7,12 +7,13 @@ use vellum_enhanced_codex::EnhancedRuntimeLockFile;
 
 use crate::model::{ModelRoute, ProviderKind, Route};
 
-use super::attestation::BridgeAttestationV1;
+use super::attestation::{BridgeAttestationV1, BridgeLifecycle};
 use super::env_lease::{self, ReleaseOutcome};
 use super::launch_manifest::{
     sha256_file, LaunchManifestV1, OfficialSuccessor, RuntimeBinaryIdentity, ATTESTATION_FILE,
     LAUNCH_MANIFEST_SCHEMA_VERSION, QUALIFICATION_JOURNAL_FILE,
 };
+use super::process_info::pid_is_alive;
 use super::protocol_compat::{
     self, ProtocolCompatibility, ProtocolDelta, ProtocolSurface, ProtocolVerdict,
 };
@@ -527,6 +528,47 @@ pub fn desktop_runtime_status(data_root: &Path) -> DesktopRuntimeStatus {
 pub fn live_bridge_attestation(data_root: &Path) -> Option<BridgeAttestationV1> {
     let attestation = BridgeAttestationV1::read(&data_root.join(ATTESTATION_FILE)).ok()?;
     attestation.is_live().then_some(attestation)
+}
+
+/// The attestation of a bridge that died under a Codex Desktop that is still
+/// running.
+///
+/// An update restart ends every bundled sidecar so the binaries can be
+/// replaced. Desktop normally starts a new bridge within a second, but when it
+/// does not, nothing on disk says so: the attestation of the dead bridge is
+/// simply "not live", the same answer as "no Desktop at all". The difference
+/// is the recorded parent -- the Desktop process that spawned the bridge is
+/// still there and has nothing to talk to.
+///
+/// A bridge that stopped cleanly is Desktop's own doing and is left out; only
+/// a state the bridge never got to finish writing counts as lost.
+pub fn lost_bridge_attestation(data_root: &Path) -> Option<BridgeAttestationV1> {
+    let attestation = BridgeAttestationV1::read(&data_root.join(ATTESTATION_FILE)).ok()?;
+    bridge_was_lost(
+        &attestation,
+        pid_is_alive(attestation.bridge_pid),
+        recorded_desktop_parent_is_up(&attestation),
+    )
+    .then_some(attestation)
+}
+
+pub(crate) fn bridge_was_lost(
+    attestation: &BridgeAttestationV1,
+    bridge_alive: bool,
+    parent_up: bool,
+) -> bool {
+    !matches!(attestation.state, BridgeLifecycle::Stopped) && !bridge_alive && parent_up
+}
+
+fn recorded_desktop_parent_is_up(attestation: &BridgeAttestationV1) -> bool {
+    let Some(recorded) = attestation.parent_executable.as_deref() else {
+        return false;
+    };
+    attestation.parent_pid != 0
+        && pid_is_alive(attestation.parent_pid)
+        && super::process_info::executable_of(attestation.parent_pid).is_some_and(|live| {
+            canonical(&live) == canonical(recorded) && is_known_codex_desktop_executable(&live)
+        })
 }
 
 /// Writes the launch manifest, takes the `CODEX_CLI_PATH` lease, and returns

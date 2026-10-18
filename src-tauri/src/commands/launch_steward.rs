@@ -12,14 +12,23 @@
 //! Before this, the same states lit "restart Codex" and waited for the user,
 //! and every Vellum update and every Codex update produced one of them.
 //!
+//! The other half of the job is a bridge that is simply gone. An update
+//! restart ends every bundled sidecar, and Desktop usually starts a new bridge
+//! at once; when it does not, Desktop has no App Server and cannot send
+//! anything, while every check above reads the missing bridge as "nothing to
+//! recycle". [`LossWatch`] notices a dead bridge whose Desktop parent is still
+//! running, says so with a restart reason, and -- since no bridge means no
+//! open turn to lose -- restarts Desktop through the managed path after a
+//! grace period.
+//!
 //! The steward only ever ends a bridge with no turn open, on a launch Vellum
 //! holds the lease for, once per launch. Ending it mid-turn would cost the
 //! user the turn; ending it twice for the same launch means the first attempt
 //! found something a second one will not fix.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::enhanced_runtime::attestation::BridgeAttestationV1;
 use crate::enhanced_runtime::LaunchManifestV1;
@@ -28,6 +37,12 @@ use crate::state::AppState;
 
 const FIRST_PASS: Duration = Duration::from_secs(10);
 const PASS_INTERVAL: Duration = Duration::from_secs(20);
+/// How long Desktop gets to start its own replacement bridge before the
+/// steward stops waiting for it.
+const LOSS_GRACE: Duration = Duration::from_secs(60);
+/// Managed restarts spent on one lost bridge. A restart that was refused is
+/// worth another look; one that ran and changed nothing is not.
+const LOSS_RESTART_ATTEMPTS: u8 = 3;
 const RECYCLE_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const RECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -35,16 +50,17 @@ pub(crate) fn spawn(state: AppState) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_PASS).await;
         let mut recycled = HashSet::<String>::new();
+        let mut loss = LossWatch::default();
         loop {
             if state.proxy_status().running {
-                steward_pass(&state, &mut recycled).await;
+                steward_pass(&state, &mut recycled, &mut loss).await;
             }
             tokio::time::sleep(PASS_INTERVAL).await;
         }
     });
 }
 
-async fn steward_pass(state: &AppState, recycled: &mut HashSet<String>) {
+async fn steward_pass(state: &AppState, recycled: &mut HashSet<String>, loss: &mut LossWatch) {
     let data_root = state.data_root();
     let pass_root = data_root.clone();
     let refresh_state = state.clone();
@@ -91,6 +107,94 @@ async fn steward_pass(state: &AppState, recycled: &mut HashSet<String>) {
         let launch_id = target.launch_id.clone();
         if recycle(state, target).await {
             recycled.insert(launch_id);
+        }
+    }
+    recover_lost_bridge(state, &status, loss).await;
+}
+
+/// What the steward owes a bridge that died under a running Desktop.
+#[derive(Debug, PartialEq, Eq)]
+enum LossStep {
+    Idle,
+    /// First sighting: tell the user, now, that Desktop is stuck.
+    Announce,
+    Restart,
+}
+
+#[derive(Default)]
+struct LossWatch {
+    seen: Option<(u32, Instant)>,
+    attempts: HashMap<u32, u8>,
+}
+
+impl LossWatch {
+    fn observe(&mut self, lost_pid: Option<u32>, now: Instant) -> LossStep {
+        let Some(pid) = lost_pid else {
+            self.seen = None;
+            return LossStep::Idle;
+        };
+        let since = match self.seen {
+            Some((seen_pid, since)) if seen_pid == pid => since,
+            _ => {
+                self.seen = Some((pid, now));
+                return LossStep::Announce;
+            }
+        };
+        let spent = self.attempts.get(&pid).copied().unwrap_or(0);
+        if now.duration_since(since) >= LOSS_GRACE && spent < LOSS_RESTART_ATTEMPTS {
+            self.attempts.insert(pid, spent + 1);
+            LossStep::Restart
+        } else {
+            LossStep::Idle
+        }
+    }
+}
+
+async fn recover_lost_bridge(
+    state: &AppState,
+    status: &crate::enhanced_runtime::DesktopRuntimeStatus,
+    loss: &mut LossWatch,
+) {
+    let lost =
+        if state.proxy_status().running && status.enabled && status.environment_state == "leased" {
+            let root = state.data_root();
+            tokio::task::spawn_blocking(move || {
+                crate::enhanced_runtime::desktop_manager::lost_bridge_attestation(&root)
+                    .map(|attestation| attestation.bridge_pid)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+    match loss.observe(lost, Instant::now()) {
+        LossStep::Idle => {}
+        LossStep::Announce => {
+            log::warn!(
+                "[Launch] bridge lost under a running Codex Desktop pid={}; restart in {}s unless Desktop recovers",
+                lost.unwrap_or_default(),
+                LOSS_GRACE.as_secs()
+            );
+            let notice = RuntimeNotice::new("enhancedBridgeLost");
+            match crate::commands::runtime::codex_process_identity() {
+                Some(identity) => state.mark_restart_required_for_process(notice, identity),
+                None => state.mark_restart_required(notice),
+            }
+        }
+        LossStep::Restart => {
+            log::warn!(
+                "[Launch] Codex Desktop still has no bridge after {}s; restarting it pid={}",
+                LOSS_GRACE.as_secs(),
+                lost.unwrap_or_default()
+            );
+            // Not forced: no bridge means no open turn, and anything that
+            // still objects (active requests, a lifecycle change) is a reason
+            // to ask again on a later pass.
+            match crate::commands::runtime::shared_restart_codex(state, false).await {
+                Ok(outcome) => state.record_live_applied(outcome.notice),
+                Err(error) => log::warn!("[Launch] bridge-loss restart failed: {error}"),
+            }
         }
     }
 }
@@ -390,6 +494,67 @@ mod tests {
             incomplete_official: Vec::new(),
             failure_reason: None,
         }
+    }
+
+    #[test]
+    fn a_lost_bridge_is_announced_then_restarted_after_the_grace_period() {
+        let start = Instant::now();
+        let mut watch = LossWatch::default();
+        assert_eq!(watch.observe(None, start), LossStep::Idle);
+        assert_eq!(watch.observe(Some(7), start), LossStep::Announce);
+        assert_eq!(
+            watch.observe(Some(7), start + Duration::from_secs(20)),
+            LossStep::Idle
+        );
+        assert_eq!(
+            watch.observe(Some(7), start + LOSS_GRACE),
+            LossStep::Restart
+        );
+    }
+
+    #[test]
+    fn a_bridge_that_comes_back_inside_the_grace_period_costs_nothing() {
+        let start = Instant::now();
+        let mut watch = LossWatch::default();
+        assert_eq!(watch.observe(Some(7), start), LossStep::Announce);
+        assert_eq!(
+            watch.observe(None, start + Duration::from_secs(20)),
+            LossStep::Idle
+        );
+        assert_eq!(
+            watch.observe(Some(7), start + LOSS_GRACE),
+            LossStep::Announce,
+            "a second loss starts its own grace period"
+        );
+    }
+
+    #[test]
+    fn restarting_for_one_lost_bridge_is_bounded() {
+        let start = Instant::now();
+        let mut watch = LossWatch::default();
+        watch.observe(Some(7), start);
+        let mut restarts = 0;
+        for pass in 0..20u64 {
+            let now = start + LOSS_GRACE + Duration::from_secs(20 * pass);
+            if watch.observe(Some(7), now) == LossStep::Restart {
+                restarts += 1;
+            }
+        }
+        assert_eq!(restarts, LOSS_RESTART_ATTEMPTS);
+    }
+
+    #[test]
+    fn only_an_unfinished_bridge_under_a_live_desktop_counts_as_lost() {
+        use crate::enhanced_runtime::desktop_manager::bridge_was_lost;
+        let mut bridge = attestation("L1", None);
+        assert!(bridge_was_lost(&bridge, false, true));
+        assert!(!bridge_was_lost(&bridge, true, true), "still serving");
+        assert!(
+            !bridge_was_lost(&bridge, false, false),
+            "Desktop is gone too"
+        );
+        bridge.state = BridgeLifecycle::Stopped;
+        assert!(!bridge_was_lost(&bridge, false, true), "stopped on its own");
     }
 
     #[test]
