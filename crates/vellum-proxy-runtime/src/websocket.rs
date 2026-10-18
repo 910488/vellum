@@ -24,6 +24,39 @@ type OfficialUpstreamSocket =
 
 const OFFICIAL_CANCEL_DRAIN_TIMEOUT_MS: u64 = 250;
 
+/// A full-input `response.create` (no `previous_response_id`) larger than this
+/// is served over the HTTP Responses path instead of the upstream WebSocket.
+/// chatgpt.com closes the socket right after a ~27 MB first frame without any
+/// error frame (2026-10-18, thread resume), while the same body succeeds over
+/// HTTP (up to ~30 MB observed). Override with
+/// `VELLUM_OFFICIAL_WS_MAX_FRAME_BYTES` (0 disables the redirect).
+const OFFICIAL_WS_FULL_INPUT_HTTP_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+
+fn official_ws_full_input_threshold() -> usize {
+    std::env::var("VELLUM_OFFICIAL_WS_MAX_FRAME_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(OFFICIAL_WS_FULL_INPUT_HTTP_THRESHOLD_BYTES)
+}
+
+fn has_previous_response_id(request: &Value) -> bool {
+    request
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+}
+
+/// Encoded size of a full-input frame that exceeds `threshold`, else `None`.
+/// Chained frames (carrying `previous_response_id`) are incremental and never
+/// qualify.
+fn oversize_full_input_frame_bytes(request: &Value, threshold: usize) -> Option<usize> {
+    if threshold == 0 || has_previous_response_id(request) {
+        return None;
+    }
+    let bytes = request.to_string().len();
+    (bytes > threshold).then_some(bytes)
+}
+
 use crate::body::MAX_REQUEST_BODY_BYTES;
 use crate::diagnostics::{DiagnosticEvent, WebSocketClosed, WebSocketOpened, WebSocketTransport};
 use crate::error::RuntimeError;
@@ -108,6 +141,10 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
     let mut deferred_account_handoffs: VecDeque<Value> = VecDeque::new();
     let mut cancelled_response_ids: VecDeque<String> = VecDeque::new();
     let mut portable_warmup: Option<PortableWarmup> = None;
+    // True while the latest response on this connection was served over HTTP
+    // (oversize full-input redirect), so a chained follow-up must not be sent
+    // to a fresh upstream socket that has never seen that response id.
+    let mut http_served_chain = false;
     let mut turns = 0_u64;
     let mut frames_in = 0_u64;
     let mut frames_out = 0_u64;
@@ -327,6 +364,41 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     }
                     _ => None,
                 };
+                if matches!(&turn_dispatch, WebSocketTurnDispatch::OfficialNative(_)) {
+                    if let Some(bytes) = oversize_full_input_frame_bytes(
+                        &request,
+                        official_ws_full_input_threshold(),
+                    ) {
+                        // The upstream socket drops oversized first frames
+                        // and Codex burns minutes retrying before its own
+                        // HTTP fallback. Serve this turn over HTTP now; the
+                        // body is untouched (no handoff sanitising), so the
+                        // session-id/prompt_cache_key affinity is preserved.
+                        log::warn!(
+                            "[OfficialSocket] full-input frame {bytes} bytes exceeds the WebSocket limit; serving over HTTP connection={connection_id}"
+                        );
+                        turn_dispatch = WebSocketTurnDispatch::PortableReplay {
+                            force_official_handoff: false,
+                        };
+                        http_served_chain = true;
+                    } else if http_served_chain
+                        && official.is_none()
+                        && has_previous_response_id(&request)
+                    {
+                        // The previous response was created over HTTP, so a
+                        // fresh upstream socket cannot resume it. Replay the
+                        // full history over HTTP as well.
+                        log::info!(
+                            "[OfficialSocket] chained frame follows an HTTP-served turn; replaying over HTTP connection={connection_id}"
+                        );
+                        runtime_request.metadata.force_portable_official_handoff = true;
+                        turn_dispatch = WebSocketTurnDispatch::PortableReplay {
+                            force_official_handoff: true,
+                        };
+                    } else {
+                        http_served_chain = false;
+                    }
+                }
                 let live_account_handoff = matches!(
                     &turn_dispatch,
                     WebSocketTurnDispatch::OfficialNative(plan)
@@ -813,6 +885,9 @@ struct OfficialSegment {
     pending: VecDeque<OfficialPendingTurn>,
     stages: OfficialStageTimes,
     started: std::time::Instant,
+    /// Encoded size of the most recent frame forwarded upstream, kept so an
+    /// upstream close can be logged next to the frame that provoked it.
+    last_sent_frame_bytes: usize,
 }
 
 enum TurnOutcome {
@@ -1277,6 +1352,7 @@ async fn open_official_segment(
             ..OfficialStageTimes::default()
         },
         started,
+        last_sent_frame_bytes: 0,
     })
 }
 
@@ -1347,6 +1423,9 @@ async fn send_official_turn(
         }
     };
     let send_started = std::time::Instant::now();
+    if let TungsteniteMessage::Text(text) = &forwarded {
+        segment.last_sent_frame_bytes = text.len();
+    }
     if send_official_upstream(&mut segment.write, forwarded)
         .await
         .is_err()
@@ -1592,6 +1671,15 @@ async fn handle_official_upstream_frame(
                 }
             }
             let closing = matches!(message, TungsteniteMessage::Close(_));
+            if let TungsteniteMessage::Close(frame) = &message {
+                log::warn!(
+                    "[OfficialSocket] upstream sent Close connection={connection_id} {} pending_turns={} frames_out={} last_sent_frame_bytes={}",
+                    describe_close_frame(frame.as_ref()),
+                    segment.pending.len(),
+                    *frames_out,
+                    segment.last_sent_frame_bytes,
+                );
+            }
             if client.send(from_tungstenite(message)).await.is_err() || closing {
                 return false;
             }
@@ -1692,7 +1780,30 @@ async fn handle_official_upstream_frame(
             let _ = send_runtime_failure(client, &error).await;
             false
         }
-        None => false,
+        None => {
+            if let Some(segment) = official.as_ref() {
+                log::warn!(
+                    "[OfficialSocket] upstream stream ended without a Close frame connection={connection_id} pending_turns={} frames_out={} last_sent_frame_bytes={}",
+                    segment.pending.len(),
+                    *frames_out,
+                    segment.last_sent_frame_bytes,
+                );
+            }
+            false
+        }
+    }
+}
+
+fn describe_close_frame(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> String {
+    match frame {
+        Some(frame) => format!(
+            "code={} reason={:?}",
+            u16::from(frame.code),
+            frame.reason.as_str()
+        ),
+        None => "code=none reason=none".to_string(),
     }
 }
 
@@ -4274,6 +4385,174 @@ mod tests {
         assert!(input_text.contains("first question"), "{input_text}");
         assert!(input_text.contains("answer from A"), "{input_text}");
         assert!(input_text.contains("follow-up question"), "{input_text}");
+
+        let _ = client.close(None).await;
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[test]
+    fn oversize_full_input_detection_ignores_chained_and_small_frames() {
+        let padding = "x".repeat(2048);
+        let full = json!({"type":"response.create","input":[{"content":padding}]});
+        assert!(oversize_full_input_frame_bytes(&full, 1024).is_some());
+        assert!(oversize_full_input_frame_bytes(&full, 1024 * 1024).is_none());
+        assert!(oversize_full_input_frame_bytes(&full, 0).is_none());
+        let mut chained = full.clone();
+        chained["previous_response_id"] = json!("resp_1");
+        assert!(oversize_full_input_frame_bytes(&chained, 1024).is_none());
+        chained["previous_response_id"] = json!("");
+        assert!(oversize_full_input_frame_bytes(&chained, 1024).is_some());
+    }
+
+    #[test]
+    fn close_frame_description_includes_code_and_reason() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        let frame = CloseFrame {
+            code: CloseCode::Size,
+            reason: "too big".into(),
+        };
+        assert_eq!(
+            describe_close_frame(Some(&frame)),
+            "code=1009 reason=\"too big\""
+        );
+        assert_eq!(describe_close_frame(None), "code=none reason=none");
+    }
+
+    /// A full-input frame above the threshold must never reach the upstream
+    /// WebSocket (chatgpt.com drops it); it is served over HTTP with the body
+    /// untouched, and a chained follow-up on the same connection stays on HTTP
+    /// because a fresh socket never saw that response id. A small full-input
+    /// frame still uses the socket.
+    #[tokio::test]
+    async fn oversize_full_input_frame_is_served_over_http() {
+        use axum::extract::Json;
+        let ws_frames = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let http_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let ws_capture = ws_frames.clone();
+        let http_capture = http_bodies.clone();
+        let upstream = Router::new().route(
+            "/backend-api/codex/responses",
+            get(move |ws: WebSocketUpgrade| {
+                let frames = ws_capture.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
+                            frames.lock().unwrap().push(serde_json::from_str(&text).unwrap());
+                            let event = json!({"type":"response.completed","response":{"id":"resp_ws","status":"completed","output":[]}});
+                            socket.send(AxumWsMessage::Text(event.to_string().into())).await.unwrap();
+                        }
+                    })
+                }
+            })
+            .post(move |Json(body): Json<Value>| {
+                let bodies = http_capture.clone();
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    axum::Json(json!({"id":"resp_http","object":"response","status":"completed","output":[]}))
+                }
+            }),
+        )
+        .layer(axum::extract::DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let config = ProxyRuntimeConfig {
+            models: vec![official_route_config(format!(
+                "http://{upstream_address}/backend-api/codex"
+            ))],
+            ..ProxyRuntimeConfig::default()
+        };
+        let mut state = StaticProxyState::from_config(config).unwrap();
+        state.mark_listener_ready();
+        let proxy =
+            build_headless_router(Arc::new(state), InboundAccessPolicy::test_only_disabled());
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, proxy).await;
+        });
+
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{proxy_address}/v1/responses"))
+                .await
+                .unwrap();
+        async fn complete(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            frame: Value,
+        ) -> Value {
+            client
+                .send(TungsteniteMessage::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+            loop {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), client.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                let TungsteniteMessage::Text(text) = message else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(&text).unwrap();
+                match event["type"].as_str() {
+                    Some("response.completed") => return event,
+                    Some("response.failed" | "error") => panic!("turn failed: {event}"),
+                    _ => {}
+                }
+            }
+        }
+
+        let padding = "x".repeat(OFFICIAL_WS_FULL_INPUT_HTTP_THRESHOLD_BYTES + 1024);
+        let big = complete(
+            &mut client,
+            json!({"type":"response.create","model":"vellum-official","stream":false,
+                "prompt_cache_key":"oversize-cache",
+                "input":[{"role":"user","content":padding}]}),
+        )
+        .await;
+        assert_eq!(big["response"]["id"], "resp_http");
+        assert!(ws_frames.lock().unwrap().is_empty());
+        {
+            let bodies = http_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(bodies[0]["prompt_cache_key"], "oversize-cache");
+            assert_eq!(
+                bodies[0]["input"][0]["content"].as_str().unwrap().len(),
+                padding.len()
+            );
+            assert!(bodies[0].get("type").is_none());
+        }
+
+        let chained = complete(
+            &mut client,
+            json!({"type":"response.create","model":"vellum-official","stream":false,
+                "previous_response_id":"resp_http",
+                "input":[{"role":"user","content":"next"}]}),
+        )
+        .await;
+        assert_eq!(chained["response"]["id"], "resp_http");
+        assert!(
+            ws_frames.lock().unwrap().is_empty(),
+            "a chain created over HTTP must not be sent to a fresh socket"
+        );
+        assert_eq!(http_bodies.lock().unwrap().len(), 2);
+
+        let small = complete(
+            &mut client,
+            json!({"type":"response.create","model":"vellum-official","stream":false,
+                "input":[{"role":"user","content":"small"}]}),
+        )
+        .await;
+        assert_eq!(small["response"]["id"], "resp_ws");
+        assert_eq!(ws_frames.lock().unwrap().len(), 1);
+        assert_eq!(http_bodies.lock().unwrap().len(), 2);
 
         let _ = client.close(None).await;
         proxy_task.abort();
