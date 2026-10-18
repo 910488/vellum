@@ -141,10 +141,10 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
     let mut deferred_account_handoffs: VecDeque<Value> = VecDeque::new();
     let mut cancelled_response_ids: VecDeque<String> = VecDeque::new();
     let mut portable_warmup: Option<PortableWarmup> = None;
-    // True while the latest response on this connection was served over HTTP
-    // (oversize full-input redirect), so a chained follow-up must not be sent
-    // to a fresh upstream socket that has never seen that response id.
-    let mut http_served_chain = false;
+    // Ids of responses created over HTTP (oversize full-input redirect). A
+    // chained follow-up naming one must not go to an upstream socket, which
+    // has never seen that id, whether or not a socket is currently open.
+    let mut http_response_ids: VecDeque<String> = VecDeque::new();
     let mut turns = 0_u64;
     let mut frames_in = 0_u64;
     let mut frames_out = 0_u64;
@@ -302,6 +302,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         false,
                         &mut portable_warmup,
                         None,
+                        &mut None,
                     )
                     .await
                     {
@@ -364,6 +365,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     }
                     _ => None,
                 };
+                let mut track_http_response_id = false;
                 if matches!(&turn_dispatch, WebSocketTurnDispatch::OfficialNative(_)) {
                     if let Some(bytes) = oversize_full_input_frame_bytes(
                         &request,
@@ -380,10 +382,11 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         turn_dispatch = WebSocketTurnDispatch::PortableReplay {
                             force_official_handoff: false,
                         };
-                        http_served_chain = true;
-                    } else if http_served_chain
-                        && official.is_none()
-                        && has_previous_response_id(&request)
+                        track_http_response_id = true;
+                    } else if request
+                        .get("previous_response_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| http_response_ids.iter().any(|known| known == id))
                     {
                         // The previous response was created over HTTP, so a
                         // fresh upstream socket cannot resume it. Replay the
@@ -395,8 +398,7 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         turn_dispatch = WebSocketTurnDispatch::PortableReplay {
                             force_official_handoff: true,
                         };
-                    } else {
-                        http_served_chain = false;
+                        track_http_response_id = true;
                     }
                 }
                 let live_account_handoff = matches!(
@@ -680,7 +682,8 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                                 },
                             ));
                         }
-                        match execute_portable_turn(
+                        let mut produced_response_id: Option<String> = None;
+                        let portable_outcome = execute_portable_turn(
                             &mut client,
                             &state,
                             runtime.as_ref(),
@@ -692,9 +695,18 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                             force_official_handoff,
                             &mut portable_warmup,
                             Some(runtime_request),
+                            &mut produced_response_id,
                         )
-                        .await
-                        {
+                        .await;
+                        if track_http_response_id {
+                            if let Some(id) = produced_response_id {
+                                http_response_ids.push_back(id);
+                                while http_response_ids.len() > 8 {
+                                    http_response_ids.pop_front();
+                                }
+                            }
+                        }
+                        match portable_outcome {
                             TurnOutcome::Continue => {}
                             TurnOutcome::Stop(stop_reason) => {
                                 reason = stop_reason;
@@ -1828,6 +1840,7 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
     force_official_handoff: bool,
     portable_warmup: &mut Option<PortableWarmup>,
     planned_request: Option<RuntimeRequest>,
+    produced_response_id: &mut Option<String>,
 ) -> TurnOutcome {
     // The HTTP Responses body has no WebSocket event discriminator.
     if request.get("type").and_then(Value::as_str) == Some("response.create") {
@@ -1936,6 +1949,7 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
         Ok(RuntimeResponse::Json(value)) => {
             match send_buffered_response_as_websocket_events(client, value, turn_started).await {
                 Ok(sent) => {
+                    *produced_response_id = sent.response_id.clone();
                     *frames_out += sent.frames_out;
                     if let Some(ms) = sent.first_downstream_ms {
                         runtime.mark_first_downstream_frame(&turn_request_id, ms);
@@ -1948,6 +1962,7 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
         Ok(RuntimeResponse::Sse(stream)) => {
             match send_stream_as_websocket_events(client, stream, turn_started).await {
                 Ok(outcome) => {
+                    *produced_response_id = outcome.response_id.clone();
                     *frames_out += outcome.frames_out;
                     for value in outcome.queued {
                         queued.push_back(value);
@@ -2112,6 +2127,21 @@ fn request_for_history(mut value: Value) -> Value {
         }
     }
     value
+}
+
+/// The `response.id` carried by a `response.created`/`response.completed`
+/// SSE block, if any.
+fn response_id_from_sse_block(block: &str) -> Option<String> {
+    block
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .find_map(|event| {
+            event
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn completed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
@@ -2738,6 +2768,7 @@ struct StreamForwardOutcome {
     queued: Vec<Value>,
     stop: Option<String>,
     first_downstream_ms: Option<u64>,
+    response_id: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -3044,6 +3075,9 @@ async fn send_stream_as_websocket_events(
         };
         append_utf8_safe(&mut body, &mut remainder, &bytes);
         while let Some(block) = take_sse_block(&mut body) {
+            if let Some(id) = response_id_from_sse_block(&block) {
+                outcome.response_id = Some(id);
+            }
             match send_sse_block_as_websocket_event(client, &block, &mut terminal_seen).await {
                 Ok(true) => {
                     outcome.frames_out += 1;
@@ -3059,6 +3093,9 @@ async fn send_stream_as_websocket_events(
     if !body.trim().is_empty() {
         body.push_str("\n\n");
         while let Some(block) = take_sse_block(&mut body) {
+            if let Some(id) = response_id_from_sse_block(&block) {
+                outcome.response_id = Some(id);
+            }
             match send_sse_block_as_websocket_event(client, &block, &mut terminal_seen).await {
                 Ok(true) => {
                     outcome.frames_out += 1;
@@ -3186,7 +3223,13 @@ async fn send_buffered_response_as_websocket_events(
     turn_started: std::time::Instant,
 ) -> Result<StreamForwardOutcome, ()> {
     let frames = buffered_application_frames(&response);
-    let mut outcome = StreamForwardOutcome::default();
+    let mut outcome = StreamForwardOutcome {
+        response_id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        ..StreamForwardOutcome::default()
+    };
     for frame in frames {
         if client
             .send(AxumWsMessage::Text(frame.to_string().into()))
@@ -4509,6 +4552,16 @@ mod tests {
             }
         }
 
+        // A socket is already open (and owns resp_ws) before the oversize frame.
+        let first = complete(
+            &mut client,
+            json!({"type":"response.create","model":"vellum-official","stream":false,
+                "input":[{"role":"user","content":"warm"}]}),
+        )
+        .await;
+        assert_eq!(first["response"]["id"], "resp_ws");
+        assert_eq!(ws_frames.lock().unwrap().len(), 1);
+
         let padding = "x".repeat(OFFICIAL_WS_FULL_INPUT_HTTP_THRESHOLD_BYTES + 1024);
         let big = complete(
             &mut client,
@@ -4518,7 +4571,7 @@ mod tests {
         )
         .await;
         assert_eq!(big["response"]["id"], "resp_http");
-        assert!(ws_frames.lock().unwrap().is_empty());
+        assert_eq!(ws_frames.lock().unwrap().len(), 1);
         {
             let bodies = http_bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1);
@@ -4538,9 +4591,10 @@ mod tests {
         )
         .await;
         assert_eq!(chained["response"]["id"], "resp_http");
-        assert!(
-            ws_frames.lock().unwrap().is_empty(),
-            "a chain created over HTTP must not be sent to a fresh socket"
+        assert_eq!(
+            ws_frames.lock().unwrap().len(),
+            1,
+            "a chain created over HTTP must not be sent to the open socket"
         );
         assert_eq!(http_bodies.lock().unwrap().len(), 2);
 
@@ -4551,7 +4605,7 @@ mod tests {
         )
         .await;
         assert_eq!(small["response"]["id"], "resp_ws");
-        assert_eq!(ws_frames.lock().unwrap().len(), 1);
+        assert_eq!(ws_frames.lock().unwrap().len(), 2);
         assert_eq!(http_bodies.lock().unwrap().len(), 2);
 
         let _ = client.close(None).await;
