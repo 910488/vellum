@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { RemoteWorkSurface } from "@/components/RemoteWorkSurface";
 import { Btn, Notice, Row, Rows, State } from "@/components/ui";
 import { elapsedLabel, convergePairingSuggested } from "@/lib/remoteVocabulary";
+import { RemotePairingPrompt } from "./RemotePairingPrompt";
 import type { RemoteController } from './useRemoteController';
 export function RemoteHostWork({ model }: {
   model: RemoteController;
@@ -58,6 +59,8 @@ export function RemoteHostWork({ model }: {
       <summary>{t("remoteWork.details")}</summary>
       <pre>{failure?.raw ?? (ownOperation?.state === "failed" ? ownOperation.message : null) ?? blockers.map((blocker) => blocker.code).join("\n")}</pre>
     </details> : null} />
+
+    <RemotePairingPrompt model={model} />
 
     {/* 進行中／失敗都原地取代按鈕。因與果同一格。 */}
     {ownOperation?.state === "completed" && convergePairingSuggested(ownOperation.result) ? (<Notice tone="info" acts={<Btn mini soft onClick={() => pairChatGpt()} disabled={busy !== null || Boolean(chatgptLogin) || !pairings.some((row) => row.isDesktopDefault)}>

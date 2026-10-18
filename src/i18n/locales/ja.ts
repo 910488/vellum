@@ -803,6 +803,7 @@ const ja: ResourceTree = {
       "grokAbsent": "未設定",
       "pairingHint": "デスクトップで選択したアカウントだけでログインしてください：",
       "optionalAfterDeploy": "利用可能なモデルでデプロイが完了しました。このホストで ChatGPT を使うには、現在デスクトップで選択したアカウントをペアリングし、再デプロイしてください。",
+      "pendingPairing": "Desktop のアカウント {{count}} 件がこのホストでまだ認可されていません。", "pendingPairingOne": "{{who}} はこのホストでまだ認可されていません。",
       "pairingRemaining": "残り {{remaining}} 件",
       "pairingActive": "このホストで使用中",
       "pairingPaired": "ペアリング済み・未使用",

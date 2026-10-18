@@ -579,7 +579,8 @@ describe("Remote Manager operations UI", () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "授權到遠端" }));
+    // 工作面下的提示與帳號卡各有一顆；按最上面那顆，碼就要出現在同一處。
+    fireEvent.click((await screen.findAllByRole("button", { name: "授權到遠端" }))[0]!);
     await waitFor(() => expect(apiMocks.startRemoteCodexAccountLogin)
       .toHaveBeenCalledWith("jetson", "acct-windows"));
     expect(open).toHaveBeenCalledWith(
@@ -667,7 +668,7 @@ describe("Remote Manager operations UI", () => {
     vi.spyOn(window, "open").mockImplementation(() => null);
     renderRemote();
 
-    fireEvent.click(await screen.findByRole("button", { name: "配對桌面端全部 ChatGPT 帳號" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "配對桌面端全部 ChatGPT 帳號" }))[0]!);
 
     // 已配對的 acct-a 不會被排進去，只有 b 和 c。
     await waitFor(() => expect(apiMocks.startRemoteCodexAccountLogin)

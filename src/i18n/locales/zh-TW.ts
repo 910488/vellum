@@ -858,6 +858,7 @@ const zhTW: ResourceTree = {
       "grokAbsent": "未設定",
       "pairingHint": "請使用桌面端選定的帳號登入：",
       "optionalAfterDeploy": "已使用可用模型完成部署。要在這台使用 ChatGPT？請配對桌面端目前選定的帳號，再重新部署。",
+      "pendingPairing": "有 {{count}} 個桌面端帳號還沒在這台主機授權。", "pendingPairingOne": "{{who}} 還沒在這台主機授權。",
       "pairingRemaining": "還剩 {{remaining}} 個",
       "pairingActive": "這台主機正在使用",
       "pairingPaired": "已配對，未使用",
