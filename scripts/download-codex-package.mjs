@@ -4,6 +4,15 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// CI runners share IPs, so the anonymous 60/hour API limit returns 403 there.
+// The token is only sent to api.github.com, never to the asset download.
+function githubApiHeaders(env = process.env) {
+  const headers = { "User-Agent": "vellum-remote-package", Accept: "application/vnd.github+json" };
+  const token = env.GITHUB_TOKEN || env.GH_TOKEN;
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 export async function downloadCodexPackage(version, target, destination, fetcher = fetch) {
   if (!/^[0-9][0-9A-Za-z.+-]{0,79}$/.test(version)
     || !/^(x86_64|aarch64)-(unknown-linux-musl|apple-darwin)$/.test(target)) {
@@ -12,7 +21,7 @@ export async function downloadCodexPackage(version, target, destination, fetcher
   const tag = `rust-v${version}`;
   const name = `codex-package-${target}.tar.gz`;
   const response = await fetcher(`https://api.github.com/repos/openai/codex/releases/tags/${tag}`, {
-    headers: { "User-Agent": "vellum-remote-package", Accept: "application/vnd.github+json" },
+    headers: githubApiHeaders(),
     signal: AbortSignal.timeout(300_000),
   });
   if (!response.ok) throw new Error(`Codex release lookup failed: ${response.status}`);

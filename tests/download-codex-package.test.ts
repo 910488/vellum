@@ -42,4 +42,31 @@ describe("official Codex runtime package downloads", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("authenticates only the API lookup when CI provides a token", async () => {
+    const root = mkdtempSync(join(tmpdir(), "vellum-codex-package-"));
+    const previous = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+      const version = "0.147.0-alpha.6.6";
+      const target = "aarch64-apple-darwin";
+      const name = `codex-package-${target}.tar.gz`;
+      const url = `https://github.com/openai/codex/releases/download/rust-v${version}/${name}`;
+      const bytes = Buffer.from("archive");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const release = { tag_name: `rust-v${version}`, assets: [{ name, browser_download_url: url, digest: `sha256:${sha256}` }] };
+      const calls = [];
+      const fetcher = async (request, init) => {
+        calls.push(init?.headers ?? {});
+        return calls.length === 1 ? Response.json(release) : new Response(bytes);
+      };
+      await downloadCodexPackage(version, target, join(root, "pkg.tar.gz"), fetcher);
+      expect(calls[0].Authorization).toBe("Bearer test-token");
+      expect(calls[1].Authorization).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

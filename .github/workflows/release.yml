@@ -219,6 +219,8 @@ jobs:
         with:
           node-version: 22
       - name: Build Linux remote payloads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/build-local-release.sh stage-only
       - uses: actions/upload-artifact@v4
         with:
@@ -251,6 +253,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - name: Build Darwin remote payload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/stage-remote-darwin-payload.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -378,6 +382,8 @@ jobs:
         with:
           node-version: 22
       - name: Build Linux remote payloads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/build-local-release.sh stage-only
       - name: Pack architecture set
         run: |

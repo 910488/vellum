@@ -56,6 +56,8 @@ jobs:
           node-version: 22
 
       - name: Build Linux deployment payloads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/build-local-release.sh stage-only
 
       - name: Upload embedded payload
@@ -92,6 +94,8 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Build Darwin remote payload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/stage-remote-darwin-payload.sh
 
       - name: Upload Darwin payload
