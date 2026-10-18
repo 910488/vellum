@@ -1502,7 +1502,8 @@ async fn prepare_quota_handoff(
     if allow_retry {
         match runtime.hydrate_official_socket_handoff(plan, &request.body) {
             Ok(body) => request.body = body,
-            Err(_) => {
+            Err(error) => {
+                log::warn!("[QuotaPool] event=retry_declined stage=hydrate_before_selection reason={} chained={} request={}", error.category(), request.body.get("previous_response_id").is_some(), request.metadata.request_id);
                 let _ = runtime
                     .prepare_websocket_quota_retry(plan, request, reset_at, false)
                     .await;
@@ -1515,15 +1516,30 @@ async fn prepare_quota_handoff(
         .await
     {
         Ok(Some(next)) if allow_retry => next,
-        Ok(_) => return None,
+        Ok(_) => {
+            log::info!("[QuotaPool] event=retry_declined stage=handoff reason=no_replacement allow_retry={allow_retry} request={}", request.metadata.request_id);
+            return None;
+        }
         Err(error) => {
-            log::warn!("[QuotaPool] socket retry unavailable: {}", error.category());
+            log::warn!(
+                "[QuotaPool] event=retry_declined stage=prepare_replacement reason={} request={}",
+                error.category(),
+                request.metadata.request_id
+            );
             return None;
         }
     };
-    request.body = runtime
-        .hydrate_official_socket_handoff(&next, &request.body)
-        .ok()?;
+    request.body = match runtime.hydrate_official_socket_handoff(&next, &request.body) {
+        Ok(body) => body,
+        Err(error) => {
+            log::warn!(
+                "[QuotaPool] event=retry_declined stage=hydrate_replacement reason={} request={}",
+                error.category(),
+                request.metadata.request_id
+            );
+            return None;
+        }
+    };
     request.body["type"] = json!("response.create");
     request.metadata.official_socket_affinity = None;
     Some(next)
@@ -1544,13 +1560,28 @@ async fn prepare_quota_retry<S: ProxyRuntimeState>(
     if official_websocket_failure_category(&failed) != "provider_quota" {
         return None;
     }
-    let segment = official.as_mut()?;
-    let turn = segment.pending.front_mut()?;
-    let plan = turn.plan.as_mut()?;
+    let Some(segment) = official.as_mut() else {
+        log::info!("[QuotaPool] event=retry_declined stage=frame reason=no_official_segment connection={connection_id}");
+        return None;
+    };
+    let Some(turn) = segment.pending.front_mut() else {
+        log::info!("[QuotaPool] event=retry_declined stage=frame reason=no_pending_turn connection={connection_id}");
+        return None;
+    };
+    let Some(plan) = turn.plan.as_mut() else {
+        log::info!("[QuotaPool] event=retry_declined stage=frame reason=no_pending_plan connection={connection_id}");
+        return None;
+    };
     let allow_retry = !turn.quota_retried
         && turn.first_downstream_ms.is_none()
         && !turn.recorded
         && !turn.cancel_rx.as_ref().is_some_and(|rx| *rx.borrow());
+    log::info!("[QuotaPool] event=retry_evaluate stage=frame allow_retry={allow_retry} chained={} connection={connection_id} request={}", turn.request.get("previous_response_id").is_some(), turn.request_id);
+    if !allow_retry {
+        log::info!("[QuotaPool] event=retry_declined stage=eligibility allow_retry=false quota_retried={} first_downstream={:?} recorded={} cancel={} connection={connection_id} request={}",
+            turn.quota_retried, turn.first_downstream_ms, turn.recorded,
+            turn.cancel_rx.as_ref().is_some_and(|rx| *rx.borrow()), turn.request_id);
+    }
     let mut request = runtime_request_from_body(state, headers, &turn.request, connection_id);
     request.metadata = plan.request_metadata.clone();
     let next = prepare_quota_handoff(
@@ -1563,7 +1594,10 @@ async fn prepare_quota_retry<S: ProxyRuntimeState>(
     .await?;
     segment.quota_exhausted = true;
     log::info!("[QuotaPool] retrying pre-output Official quota failure on another socket connection={connection_id}");
-    let turn = segment.pending.pop_front()?;
+    let turn = segment
+        .pending
+        .pop_front()
+        .expect("pending turn retained during handoff planning");
     Some(DeferredOfficialTurn {
         plan: next,
         request: request.body.clone(),
@@ -4658,7 +4692,22 @@ mod tests {
         run_pool_quota_retry("no_fit").await;
     }
 
+    #[tokio::test]
+    async fn pooled_quota_retries_long_chained_active_turn_on_other_socket() {
+        run_pool_quota_retry("long_continuation").await;
+    }
+
+    #[tokio::test]
+    async fn pooled_quota_with_missing_history_marks_exhausted_and_forwards_error() {
+        run_pool_quota_retry("missing_history").await;
+    }
+
     async fn run_pool_quota_retry(mode: &'static str) {
+        let continuation_turns = match mode {
+            "long_continuation" => 40,
+            "continuation" => 1,
+            _ => 0,
+        };
         use crate::config::ProxyRuntimeIdentity;
         use crate::credentials::{CredentialProvider, MemoryCredentialProvider};
         use crate::diagnostics::RuntimeDiagnostics;
@@ -4763,10 +4812,10 @@ mod tests {
                         if mode == "after_output" {
                             socket.send(AxumWsMessage::Text(json!({"type":"response.output_text.delta", "delta":"started"}).to_string().into())).await.unwrap();
                         }
-                        let event = if mode == "continuation" && attempt == 1 {
-                            json!({"type":"response.completed", "response":{"id":"resp_before_quota", "status":"completed",
+                        let event = if attempt <= continuation_turns {
+                            json!({"type":"response.completed", "response":{"id":format!("resp_before_quota_{attempt}"), "status":"completed",
                                 "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"prior answer"}]}]}})
-                        } else if account == "account-b" && matches!(mode, "success" | "handshake" | "continuation") {
+                        } else if account == "account-b" && matches!(mode, "success" | "handshake" | "continuation" | "long_continuation") {
                             json!({"type":"response.completed", "response":{"id":"resp_retry", "status":"completed", "output":[]}})
                         } else {
                             json!({"type":"error", "status":429, "error":{"type":"usage_limit_reached", "code":"usage_limit_reached", "message":"The usage limit has been reached", "resets_at":1_900_000_000_u64}})
@@ -4816,11 +4865,19 @@ mod tests {
                 .unwrap();
         let mut request = json!({"type":"response.create", "model":"vellum-official",
             "input":[{"role":"user","content":"same turn"}], "stream":true,
+            "client_metadata":{"x-codex-turn-metadata":{"session_id":"quota-retry", "thread_id":"long-thread", "root_turn_id":"running-root"}},
             "tools":[{"type":"function", "name":"test_tool", "parameters":{"type":"object"}}]
         });
-        if mode == "continuation" {
+        if mode == "missing_history" {
+            request["previous_response_id"] = json!("resp_not_in_local_history");
+        }
+        for n in 1..=continuation_turns {
             let mut first = request.clone();
-            first["input"][0]["content"] = json!("prior question");
+            first["input"][0]["content"] = if mode == "long_continuation" && n == 1 {
+                json!(format!("prior question {}", "x".repeat(900_000)))
+            } else {
+                json!("prior question")
+            };
             client
                 .send(TungsteniteMessage::Text(first.to_string().into()))
                 .await
@@ -4832,9 +4889,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 websocket_event(&frame).unwrap()["response"]["id"],
-                "resp_before_quota"
+                format!("resp_before_quota_{n}")
             );
-            request["previous_response_id"] = json!("resp_before_quota");
+            request["previous_response_id"] = json!(format!("resp_before_quota_{n}"));
         }
         client
             .send(TungsteniteMessage::Text(request.to_string().into()))
@@ -4857,7 +4914,10 @@ mod tests {
                 }
             }
         }
-        let retries = matches!(mode, "success" | "twice" | "handshake" | "continuation");
+        let retries = matches!(
+            mode,
+            "success" | "twice" | "handshake" | "continuation" | "long_continuation"
+        );
         assert_eq!(
             *accounts.lock().unwrap(),
             if retries {
@@ -4869,8 +4929,8 @@ mod tests {
         let frames = frames.lock().unwrap().clone();
         assert_eq!(
             frames.len(),
-            if mode == "continuation" {
-                3
+            if continuation_turns > 0 {
+                continuation_turns + 2
             } else if matches!(mode, "success" | "twice") {
                 2
             } else {
@@ -4880,18 +4940,25 @@ mod tests {
         if frames.len() == 2 {
             assert_eq!(frames[0]["input"], frames[1]["input"]);
         }
-        if mode == "continuation" {
-            let replay = &frames[2];
+        if continuation_turns > 0 {
+            let replay = frames.last().unwrap();
             assert!(replay.get("previous_response_id").is_none());
             let text = replay["input"].to_string();
             for expected in ["prior question", "prior answer", "same turn"] {
                 assert!(text.contains(expected), "{text}");
             }
+            assert!(replay["input"].as_array().unwrap().len() >= continuation_turns * 2 + 1);
+            if mode == "long_continuation" {
+                assert!(text.len() > 900_000);
+            }
         }
         assert_eq!(received.len(), if mode == "after_output" { 2 } else { 1 });
         assert_eq!(
             received.last().unwrap()["type"],
-            if matches!(mode, "success" | "handshake" | "continuation") {
+            if matches!(
+                mode,
+                "success" | "handshake" | "continuation" | "long_continuation"
+            ) {
                 "response.completed"
             } else {
                 "error"
@@ -4899,7 +4966,10 @@ mod tests {
         );
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls.len(), if mode == "twice" { 2 } else { 1 });
-        assert_eq!(calls[0].1, mode != "after_output");
+        assert_eq!(
+            calls[0].1,
+            !matches!(mode, "after_output" | "missing_history")
+        );
         if mode == "twice" {
             assert!(!calls[1].1, "second 429 must not retry");
         }

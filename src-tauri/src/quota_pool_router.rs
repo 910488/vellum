@@ -677,8 +677,11 @@ impl SmartRouter {
         );
         let candidates = candidates.iter().enumerate().map(|(i,c)| {
             let id=format!("{:x}",Sha256::digest(c.account_id.as_bytes()));
-            format!("account={} headroom={:.3} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} external_week_est={:.3} external_five_est={:.3} L={:.3} f={:.3} u={:.3}",
-                &id[..12],c.weekly_headroom.unwrap_or(c.headroom),c.weekly_used,fair[i].1,
+            let headroom = if reason == "socket_account_affinity" && c.weekly_used.is_none() {
+                "unknown(affinity_only)".into()
+            } else { format!("{:.3}", c.weekly_headroom.unwrap_or(c.headroom)) };
+            format!("account={} headroom={} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} external_week_est={:.3} external_five_est={:.3} L={:.3} f={:.3} u={:.3}",
+                &id[..12],headroom,c.weekly_used,fair[i].1,
                 if fair[i].2 {"measured"} else {"prior"},c.five_hour_used,
                 self.five_calibration.get(&c.account_id).and_then(|c|c.tokens_per_point).unwrap_or(fair[i].1*FIVE_HOUR_CAPACITY_RATIO),
                 if self.five_calibration.get(&c.account_id).is_some_and(|c|c.tokens_per_point.is_some()) {"measured"} else {"prior"},self.calibration.get(&c.account_id).map_or(0.0, |c| c.external_points),self.five_calibration.get(&c.account_id).map_or(0.0, |c| c.external_points),loads[i],fair[i].0,loads[i]/fair[i].0)
