@@ -429,7 +429,10 @@ pub(crate) fn codex_turn_refusal(
 /// every turn ran on Official Codex. So the Enhanced path waits for the bridge
 /// belonging to *this* launch id to attest that it is ready, and reports
 /// `EnhancedDesktopBridgeNotObserved` if it never does.
-async fn shared_restart_codex(state: &AppState, force: bool) -> AppResult<ManagedRestart> {
+pub(crate) async fn shared_restart_codex(
+    state: &AppState,
+    force: bool,
+) -> AppResult<ManagedRestart> {
     let mut slot = CODEX_RESTART_FLIGHT.lock().await;
     let mut rx = if let Some(rx) = slot.as_ref() {
         rx.clone()
