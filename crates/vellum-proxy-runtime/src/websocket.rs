@@ -4948,7 +4948,7 @@ mod tests {
             for expected in ["prior question", "prior answer", "same turn"] {
                 assert!(text.contains(expected), "{text}");
             }
-            assert!(replay["input"].as_array().unwrap().len() >= continuation_turns * 2 + 1);
+            assert!(replay["input"].as_array().unwrap().len() > continuation_turns * 2);
             if mode == "long_continuation" {
                 assert!(text.len() > 900_000);
             }
