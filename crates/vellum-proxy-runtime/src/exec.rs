@@ -2564,9 +2564,11 @@ impl ProxyRuntime {
         allow_retry: bool,
     ) -> Result<Option<OfficialWebSocketPlan>, RuntimeError> {
         if request.metadata.review_official_account_id.is_some() || plan.managed_auth.is_none() {
+            log::info!("[QuotaPool] event=retry_declined stage=runtime reason=explicit_billing_or_unmanaged explicit_billing={} managed={} request={}", request.metadata.review_official_account_id.is_some(), plan.managed_auth.is_some(), request.metadata.request_id);
             return Ok(None);
         }
         let Some(account_hash) = plan.execution_account_hash.as_deref() else {
+            log::info!("[QuotaPool] event=retry_declined stage=runtime reason=no_execution_account request={}", request.metadata.request_id);
             return Ok(None);
         };
         let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref());
@@ -2589,6 +2591,7 @@ impl ProxyRuntime {
             .await
             .map_err(RuntimeError::AuthenticationFailed)?
         else {
+            log::info!("[QuotaPool] event=retry_declined stage=runtime reason=auth_provider_declined allow_retry={allow_retry} account={account_hash} request={}", request.metadata.request_id);
             return Ok(None);
         };
         let auth = ResolvedAuth::OfficialManaged {
@@ -2608,7 +2611,14 @@ impl ProxyRuntime {
             {
                 Ok(Some(next))
             }
-            _ => Ok(None),
+            WebSocketTurnDispatch::OfficialNative(next) => {
+                log::info!("[QuotaPool] event=retry_declined stage=runtime reason=account_or_route_unchanged from={:?} to={:?} same_route={} request={}", plan.execution_account_hash, next.execution_account_hash, next.route_id == plan.route_id, request.metadata.request_id);
+                Ok(None)
+            }
+            WebSocketTurnDispatch::PortableReplay { .. } => {
+                log::info!("[QuotaPool] event=retry_declined stage=runtime reason=replacement_not_native request={}", request.metadata.request_id);
+                Ok(None)
+            }
         }
     }
 
