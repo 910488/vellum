@@ -1,6 +1,6 @@
 [package]
 name = "vellum"
-version = "0.2.9"
+version = "0.2.10"
 description = "Vellum — 本機代理管理器"
 authors = ["Josh Huang"]
 license = "Apache-2.0"
