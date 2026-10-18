@@ -1594,10 +1594,11 @@ async fn prepare_quota_retry<S: ProxyRuntimeState>(
     .await?;
     segment.quota_exhausted = true;
     log::info!("[QuotaPool] retrying pre-output Official quota failure on another socket connection={connection_id}");
-    let turn = segment
-        .pending
-        .pop_front()
-        .expect("pending turn retained during handoff planning");
+    // A panic here aborts the whole Desktop process; decline instead.
+    let Some(turn) = segment.pending.pop_front() else {
+        log::warn!("[QuotaPool] event=retry_declined stage=frame reason=pending_turn_vanished connection={connection_id}");
+        return None;
+    };
     Some(DeferredOfficialTurn {
         plan: next,
         request: request.body.clone(),
