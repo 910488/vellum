@@ -305,6 +305,11 @@ function installFixture(getScene: () => Scene) {
             ];
       // 帳號配對：五種狀態各一列，因為這張卡的排版問題只有在
       // 「已啟用／已配對／未配對／讀不到」同時出現時才看得出來。
+      // 按「授權到遠端」之後的配對碼。輪詢一直停在 pairingPending，碼才不會一閃就消失。
+      case "start_remote_codex_account_login":
+        return { loginId: "login-preview", verificationUrl: "https://auth.openai.com/codex/device", userCode: "VLM4-7QXZ", expectedAccountId: "acct-9b04c8" };
+      case "poll_remote_codex_account_login":
+        return { state: "pairingPending" };
       case "list_remote_codex_account_pairings":
         return scene === "fresh"
           ? []

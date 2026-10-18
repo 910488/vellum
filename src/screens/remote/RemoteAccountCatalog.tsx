@@ -11,24 +11,14 @@ export function RemoteAccountCatalog({ model }: {
     busy,
     chatgptLogin,
     pairings,
-    pairQueueLength,
     pairChatGpt,
     pairAllChatGptAccounts,
-    skipPairing,
   } = model;
   return <>{modelObservation && modelObservation.hostId === selectedHostId && modelObservation.models.some((model) => model.mandatory && model.selected) ? <Card>
     <div className="rowline">
       <Cap>{t("remote.account.title")}</Cap>
       <span className="rows__hint">{t("remote.account.catalogHint")}</span>
     </div>
-    {chatgptLogin ? (<Notice acts={pairQueueLength || chatgptLogin ? (<Btn mini soft onClick={skipPairing} disabled={busy !== null}>{t("remote.act.chatgptPairSkip")}</Btn>) : null}>
-      {t("remote.account.pairingHint")}
-      {" "}
-      <a href={chatgptLogin.verificationUrl} target="_blank" rel="noreferrer">{chatgptLogin.verificationUrl}</a>
-      {" · "}
-      <strong>{chatgptLogin.userCode}</strong>
-      {pairQueueLength ? <> · {t("remote.account.pairingRemaining", { remaining: pairQueueLength })}</> : null}
-    </Notice>) : null}
     {pairings.length ? (<div className="accounts">
       {pairings.map((row, index) => (<div className="accounts__row" key={row.accountId}>
         <span className="accounts__who">

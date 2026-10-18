@@ -803,6 +803,7 @@ const zhCN: ResourceTree = {
       "grokAbsent": "未配置",
       "pairingHint": "请使用桌面端选定的账号登录：",
       "optionalAfterDeploy": "已使用可用模型完成部署。要在这台使用 ChatGPT？请配对桌面端当前选定的账号，再重新部署。",
+      "pendingPairing": "有 {{count}} 个桌面端账号还没在这台主机授权。", "pendingPairingOne": "{{who}} 还没在这台主机授权。",
       "pairingRemaining": "还剩 {{remaining}} 个",
       "pairingActive": "这台主机正在使用",
       "pairingPaired": "已配对，未使用",

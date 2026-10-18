@@ -834,6 +834,7 @@ const en: ResourceTree = {
       "grokAbsent": "Not set up",
       "pairingHint": "Sign in with the account selected on the desktop, and only that one:",
       "optionalAfterDeploy": "Deployment is ready using the available models. To use ChatGPT on this host, pair the account currently selected on Desktop, then redeploy.",
+      "pendingPairing": "{{count}} Desktop accounts are not authorized on this host yet.", "pendingPairingOne": "{{who}} is not authorized on this host yet.",
       "pairingRemaining": "{{remaining}} more to go",
       "pairingActive": "in use on this host",
       "pairingPaired": "paired, not in use",
