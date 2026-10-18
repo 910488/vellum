@@ -2933,7 +2933,7 @@ impl ProxyRuntime {
         request: RuntimeRequest,
         execution_id: &str,
     ) -> Result<RuntimeResponse, RuntimeError> {
-        let _lifecycle_guard = self.begin_lifecycle()?;
+        let lifecycle_guard = self.begin_lifecycle()?;
         let (cancel_guard, cancel_rx) = self.register_request_cancel(execution_id);
         let snapshot = RuntimeSnapshot::capture_from(self.catalog.as_ref())
             .with_web_search_enabled(self.web_search_wrapper_enabled)
@@ -3022,10 +3022,15 @@ impl ProxyRuntime {
             "proxy request completed"
         );
         match result {
+            // The lifecycle guard rides inside the stream too. Headers arrive
+            // long before the model finishes, and `active_requests` reaching
+            // zero at headers let a scheduled update restart kill a turn that
+            // was still streaming.
             Ok(RuntimeResponse::Sse(stream)) => Ok(RuntimeResponse::Sse(take_until_cancel(
                 stream,
                 cancel_rx,
                 cancel_guard,
+                lifecycle_guard,
             ))),
             // Buffered responses and errors are already terminal here: letting
             // `cancel_guard` drop at the end of this function releases the
@@ -8561,6 +8566,7 @@ fn take_until_cancel(
     stream: BoxStream<'static, Result<Bytes, RuntimeError>>,
     cancel: watch::Receiver<bool>,
     guard: CancelRegistration,
+    lifecycle: RequestGuard,
 ) -> BoxStream<'static, Result<Bytes, RuntimeError>> {
     let mut cancel = cancel;
     let cancel_future = async move {
@@ -8573,6 +8579,7 @@ fn take_until_cancel(
     GuardedCancelStream {
         inner,
         _guard: guard,
+        _lifecycle: lifecycle,
     }
     .boxed()
 }
@@ -8580,6 +8587,8 @@ fn take_until_cancel(
 struct GuardedCancelStream {
     inner: BoxStream<'static, Result<Bytes, RuntimeError>>,
     _guard: CancelRegistration,
+    /// Counts the stream as an active request until it ends or is dropped.
+    _lifecycle: RequestGuard,
 }
 
 impl futures_util::Stream for GuardedCancelStream {
@@ -16958,6 +16967,25 @@ mod tests {
         runtime.cancel_request("solo-1");
         assert!(runtime.is_request_cancelled("solo-1"));
         assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn a_returned_sse_stream_still_counts_as_an_active_request() {
+        // Regression: the lifecycle guard used to drop when `execute()`
+        // returned the stream at upstream headers, so `active_requests` hit
+        // zero mid-stream and a scheduled update restart killed the turn.
+        let runtime = cancel_runtime();
+        let lifecycle = crate::lifecycle::CountingRequestLifecycle::new();
+        let (cancel_guard, rx) = runtime.register_request_cancel("streaming-1");
+        let stream = take_until_cancel(
+            futures_util::stream::pending().boxed(),
+            rx,
+            cancel_guard,
+            crate::lifecycle::RequestLifecycle::begin(&lifecycle).unwrap(),
+        );
+        assert_eq!(lifecycle.active_count(), 1);
+        drop(stream);
+        assert_eq!(lifecycle.active_count(), 0);
     }
 
     #[test]
