@@ -6,6 +6,7 @@ pub mod adapter;
 pub mod boot;
 pub mod budget;
 pub mod catalog;
+pub mod claude_code;
 pub mod codex;
 mod codex_restart;
 pub mod codex_oauth;
@@ -100,6 +101,9 @@ pub(crate) async fn shutdown_for_exit(
     state: &AppState,
     apply_desktop_update: bool,
 ) -> Option<error::AppResult<crate::updates::UpdateOperation>> {
+    if let Err(error) = state.claude_code().stop(true).await {
+        log::error!("[ClaudeCode] exit-time restore failed: {error}");
+    }
     if let Err(error) = crate::commands::proxy::stop_proxy_gracefully(state).await {
         log::error!("[Codex] 結束前還原 Proxy/Enhanced 啟動接管失敗：{error}");
     }
@@ -262,6 +266,17 @@ pub fn run() {
         })
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
+            commands::claude_code_status,
+            commands::claude_code_prepare_certificate,
+            commands::claude_code_trust_certificate,
+            commands::claude_code_restore_trust,
+            commands::claude_code_start,
+            commands::claude_code_stop,
+            commands::claude_code_select_account,
+            commands::claude_code_begin_login,
+            commands::claude_code_cancel_login,
+            commands::claude_code_remove_account,
+            commands::claude_code_refresh_usage,
             commands::get_overview,
             commands::get_provider_overviews,
             commands::get_request_log,

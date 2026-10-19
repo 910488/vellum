@@ -18,6 +18,7 @@ import { getLocalePreference, setLocalePreference } from "@/i18n";
 import { APP_LOCALES, type LocalePreference } from "@/i18n/locale";
 import { api } from "@/lib/api";
 import { Models } from "@/screens/Models";
+import { claudeCodeApi } from "@/lib/claudeCode";
 import type { QuotaPoolSettings, QuotaPoolStatus, QuotaSnapshot } from "@/types";
 
 import "@/styles/tokens.css";
@@ -25,6 +26,23 @@ import "@/styles/base.css";
 import "@/styles/components.css";
 
 const ACCOUNT = "acct_01HZX9K3QW";
+
+// Display-only local fixture; never opens OAuth or accesses real credentials.
+claudeCodeApi.status = async () => ({
+  running: false, project: null, port: null, settingsMatch: false,
+  recoveryRequired: false, notice: null,
+  trust: { supported: true, sha256: null, trusted: false, managed: false, recoveryRequired: false },
+  routing: { activeRequests: 0, desktopRequests: 0, records: [] },
+  accounts: {
+    selected: "claude-preview-a", loginPending: false, loginError: null,
+    accounts: [
+      { id: "claude-preview-a", label: "claude.personal@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
+        usage: { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null } } },
+      { id: "claude-preview-b", label: "claude.work@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
+        usage: { observedAt: 1, fiveHour: { utilization: 8, resetsAt: null }, sevenDay: { utilization: 41, resetsAt: null } } },
+    ],
+  },
+});
 
 /* 額度池要看的是「好幾個帳號擺在一起」的樣子，所以池的場景另外給一組
    帳號：一個週額度很鬆、一個 5 小時見底但週還有、一個已經到閘門。

@@ -563,6 +563,7 @@ export function App() {
           {mountedScreens.has("models") ? (
             <div className="screen-slot" hidden={screen !== "models"}>
             <Models
+              active={screen === "models"}
               onChanged={() => void refresh()}
               refreshVersion={refreshVersions.models ?? 0}
               onRefreshComplete={pageRefreshComplete}

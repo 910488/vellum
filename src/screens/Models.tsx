@@ -2,6 +2,7 @@ import { useLocaleFormat } from "@/i18n/useLocaleFormat";
 import { useTranslation } from "react-i18next";
 import { operationalErrorKey } from "@/lib/operationalError";
 import { Notice } from "@/components/ui";
+import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
 /**
  * 模型 —— 換 Codex 用的模型，以及加供應商。
  *
@@ -370,10 +371,12 @@ function ResetLedger({
 }
 
 export function Models({
+  active = true,
   onChanged,
   refreshVersion,
   onRefreshComplete,
 }: {
+  active?: boolean;
   onChanged: () => void;
   refreshVersion: number;
   onRefreshComplete: (version: number) => void;
@@ -2044,6 +2047,8 @@ export function Models({
           onCancel={() => setPoolRulesOpen(false)}
         />
       </Card>
+
+      <ClaudeCodeCard active={active} />
 
       {grokRoute ? (
         <Card>

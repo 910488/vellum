@@ -44,6 +44,7 @@ pub struct AppState {
     eval_mode: bool,
     codex_oauth: Arc<crate::codex_oauth::CodexOAuthManager>,
     grok_accounts: Arc<crate::grok_accounts::GrokAccountManager>,
+    claude_code: Arc<crate::claude_code::CodeManager>,
     /// 額度服務獨立持有，用 Arc 包起來——async 指令可 clone 一份搬進
     /// `spawn_blocking`，不卡 Mutex 也不卡 Tauri State 的生命週期。
     /// QuotaService 內部自己用 Mutex 保護快取，所以 Arc 就夠。
@@ -271,6 +272,7 @@ impl AppState {
             eval_mode: false,
             codex_oauth: Arc::new(crate::codex_oauth::CodexOAuthManager::new(root.clone())),
             grok_accounts: Arc::new(crate::grok_accounts::GrokAccountManager::new(root.clone())),
+            claude_code: crate::claude_code::CodeManager::new(root.clone()),
             quota: Arc::new(QuotaService::with_grok(root)),
             usage: Arc::new(usage),
             history: Arc::new(history),
@@ -1608,6 +1610,10 @@ impl AppState {
 
     pub fn data_root(&self) -> PathBuf {
         self.data_root.clone()
+    }
+
+    pub fn claude_code(&self) -> Arc<crate::claude_code::CodeManager> {
+        self.claude_code.clone()
     }
 
     pub fn codex_oauth(&self) -> Arc<crate::codex_oauth::CodexOAuthManager> {

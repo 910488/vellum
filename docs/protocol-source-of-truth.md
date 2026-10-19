@@ -29,6 +29,81 @@ Desktop, the headless daemon, or a bundled remote image belongs in
 
 ## Execution planes
 
+### Claude Desktop local Code
+
+Claude Desktop local Code is an independent, experimental native Anthropic
+Messages data plane. It does not participate in Codex execution-plane adoption,
+OpenAI wire conversion, portable replay, compaction, or provider recovery.
+Its shared transport lives in `crates/vellum-proxy-runtime/src/claude_code/`;
+the Desktop host owns OAuth, encrypted storage and project settings leases in
+`src-tauri/src/claude_code/`.
+
+- Scope is the selected project's **local Claude Desktop Code** sessions.
+  Chat, Cowork, SSH, WSL, cloud Code and standalone CLI account routing are
+  outside this contract. A standalone client sharing the project can traverse
+  the proxy, but retains its inbound authorization.
+- Desktop's control/login account A and its existing session files are never
+  rewritten. Separately authorized execution accounts supply only inference
+  authorization. No other account's conversation-list API is queried.
+- An authenticated loopback CONNECT proxy terminates TLS only for exactly
+  `api.anthropic.com:443`. Other public HTTPS destinations are raw tunnels;
+  private destinations and unauthenticated callers are refused. The generated
+  CA path is supplied through the project's `NODE_EXTRA_CA_CERTS`. Windows
+  additionally supports temporary CurrentUser ROOT trust only after explicit
+  approval bound to the reviewed SHA-256 fingerprint; never LocalMachine or an
+  automatic TLS-error fallback. Trust is journaled before insertion and tagged
+  with a random per-lease ownership property. If Windows reports a successful
+  CurrentUser Root insertion but the certificate is absent on reopening, the
+  manager first verifies that Windows retained the exact fingerprint in its
+  protected-root approval list (unknown formats fail closed), then may repair
+  only the same approved and owned DER through the existing
+  CurrentUser Root physical registry store, followed by ordinary Root and
+  journal verification. Stop restores only owned trust;
+  preexisting roots are preserved, ambiguous ownership requires manual repair,
+  and a crash leaves a visible recovery action even without a project lease.
+  Project configuration alone is not proof of actual Desktop trust.
+  The CA signing key is discarded after issuing its leaf;
+  the leaf private key is stored encrypted.
+- Only exact POST `/v1/messages` and `/v1/messages/count_tokens` paths are
+  execution routes. Query strings are preserved. A single native Code
+  User-Agent identifying `claude-desktop`, plus a supported session identity,
+  is required to use execution credentials. The User-Agent is a compatibility
+  gate, not OS process attestation; proxy authentication is the access boundary.
+- Non-inference traffic keeps its inbound authorization. An explicitly selected
+  A-to-A probe mode preserves it for inference too. A failed execution account
+  never silently falls back to A.
+- Each admitted inference snapshots one account. Manual selection affects the
+  next inference request, including requests in an existing session, not the
+  already-running stream or an entire multi-request agent turn atomically.
+- Request bytes, thinking signatures, tools, model and upstream SSE are
+  preserved. Gzip is decoded only in a bounded identity-inspection copy. No
+  cross-account history stripping, model conversion or automatic replay occurs.
+  HTTP failures and stream errors are preserved; ambiguous transport failures
+  are never replayed on another account.
+- Route diagnostics retain bounded identifiers, account attribution and
+  transport status only. `completed` means upstream transport completion,
+  not verified model success, subscription debit or tool success.
+- Settings diversion happens only after authenticated readiness. A durable
+  encrypted lease precedes publication. Restore merges only fields still
+  matching Vellum's applied values, preserving unrelated and externally edited
+  settings. Start/Stop are serialized. Stop closes admission before checking
+  in-flight work; an explicit immediate stop cancels it. A settings-restored
+  status does not imply an already-running Code process has reloaded its proxy.
+- OAuth refresh is serialized and journaled before dispatch so a possibly
+  consumed refresh token is not replayed after cancellation/crash. Credentials
+  and private keys never appear in frontend status or request diagnostics.
+  Account authorization is independent of active routing and requests only
+  profile/inference scopes. Its loopback callback prefers port 54545, with an
+  ephemeral-port fallback; the exact per-login redirect URI is used for both
+  authorization and code exchange. PKCE and state are validated per attempt.
+  Subscription utilization is separately fetched for execution accounts, with
+  its observation time; it is not inferred from per-request token counts.
+
+Cross-account thinking/tool compatibility, actual subscription attribution and
+Desktop's behavior when A is exhausted require live acceptance. Until those
+gates pass, automatic quota-driven cross-account retries are not enabled. See
+`docs/claude-desktop-code.md` for activation, recovery and acceptance steps.
+
 Vellum has two Desktop execution planes:
 
 1. **Native Codex** — the unmodified Codex process and its Official OpenAI

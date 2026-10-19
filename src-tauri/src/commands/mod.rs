@@ -5,6 +5,7 @@
 
 pub mod budget;
 pub mod codex_oauth;
+pub mod claude_code;
 pub mod grok_accounts;
 pub mod overview;
 pub mod probe;
@@ -19,6 +20,7 @@ pub mod web_search;
 // `generate_handler!` 兩者都要找得到。具名 re-export 只帶走函式，會編不過。
 pub use budget::*;
 pub use codex_oauth::*;
+pub use claude_code::*;
 pub use grok_accounts::*;
 pub use overview::*;
 pub use probe::*;

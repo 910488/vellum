@@ -21,6 +21,7 @@ pub mod adapter;
 pub mod auth;
 pub mod auto_continue;
 pub mod body;
+pub mod claude_code;
 pub mod codex_local_v0_150;
 pub mod codex_metadata;
 pub mod compaction;

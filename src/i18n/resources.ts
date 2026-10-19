@@ -2,6 +2,7 @@ import zhTW from "./locales/zh-TW";
 import zhCN from "./locales/zh-CN";
 import en from "./locales/en";
 import ja from "./locales/ja";
+import { claudeCodeMessages } from "./claudeCodeMessages";
 import type { AppLocale } from "./locale";
 
 export type ResourceTree = {
@@ -9,10 +10,10 @@ export type ResourceTree = {
 };
 
 export const resources = {
-  "zh-TW": { translation: zhTW },
-  "zh-CN": { translation: zhCN },
-  en: { translation: en },
-  ja: { translation: ja },
+  "zh-TW": { translation: { ...zhTW, claudeCode: claudeCodeMessages["zh-TW"] } },
+  "zh-CN": { translation: { ...zhCN, claudeCode: claudeCodeMessages["zh-CN"] } },
+  en: { translation: { ...en, claudeCode: claudeCodeMessages.en } },
+  ja: { translation: { ...ja, claudeCode: claudeCodeMessages.ja } },
 } as const satisfies Record<AppLocale, { translation: ResourceTree }>;
 
 export type TranslationResources = typeof resources;
