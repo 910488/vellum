@@ -20,7 +20,7 @@ use crate::grok_session::GrokSessionRegistry;
 use crate::history::HistoryStore;
 use crate::official_auth::{OfficialAuthDecision, OfficialAuthProvider};
 use crate::request::RuntimeRequest;
-use crate::route::{RuntimeAccessMode, RuntimeAuthKind, RuntimeModelRoute};
+use crate::route::{RuntimeAuthKind, RuntimeModelRoute};
 
 /// The authorization posture for one request, resolved once and then consumed
 /// by dispatch.
@@ -78,17 +78,19 @@ impl ResolvedAuth {
         history: Option<&dyn HistoryStore>,
     ) -> Result<Self, RuntimeError> {
         if route.effective_provider_profile().is_some() {
-            let mode = route
-                .effective_access_mode()
-                .unwrap_or(RuntimeAccessMode::Credentialed);
-            let stored = match (mode, route.credential_id.as_deref()) {
-                (RuntimeAccessMode::Credentialed, Some(id)) => credentials
+            if crate::opencode::is_free_tier_model(&route.upstream_model) {
+                return Err(RuntimeError::UnsupportedMode(
+                    crate::opencode::FREE_TIER_UNSUPPORTED.into(),
+                ));
+            }
+            let stored = match route.credential_id.as_deref() {
+                Some(id) => credentials
                     .get_secret(id)
                     .await
                     .map_err(RuntimeError::AuthenticationFailed)?,
-                _ => None,
+                None => None,
             };
-            let token = crate::opencode::authorization_token(mode, stored.as_deref())
+            let token = crate::opencode::authorization_token(stored.as_deref())
                 .map_err(RuntimeError::CredentialMissing)?;
             return Ok(Self::Bearer(token));
         }
@@ -361,6 +363,7 @@ async fn resolve_bearer_secret(
 mod tests {
     use super::*;
     use crate::credentials::MemoryCredentialProvider;
+    use crate::route::RuntimeAccessMode;
     use crate::environment::{
         ExecutionEnvironment, ExecutorCapability, RuntimeAmpersandSemantics, RuntimePathStyle,
         RuntimePlatform, RuntimeShellKind,
@@ -1167,18 +1170,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_zen_free_models_use_the_public_token_even_when_a_key_is_stored() {
+    async fn opencode_free_models_are_refused_even_when_a_key_is_stored() {
+        // A config written while Vellum offered the free tier still carries
+        // `anonymousFree`; it now loads as credentialed and the model is
+        // refused before any request leaves the proxy.
         let mut zen = route(RuntimeAuthKind::Bearer, Some("zen-key".into()));
         zen.base_url = crate::opencode::OPENCODE_ZEN_BASE_URL.into();
-        zen.upstream_model = "mimo-v2.5-free".into();
+        zen.upstream_model = "deepseek-v4.1-flash-free".into();
         zen.provider_profile = Some(crate::route::RuntimeProviderProfile::OpenCodeZen);
-        zen.access_mode = Some(RuntimeAccessMode::AnonymousFree);
+        zen.access_mode = serde_json::from_value(serde_json::json!("anonymousFree")).unwrap();
+        assert_eq!(zen.access_mode, Some(RuntimeAccessMode::Credentialed));
         let store = MemoryCredentialProvider::new();
         store.insert("zen-key", "sk-private");
-        let auth = ResolvedAuth::resolve(
+        let error = ResolvedAuth::resolve(
             &zen,
             &request_with_auth(
-                serde_json::json!({"model": "mimo-v2.5-free"}),
+                serde_json::json!({"model": "deepseek-v4.1-flash-free"}),
                 IncomingAuthContext::default(),
             ),
             &store,
@@ -1187,11 +1194,8 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
-        assert_eq!(
-            auth.upstream_headers("mimo-v2.5-free"),
-            vec![("authorization".to_string(), "Bearer public".to_string())]
-        );
+        .unwrap_err();
+        assert!(matches!(error, RuntimeError::UnsupportedMode(_)));
     }
 
     #[tokio::test]
@@ -1247,29 +1251,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_zen_models_are_not_guessed_free_from_a_suffix() {
-        let mut unknown = route(RuntimeAuthKind::Bearer, Some("zen-key".into()));
-        unknown.base_url = crate::opencode::OPENCODE_ZEN_BASE_URL.into();
-        unknown.upstream_model = "mystery-free".into();
-        let store = MemoryCredentialProvider::new();
-        store.insert("zen-key", "sk-private");
-        let auth = ResolvedAuth::resolve(
-            &unknown,
+    async fn opencode_models_without_a_key_fail_closed() {
+        let mut keyless = route(RuntimeAuthKind::Bearer, None);
+        keyless.base_url = crate::opencode::OPENCODE_ZEN_BASE_URL.into();
+        keyless.upstream_model = "glm-5.2".into();
+        let error = ResolvedAuth::resolve(
+            &keyless,
             &request_with_auth(
-                serde_json::json!({"model": "mystery-free"}),
+                serde_json::json!({"model": "glm-5.2"}),
                 IncomingAuthContext::default(),
             ),
-            &store,
+            &MemoryCredentialProvider::new(),
             &crate::official_auth::UnconfiguredOfficialAuthProvider,
             &GrokSessionRegistry::new(),
             None,
         )
         .await
-        .unwrap();
-        assert_eq!(
-            auth.upstream_headers("mystery-free"),
-            vec![("authorization".to_string(), "Bearer sk-private".to_string())]
-        );
+        .unwrap_err();
+        assert!(matches!(error, RuntimeError::CredentialMissing(_)));
     }
 
     #[tokio::test]

@@ -8,9 +8,9 @@
 //! during that first connection is trusted silently and permanently.
 //!
 //! This module gives Vellum its own known_hosts file
-//! (`<data_root>/remote/known_hosts`) that nothing but an explicit user
-//! confirmation can write to, plus a small JSON side-store recording *that a
-//! human confirmed a fingerprint*, independent of whatever bytes happen to be
+//! (`<data_root>/remote/known_hosts`) populated by explicit confirmation or
+//! exact reuse of the user's effective known_hosts, plus a JSON side-store
+//! recording the source of that trust, independent of whatever bytes happen to be
 //! in the known_hosts file. Trust decisions are keyed by the SSH-resolved
 //! `(hostname, port)` pair, never by an SSH config alias: two aliases can
 //! point at the same host on different ports, and one alias can silently
@@ -19,13 +19,9 @@
 //! falls out for free from keying on the resolved target instead of the
 //! alias string.
 //!
-//! There is no code path in this module that can produce a "trusted but
-//! never confirmed" record: the only way an entry enters the confirmation
-//! store is [`confirm_and_trust`], which re-derives the fingerprint from the
-//! host itself and stamps `confirmed_at` at write time. A record's mere
-//! presence in the store *is* the confirmation; there is no separate
-//! defaultable/nullable flag that could be constructed as `false` and later
-//! misread as `true`.
+//! Reuse requires a fresh scan and exact endpoint/type/key bytes. Revocation,
+//! CA-only entries and unreadable files do not auto-trust; changed keys refuse.
+//! User files are read only. Existing records default to explicit confirmation.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -43,6 +39,11 @@ use sha2::{Digest, Sha256};
 use crate::error::{AppError, AppResult};
 use crate::remote::process::background_command;
 use crate::state::AppState;
+
+#[path = "ssh_key_probe.rs"]
+mod key_probe;
+#[path = "ssh_user_trust.rs"]
+mod user_trust;
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const KEYSCAN_TIMEOUT_SECS: u64 = 10;
@@ -89,8 +90,7 @@ impl SshTarget {
     }
 }
 
-/// A host key a host is currently offering, captured via `ssh-keyscan`
-/// without connecting or authenticating and without trusting anything yet.
+/// A host key collected before authentication, without trusting it yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingHostFingerprint {
@@ -115,6 +115,8 @@ pub struct SshTrustStatus {
     pub host: String,
     pub port: u16,
     pub confirmed: bool,
+    pub source: Option<String>,
+    pub fingerprint: Option<PendingHostFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +127,11 @@ struct ConfirmedRecord {
     key_type: String,
     fingerprint: String,
     confirmed_at: DateTime<Utc>,
+    #[serde(default = "explicit_source")]
+    source: String,
+}
+fn explicit_source() -> String {
+    "explicitConfirmation".into()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -209,18 +216,37 @@ pub fn strict_host_key_args(data_root: &Path) -> Vec<String> {
         "-o".into(),
         "StrictHostKeyChecking=yes".into(),
         "-o".into(),
-        format!(
-            "UserKnownHostsFile={}",
-            known_hosts_path(data_root).display()
-        ),
+        known_hosts_option(&known_hosts_path(data_root)),
     ]
+}
+
+fn known_hosts_option(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    // ssh_config tokenization understands single quotes. They survive both
+    // Win32 and MSYS argv without Rust's Windows double-quote escaping.
+    let value = if value.chars().any(char::is_whitespace) || value.contains(['\'', '"']) {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        value
+    };
+    format!("UserKnownHostsFile={value}")
+}
+/// User HostKeyAlias is respected when consulting their trust, but Vellum's
+/// private store always pins the resolved endpoint (including its port).
+pub fn strict_host_key_args_for(data_root: &Path, target: &SshTarget) -> Vec<String> {
+    let mut args = strict_host_key_args(data_root);
+    args.extend([
+        "-o".into(),
+        format!("HostKeyAlias={}", target.known_hosts_pattern()),
+    ]);
+    args
 }
 
 /// Resolve an SSH config alias (or a bare `user@host`/`user@host:port`
 /// destination, which `ssh -G` also accepts) to the actual hostname/IP and
 /// port `ssh` will contact. Never trusts anything; this only reads config.
 pub fn resolve_ssh_target(destination: &str) -> AppResult<SshTarget> {
-    let output = background_command("ssh")
+    let output = super::ssh_added::command(&runtime_data_root(), destination)
         .args(["-G", "--", destination])
         .output()
         .map_err(|error| AppError::Message(format!("ssh -G unavailable: {error}")))?;
@@ -262,38 +288,21 @@ fn fingerprint_of(key_base64: &str) -> AppResult<String> {
     Ok(format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)))
 }
 
-/// Fetch every host key `target` currently offers via `ssh-keyscan`. This
-/// never connects/authenticates as a client and never writes anything --
-/// it only asks the host "what keys do you have", the same thing
-/// `ssh-keyscan` is designed to do without trusting the answer.
+/// Collect untrusted keys for a literal endpoint. Production callers retain
+/// their original SSH alias through key_probe::fetch. Windows uses SSH KEX,
+/// with authentication disabled and only disposable known_hosts writes.
 pub fn fetch_pending_fingerprints(target: &SshTarget) -> AppResult<Vec<PendingHostFingerprint>> {
-    let mut diagnostics = Vec::new();
-    for program in keyscan_programs() {
-        match run_keyscan(&program, target) {
-            Ok(output) => {
-                let results = parse_keyscan_output(target, &output.stdout);
-                if !results.is_empty() {
-                    return Ok(results);
-                }
-                diagnostics.push(keyscan_diagnostic(&program, &output));
-                // A keyscan process that started has already contacted the
-                // host. Do not immediately repeat the same network probe with
-                // another implementation: that used to double the pre-auth
-                // burst on Windows and could trigger fail2ban. The fallback
-                // below is only for a scanner that could not be launched.
-                break;
-            }
-            Err(error) => {
-                diagnostics.push(format!("{} could not start: {error}", program.display()))
-            }
-        }
-    }
-    Err(AppError::Message(format!(
-        "SSH host key scan failed for {}:{}; {}",
-        target.host,
-        target.port,
-        diagnostics.join("; ")
-    )))
+    let host = if target.host.contains(':') {
+        format!("[{}]", target.host)
+    } else {
+        target.host.clone()
+    };
+    key_probe::fetch(
+        &runtime_data_root(),
+        &format!("ssh://{host}:{}", target.port),
+        target,
+        cfg!(windows),
+    )
 }
 
 fn run_keyscan(program: &Path, target: &SshTarget) -> std::io::Result<Output> {
@@ -369,41 +378,6 @@ fn keyscan_diagnostic(program: &Path, output: &Output) -> String {
     }
 }
 
-fn keyscan_programs() -> Vec<PathBuf> {
-    #[cfg(windows)]
-    let mut programs = Vec::new();
-    #[cfg(not(windows))]
-    let programs = vec![PathBuf::from("ssh-keyscan")];
-    #[cfg(windows)]
-    {
-        // OpenSSH_for_Windows 9.5's ssh-keyscan aborts against otherwise
-        // compatible Ubuntu 22.04 servers that advertise
-        // sntrup761x25519-sha512@openssh.com, even though `ssh` itself
-        // correctly negotiates curve25519. Git for Windows' keyscan does not
-        // have that incompatibility, so prefer it when installed in one of
-        // Git's standard locations. The system tool is only a launch
-        // fallback; a completed Git keyscan is never repeated with it.
-        let mut roots = Vec::new();
-        if let Some(program_files) = std::env::var_os("ProgramFiles") {
-            roots.push(PathBuf::from(program_files).join("Git"));
-        }
-        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
-            roots.push(PathBuf::from(program_files_x86).join("Git"));
-        }
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            roots.push(PathBuf::from(local_app_data).join("Programs").join("Git"));
-        }
-        for root in roots {
-            let candidate = root.join("usr").join("bin").join("ssh-keyscan.exe");
-            if candidate.is_file() && !programs.contains(&candidate) {
-                programs.push(candidate);
-            }
-        }
-        programs.push(PathBuf::from("ssh-keyscan"));
-    }
-    programs
-}
-
 /// Pick the single fingerprint to show the user, preferring the strongest
 /// key type a host offered. Deterministic so the same host always surfaces
 /// the same fingerprint for confirmation.
@@ -421,7 +395,7 @@ pub fn preferred_fingerprint(
 
 /// Record the user's explicit confirmation of `expected_fingerprint` for
 /// `target`, and only then append its key to Vellum's own known_hosts file.
-/// The fingerprint is re-derived from a fresh `ssh-keyscan` rather than
+/// The fingerprint is re-derived from a fresh pre-auth probe rather than
 /// trusting the caller's claim, so a host that changed keys between "fetch"
 /// and "confirm" (or a caller passing an arbitrary string) cannot get a
 /// stale/wrong key written as trusted.
@@ -453,8 +427,28 @@ fn confirm_matching_fingerprint(
                 target.host, target.port
             ))
         })?;
-    append_known_hosts_line(data_root, &matched.key_line)?;
+    persist_trust(data_root, target, matched, "explicitConfirmation")
+}
+fn persist_trust(
+    data_root: &Path,
+    target: &SshTarget,
+    matched: PendingHostFingerprint,
+    source: &str,
+) -> AppResult<()> {
+    if matched.host != target.host || matched.port != target.port {
+        return Err(AppError::Message(
+            "SshHostKeyFingerprintMismatch: scanned endpoint changed".into(),
+        ));
+    }
     let mut store = load_store(data_root)?;
+    if let Some(existing) = store.confirmed.get(&target.store_key()) {
+        if existing.key_type != matched.key_type || existing.fingerprint != matched.fingerprint {
+            return Err(AppError::Message(
+                "SshHostKeyFingerprintMismatch: previously trusted host key changed".into(),
+            ));
+        }
+    }
+    append_known_hosts_line(data_root, &matched.key_line)?;
     store.confirmed.insert(
         target.store_key(),
         ConfirmedRecord {
@@ -463,6 +457,7 @@ fn confirm_matching_fingerprint(
             key_type: matched.key_type,
             fingerprint: matched.fingerprint,
             confirmed_at: Utc::now(),
+            source: source.into(),
         },
     );
     save_store(data_root, &store)
@@ -503,9 +498,8 @@ fn resolved_target_for_host(state: &AppState, host_id: &str) -> AppResult<SshTar
     resolve_ssh_target(&destination)
 }
 
-/// Fetch (without trusting) the resolved host+port and confirmation state
-/// for a cached host, so the frontend can decide whether to show the
-/// confirmation prompt at all.
+/// Resolve trust for a cached host, reusing an exact user known_hosts match
+/// when possible. A fresh scan is required before any inherited trust write.
 #[tauri::command]
 pub async fn remote_ssh_trust_status(
     state: tauri::State<'_, AppState>,
@@ -513,12 +507,29 @@ pub async fn remote_ssh_trust_status(
 ) -> AppResult<SshTrustStatus> {
     let owned = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let target = resolved_target_for_host(&owned, &host_id)?;
-        let confirmed = is_confirmed(&owned.data_root(), &target)?;
+        let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
+            .ssh_destination
+            .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
+        let target = resolve_ssh_target(&destination)?;
+        let root = owned.data_root();
+        let mut fingerprint = None;
+        if !is_confirmed(&root, &target)? {
+            let config = user_trust::resolve(&destination, &target)?;
+            // No pre-auth scan when no readable user trust is available.
+            if config.has_trust_hint() {
+                let candidates = key_probe::fetch(&root, &destination, &target, cfg!(windows))?;
+                fingerprint = preferred_fingerprint(candidates.clone());
+                user_trust::inherit(&root, &target, &config, candidates)?;
+            }
+        }
+        let store = load_store(&root)?;
+        let record = store.confirmed.get(&target.store_key());
         Ok(SshTrustStatus {
             host: target.host,
             port: target.port,
-            confirmed,
+            confirmed: record.is_some(),
+            source: record.map(|record| record.source.clone()),
+            fingerprint,
         })
     })
     .await
@@ -534,7 +545,11 @@ pub async fn remote_ssh_fetch_fingerprint(
     let owned = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let target = resolved_target_for_host(&owned, &host_id)?;
-        let candidates = fetch_pending_fingerprints(&target)?;
+        let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
+            .ssh_destination
+            .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
+        let candidates =
+            key_probe::fetch(&owned.data_root(), &destination, &target, cfg!(windows))?;
         preferred_fingerprint(candidates)
             .ok_or_else(|| AppError::Message("no SSH host key offered".into()))
     })
@@ -554,7 +569,14 @@ pub async fn remote_ssh_confirm_fingerprint(
     let owned = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let target = resolved_target_for_host(&owned, &host_id)?;
-        confirm_and_trust(&owned.data_root(), &target, &fingerprint)
+        let destination = crate::remote::RemoteHostManager::resolve_target(&owned, &host_id)?
+            .ssh_destination
+            .ok_or_else(|| AppError::Message("host has no SSH destination".into()))?;
+        let candidates =
+            key_probe::fetch(&owned.data_root(), &destination, &target, cfg!(windows))?;
+        let config = user_trust::resolve(&destination, &target)?;
+        user_trust::refuse_changed(&config, &candidates)?;
+        confirm_matching_fingerprint(&owned.data_root(), &target, &fingerprint, candidates)
     })
     .await
     .map_err(|error| AppError::Message(format!("SSH trust confirmation task failed: {error}")))?
@@ -562,6 +584,65 @@ pub async fn remote_ssh_confirm_fingerprint(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_hosts_options_quote_only_paths_that_need_config_tokenization() {
+        assert_eq!(
+            super::known_hosts_option(std::path::Path::new("E:/data/known_hosts")),
+            "UserKnownHostsFile=E:/data/known_hosts"
+        );
+        assert_eq!(
+            super::known_hosts_option(std::path::Path::new("E:/data with spaces/known_hosts")),
+            "UserKnownHostsFile='E:/data with spaces/known_hosts'"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn known_hosts_option_is_accepted_by_native_and_git_ssh_without_connecting() {
+        let native = crate::process::resolve_ssh_tool("ssh");
+        let git = std::path::PathBuf::from("C:/Program Files/Git/usr/bin/ssh.exe");
+        let mut tested = 0;
+        for program in [native, git].into_iter().filter(|p| p.is_file()) {
+            for path in [
+                "E:/data/known_hosts",
+                "E:/data with spaces/known_hosts",
+                "E:/O'Neil data/known_hosts",
+            ] {
+                let output = super::background_command(&program)
+                    .args([
+                        "-F",
+                        "none",
+                        "-G",
+                        "-o",
+                        "CanonicalizeHostname=no",
+                        "-o",
+                        &super::known_hosts_option(std::path::Path::new(path)),
+                        "host.invalid",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}: {}",
+                    program.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|l| l.starts_with("userknownhostsfile ") && l.contains(path)),
+                    "{}: {}",
+                    program.display(),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+            tested += 1;
+        }
+        assert!(
+            tested >= 1,
+            "install Windows OpenSSH Client to run argv qualification"
+        );
+    }
     use super::*;
 
     /// Cross-checked against a real, locally generated ed25519 key with
@@ -676,12 +757,6 @@ mod tests {
         let stdout = b"# choose_kex: unsupported KEX method\nnot-a-host-key\n";
 
         assert!(parse_keyscan_output(&target, stdout).is_empty());
-        let programs = keyscan_programs();
-        assert!(programs.contains(&PathBuf::from("ssh-keyscan")));
-        #[cfg(windows)]
-        if programs.iter().any(|program| program.is_absolute()) {
-            assert_ne!(programs[0], PathBuf::from("ssh-keyscan"));
-        }
     }
 
     #[test]
@@ -777,6 +852,7 @@ mod tests {
                 key_type: "ssh-ed25519".into(),
                 fingerprint: GOLDEN_FINGERPRINT.into(),
                 confirmed_at: Utc::now(),
+                source: explicit_source(),
             },
         );
         save_store(temp.path(), &store).unwrap();
@@ -805,6 +881,12 @@ mod tests {
             .iter()
             .any(|arg| arg.starts_with("UserKnownHostsFile=")));
         assert!(!args.iter().any(|arg| arg.contains("accept-new")));
+        let target = SshTarget {
+            host: "host.test".into(),
+            port: 2222,
+        };
+        assert!(strict_host_key_args_for(temp.path(), &target)
+            .contains(&"HostKeyAlias=[host.test]:2222".into()));
     }
 
     #[test]

@@ -18,6 +18,10 @@
    ============================================================ */
 
 :root {
+  /* 原生控制項（select 展開的清單、勾選框、捲軸、日期欄）只認 color-scheme，
+     不認我們的 token。不宣告的話，暗色主題下它們照亮色畫，變成一塊白或一顆亮藍。 */
+  color-scheme: light;
+
   /* ---- 底：米白偏暖霧面 + 淡藍天光 ---- */
   --ground: #f7f4ee;
   --ground-tint: #e6eef7;
@@ -159,6 +163,7 @@
 /* ---- 暗色：深夜藍黑底配同色系霧光 ---- */
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --ground: #12141c;
     --ground-tint: #1a2030;
     --ground-deep: #0d0f16;
@@ -227,6 +232,7 @@
 
 /* ---- 手動切換必須勝過 media query，兩個方向都要寫 ---- */
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --ground: #12141c;
   --ground-tint: #1a2030;
   --ground-deep: #0d0f16;
@@ -280,6 +286,7 @@
 }
 
 :root[data-theme="light"] {
+  color-scheme: light;
   --ground: #f7f4ee;
   --ground-tint: #e6eef7;
   --ground-deep: #ece6dc;

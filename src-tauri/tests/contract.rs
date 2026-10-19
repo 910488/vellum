@@ -35,26 +35,15 @@ fn route_serializes_as_camel_case() {
         context_window: Some(128_000),
         model_capabilities: Vec::new(),
         insecure_http_policy: Default::default(),
-        catalog_scope: CatalogScope::All,
     };
     let json = serde_json::to_value(&route).unwrap();
     let k = keys(&json);
     assert!(k.contains(&"baseUrl".to_string()), "got {k:?}");
     assert!(k.contains(&"isCurrent".to_string()), "got {k:?}");
     assert!(k.contains(&"serverSideResume".to_string()), "got {k:?}");
-    assert!(k.contains(&"catalogScope".to_string()), "got {k:?}");
     assert!(
         !k.iter().any(|key| key.contains('_')),
         "snake_case leaked: {k:?}"
-    );
-}
-
-#[test]
-fn catalog_scope_matches_typescript_union() {
-    assert_eq!(serde_json::to_value(CatalogScope::All).unwrap(), "all");
-    assert_eq!(
-        serde_json::to_value(CatalogScope::FreeOnly).unwrap(),
-        "freeOnly"
     );
 }
 

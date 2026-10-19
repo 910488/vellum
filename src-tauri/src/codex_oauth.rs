@@ -235,6 +235,8 @@ pub struct CodexOAuthManager {
     quota_pool: RwLock<QuotaPoolSettings>,
     active_pool_account_id: RwLock<Option<String>>,
     smart_router: parking_lot::Mutex<crate::quota_pool_router::SmartRouter>,
+    exhausted_pool_accounts: parking_lot::Mutex<HashMap<String, u64>>,
+    pool_reset_times: parking_lot::Mutex<HashMap<String, u64>>,
     pool_diagnostics: parking_lot::Mutex<crate::quota_pool_diagnostics::DecisionObserver>,
     selection_lock: Mutex<()>,
     access_tokens: RwLock<HashMap<String, CachedToken>>,
@@ -339,6 +341,8 @@ impl CodexOAuthManager {
             quota_pool: RwLock::new(store.quota_pool),
             active_pool_account_id: RwLock::new(None),
             smart_router: parking_lot::Mutex::new(crate::quota_pool_router::SmartRouter::default()),
+            exhausted_pool_accounts: parking_lot::Mutex::new(HashMap::new()),
+            pool_reset_times: parking_lot::Mutex::new(HashMap::new()),
             pool_diagnostics: parking_lot::Mutex::new(Default::default()),
             selection_lock: Mutex::const_new(()),
             access_tokens: RwLock::new(HashMap::new()),
@@ -768,6 +772,64 @@ impl CodexOAuthManager {
         &self,
         context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
     ) -> Result<Option<AppliedOAuth>, OAuthError> {
+        self.routing_auth(context, false).await
+    }
+
+    pub async fn retry_pool_after_quota(
+        &self,
+        account_hash: &str,
+        reset_at: Option<u64>,
+        context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
+        allow_retry: bool,
+    ) -> Result<Option<AppliedOAuth>, OAuthError> {
+        let settings = self.quota_pool.read().await.clone();
+        if !settings.enabled
+            || !settings
+                .members
+                .iter()
+                .any(|m| m.in_pool && pool_account_hash(&m.account_id) == account_hash)
+        {
+            log::info!("[QuotaPool] event=retry_declined stage=pool reason=disabled_or_not_pool_member account={account_hash} allow_retry={allow_retry}");
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        // Prefer the provider's reset. Without one, use the observed window
+        // reset retained by routing, or a conservative five-hour window.
+        let until = reset_at.filter(|t| *t > now).unwrap_or_else(|| {
+            self.pool_reset_times
+                .lock()
+                .get(account_hash)
+                .copied()
+                .filter(|t| *t > now)
+                .unwrap_or(now + 18_000_000)
+        });
+        self.exhausted_pool_accounts
+            .lock()
+            .insert(account_hash.to_owned(), until);
+        if !allow_retry {
+            log::info!("[QuotaPool] event=retry_declined stage=pool reason=allow_retry_false account={account_hash}");
+            return Ok(None);
+        }
+        let mut context = context.clone();
+        context.socket_affinity = None;
+        let auth = match self.routing_auth(&context, true).await {
+            Ok(auth) => auth,
+            Err(error) => {
+                log::warn!("[QuotaPool] event=retry_declined stage=pool reason=selection_failed account={account_hash}");
+                return Err(error);
+            }
+        };
+        if auth.is_none() {
+            log::info!("[QuotaPool] event=retry_declined stage=pool reason=no_fitting_candidate account={account_hash}");
+        }
+        Ok(auth)
+    }
+
+    async fn routing_auth(
+        &self,
+        context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
+        require_fit: bool,
+    ) -> Result<Option<AppliedOAuth>, OAuthError> {
         let settings = self.quota_pool.read().await.clone();
         let selection_id = ulid::Ulid::new();
         if settings.enabled {
@@ -784,28 +846,12 @@ impl CodexOAuthManager {
                     .find(|id| affinity.is_account(id))
                     .cloned();
                 if let Some(account) = account {
-                    // Register the invocation even when no quota lookup is
-                    // allowed to move this root turn. Its eventual usage must
-                    // still feed load and capacity observations.
-                    let plan = self
-                        .accounts
-                        .read()
+                    if let Some(auth) = self
+                        .active_turn_pool_auth(&account, &settings, context)
                         .await
-                        .get(&account)
-                        .and_then(|a| a.plan_type.clone());
-                    self.smart_router.lock().choose(
-                        &[crate::quota_pool_router::Candidate {
-                            account_id: account.clone(),
-                            capacity_prior: crate::quota_pool_router::plan_capacity_prior(
-                                plan.as_deref(),
-                            ),
-                            plan_type: plan,
-                            headroom: 100.0,
-                            ..Default::default()
-                        }],
-                        context,
-                        chrono::Utc::now().timestamp_millis().max(0) as u64,
-                    );
+                    {
+                        return Ok(Some(auth));
+                    }
                     log::info!("[QuotaPool] selection={selection_id} reason=active_turn_affinity account={} context_tokens={}", affinity.account_hash, context.estimated_input_tokens);
                     return self.valid_auth_for(&account).await.map(Some);
                 }
@@ -813,6 +859,9 @@ impl CodexOAuthManager {
             }
         }
         if !settings.enabled || !settings.members.iter().any(|member| member.in_pool) {
+            if require_fit {
+                return Ok(None);
+            }
             log::info!(
                 "[QuotaPool] selection={selection_id} event=bypass reason={}",
                 if settings.enabled {
@@ -917,6 +966,25 @@ impl CodexOAuthManager {
                 continue;
             }
             rank += 1;
+            if self
+                .exhausted_pool_accounts
+                .lock()
+                .get(&pool_account_hash(&member.account_id))
+                .is_some_and(|until| *until > chrono::Utc::now().timestamp_millis().max(0) as u64)
+            {
+                log_pool_candidate(
+                    &mut diagnostic_candidates,
+                    selection_id,
+                    "skip",
+                    &member.account_id,
+                    rank,
+                    "upstream_quota_until_reset",
+                );
+                if settings.strategy == QuotaPoolStrategy::Balanced && !member.paused {
+                    let _ = balanced_reads.next();
+                }
+                continue;
+            }
             if context.socket_affinity.as_ref().is_some_and(|affinity| {
                 !affinity.turn_in_progress
                     && affinity.quota_exhausted
@@ -1058,6 +1126,20 @@ impl CodexOAuthManager {
                 }
             };
             if let Some(observation) = quota_pool_observation(&windows, member.weekly_floor) {
+                let reset = if observation.five_hour_used.is_some_and(|used| used >= 90.0) {
+                    observation.five_hour_reset_at
+                } else if observation.weekly_headroom <= 5.0 {
+                    observation.weekly_reset_at
+                } else {
+                    observation
+                        .five_hour_reset_at
+                        .or(observation.weekly_reset_at)
+                };
+                if let Some(reset) = reset {
+                    self.pool_reset_times
+                        .lock()
+                        .insert(pool_account_hash(&member.account_id), reset);
+                }
                 if settings.strategy == QuotaPoolStrategy::Balanced {
                     // Reconcile resets even when this account is still gated.
                     let plan_type = self
@@ -1112,7 +1194,7 @@ impl CodexOAuthManager {
                     }
                 }
                 if observation.usable {
-                    if settings.strategy == QuotaPoolStrategy::Balanced {
+                    if settings.strategy == QuotaPoolStrategy::Balanced || require_fit {
                         eligible.push((auth, rank, observation));
                         continue;
                     }
@@ -1202,6 +1284,9 @@ impl CodexOAuthManager {
                     context,
                     chrono::Utc::now().timestamp_millis().max(0) as u64,
                 );
+                if require_fit && router.last_admission.get(result.0) != Some(&true) {
+                    return Ok(None);
+                }
                 for (i, candidate) in candidates.iter().enumerate() {
                     if let Some(d) = diagnostic_candidates
                         .iter_mut()
@@ -1247,12 +1332,24 @@ impl CodexOAuthManager {
             return Ok(Some(auth));
         }
 
+        if require_fit {
+            return Ok(None);
+        }
+
         // The usage endpoint is advisory. A depleted or unreadable snapshot
         // must not prevent a valid credential from reaching the provider.
         // Prefer the user's manual selection, including an account outside the
         // pool, but do not override an explicit pause on a pooled member.
         let manual = self.resolve_default().await;
         let manual_paused = manual.as_ref().is_some_and(|account_id| {
+            if self
+                .exhausted_pool_accounts
+                .lock()
+                .get(&pool_account_hash(account_id))
+                .is_some_and(|until| *until > chrono::Utc::now().timestamp_millis().max(0) as u64)
+            {
+                return true;
+            }
             settings
                 .members
                 .iter()
@@ -1340,6 +1437,148 @@ impl CodexOAuthManager {
         Err(OAuthError::AuthenticationFailed(format!(
             "quota pool has no available ChatGPT credential: {detail}"
         )))
+    }
+
+    async fn cached_pool_candidate(
+        &self,
+        account: &str,
+        weekly_floor: u8,
+    ) -> (
+        crate::quota_pool_router::Candidate,
+        Option<QuotaPoolObservation>,
+    ) {
+        let metadata = self.accounts.read().await.get(account).cloned();
+        let token = self.access_tokens.read().await.get(account).cloned();
+        let windows = if let (Some(metadata), Some(token)) = (&metadata, token) {
+            crate::codex_quota::cached_snapshot(
+                &token.access_token,
+                metadata.chatgpt_account_id.as_deref().unwrap_or(account),
+            )
+            .await
+        } else {
+            None
+        };
+        let observation = windows
+            .as_deref()
+            .and_then(|windows| quota_pool_observation(windows, weekly_floor));
+        let plan_type = metadata.and_then(|a| a.plan_type);
+        let mut candidate = crate::quota_pool_router::Candidate {
+            account_id: account.into(),
+            capacity_prior: crate::quota_pool_router::plan_capacity_prior(plan_type.as_deref()),
+            plan_type,
+            // Unknown quota preserves affinity; log_decision labels it as
+            // affinity-only rather than reporting a fabricated allowance.
+            headroom: 0.0,
+            ..Default::default()
+        };
+        if let Some(o) = &observation {
+            candidate.headroom = o.headroom;
+            candidate.weekly_used = Some(o.weekly_used);
+            candidate.weekly_headroom = Some(o.weekly_headroom);
+            candidate.weekly_reset_at = o.weekly_reset_at;
+            candidate.five_hour_used = o.five_hour_used;
+            candidate.five_hour_reset_at = o.five_hour_reset_at;
+        }
+        (candidate, observation)
+    }
+
+    /// Each response.create is a safe socket handoff boundary, even when the
+    /// enclosing Codex root turn continues. Quota reads here are cache-only.
+    async fn active_turn_pool_auth(
+        &self,
+        account: &str,
+        settings: &QuotaPoolSettings,
+        context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
+    ) -> Option<AppliedOAuth> {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let floor = settings
+            .members
+            .iter()
+            .find(|m| m.account_id == account)
+            .map_or(0, |m| m.weekly_floor);
+        let (incumbent, observation) = self.cached_pool_candidate(account, floor).await;
+        let exhausted = self
+            .exhausted_pool_accounts
+            .lock()
+            .get(&pool_account_hash(account))
+            .is_some_and(|until| *until > now)
+            || context
+                .socket_affinity
+                .as_ref()
+                .is_some_and(|a| a.quota_exhausted);
+        let reason = if exhausted {
+            Some("upstream_quota_until_reset")
+        } else {
+            observation.as_ref().and_then(|o| o.skip_reason)
+        };
+        if let Some(reason) = reason {
+            let mut candidates = Vec::new();
+            for member in settings
+                .members
+                .iter()
+                .filter(|m| m.in_pool && !m.paused && m.account_id != account)
+            {
+                if self
+                    .exhausted_pool_accounts
+                    .lock()
+                    .get(&pool_account_hash(&member.account_id))
+                    .is_some_and(|until| *until > now)
+                {
+                    continue;
+                }
+                let (candidate, quota) = self
+                    .cached_pool_candidate(&member.account_id, member.weekly_floor)
+                    .await;
+                if quota.is_some_and(|o| o.usable) {
+                    candidates.push(candidate);
+                }
+            }
+            while !candidates.is_empty() {
+                // No incumbent cache discount on a full-input account switch.
+                let mut placement = context.clone();
+                placement.socket_affinity = None;
+                let selected = {
+                    let mut router = self.smart_router.lock();
+                    let (index, _) = router.choose(&candidates, &placement, now);
+                    router
+                        .last_admission
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false)
+                        .then_some(index)
+                };
+                let Some(index) = selected else {
+                    break;
+                };
+                let _guard = self.selection_lock.lock().await;
+                if *self.quota_pool.read().await != *settings {
+                    log::info!(
+                        "[QuotaPool] event=active_turn_stay account={} reason=settings_changed",
+                        pool_account_hash(account)
+                    );
+                    break;
+                }
+                match self.valid_auth_for(&candidates[index].account_id).await {
+                    Ok(auth) => {
+                        log::info!(
+                            "[QuotaPool] event=active_turn_migrate from={} to={} reason={reason}",
+                            pool_account_hash(account),
+                            pool_account_hash(&auth.credential_id)
+                        );
+                        *self.active_pool_account_id.write().await =
+                            Some(auth.credential_id.clone());
+                        return Some(auth);
+                    }
+                    Err(_) => {
+                        log::info!("[QuotaPool] event=active_turn_candidate_skip account={} reason=auth_unavailable", pool_account_hash(&candidates[index].account_id));
+                        candidates.remove(index);
+                    }
+                }
+            }
+            log::info!("[QuotaPool] event=active_turn_stay account={} reason=no_fitting_cached_alternative gate={reason}", pool_account_hash(account));
+        }
+        self.smart_router.lock().choose(&[incumbent], context, now);
+        None
     }
 
     /// Resolve a valid access token for one specific managed ChatGPT account.
@@ -2452,6 +2691,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_retry_requires_fit_and_excludes_exhausted_account_until_reset() {
+        use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
+        for strategy in [QuotaPoolStrategy::Balanced, QuotaPoolStrategy::Rank] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+            let mut members = Vec::new();
+            for id in ["quota-retry-a", "quota-retry-b"] {
+                let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({
+                    "sub": id, "chatgpt_account_id": "quota-retry-workspace", "chatgpt_plan_type":"plus",
+                }).to_string());
+                let token = format!("header.{payload}.signature");
+                manager.accounts.write().await.insert(
+                    id.into(),
+                    AccountMetadata {
+                        account_id: id.into(),
+                        chatgpt_account_id: Some("quota-retry-workspace".into()),
+                        workspace_name: None,
+                        plan_type: Some("plus".into()),
+                        email: None,
+                        authenticated_at: 1,
+                    },
+                );
+                manager.access_tokens.write().await.insert(
+                    id.into(),
+                    CachedToken {
+                        access_token: token.clone(),
+                        expires_at_ms: i64::MAX,
+                    },
+                );
+                crate::codex_quota::seed_test_quota(
+                    &token,
+                    "quota-retry-workspace",
+                    vec![
+                        quota_window(crate::model::QuotaPeriodUnit::Hour, Some(5), 10.0, None),
+                        quota_window(crate::model::QuotaPeriodUnit::Week, None, 10.0, None),
+                    ],
+                )
+                .await;
+                members.push(QuotaPoolMember {
+                    account_id: id.into(),
+                    in_pool: true,
+                    paused: false,
+                    weekly_floor: 0,
+                    maintain_five_hour_window: false,
+                });
+            }
+            *manager.quota_pool.write().await = QuotaPoolSettings {
+                enabled: true,
+                strategy,
+                members,
+            };
+            *manager.default_account_id.write().await = Some("quota-retry-a".into());
+            let mut context = OfficialRoutingContext {
+                session_key: Some("quota-retry-session".into()),
+                request_id: "quota-retry-request".into(),
+                estimated_input_tokens: 1000,
+                ..Default::default()
+            };
+            let hash = pool_account_hash("quota-retry-a");
+            let reset = chrono::Utc::now().timestamp_millis().max(0) as u64 + 60_000;
+            assert_eq!(
+                manager
+                    .retry_pool_after_quota(&hash, Some(reset), &context, true)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_id,
+                "quota-retry-b"
+            );
+            assert_eq!(manager.exhausted_pool_accounts.lock()[&hash], reset);
+            assert_eq!(
+                manager
+                    .valid_routing_auth_with_context(&context)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_id,
+                "quota-retry-b"
+            );
+            context.estimated_input_tokens = 10_000_000;
+            assert!(
+                manager
+                    .retry_pool_after_quota(&hash, Some(reset), &context, true)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no fitting member must never use manual fallback"
+            );
+            context.estimated_input_tokens = 1000;
+            assert!(manager
+                .retry_pool_after_quota(&hash, Some(reset), &context, false)
+                .await
+                .unwrap()
+                .is_none());
+            manager.exhausted_pool_accounts.lock().insert(hash, 0);
+            manager
+                .exhausted_pool_accounts
+                .lock()
+                .insert(pool_account_hash("quota-retry-b"), reset);
+            assert_eq!(
+                manager
+                    .valid_routing_auth_with_context(&context)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_id,
+                "quota-retry-a",
+                "account is eligible again after reset"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn quota_pool_balanced_routes_with_context_and_preserves_explicit_billing() {
         use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
         let temp = tempfile::tempdir().unwrap();
@@ -2575,7 +2927,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_pool_enable_preserves_active_turn_and_defers_usage_limit_switch_to_boundary() {
+    async fn active_turn_uses_cached_reserve_and_exhaustion_gates_with_fit_fallback() {
+        use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
+        use vellum_proxy_runtime::request::OfficialSocketAffinity;
+        for (case, weekly, five, exhausted, tokens, cache_other, expected) in [
+            ("healthy", 10.0, 10.0, false, 1000, true, "a"),
+            ("five-reserve", 10.0, 96.0, false, 1000, true, "b"),
+            ("weekly-reserve", 100.0, 10.0, false, 1000, true, "b"),
+            ("exhausted", 10.0, 10.0, true, 1000, true, "b"),
+            ("no-fit", 10.0, 96.0, false, 300_000, true, "a"),
+            ("no-cache", 10.0, 96.0, false, 1000, false, "a"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = CodexOAuthManager::new(temp.path().into());
+            let mut members = Vec::new();
+            for suffix in ["a", "b"] {
+                let id = format!("active-cache-{case}-{suffix}");
+                let payload = URL_SAFE_NO_PAD.encode(
+                    serde_json::json!({
+                        "sub":id, "chatgpt_account_id":id, "chatgpt_plan_type":"plus",
+                    })
+                    .to_string(),
+                );
+                let token = format!("header.{payload}.signature");
+                manager.accounts.write().await.insert(
+                    id.clone(),
+                    AccountMetadata {
+                        account_id: id.clone(),
+                        chatgpt_account_id: Some(id.clone()),
+                        workspace_name: None,
+                        plan_type: Some("plus".into()),
+                        email: None,
+                        authenticated_at: 1,
+                    },
+                );
+                manager.access_tokens.write().await.insert(
+                    id.clone(),
+                    CachedToken {
+                        access_token: token.clone(),
+                        expires_at_ms: i64::MAX,
+                    },
+                );
+                if suffix == "a" || cache_other {
+                    crate::codex_quota::seed_test_quota(
+                        &token,
+                        &id,
+                        vec![
+                            quota_window(
+                                crate::model::QuotaPeriodUnit::Hour,
+                                Some(5),
+                                if suffix == "a" { five } else { 10.0 },
+                                None,
+                            ),
+                            quota_window(
+                                crate::model::QuotaPeriodUnit::Week,
+                                None,
+                                if suffix == "a" { weekly } else { 10.0 },
+                                None,
+                            ),
+                        ],
+                    )
+                    .await;
+                }
+                members.push(QuotaPoolMember {
+                    account_id: id,
+                    in_pool: true,
+                    paused: false,
+                    weekly_floor: 0,
+                    maintain_five_hour_window: false,
+                });
+            }
+            let incumbent = members[0].account_id.clone();
+            *manager.quota_pool.write().await = QuotaPoolSettings {
+                enabled: true,
+                strategy: QuotaPoolStrategy::Balanced,
+                members,
+            };
+            if exhausted {
+                manager
+                    .exhausted_pool_accounts
+                    .lock()
+                    .insert(pool_account_hash(&incumbent), u64::MAX);
+            }
+            let context = OfficialRoutingContext {
+                session_key: Some(format!("main:{case}")),
+                request_id: format!("req-{case}"),
+                estimated_input_tokens: tokens,
+                socket_affinity: Some(OfficialSocketAffinity {
+                    account_hash: OfficialSocketAffinity::hash_account(&incumbent),
+                    turn_in_progress: true,
+                    input_tokens: tokens,
+                    quota_exhausted: false,
+                }),
+                ..Default::default()
+            };
+            let selected = manager
+                .valid_routing_auth_with_context(&context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                selected.credential_id,
+                format!("active-cache-{case}-{expected}"),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_pool_enable_preserves_active_turn_when_no_cached_alternative_fits() {
         use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
         use vellum_proxy_runtime::request::OfficialSocketAffinity;
         let temp = tempfile::tempdir().unwrap();
@@ -2680,7 +3140,7 @@ mod tests {
                 .unwrap()
                 .credential_id,
             "midturn-a",
-            "an authoritative usage-limit 429 cannot move an unfinished root turn"
+            "unfinished root stays when full replay cannot fit another member"
         );
         context.socket_affinity.as_mut().unwrap().turn_in_progress = false;
         assert_eq!(

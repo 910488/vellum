@@ -2,6 +2,11 @@
 //!
 //! The wrapper sets `CODEX_HOME` / `CODEX_INSTALL_DIR` for that key's sessions
 //! and leaves scp/sftp/rsync usable. It never rewrites `~/.codex`.
+//!
+//! Compatibility helper for agent library consumers. Production Desktop
+//! provisioning uses src-tauri/src/remote/ssh_isolation.rs instead. Keep the
+//! shell body in sync, and construct remote paths with POSIX separators on
+//! every Desktop/test OS.
 
 use std::path::Path;
 
@@ -18,6 +23,9 @@ pub fn managed_ssh_wrapper_contents(
 export CODEX_HOME={home}\n\
 export CODEX_INSTALL_DIR={install}\n\
 export PATH={install}:{extra}:\"$PATH\"\n\
+if [ -x {agent} ]; then\n\
+  {agent} ensure-services </dev/null >/dev/null || printf '%s\\n' 'Vellum service recovery failed; inspect the remote supervisor logs.' >&2\n\
+fi\n\
 case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
   \"\") exec \"${{SHELL:-/bin/bash}}\" -l ;;\n\
   scp\\ *|scp|sftp*|rsync\\ *|/usr/libexec/sftp-server*) exec \"${{SHELL:-/bin/bash}}\" -c \"$SSH_ORIGINAL_COMMAND\" ;;\n\
@@ -25,6 +33,7 @@ case \"${{SSH_ORIGINAL_COMMAND-}}\" in\n\
         home = shell_single_quote(&codex_home.to_string_lossy()),
         install = shell_single_quote(&install_dir.to_string_lossy()),
         extra = shell_single_quote(&extra_path.to_string_lossy()),
+        agent = shell_single_quote(&format!("{}/vellum-remote-agent", extra_path.to_string_lossy().trim_end_matches('/'))),
     )
 }
 
@@ -37,11 +46,7 @@ pub fn is_managed_wrapper(contents: &str) -> bool {
     contents.starts_with(&format!("#!/bin/sh\n{WRAPPER_MARKER}\n"))
 }
 
-pub fn marked_authorized_keys_line(
-    host_id: &str,
-    wrapper_path: &Path,
-    public_key: &str,
-) -> String {
+pub fn marked_authorized_keys_line(host_id: &str, wrapper_path: &Path, public_key: &str) -> String {
     let command = format!(
         "command={},no-agent-forwarding,no-X11-forwarding {}",
         shell_double_quote(&wrapper_path.to_string_lossy()),
@@ -117,6 +122,11 @@ mod tests {
         assert!(contents.contains("scp"));
         assert!(contents.contains("sftp"));
         assert!(contents.contains("rsync"));
+        assert!(contents.contains("'/Users/joshhuang/.local/bin/vellum-remote-agent' ensure-services </dev/null >/dev/null"));
+        assert!(
+            contents.find("ensure-services").unwrap()
+                < contents.find("SSH_ORIGINAL_COMMAND").unwrap()
+        );
     }
 
     #[test]

@@ -5,11 +5,18 @@ import buildLocalRelease from "../scripts/build-local-release.sh?raw";
 import desktopWorkflow from "../.github/workflows/desktop-build.yml?raw";
 import hotUpdateConfig from "../src-tauri/tauri.hot-update.conf.json";
 import releaseWorkflow from "../.github/workflows/release.yml?raw";
+import stageDarwin from "../scripts/stage-remote-darwin-payload.sh?raw";
 import finalizeDarwinManifest from "../scripts/finalize-remote-darwin-manifest.mjs?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 import workspaceToml from "../Cargo.toml?raw";
+import buildRust from "../src-tauri/build.rs?raw";
 
 describe("daily Desktop package", () => {
+  it("refuses release installers whose remote resources exceed 80 MiB", () => {
+    expect(buildRust).toMatch(/remote_payload_bytes/);
+    expect(buildRust).toMatch(/bytes <= 80 \* 1024 \* 1024/);
+    expect(buildRust).toMatch(/PROFILE.*Ok\("release"\)/);
+  });
   it("does not declare eval, app-server, or gate-child bins", () => {
     expect(desktopToml).not.toMatch(/name = "vellum-eval"/);
     expect(desktopToml).not.toMatch(/name = "vellum-codex-app-server"/);
@@ -30,7 +37,7 @@ describe("daily Desktop package", () => {
     expect(workspaceToml).toMatch("crates/vellum-codex-gate-child");
   });
 
-  it("keeps full installers bundled and hot updates component-only", () => {
+  it("keeps full installers bundled and Desktop hot updates free of Core", () => {
     expect(tauriConfig.bundle.resources).toEqual([
       "resources/remote/**/*",
       "binaries/*",
@@ -39,6 +46,7 @@ describe("daily Desktop package", () => {
     expect(desktopWorkflow).toMatch(/build-local-release\.sh stage-only/);
 
     expect(hotUpdateConfig.bundle.resources).toEqual([
+      "resources/remote/**/*",
       "binaries/vellum-codex-app-server*",
       "binaries/vellum-codex-relay*",
     ]);
@@ -57,7 +65,27 @@ describe("daily Desktop package", () => {
       expect(job).toMatch(/VELLUM_DESKTOP_HOT_UPDATE/);
       expect(job).toMatch(/tauri\.hot-update\.conf\.json/);
       expect(job).not.toMatch(/build-only-remote-payload|build-local-release/);
+      // build.rs compiles the remote manifest hash into the executable, so a
+      // Desktop update without its own payload cannot deploy remote hosts.
+      expect(job).toMatch(/needs: \[resolve, desktop-remote-payload-darwin\]/);
+      expect(job).toMatch(/name: desktop-remote-payload\r?\n/);
+      expect(job).toMatch(/path: src-tauri\/resources\/remote/);
     }
+
+    const linuxPayload = releaseWorkflow.slice(
+      releaseWorkflow.indexOf("  desktop-remote-payload:"),
+      releaseWorkflow.indexOf("  desktop-remote-payload-darwin:"),
+    );
+    const darwinPayload = releaseWorkflow.slice(
+      releaseWorkflow.indexOf("  desktop-remote-payload-darwin:"),
+      releaseWorkflow.indexOf("  windows-updater:"),
+    );
+    for (const job of [linuxPayload, darwinPayload]) {
+      expect(job).toMatch(/component == 'desktop'/);
+      expect(job).toMatch(/prepare-release-source/);
+    }
+    expect(linuxPayload).toMatch(/build-local-release\.sh stage-only/);
+    expect(darwinPayload).toMatch(/stage-remote-darwin-payload\.sh/);
   });
 
   it("finalizes one complete Darwin-aware manifest before building either installer", () => {
@@ -66,12 +94,14 @@ describe("daily Desktop package", () => {
       desktopWorkflow.indexOf("  macos-dmg:"),
     );
     expect(darwinJob).toMatch(/needs: remote-payload/);
-    expect(darwinJob).toMatch(/codex-aarch64-apple-darwin\.tar\.gz/);
-    expect(darwinJob).toMatch(/finalize-remote-darwin-manifest\.mjs/);
+    expect(darwinJob).toMatch(/stage-remote-darwin-payload\.sh/);
+    expect(stageDarwin).toMatch(/download-codex-package\.mjs.*aarch64-apple-darwin.*\$package_path/);
+    expect(stageDarwin).toMatch(/remote-dev-cache\/codex/);
+    expect(stageDarwin).toMatch(/finalize-remote-darwin-manifest\.mjs/);
     expect(buildLocalRelease).toMatch(/aarch64-apple-darwin/);
     expect(buildLocalRelease).toMatch(/finalize-remote-darwin-manifest\.mjs/);
-    expect(finalizeDarwinManifest).toMatch(/schemaVersion = 4/);
-    expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/codex/);
+    expect(finalizeDarwinManifest).toMatch(/schemaVersion === 5 \? 5 : 4/);
+    expect(finalizeDarwinManifest).toMatch(/codexArtifact\(packagePath/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-remote-agent/);
     expect(finalizeDarwinManifest).toMatch(/darwin-arm64\/vellum-proxy-daemon/);
 
@@ -89,5 +119,6 @@ describe("daily Desktop package", () => {
 
     const signJob = releaseWorkflow.slice(releaseWorkflow.indexOf("  sign-and-release:"));
     expect(signJob).toMatch(/- remote-darwin/);
+    expect(signJob).toMatch(/- desktop-remote-payload-darwin/);
   });
 });

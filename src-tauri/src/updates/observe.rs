@@ -73,6 +73,8 @@ mod tests {
             enhanced_identity: None,
             session_features_applied: 0,
             open_turns: open,
+            fallback: None,
+            incomplete_official: Vec::new(),
             failure_reason: None,
         }
     }

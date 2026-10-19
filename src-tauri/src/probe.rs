@@ -244,146 +244,88 @@ pub fn opencode_zen_wire_for_model(model: &str) -> Option<WireFormat> {
     }
 }
 
-/// (model id, context window, reasoning, free, deprecated) — sourced from
+/// (model id, context window, reasoning, deprecated) — sourced from
 /// OpenCode Desktop's own bundled model registry (the same catalog
 /// github.com/anomalyco/opencode's console generates `/zen/{v1,go/v1}/models`
 /// from), not guessed from a naming convention or a live probe. Zen's
 /// `/models` response itself carries no capability fields at all — just id,
 /// object, created, owned_by.
-type OpenCodeZenModelRow = (&'static str, Option<u64>, bool, bool, bool);
+type OpenCodeZenModelRow = (&'static str, Option<u64>, bool, bool);
 
 /// The full `/zen/v1` catalog.
 const OPENCODE_ZEN_MODEL_METADATA: &[OpenCodeZenModelRow] = &[
-    ("big-pickle", Some(200000), true, true, false),
-    ("claude-3-5-haiku", Some(200000), false, false, true),
-    ("claude-fable-5", Some(1000000), true, false, false),
-    ("claude-fable-5-1", Some(1000000), true, false, false),
-    ("claude-haiku-4-5", Some(200000), true, false, false),
-    ("claude-opus-4-1", Some(200000), true, false, true),
-    ("claude-opus-4-5", Some(200000), true, false, false),
-    ("claude-opus-4-6", Some(1000000), true, false, false),
-    ("claude-opus-4-7", Some(1000000), true, false, false),
-    ("claude-opus-4-8", Some(1000000), true, false, false),
-    ("claude-opus-5", Some(1000000), true, false, false),
-    ("claude-sonnet-4", Some(1000000), true, false, false),
-    ("claude-sonnet-4-5", Some(1000000), true, false, false),
-    ("claude-sonnet-4-6", Some(1000000), true, false, false),
-    ("claude-sonnet-5", Some(1000000), true, false, false),
-    ("deepseek-v4-flash", Some(1000000), true, false, false),
-    ("deepseek-v4-flash-free", Some(200000), true, true, true),
-    (
-        "deepseek-v4-flash-vision-exp",
-        Some(1000000),
-        true,
-        false,
-        false,
-    ),
-    ("deepseek-v4-pro", Some(1000000), true, false, false),
-    ("gemini-3-flash", Some(1048576), true, false, false),
-    ("gemini-3-pro", Some(1048576), true, false, true),
-    ("gemini-3.1-pro", Some(1048576), true, false, false),
-    ("gemini-3.5-flash", Some(1048576), true, false, false),
-    ("gemini-3.5-flash-lite", Some(1048576), true, false, false),
-    ("gemini-3.6-flash", Some(1048576), true, false, false),
-    ("gemini-3.7-flash", Some(1048576), true, false, false),
-    ("gemini-3.8-flash", Some(1048576), true, false, false),
-    ("glm-4.6", Some(204800), true, false, true),
-    ("glm-4.7", Some(204800), true, false, true),
-    ("glm-4.7-free", Some(204800), true, true, true),
-    ("glm-5", Some(204800), true, false, false),
-    ("glm-5-free", Some(204800), true, true, true),
-    ("glm-5.1", Some(204800), true, false, false),
-    ("glm-5.2", Some(1000000), true, false, false),
-    ("glm-5.3", Some(1000000), true, false, false),
-    ("glm-5.3-flash", Some(1000000), true, false, false),
-    ("gpt-5", Some(400000), true, false, false),
-    ("gpt-5-codex", Some(400000), true, false, false),
-    ("gpt-5-nano", Some(400000), true, false, false),
-    ("gpt-5.1", Some(400000), true, false, false),
-    ("gpt-5.1-codex", Some(400000), true, false, false),
-    ("gpt-5.1-codex-max", Some(400000), true, false, false),
-    ("gpt-5.1-codex-mini", Some(400000), true, false, false),
-    ("gpt-5.2", Some(400000), true, false, false),
-    ("gpt-5.2-codex", Some(400000), true, false, false),
-    ("gpt-5.3-codex", Some(400000), true, false, false),
-    ("gpt-5.3-codex-spark", Some(128000), true, false, false),
-    ("gpt-5.4", Some(1050000), true, false, false),
-    ("gpt-5.4-mini", Some(400000), true, false, false),
-    ("gpt-5.4-nano", Some(400000), true, false, false),
-    ("gpt-5.4-pro", Some(1050000), true, false, false),
-    ("gpt-5.5", Some(1050000), true, false, false),
-    ("gpt-5.5-pro", Some(1050000), true, false, false),
-    ("gpt-5.6-luna", Some(1050000), true, false, false),
-    ("gpt-5.6-sol", Some(1050000), true, false, false),
-    ("gpt-5.6-terra", Some(1050000), true, false, false),
-    ("gpt-6-astra", Some(1050000), true, false, false),
-    ("grok-4.5", Some(500000), true, false, false),
-    ("grok-4.6", Some(500000), true, false, false),
-    ("grok-build-0.1", Some(256000), true, false, false),
-    ("grok-code", Some(256000), true, true, true),
-    ("hy3-free", Some(190000), true, true, true),
-    ("hy3-preview-free", Some(256000), true, true, true),
-    ("kimi-k2", Some(262144), false, false, true),
-    ("kimi-k2-thinking", Some(262144), true, false, true),
-    ("kimi-k2.5", Some(262144), true, false, false),
-    ("kimi-k2.5-free", Some(262144), true, true, true),
-    ("kimi-k2.6", Some(262144), true, false, false),
-    ("kimi-k2.7-code", Some(262144), true, false, false),
-    ("kimi-k3", Some(1048576), true, false, false),
-    ("laguna-s-2.1-free", Some(256000), true, true, true),
-    ("ling-2.6-flash-free", Some(262100), false, true, true),
-    ("ling-3.0-flash-fin-free", Some(262144), true, true, false),
-    ("ling-3.0-flash-free", Some(262144), true, true, true),
-    ("longcat-2.0-free", Some(1000000), true, true, true),
-    ("mimo-v2-flash-free", Some(262144), true, true, true),
-    ("mimo-v2-omni-free", Some(262144), true, true, true),
-    ("mimo-v2-pro-free", Some(1048576), true, true, true),
-    ("mimo-v2.5-free", Some(200000), true, true, false),
-    ("minimax-m2.1", Some(204800), true, false, true),
-    ("minimax-m2.1-free", Some(204800), true, true, true),
-    ("minimax-m2.5", Some(204800), true, false, false),
-    ("minimax-m2.5-free", Some(204800), true, true, true),
-    ("minimax-m2.7", Some(204800), true, false, false),
-    ("minimax-m3", Some(512000), true, false, false),
-    ("minimax-m3-free", Some(200000), true, true, true),
-    ("muse-spark-1.2", Some(1048576), true, false, false),
-    (
-        "muse-spark-1.2-contributor-free",
-        Some(1048576),
-        true,
-        true,
-        false,
-    ),
-    ("muse-spark-1.3", Some(1048576), true, false, false),
-    (
-        "muse-spark-1.3-contributor-free",
-        Some(1048576),
-        true,
-        true,
-        false,
-    ),
-    ("nemotron-3-super-free", Some(204800), true, true, true),
-    ("nemotron-3-ultra-free", Some(1000000), true, true, false),
-    (
-        "nemotron-3.5-lightning-free",
-        Some(262144),
-        true,
-        true,
-        false,
-    ),
-    ("north-mini-code-free", Some(256000), true, true, true),
-    ("qwen3-coder", Some(262144), false, false, true),
-    ("qwen3.5-plus", Some(262144), true, false, false),
-    ("qwen3.6-plus", Some(262144), true, false, false),
-    ("qwen3.6-plus-free", Some(262144), true, true, true),
-    ("ring-2.6-1t-free", Some(262000), true, true, true),
-    (
-        "trinity-large-preview-free",
-        Some(131072),
-        false,
-        true,
-        true,
-    ),
+    ("claude-3-5-haiku", Some(200000), false, true),
+    ("claude-fable-5", Some(1000000), true, false),
+    ("claude-fable-5-1", Some(1000000), true, false),
+    ("claude-haiku-4-5", Some(200000), true, false),
+    ("claude-opus-4-1", Some(200000), true, true),
+    ("claude-opus-4-5", Some(200000), true, false),
+    ("claude-opus-4-6", Some(1000000), true, false),
+    ("claude-opus-4-7", Some(1000000), true, false),
+    ("claude-opus-4-8", Some(1000000), true, false),
+    ("claude-opus-5", Some(1000000), true, false),
+    ("claude-sonnet-4", Some(1000000), true, false),
+    ("claude-sonnet-4-5", Some(1000000), true, false),
+    ("claude-sonnet-4-6", Some(1000000), true, false),
+    ("claude-sonnet-5", Some(1000000), true, false),
+    ("deepseek-v4-flash", Some(1000000), true, false),
+    ("deepseek-v4-flash-vision-exp", Some(1000000), true, false),
+    ("deepseek-v4-pro", Some(1000000), true, false),
+    ("gemini-3-flash", Some(1048576), true, false),
+    ("gemini-3-pro", Some(1048576), true, true),
+    ("gemini-3.1-pro", Some(1048576), true, false),
+    ("gemini-3.5-flash", Some(1048576), true, false),
+    ("gemini-3.5-flash-lite", Some(1048576), true, false),
+    ("gemini-3.6-flash", Some(1048576), true, false),
+    ("gemini-3.7-flash", Some(1048576), true, false),
+    ("gemini-3.8-flash", Some(1048576), true, false),
+    ("glm-4.6", Some(204800), true, true),
+    ("glm-4.7", Some(204800), true, true),
+    ("glm-5", Some(204800), true, false),
+    ("glm-5.1", Some(204800), true, false),
+    ("glm-5.2", Some(1000000), true, false),
+    ("glm-5.3", Some(1000000), true, false),
+    ("glm-5.3-flash", Some(1000000), true, false),
+    ("gpt-5", Some(400000), true, false),
+    ("gpt-5-codex", Some(400000), true, false),
+    ("gpt-5-nano", Some(400000), true, false),
+    ("gpt-5.1", Some(400000), true, false),
+    ("gpt-5.1-codex", Some(400000), true, false),
+    ("gpt-5.1-codex-max", Some(400000), true, false),
+    ("gpt-5.1-codex-mini", Some(400000), true, false),
+    ("gpt-5.2", Some(400000), true, false),
+    ("gpt-5.2-codex", Some(400000), true, false),
+    ("gpt-5.3-codex", Some(400000), true, false),
+    ("gpt-5.3-codex-spark", Some(128000), true, false),
+    ("gpt-5.4", Some(1050000), true, false),
+    ("gpt-5.4-mini", Some(400000), true, false),
+    ("gpt-5.4-nano", Some(400000), true, false),
+    ("gpt-5.4-pro", Some(1050000), true, false),
+    ("gpt-5.5", Some(1050000), true, false),
+    ("gpt-5.5-pro", Some(1050000), true, false),
+    ("gpt-5.6-luna", Some(1050000), true, false),
+    ("gpt-5.6-sol", Some(1050000), true, false),
+    ("gpt-5.6-terra", Some(1050000), true, false),
+    ("gpt-6-astra", Some(1050000), true, false),
+    ("grok-4.5", Some(500000), true, false),
+    ("grok-4.6", Some(500000), true, false),
+    ("grok-build-0.1", Some(256000), true, false),
+    ("grok-code", Some(256000), true, true),
+    ("kimi-k2", Some(262144), false, true),
+    ("kimi-k2-thinking", Some(262144), true, true),
+    ("kimi-k2.5", Some(262144), true, false),
+    ("kimi-k2.6", Some(262144), true, false),
+    ("kimi-k2.7-code", Some(262144), true, false),
+    ("kimi-k3", Some(1048576), true, false),
+    ("minimax-m2.1", Some(204800), true, true),
+    ("minimax-m2.5", Some(204800), true, false),
+    ("minimax-m2.7", Some(204800), true, false),
+    ("minimax-m3", Some(512000), true, false),
+    ("muse-spark-1.2", Some(1048576), true, false),
+    ("muse-spark-1.3", Some(1048576), true, false),
+    ("qwen3-coder", Some(262144), false, true),
+    ("qwen3.5-plus", Some(262144), true, false),
+    ("qwen3.6-plus", Some(262144), true, false),
 ];
 
 /// The `/zen/go/v1` catalog. Deliberately not merged with the table above:
@@ -392,59 +334,41 @@ const OPENCODE_ZEN_MODEL_METADATA: &[OpenCodeZenModelRow] = &[
 /// this is a distinct catalog behind a distinct endpoint, not a filtered view
 /// of the full one.
 const OPENCODE_GO_MODEL_METADATA: &[OpenCodeZenModelRow] = &[
-    ("deepseek-v4-flash", Some(1000000), true, false, false),
-    (
-        "deepseek-v4-flash-vision-exp",
-        Some(1000000),
-        true,
-        false,
-        false,
-    ),
-    ("deepseek-v4-pro", Some(1000000), true, false, false),
-    ("deepseek-v4.1-flash", Some(1000000), true, false, false),
-    ("glm-5", Some(202752), true, false, true),
-    ("glm-5.1", Some(202752), true, false, false),
-    ("glm-5.2", Some(1000000), true, false, false),
-    ("glm-5.3", Some(1000000), true, false, false),
-    ("glm-5.3-flash", Some(1000000), true, false, false),
-    ("gpt-5.6-luna", Some(1050000), true, false, false),
-    ("grok-4.5", Some(500000), true, false, true),
-    ("grok-4.6", Some(500000), true, false, false),
-    ("hy3", Some(256000), true, false, false),
-    ("hy4-preview", Some(1024000), true, false, false),
-    ("kimi-k2.5", Some(262144), true, false, true),
-    ("kimi-k2.6", Some(262144), true, false, false),
-    ("kimi-k2.7-code", Some(262144), true, false, false),
-    ("kimi-k3", Some(1048576), true, false, false),
-    ("longcat-2.0", Some(1000000), true, false, false),
-    ("mimo-v2-omni", Some(262144), true, false, true),
-    ("mimo-v2-pro", Some(1048576), true, false, true),
-    ("mimo-v2.5", Some(1000000), true, false, false),
-    ("mimo-v2.5-pro", Some(1048576), true, false, false),
-    ("minimax-m2.5", Some(204800), true, false, true),
-    ("minimax-m2.7", Some(204800), true, false, false),
-    ("minimax-m3", Some(1000000), true, false, false),
-    (
-        "muse-spark-1.2-contributor",
-        Some(1048576),
-        true,
-        false,
-        false,
-    ),
-    (
-        "muse-spark-1.3-contributor",
-        Some(1048576),
-        true,
-        false,
-        false,
-    ),
-    ("omen-alpha", Some(500000), true, false, true),
-    ("qwen3.5-plus", Some(262144), true, false, true),
-    ("qwen3.6-plus", Some(1000000), true, false, false),
-    ("qwen3.7-max", Some(1000000), true, false, false),
-    ("qwen3.7-plus", Some(1000000), true, false, false),
-    ("qwen3.8-flash", Some(1000000), true, false, false),
-    ("qwen3.8-max", Some(1000000), true, false, false),
+    ("deepseek-v4-flash", Some(1000000), true, false),
+    ("deepseek-v4-flash-vision-exp", Some(1000000), true, false),
+    ("deepseek-v4-pro", Some(1000000), true, false),
+    ("deepseek-v4.1-flash", Some(1000000), true, false),
+    ("glm-5", Some(202752), true, true),
+    ("glm-5.1", Some(202752), true, false),
+    ("glm-5.2", Some(1000000), true, false),
+    ("glm-5.3", Some(1000000), true, false),
+    ("glm-5.3-flash", Some(1000000), true, false),
+    ("gpt-5.6-luna", Some(1050000), true, false),
+    ("grok-4.5", Some(500000), true, true),
+    ("grok-4.6", Some(500000), true, false),
+    ("hy3", Some(256000), true, false),
+    ("hy4-preview", Some(1024000), true, false),
+    ("kimi-k2.5", Some(262144), true, true),
+    ("kimi-k2.6", Some(262144), true, false),
+    ("kimi-k2.7-code", Some(262144), true, false),
+    ("kimi-k3", Some(1048576), true, false),
+    ("longcat-2.0", Some(1000000), true, false),
+    ("mimo-v2-omni", Some(262144), true, true),
+    ("mimo-v2-pro", Some(1048576), true, true),
+    ("mimo-v2.5", Some(1000000), true, false),
+    ("mimo-v2.5-pro", Some(1048576), true, false),
+    ("minimax-m2.5", Some(204800), true, true),
+    ("minimax-m2.7", Some(204800), true, false),
+    ("minimax-m3", Some(1000000), true, false),
+    ("muse-spark-1.2-contributor", Some(1048576), true, false),
+    ("muse-spark-1.3-contributor", Some(1048576), true, false),
+    ("omen-alpha", Some(500000), true, true),
+    ("qwen3.5-plus", Some(262144), true, true),
+    ("qwen3.6-plus", Some(1000000), true, false),
+    ("qwen3.7-max", Some(1000000), true, false),
+    ("qwen3.7-plus", Some(1000000), true, false),
+    ("qwen3.8-flash", Some(1000000), true, false),
+    ("qwen3.8-max", Some(1000000), true, false),
 ];
 
 fn opencode_zen_metadata_tables(
@@ -488,65 +412,23 @@ fn opencode_zen_known_reasoning(catalog: OpenCodeZenCatalog, model: &str) -> boo
 }
 
 fn opencode_zen_known_deprecated(catalog: OpenCodeZenCatalog, model: &str) -> bool {
-    opencode_zen_metadata_row(catalog, model).is_some_and(|(_, _, _, _, deprecated)| *deprecated)
-}
-
-pub fn opencode_zen_known_free(catalog: OpenCodeZenCatalog, model: &str) -> Option<bool> {
-    if let Some((_, _, _, free, _)) = opencode_zen_metadata_row(catalog, model) {
-        return Some(*free);
-    }
-    // Unknown ids are not guessed from a `-free` suffix.
-    match catalog {
-        OpenCodeZenCatalog::Full => {
-            vellum_proxy_runtime::opencode::confirmed_free_zen_model(model).then_some(true)
-        }
-        OpenCodeZenCatalog::Go => Some(false),
-    }
-}
-
-/// Whether a model is actually usable on the free tier *today*: costs
-/// nothing **and** has not been retired by the provider.
-///
-/// The two are independent. models.dev still reports
-/// `deepseek-v4-flash-free` at `cost: {input: 0, output: 0}` while marking it
-/// `status: deprecated` -- the price of a withdrawn model does not change. A
-/// `freeOnly` catalog that reads only the price keeps offering it.
-pub fn opencode_zen_free_tier_model(catalog: OpenCodeZenCatalog, model: &str) -> bool {
-    opencode_zen_known_free(catalog, model).unwrap_or(false)
-        && !opencode_zen_known_deprecated(catalog, model)
-}
-
-fn opencode_zen_access_mode(catalog: OpenCodeZenCatalog, model: &str) -> crate::model::AccessMode {
-    match catalog {
-        OpenCodeZenCatalog::Full
-            if vellum_proxy_runtime::opencode::confirmed_free_zen_model(model) =>
-        {
-            crate::model::AccessMode::AnonymousFree
-        }
-        _ => crate::model::AccessMode::Credentialed,
-    }
+    opencode_zen_metadata_row(catalog, model).is_some_and(|(_, _, _, deprecated)| *deprecated)
 }
 
 /// Ordering used both to pick verification candidates and to sort the catalog
-/// for display: free-and-current models first, then free-but-deprecated, then
-/// paid-and-current, then paid-and-deprecated — each group in catalog order
-/// (a stable sort). Models Vellum cannot route at all (`opencode_zen_wire_for_model`
+/// for display: current models first, then deprecated ones — each group in
+/// catalog order (a stable sort). Models Vellum cannot route at all (`opencode_zen_wire_for_model`
 /// returns `None`) always sort last, since no amount of preference helps if the
 /// endpoint cannot be reached.
-fn opencode_zen_display_rank(catalog: OpenCodeZenCatalog, model: &str) -> (bool, bool, bool) {
+fn opencode_zen_display_rank(catalog: OpenCodeZenCatalog, model: &str) -> (bool, bool) {
     let unsupported = opencode_zen_wire_for_model(model).is_none();
-    let free = opencode_zen_known_free(catalog, model).unwrap_or(false);
     let deprecated = opencode_zen_known_deprecated(catalog, model);
-    (unsupported, !free, deprecated)
+    (unsupported, deprecated)
 }
 
-/// Ordered candidates for the one paid-credit-free verification request
-/// Vellum makes when a Zen account is connected. Free, non-deprecated models
-/// come first, in catalog order, so connecting an account never unexpectedly
-/// consumes paid credits and never leads with a model OpenCode itself has
-/// retired; every other protocol-supported model follows so the connection
-/// still succeeds if none of the free models pass the Codex typed-tool-call
-/// probe (some free/coding models genuinely do not support function calling).
+/// Ordered candidates for the representative model of a connected Zen/Go
+/// catalog: current models first, in catalog order, so the connection never
+/// leads with a model OpenCode itself has retired.
 fn opencode_zen_probe_candidates(catalog: OpenCodeZenCatalog, models: &[String]) -> Vec<&str> {
     let mut candidates: Vec<&str> = models
         .iter()
@@ -1006,7 +888,7 @@ pub async fn probe_endpoint_with_client(
                 .to_string(),
             OpenCodeZenCatalog::Full => api_key
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or(vellum_proxy_runtime::OPENCODE_PUBLIC_TOKEN)
+                .ok_or_else(|| AppError::Message("OpenCode Zen requires an API key".into()))?
                 .to_string(),
         };
         return probe_opencode_zen_catalog(
@@ -1232,13 +1114,7 @@ pub async fn discover_endpoint_with_client(
                 // `zen_catalog` is `None`.
                 tool_calling: (zen_catalog.is_some() && catalog_wire.is_none()).then_some(false),
                 probe_version: None,
-                free: zen_catalog.and_then(|catalog| opencode_zen_known_free(catalog, model)),
-                access_mode: zen_catalog.map(|catalog| opencode_zen_access_mode(catalog, model)),
-                display_name: zen_catalog
-                    .and_then(|_| {
-                        vellum_proxy_runtime::opencode::confirmed_zen_model_display_name(model)
-                    })
-                    .map(str::to_string),
+                access_mode: zen_catalog.map(|_| crate::model::AccessMode::Credentialed),
                 ..Default::default()
             }
         })
@@ -1457,8 +1333,7 @@ async fn probe_opencode_zen_catalog(
             )
         })?;
 
-    // Free-and-current models first (matching OpenCode's own model picker),
-    // then free-but-deprecated, then paid, with protocol-unsupported models
+    // Current models first, then deprecated, with protocol-unsupported models
     // last — see `opencode_zen_display_rank`. `models` and `model_capabilities`
     // are sorted together so every consumer (the detected-models list during
     // Add Provider, and the model catalog ledger once the route exists) shows
@@ -1484,13 +1359,8 @@ async fn probe_opencode_zen_catalog(
                 .then_some(true),
                 tool_calling: wire.is_none().then_some(false),
                 probe_version: None,
-                free: opencode_zen_known_free(catalog, model),
                 deprecated: Some(opencode_zen_known_deprecated(catalog, model)),
-                access_mode: Some(opencode_zen_access_mode(catalog, model)),
-                display_name: vellum_proxy_runtime::opencode::confirmed_zen_model_display_name(
-                    model,
-                )
-                .map(str::to_string),
+                access_mode: Some(crate::model::AccessMode::Credentialed),
                 ..Default::default()
             }
         })
@@ -1532,8 +1402,8 @@ async fn probe_opencode_zen_catalog(
     })
 }
 
-/// Probe selected OpenCode models at most once each. Free models run with
-/// concurrency 1. The first 429 stops the rest.
+/// Probe selected OpenCode models at most once each, one at a time. The first
+/// 429 stops the rest.
 pub async fn probe_opencode_selected_models(
     client: &reqwest::Client,
     base_url: &str,
@@ -1581,12 +1451,10 @@ fn opencode_catalog_token<'a>(v1: &str, api_key: Option<&'a str>) -> AppResult<O
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| AppError::Message("OpenCode Go requires an API key".into()))
             .map(Some),
-        Some(OpenCodeZenCatalog::Full) => Ok(Some(
-            api_key
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(vellum_proxy_runtime::OPENCODE_PUBLIC_TOKEN),
-        )),
-        None => Ok(api_key.filter(|value| !value.trim().is_empty())),
+        // Zen lists its catalog without a key; a key, when present, is sent.
+        Some(OpenCodeZenCatalog::Full) | None => {
+            Ok(api_key.filter(|value| !value.trim().is_empty()))
+        }
     }
 }
 
@@ -1601,9 +1469,11 @@ fn opencode_model_probe_token<'a>(
             .ok_or_else(|| AppError::Message("OpenCode Go requires an API key".into()))
             .map(Some),
         Some(OpenCodeZenCatalog::Full)
-            if vellum_proxy_runtime::opencode::confirmed_free_zen_model(model) =>
+            if vellum_proxy_runtime::opencode::is_free_tier_model(model) =>
         {
-            Ok(Some(vellum_proxy_runtime::OPENCODE_PUBLIC_TOKEN))
+            Err(AppError::Message(
+                vellum_proxy_runtime::opencode::FREE_TIER_UNSUPPORTED.into(),
+            ))
         }
         Some(OpenCodeZenCatalog::Full) => api_key
             .filter(|value| !value.trim().is_empty())
@@ -1742,12 +1612,20 @@ async fn get_models(
         .json()
         .await
         .map_err(|e| AppError::Message(e.to_string()))?;
-    models_outcome_from_entries(
+    let mut outcome = models_outcome_from_entries(
         body.get("data")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default(),
-    )
+    )?;
+    if opencode_zen_catalog(v1).is_some() {
+        // OpenCode serves its free tier only to the OpenCode app, so those
+        // models never enter a Vellum catalog.
+        outcome
+            .models
+            .retain(|model| !vellum_proxy_runtime::opencode::is_free_tier_model(model));
+    }
+    Ok(outcome)
 }
 
 fn models_catalog_timeout(v1: &str) -> std::time::Duration {
@@ -4048,97 +3926,34 @@ mod tests {
     }
 
     #[test]
-    fn opencode_zen_known_free_uses_the_real_catalog_flag_not_a_naming_guess() {
-        // Ground truth from OpenCode's own model registry, not a naming
-        // convention: `-free` id suffixes happen to line up for these, but
-        // the lookup is a real per-id `cost == 0` flag, and `gpt-5-nano` was
-        // never free despite once being treated as a fallback free pick.
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "big-pickle"),
-            Some(true)
-        );
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "deepseek-v4-flash-free"),
-            Some(true)
-        );
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "Laguna-S-2.1-Free"),
-            Some(true)
-        );
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "gpt-5-nano"),
-            Some(false)
-        );
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "deepseek-v4-flash"),
-            Some(false)
-        );
-        // OpenCode Go carries no free models at all — every one of its 24
-        // models has a real per-token cost.
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Go, "deepseek-v4-flash"),
-            Some(false)
-        );
-        // An id absent from both tables is unknown, never guessed from a suffix.
-        assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "some-new-model-free"),
-            None
-        );
-    }
-
-    /// The case this predicate exists for. OpenCode withdrew
-    /// `deepseek-v4-flash-free`; models.dev still reports it at zero cost and
-    /// additionally marks it `status: deprecated`. A free-tier catalog that
-    /// reads only the price keeps offering a model the provider has retired.
-    #[test]
-    fn a_retired_zero_cost_model_is_not_on_the_free_tier() {
-        let catalog = OpenCodeZenCatalog::Full;
-        // Still free, by price.
-        assert_eq!(
-            opencode_zen_known_free(catalog, "deepseek-v4-flash-free"),
-            Some(true)
-        );
-        // ...and still withdrawn, so not offered.
-        assert!(!opencode_zen_free_tier_model(
-            catalog,
-            "deepseek-v4-flash-free"
-        ));
-        // A free model that is current stays on the tier.
-        assert!(opencode_zen_free_tier_model(catalog, "big-pickle"));
-        // Paid models were never on it.
-        assert!(!opencode_zen_free_tier_model(catalog, "glm-5.2"));
+    fn opencode_zen_metadata_carries_no_free_tier_rows() {
+        for (id, ..) in OPENCODE_ZEN_MODEL_METADATA
+            .iter()
+            .chain(OPENCODE_GO_MODEL_METADATA)
+        {
+            assert!(
+                !vellum_proxy_runtime::opencode::is_free_tier_model(id),
+                "{id} is an OpenCode free-tier model"
+            );
+        }
     }
 
     #[test]
-    fn opencode_zen_probe_candidates_prefer_free_current_models_before_paid_or_deprecated_ones() {
-        // The annotations below are read from `OPENCODE_ZEN_MODEL_METADATA`,
-        // not asserted from a naming convention -- `-free` in an id says
-        // nothing, and a model's deprecation flag moves whenever
-        // `scripts/refresh-opencode-catalog.mjs` picks up the upstream
-        // registry again. When this expectation changes after a refresh,
-        // check the table before touching the ordering: it is far more
-        // likely that a model was deprecated upstream than that the
-        // ordering rule broke.
+    fn opencode_zen_probe_candidates_prefer_current_models_before_deprecated_ones() {
+        // The annotations below are read from `OPENCODE_ZEN_MODEL_METADATA`.
+        // When this expectation changes after a catalog refresh, check the
+        // table before touching the ordering: it is far more likely that a
+        // model was deprecated upstream than that the ordering rule broke.
         let models = vec![
             "claude-opus-5".to_string(),
+            "omen-alpha".to_string(), // deprecated
             "gpt-5.6-sol".to_string(),
-            "glm-5-free".to_string(),             // free but deprecated
-            "deepseek-v4-flash-free".to_string(), // free but deprecated
-            "big-pickle".to_string(),             // free and current
-            "glm-5.2".to_string(),                // paid and current
+            "glm-5.2".to_string(),
         ];
         // claude-opus-5 is dropped entirely: it has no wire Vellum can speak.
-        // Free + current models come first (catalog order preserved), then
-        // free-but-deprecated (also in catalog order), then paid.
         assert_eq!(
             opencode_zen_probe_candidates(OpenCodeZenCatalog::Full, &models),
-            vec![
-                "big-pickle",
-                "glm-5-free",
-                "deepseek-v4-flash-free",
-                "gpt-5.6-sol",
-                "glm-5.2",
-            ],
+            vec!["gpt-5.6-sol", "glm-5.2", "omen-alpha"],
         );
     }
 
@@ -4152,12 +3967,6 @@ mod tests {
             opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "kimi-k3"),
             Some(1_048_576)
         );
-        // A `-free` id is its own catalog row, not an alias of the paid
-        // sibling — Zen genuinely serves it with a smaller context window.
-        assert_eq!(
-            opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "deepseek-v4-flash-free"),
-            Some(200_000)
-        );
         assert_eq!(
             opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "deepseek-v4-flash"),
             Some(1_000_000)
@@ -4168,7 +3977,7 @@ mod tests {
         );
         assert!(opencode_zen_known_reasoning(
             OpenCodeZenCatalog::Full,
-            "mimo-v2.5-free"
+            "glm-5.2"
         ));
         assert_eq!(
             opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "unknown-zen-model"),
@@ -4189,10 +3998,6 @@ mod tests {
         assert_eq!(
             opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "hy3"),
             Some(256_000)
-        );
-        assert_eq!(
-            opencode_zen_known_context_window(OpenCodeZenCatalog::Full, "hy3-free"),
-            Some(190_000)
         );
     }
 
@@ -4223,58 +4028,18 @@ mod tests {
     }
 
     #[test]
-    fn opencode_free_models_do_not_require_a_private_key() {
-        let token =
-            opencode_model_probe_token(OPENCODE_ZEN_BASE_URL, "mimo-v2.5-free", None).unwrap();
-        assert_eq!(token, Some(vellum_proxy_runtime::OPENCODE_PUBLIC_TOKEN));
-        let token =
-            opencode_model_probe_token(OPENCODE_ZEN_BASE_URL, "mimo-v2.5-free", Some("sk-private"))
-                .unwrap();
-        assert_eq!(token, Some(vellum_proxy_runtime::OPENCODE_PUBLIC_TOKEN));
-        assert!(opencode_zen_known_free(OpenCodeZenCatalog::Full, "mystery-free").is_none());
+    fn opencode_free_models_are_refused_even_with_a_key() {
+        for key in [None, Some("sk-private")] {
+            let error =
+                opencode_model_probe_token(OPENCODE_ZEN_BASE_URL, "deepseek-v4.1-flash-free", key)
+                    .unwrap_err();
+            assert!(error.to_string().contains("free"), "{error}");
+        }
         assert_eq!(
-            opencode_zen_known_free(OpenCodeZenCatalog::Full, "mimo-v2.5-free"),
-            Some(true)
+            opencode_model_probe_token(OPENCODE_ZEN_BASE_URL, "glm-5.2", Some("sk-private"))
+                .unwrap(),
+            Some("sk-private")
         );
-    }
-
-    #[tokio::test]
-    async fn opencode_zen_catalog_assigns_the_confirmed_display_name_and_leaves_the_routing_id_alone(
-    ) {
-        // The selected-model re-probe path (`probe_opencode_zen_catalog`)
-        // must surface `x-preview-f-free`'s real catalog name ("Ox Alpha
-        // Free") the same way initial discovery does -- and must never let
-        // that friendly name leak into `model`, which routing and
-        // persistence key off unconditionally.
-        let result = probe_opencode_zen_catalog(
-            &default_client().unwrap(),
-            "http://127.0.0.1:1/v1",
-            OpenCodeZenCatalog::Full,
-            None,
-            vec!["x-preview-f-free".into(), "big-pickle".into()],
-            None,
-            HashMap::new(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
-
-        let ox = result
-            .model_capabilities
-            .iter()
-            .find(|capability| capability.model == "x-preview-f-free")
-            .unwrap();
-        assert_eq!(ox.display_name.as_deref(), Some("Ox Alpha Free"));
-        assert_eq!(ox.model, "x-preview-f-free");
-
-        // A model with no confirmed catalog name shows the upstream id
-        // unchanged, exactly as before this feature.
-        let pickle = result
-            .model_capabilities
-            .iter()
-            .find(|capability| capability.model == "big-pickle")
-            .unwrap();
-        assert_eq!(pickle.display_name, None);
     }
 
     #[tokio::test]
@@ -4317,7 +4082,7 @@ mod tests {
         // gpt-5.4-mini resolves to the Responses wire (see
         // opencode_zen_wire_for_model), so it needs its own route now that
         // every wire-supported candidate is actually probed, not just the
-        // free one.
+        // first one.
         async fn responses(headers: HeaderMap, Json(body): Json<Value>) -> Response {
             if body["tool_choice"] == "required" {
                 return Json(json!({"output": [{
@@ -4358,8 +4123,8 @@ mod tests {
             None,
             vec![
                 "claude-opus-5".into(),
+                "glm-5.1".into(),
                 "gpt-5.4-mini".into(),
-                "big-pickle".into(),
             ],
             None,
             HashMap::new(),
@@ -4370,17 +4135,17 @@ mod tests {
         server.abort();
 
         assert_eq!(result.wire, Some(WireFormat::Chat));
-        let free = result
+        let glm = result
             .model_capabilities
             .iter()
-            .find(|capability| capability.model == "big-pickle")
+            .find(|capability| capability.model == "glm-5.1")
             .unwrap();
-        assert_eq!(free.wire, Some(WireFormat::Chat));
-        assert_eq!(free.tool_calling, None);
-        assert_eq!(free.probe_version, None);
+        assert_eq!(glm.wire, Some(WireFormat::Chat));
+        assert_eq!(glm.tool_calling, None);
+        assert_eq!(glm.probe_version, None);
         assert_eq!(
-            free.access_mode,
-            Some(crate::model::AccessMode::AnonymousFree)
+            glm.access_mode,
+            Some(crate::model::AccessMode::Credentialed)
         );
 
         let gpt = result
@@ -4405,14 +4170,14 @@ mod tests {
         assert_eq!(claude.probe_version, None);
     }
 
-    /// Reproduces the bug: `big-pickle` accepts the plain request (so it used
+    /// Reproduces the bug: `glm-5.1` accepts the plain request (so it used
     /// to satisfy the old "wire is some" check) but never returns a typed
     /// tool call. The catalog probe must not settle for it — it has to fall
     /// through to the next candidate that actually passes the Codex
     /// tool-calling probe, here `glm-5.2`, and must not leave `claude-opus-5`
     /// (unsupported protocol, never probed at all) selected as a side effect.
     #[tokio::test]
-    async fn opencode_catalog_falls_through_when_the_free_model_cannot_call_tools() {
+    async fn opencode_catalog_falls_through_when_the_first_model_cannot_call_tools() {
         use axum::extract::Json;
         use axum::http::{header, HeaderMap};
         use axum::response::{IntoResponse, Response};
@@ -4422,9 +4187,9 @@ mod tests {
         async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> Response {
             let model = body["model"].as_str().unwrap_or_default().to_string();
             if body["tool_choice"] == "required" {
-                if model == "big-pickle" {
+                if model == "glm-5.1" {
                     // Accepts the request but answers in prose — a real
-                    // free/coding model that does not support function calls.
+                    // model that does not support function calls.
                     return Json(json!({"choices": [{"message": {"content": "sure, done"}}]}))
                         .into_response();
                 }
@@ -4467,7 +4232,7 @@ mod tests {
             None,
             vec![
                 "claude-opus-5".into(),
-                "big-pickle".into(),
+                "glm-5.1".into(),
                 "glm-5.2".into(),
             ],
             None,
@@ -4478,7 +4243,7 @@ mod tests {
         .unwrap();
         server.abort();
 
-        // glm-5.2, not big-pickle, is the one the catalog actually verified.
+        // glm-5.2, not glm-5.1, is the one the catalog actually verified.
         assert_eq!(result.wire, Some(WireFormat::Chat));
         let glm = result
             .model_capabilities
@@ -4488,12 +4253,12 @@ mod tests {
         assert_eq!(glm.tool_calling, None);
         assert_eq!(glm.context_window, Some(1_000_000));
 
-        let free = result
+        let prose = result
             .model_capabilities
             .iter()
-            .find(|capability| capability.model == "big-pickle")
+            .find(|capability| capability.model == "glm-5.1")
             .unwrap();
-        assert_eq!(free.tool_calling, None);
+        assert_eq!(prose.tool_calling, None);
 
         // claude-opus-5 was never a wire-eligible candidate, so it stays
         // unverified — it must never become the route's model.
@@ -4622,11 +4387,10 @@ mod tests {
         assert!(error.to_string().contains("no models Vellum can speak"));
     }
 
-    /// Free models must render first — this is the ordering OpenCode's own
-    /// model picker uses, and the point of the fix: a paid model no longer
-    /// buries the free ones a user would actually want to pick first.
+    /// Current models render before ones OpenCode has retired, with
+    /// unsupported-protocol models last.
     #[tokio::test]
-    async fn opencode_catalog_sorts_free_models_before_paid_ones() {
+    async fn opencode_catalog_sorts_current_models_before_deprecated_ones() {
         use axum::extract::Json;
         use axum::routing::post;
         use axum::Router;
@@ -4653,13 +4417,13 @@ mod tests {
             &format!("http://{address}/v1"),
             OpenCodeZenCatalog::Full,
             None,
-            // Catalog order deliberately puts the paid model first and mixes
-            // in an unsupported-protocol one — the sort must still put the
-            // free model first and the unsupported one last.
+            // Catalog order deliberately puts the deprecated model first and
+            // mixes in an unsupported-protocol one — the sort must still put
+            // the current model first and the unsupported one last.
             vec![
-                "glm-5.2".into(),
+                "omen-alpha".into(),
                 "claude-opus-5".into(),
-                "deepseek-v4-flash-free".into(),
+                "glm-5.2".into(),
             ],
             None,
             HashMap::new(),
@@ -4671,7 +4435,7 @@ mod tests {
 
         assert_eq!(
             result.models,
-            vec!["deepseek-v4-flash-free", "glm-5.2", "claude-opus-5"],
+            vec!["glm-5.2", "omen-alpha", "claude-opus-5"],
         );
         assert_eq!(
             result
@@ -4679,18 +4443,18 @@ mod tests {
                 .iter()
                 .map(|capability| capability.model.as_str())
                 .collect::<Vec<_>>(),
-            vec!["deepseek-v4-flash-free", "glm-5.2", "claude-opus-5"],
+            vec!["glm-5.2", "omen-alpha", "claude-opus-5"],
         );
-        let free_flags = result
+        let deprecated_flags = result
             .model_capabilities
             .iter()
-            .map(|capability| (capability.model.as_str(), capability.free))
+            .map(|capability| (capability.model.as_str(), capability.deprecated))
             .collect::<Vec<_>>();
         assert_eq!(
-            free_flags,
+            deprecated_flags,
             vec![
-                ("deepseek-v4-flash-free", Some(true)),
                 ("glm-5.2", Some(false)),
+                ("omen-alpha", Some(true)),
                 ("claude-opus-5", Some(false)),
             ],
         );
@@ -4775,15 +4539,15 @@ mod tests {
         let results = probe_opencode_selected_models(
             &default_client().unwrap(),
             &format!("http://{address}/v1"),
-            Some(vellum_proxy_runtime::OPENCODE_PUBLIC_TOKEN),
-            &["mimo-v2.5-free".into(), "big-pickle".into()],
+            Some("sk-test"),
+            &["mimo-v2.5".into(), "glm-5.1".into()],
         )
         .await
         .unwrap();
         server.abort();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].probe_issue.as_deref(), Some("provider_quota"));
-        assert_eq!(*seen.lock().unwrap(), vec!["mimo-v2.5-free".to_string()]);
+        assert_eq!(*seen.lock().unwrap(), vec!["mimo-v2.5".to_string()]);
     }
 
     #[test]
@@ -4818,7 +4582,7 @@ mod tests {
 
     #[test]
     fn chat_probe_never_sends_an_empty_user_turn() {
-        let body = build_chat_body("", "x-preview-f-free");
+        let body = build_chat_body("", "glm-5.1");
         assert_eq!(
             body["messages"],
             json!([{ "role": "user", "content": "ping" }])

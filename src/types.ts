@@ -3,7 +3,7 @@
 export type WireFormat = "responses" | "chat";
 export type ProviderKind = "official" | "openAiCompatible" | "grokCli";
 export type AuthKind = "chatGpt" | "bearer" | "grokSession" | "none";
-export type AccessMode = "anonymousFree" | "credentialed";
+export type AccessMode = "credentialed";
 
 /** 上下文視窗數值的來源。決定 UI 顯示哪一層命中。 */
 export type BudgetSource =
@@ -11,8 +11,6 @@ export type BudgetSource =
   | "modelCache" // 供應商自帶的模型快取
   | "catalog" // Codex 型錄 context_window × percent
   | "fallback"; // 保底常數
-
-export type CatalogScope = "all" | "freeOnly";
 
 export type InsecureHttpPolicy =
   | "deny"
@@ -39,7 +37,6 @@ export interface Route {
   modelCapabilities: ModelCapability[];
   /** Third-party plaintext HTTP exemption. Older files omit this and load as deny. */
   insecureHttpPolicy?: InsecureHttpPolicy;
-  catalogScope?: CatalogScope;
 }
 
 export interface ModelCapability {
@@ -84,20 +81,13 @@ export interface ModelCapability {
   /** `effortProbeStatus` 是 `"indeterminate"` 時，機器可讀的原因代碼。 */
   effortProbeIssue?: string | null;
   /**
-   * 這個模型免不免費，來自供應商自己的型錄（目前只有 OpenCode Zen／Go 有這個
-   * 資料）。null／undefined 代表這個供應商沒有免費／付費的區分，不是「已知付費」。
-   */
-  free?: boolean | null;
-  /**
-   * 供應商已經把這個模型退役了。跟 `free` 是**兩件事**：
-   * `deepseek-v4-flash-free` 到現在價格仍然是 0，但狀態是 deprecated。
-   * 免費型錄要同時看這兩個欄位，只看價格就會一直列出供應商已經撤掉的模型。
+   * 供應商已經把這個模型退役了。
    * null／undefined 是「不知道」，不是「還在供應」。
    */
   deprecated?: boolean | null;
   /**
-   * OpenCode 存取模式。官方目錄確認的免費 Zen 模型是 `anonymousFree`
-   *（`Authorization: Bearer public`）；付費、Go 或未知模型是 `credentialed`。
+   * OpenCode 存取模式。一律是 `credentialed`：OpenCode 的免費模型只開放給
+   * OpenCode 自己的 App，Vellum 不提供。
    */
   accessMode?: AccessMode | null;
   /**
@@ -1142,6 +1132,14 @@ export interface SshTrustStatus {
   host: string;
   port: number;
   confirmed: boolean;
+  source?: "userKnownHosts" | "explicitConfirmation" | null;
+  fingerprint?: PendingHostFingerprint | null;
+}
+
+export interface AddedRemoteHost {
+  candidate: RemoteHostCandidate;
+  loginCommand: string;
+  keyInstallCommand: string;
 }
 
 /** A host key currently offered by a host, fetched via `ssh-keyscan` without
@@ -1199,6 +1197,7 @@ export interface RemoteHostStatus {
       proxyBackend?: string | null;
       serviceManager?: string | null;
       persistenceScope?: string | null;
+      supervisorReady?: boolean | null;
       managedCodexHome?: string | null;
       guiSessionAvailable?: boolean | null;
     };
@@ -1494,13 +1493,15 @@ export interface RemoteSessionSummary {
   }>;
 }
 
+export type RemoteModelOption = RemoteDeploymentPlan["selectedModels"][number];
+
 export interface RemoteOperationProgress {
   operationId: string;
   hostId: string;
   kind: string;
   phase: string;
   percent: number;
-  state: "running" | "completed" | "failed";
+  state: "running" | "completed" | "failed" | "cancelled";
   message: string | null;
   result: unknown | null;
   updatedAt: string;
@@ -1603,4 +1604,13 @@ export interface UpdateOperation {
   component: UpdateComponent;
   phase: UpdatePhase;
   targetVersion: string | null;
+}
+
+export interface RemoteDeploySummary {
+  total: number;
+  succeeded: number;
+  failed: number;
+  interrupted: number;
+  blocked: number;
+  lastFailureCode: string | null;
 }

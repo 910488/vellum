@@ -8,7 +8,6 @@
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -16,7 +15,6 @@ use sha2::{Digest, Sha256};
 use vellum_remote_agent::configuration::{
     configure, credential_status, put_credential, remove_credential,
 };
-use vellum_remote_agent::docker::ProcessDockerClient;
 use vellum_remote_agent::host_probe::probe_host;
 use vellum_remote_agent::operations::BeginOutcome;
 use vellum_remote_agent::profile::ProfileManager;
@@ -57,6 +55,10 @@ enum Commands {
     Doctor,
     /// Refresh the detached Grok account (systemd timer entrypoint).
     RefreshGrok,
+    /// Restore enabled on-demand services on managed SSH reconnect.
+    EnsureServices,
+    /// Internal detached on-demand supervisor (no stdin/RPC transport).
+    Supervise,
 }
 
 fn main() {
@@ -82,7 +84,7 @@ fn run() -> Result<(), String> {
     };
     paths.ensure()?;
     let store = AgentStateStore::new(paths);
-    let manager = ProxyManager::with_docker(store.clone(), Arc::new(ProcessDockerClient::new()));
+    let manager = ProxyManager::new(store.clone());
     let profiles = ProfileManager::new(store.clone());
 
     match cli.command {
@@ -106,6 +108,20 @@ fn run() -> Result<(), String> {
         Commands::RefreshGrok => {
             let status = vellum_remote_agent::grok::refresh(store.paths())?;
             print_ok(serde_json::to_value(status).map_err(|error| error.to_string())?)?;
+        }
+        Commands::EnsureServices => {
+            if cfg!(target_os = "linux") && !vellum_remote_agent::persistence::probe().systemd_user
+            {
+                vellum_remote_agent::on_demand::OnDemandClient::new(store.paths().clone())
+                    .ensure_enabled()?;
+            }
+        }
+        Commands::Supervise => {
+            if !cfg!(target_os = "linux") {
+                return Err("OnDemandLinuxOnly".into());
+            }
+            vellum_remote_agent::on_demand::OnDemandClient::new(store.paths().clone())
+                .supervise()?;
         }
         Commands::Rpc { request } => {
             let raw = match request {
@@ -137,6 +153,11 @@ fn dispatch(
         AgentRequest::AgentVersion => Ok(json!({
             "agentVersion": AGENT_VERSION,
             "agentProtocol": AGENT_PROTOCOL_VERSION,
+            "proxyMigrationRecovery": true,
+            "confirmedTakeoverIdentity": true,
+            "fullCodexRuntimePackage": true,
+            "codexHandoff": true,
+            "codexHandoffPreflight": true,
         })),
         AgentRequest::HostCapabilities => {
             Ok(serde_json::to_value(probe_host()).map_err(|e| e.to_string())?)
@@ -161,6 +182,9 @@ fn dispatch(
         .map_err(|e| e.to_string())?),
         AgentRequest::ProxyStatus => {
             Ok(serde_json::to_value(manager.status()?).map_err(|e| e.to_string())?)
+        }
+        AgentRequest::ProxySelectPort { preferred_port } => {
+            Ok(json!({"hostPort": manager.select_port(preferred_port)?}))
         }
         AgentRequest::ProxyInstall {
             operation_id,
@@ -189,6 +213,12 @@ fn dispatch(
         })?),
         AgentRequest::ProxyStop { operation_id } => {
             operation_to_value(manager.stop(&operation_id)?)
+        }
+        AgentRequest::ProxyMigrationCommit { operation_id } => {
+            operation_to_value(manager.migration_commit(&operation_id)?)
+        }
+        AgentRequest::ProxyMigrationRollback { operation_id } => {
+            operation_to_value(manager.migration_rollback(&operation_id)?)
         }
         AgentRequest::ProxyRestart { operation_id } => {
             operation_to_value(manager.restart(&operation_id)?)
@@ -232,10 +262,9 @@ fn dispatch(
             image,
             image_digest,
         } => operation_to_value(manager.update(&operation_id, &image, image_digest)?),
-        AgentRequest::ProxyLogs { max_bytes } => {
-            Ok(serde_json::to_value(manager.logs(max_bytes)?)
-                .map_err(|error| error.to_string())?)
-        }
+        AgentRequest::ProxyLogs { max_bytes } => Ok(
+            serde_json::to_value(manager.logs(max_bytes)?).map_err(|error| error.to_string())?
+        ),
         AgentRequest::ProxyRollback { operation_id } => {
             operation_to_value(manager.rollback(&operation_id)?)
         }
@@ -448,6 +477,27 @@ fn dispatch(
                 .map_err(|error| error.to_string())?,
             )
         }
+        AgentRequest::CodexHandoffPreflight => {
+            vellum_remote_agent::handoff::preflight(&resolve_codex_home()?)
+        }
+        AgentRequest::CodexHandoffStart(request) => {
+            let home = resolve_codex_home()?;
+            serde_json::to_value(vellum_remote_agent::handoff::start(
+                store.paths(),
+                &home,
+                request,
+            )?)
+            .map_err(|e| e.to_string())
+        }
+        AgentRequest::CodexHandoffResult(request) => {
+            let home = resolve_codex_home()?;
+            serde_json::to_value(vellum_remote_agent::handoff::result(
+                store.paths(),
+                &home,
+                request,
+            )?)
+            .map_err(|e| e.to_string())
+        }
         AgentRequest::CodexSessionStatus { thread_id } => {
             let codex_home = resolve_codex_home()?;
             Ok(
@@ -638,14 +688,23 @@ fn dispatch(
                 serde_json::to_value(runtime).map_err(|error| error.to_string())
             },
         ),
-        AgentRequest::CodexStopAppOwned { operation_id } => run_mutation(
+        AgentRequest::CodexStopAppOwned {
+            operation_id,
+            expected_daemon_pid,
+            expected_daemon_identity,
+        } => run_mutation(
             store,
             &operation_id,
             "codex.stopAppOwned",
-            json!({}),
+            json!({"expectedDaemonPid": expected_daemon_pid, "expectedDaemonIdentity": expected_daemon_identity}),
             || {
-                serde_json::to_value(vellum_remote_agent::native_codex::stop_app_owned_native()?)
-                    .map_err(|error| error.to_string())
+                serde_json::to_value(
+                    vellum_remote_agent::native_codex::stop_app_owned_native_expected(
+                        expected_daemon_pid,
+                        expected_daemon_identity.as_deref(),
+                    )?,
+                )
+                .map_err(|error| error.to_string())
             },
         ),
         AgentRequest::CodexRestoreNative { operation_id } => run_mutation(
@@ -833,11 +892,19 @@ fn host_status_with_native(
     let native_codex = native.and_then(|status| serde_json::to_value(status.clone()).ok());
     let mut managed_profiles = profiles.aggregate_statuses()?;
     reconcile_native_profile_runtime(&mut managed_profiles, native_codex.as_ref());
+    let mut capabilities = probe_host();
+    if capabilities.persistence_scope.as_deref() == Some("onDemand") {
+        capabilities.supervisor_ready = Some(
+            vellum_remote_agent::on_demand::OnDemandClient::new(store.paths().clone())
+                .supervisor_ready()
+                .unwrap_or(false),
+        );
+    }
     Ok(HostStatus {
         host_id: state.host_id,
         agent_version: AGENT_VERSION.to_string(),
         agent_protocol: AGENT_PROTOCOL_VERSION,
-        capabilities: probe_host(),
+        capabilities,
         proxy: manager.status()?,
         install: state.install,
         configuration: serde_json::to_value(vellum_remote_agent::configuration::public_status(
@@ -880,11 +947,8 @@ fn host_inventory_with_native(
 ) -> Result<HostInventoryV2, String> {
     let state = store.load()?;
     let system = vellum_remote_agent::host_probe::probe_system_inventory();
-    let platform = vellum_remote_agent::platform::RemotePlatform::from_os_arch(
-        &system.os,
-        &system.arch,
-    )
-    .ok();
+    let platform =
+        vellum_remote_agent::platform::RemotePlatform::from_os_arch(&system.os, &system.arch).ok();
     let managed_home = dirs::home_dir().map(|home| {
         vellum_remote_agent::platform::managed_codex_home(&home, &system.os)
             .display()
@@ -906,6 +970,17 @@ fn host_inventory_with_native(
         persistence_scope: platform.map(|item| item.persistence_scope().to_string()),
         managed_codex_home: managed_home,
     };
+    let persistence = vellum_remote_agent::persistence::probe();
+    inventory.service_manager = vellum_remote_agent::host_probe::observed_service_manager(
+        &inventory.system.os,
+        platform,
+        persistence,
+    );
+    inventory.persistence_scope = vellum_remote_agent::host_probe::observed_persistence_scope(
+        &inventory.system.os,
+        platform,
+        persistence,
+    );
     inventory.blockers = host_blockers(&inventory);
     inventory.available_actions = host_actions(&inventory);
     Ok(inventory)
@@ -1030,6 +1105,24 @@ fn host_blockers(inventory: &HostInventoryV2) -> Vec<HostBlocker> {
             true,
         ));
     }
+    match inventory.proxy.last_error.as_deref() {
+        Some("proxyMigrationRolledBack") => blockers.push(HostBlocker::new(
+            "proxyMigrationRolledBack",
+            "Native migration failed; the previous managed Docker proxy was restored",
+            true,
+        )),
+        Some("proxyPortOccupied") => blockers.push(HostBlocker::new(
+            "proxyPortOccupied",
+            "The installed proxy port is occupied; converge can select a free port",
+            true,
+        )),
+        Some("proxyPortConflict") => blockers.push(HostBlocker::new(
+            "proxyPortConflict",
+            "All proxy fallback ports are occupied",
+            true,
+        )),
+        _ => {}
+    }
     blockers
 }
 
@@ -1127,6 +1220,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stopped_proxy_port_failure_reaches_host_inventory() {
+        let mut inventory = HostInventoryV2::default();
+        inventory.system.os = "linux".into();
+        inventory.system.arch = "aarch64".into();
+        inventory.proxy.present = true;
+        for code in [
+            "proxyPortOccupied",
+            "proxyPortConflict",
+            "proxyMigrationRolledBack",
+        ] {
+            inventory.proxy.last_error = Some(code.into());
+            assert!(host_blockers(&inventory)
+                .iter()
+                .any(|blocker| blocker.code == code));
+        }
+        inventory.proxy.last_error = None;
+        assert!(!host_blockers(&inventory)
+            .iter()
+            .any(|blocker| blocker.code.starts_with("proxyPort")));
+    }
+
+    #[test]
     fn native_profile_runtime_uses_native_daemon_authority() {
         let mut profiles = vec![json!({
             "profile": {"profileId": "codex-app-native"},
@@ -1143,7 +1258,7 @@ mod tests {
         HostInventoryV2 {
             host_id: "h-1".into(),
             agent_version: "0.1.0".into(),
-            agent_protocol: 1,
+            agent_protocol: AGENT_PROTOCOL_VERSION,
             system: vellum_remote_agent::protocol::SystemInventory {
                 os: "linux".into(),
                 arch: "aarch64".into(),
@@ -1184,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_codex_and_docker_produce_blockers_and_actions() {
+    fn linux_missing_codex_is_actionable_without_a_docker_blocker() {
         let mut inventory = inventory_fixture();
         inventory.codex.source = "missing".into();
         inventory.docker.available = false;
@@ -1195,15 +1310,23 @@ mod tests {
             .iter()
             .map(|blocker| blocker.code.as_str())
             .collect();
-        assert!(codes.contains(&"dockerUnavailable"));
+        assert!(!codes.contains(&"dockerUnavailable"));
         assert!(codes.contains(&"codexBinaryMissing"));
         assert!(blockers.iter().all(|blocker| blocker.repairable));
 
         let actions = host_actions(&inventory);
         assert!(actions.contains(&"installCodex".to_string()));
-        assert!(actions.contains(&"repair".to_string()));
+        assert!(!actions.contains(&"repair".to_string()));
         assert!(actions.contains(&"exportSupportBundle".to_string()));
         assert!(actions.contains(&"updateComponents".to_string()));
+    }
+
+    #[test]
+    fn healthy_linux_without_docker_needs_no_repair() {
+        let mut inventory = inventory_fixture();
+        inventory.docker.available = false;
+        assert!(host_blockers(&inventory).is_empty());
+        assert!(!host_actions(&inventory).contains(&"repair".to_string()));
     }
 
     #[test]
@@ -1242,7 +1365,10 @@ mod tests {
             .map(|blocker| blocker.code.as_str())
             .collect();
         assert!(!codes.contains(&"dockerUnavailable"));
-        assert!(!host_actions(&inventory).contains(&"repair".to_string()) || inventory.codex.standalone_installed);
+        assert!(
+            !host_actions(&inventory).contains(&"repair".to_string())
+                || inventory.codex.standalone_installed
+        );
         let intel = {
             let mut item = inventory.clone();
             item.system.arch = "x86_64".into();

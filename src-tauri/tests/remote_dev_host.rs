@@ -107,22 +107,18 @@ fn fixture() -> Fixture {
 }
 
 /// The artifacts bootstrap will actually install. Reported rather than
-/// asserted, because which pair is in play decides what a failure means:
+/// asserted, because the active artifact source decides what a failure means:
 /// an override points at a build you just made, the staged payload does not.
 fn artifact_sources() -> Vec<String> {
-    ["AGENT", "BROKER"]
+    [("AGENT", "vellum-remote-agent")]
         .into_iter()
-        .map(|component| {
+        .map(|(component, binary)| {
             let key = format!("VELLUM_REMOTE_{component}_AMD64");
             match std::env::var(&key) {
                 Ok(value) => format!("{key}={value}"),
                 Err(_) => format!(
                     "{key} unset -> src-tauri/resources/remote/linux-amd64/{}",
-                    if component == "AGENT" {
-                        "vellum-remote-agent"
-                    } else {
-                        "vellum-remote-broker"
-                    }
+                    binary
                 ),
             }
         })
@@ -406,7 +402,6 @@ fn configure_one_deployable_route(state: &AppState) {
                 probe_version: Some(vellum_lib::probe::HARNESS_PROBE_VERSION),
                 ..Default::default()
             }],
-            catalog_scope: None,
         },
         vellum_lib::model::ProviderKind::OpenAiCompatible,
         vellum_lib::model::AuthKind::Bearer,
@@ -914,9 +909,8 @@ fn the_staged_payload_matches_the_hash_compiled_into_this_binary() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/remote");
     for relative in [
         "linux-amd64/vellum-remote-agent",
-        "linux-amd64/vellum-remote-broker",
+        "linux-amd64/vellum-proxy-daemon",
         "linux-amd64/codex",
-        "linux-amd64/proxy-image.tar",
     ] {
         assert!(
             root.join(relative).is_file(),

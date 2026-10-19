@@ -9,18 +9,25 @@
 //! with no app-server at all ("cannot find Codex host" on Windows, "cannot load
 //! organization settings" on macOS).
 //!
-//! The bridge therefore falls back to the core Desktop itself ships, run as
-//! plain Official Codex with no Enhanced plane, and leaves a record here so
-//! Vellum can rebuild the launch. That widens nothing: the fallback is the
-//! binary Desktop would run if Vellum were not installed. The Enhanced core is
-//! still only ever started from a verified manifest.
+//! Most updates are known in advance: the Store stages the next package long
+//! before Desktop restarts into it. Vellum checks that core against the launch
+//! and lists it in the manifest as an approved successor, and the bridge then
+//! runs it with the full Enhanced plane as though it had been pinned.
+//!
+//! Anything else falls back to the core Desktop itself ships, run as plain
+//! Official Codex with no Enhanced plane, and leaves a record here so Vellum can
+//! rebuild the launch. That widens nothing: the fallback is the binary Desktop
+//! would run if Vellum were not installed. The Enhanced core is still only ever
+//! started beside a core Vellum verified.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::atomic::write_atomic;
-use super::launch_manifest::{sha256_file, LaunchManifestV1, RuntimeBinaryIdentity};
+use super::launch_manifest::{
+    missing_official_helpers, sha256_file, LaunchManifestV1, RuntimeBinaryIdentity,
+};
 
 pub const OFFICIAL_DRIFT_FILE: &str = "official-drift.json";
 
@@ -61,48 +68,225 @@ impl OfficialDriftRecord {
     }
 }
 
-/// The Official core this manifest pinned, or Desktop's current one when the
-/// pinned core no longer verifies. The flag says which.
+/// Which core [`resolve_official`] chose, and on what authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfficialSource {
+    /// The core this launch was prepared with.
+    Pinned,
+    /// A core Vellum checked against this launch ahead of Desktop's update. It
+    /// runs with the full Enhanced plane, exactly like the pinned one.
+    Successor,
+    /// Desktop's current core, which nobody checked. Served as plain Official
+    /// until Vellum rebuilds the launch.
+    Drifted,
+}
+
+/// The Official core this launch should run, and which kind of choice it was.
 pub fn resolve_official(
     manifest: &LaunchManifestV1,
-) -> Result<(RuntimeBinaryIdentity, bool), super::LaunchManifestError> {
+) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
     resolve_official_with(manifest, desktop_official_candidates())
+}
+
+pub(crate) fn observe_official(
+    manifest: &LaunchManifestV1,
+) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
+    resolve_official_inner(manifest, desktop_official_candidates(), false)
+}
+
+/// Whether a bridge started now would have to serve this launch as plain
+/// Official. Asks the same question as [`resolve_official`] without leaving a
+/// drift record: Vellum asking is not a bridge having fallen back.
+pub fn would_drift(manifest: &LaunchManifestV1) -> bool {
+    observe_official(manifest).map_or(true, |(_, source)| source == OfficialSource::Drifted)
+}
+
+/// A recycle must improve the running bridge, never respawn into the same
+/// incomplete directory. Errors are unsafe, just like missing helpers.
+pub fn launch_is_complete(manifest: &LaunchManifestV1) -> bool {
+    observe_official(manifest).is_ok_and(|(official, _)| {
+        missing_official_helpers(
+            &official.executable,
+            &expected_helpers(manifest, &official.artifact_sha256),
+        )
+        .is_empty()
+    })
+}
+
+pub fn expected_helpers(manifest: &LaunchManifestV1, sha256: &str) -> Vec<String> {
+    let mut expected = manifest.official_helpers.clone();
+    if let Some(successor) = manifest
+        .official_successors
+        .iter()
+        .find(|successor| successor.artifact_sha256 == sha256)
+    {
+        expected.extend(successor.helpers.clone());
+    }
+    expected.sort();
+    expected.dedup();
+    expected
 }
 
 fn resolve_official_with(
     manifest: &LaunchManifestV1,
     candidates: Vec<PathBuf>,
-) -> Result<(RuntimeBinaryIdentity, bool), super::LaunchManifestError> {
-    let error = match manifest.official.verify_on_disk("official") {
-        Ok(()) => return Ok((manifest.official.clone(), false)),
-        Err(error) => error,
-    };
-    let Some((current, sha256)) = candidates
+) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
+    resolve_official_inner(manifest, candidates, true)
+}
+
+fn resolve_official_inner(
+    manifest: &LaunchManifestV1,
+    candidates: Vec<PathBuf>,
+    record: bool,
+) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
+    let candidates = candidates
         .into_iter()
         .filter(|candidate| candidate.is_absolute() && candidate.is_file())
-        .find_map(|candidate| sha256_file(&candidate).ok().map(|sha| (candidate, sha)))
-    else {
-        return Err(error);
-    };
-    OfficialDriftRecord {
-        launch_id: manifest.launch_id.clone(),
-        observed_at: chrono::Utc::now().timestamp(),
-        recorded_executable: manifest.official.executable.clone(),
-        recorded_sha256: manifest.official.artifact_sha256.clone(),
-        current_executable: current.clone(),
-        current_sha256: sha256.clone(),
-        reason: error.to_string(),
+        .collect::<Vec<_>>();
+    // Desktop's current core comes first. An approved successor wins even while
+    // the pinned file is still on disk: after an update the old directory only
+    // survives until Desktop's cleanup, which deletes the helpers beside the old
+    // core (code mode host, sandbox setup) but not an executable a launch holds.
+    if let Some(current) = candidates.first() {
+        if !same_file(current, &manifest.official.executable) {
+            if let Some(successor) = approved_successor(manifest, current) {
+                return Ok((successor, OfficialSource::Successor));
+            }
+        }
     }
-    .write_beside(&manifest.attestation_path);
+    let verification = manifest.official.verify_on_disk("official");
+    let incomplete =
+        missing_official_helpers(&manifest.official.executable, &manifest.official_helpers);
+    if verification.is_ok() && incomplete.is_empty() {
+        return Ok((manifest.official.clone(), OfficialSource::Pinned));
+    }
+    if let Some(successor) = candidates
+        .iter()
+        .find_map(|candidate| approved_successor(manifest, candidate))
+    {
+        return Ok((successor, OfficialSource::Successor));
+    }
+    let replacement = candidates.into_iter().find_map(|candidate| {
+        let sha = sha256_file(&candidate).ok()?;
+        missing_official_helpers(&candidate, &expected_helpers(manifest, &sha))
+            .is_empty()
+            .then_some((candidate, sha))
+    });
+    // Keep serving a hash-verified pin when there is no complete replacement.
+    // The bridge records the missing helpers; Vellum can converge later.
+    let Some((current, sha256)) = replacement else {
+        return verification.map(|()| (manifest.official.clone(), OfficialSource::Pinned));
+    };
+    let error = verification
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| format!("Official core missing helpers: {}", incomplete.join(", ")));
+    if record {
+        OfficialDriftRecord {
+            launch_id: manifest.launch_id.clone(),
+            observed_at: chrono::Utc::now().timestamp(),
+            recorded_executable: manifest.official.executable.clone(),
+            recorded_sha256: manifest.official.artifact_sha256.clone(),
+            current_executable: current.clone(),
+            current_sha256: sha256.clone(),
+            reason: error,
+        }
+        .write_beside(&manifest.attestation_path);
+    }
     Ok((
-        RuntimeBinaryIdentity {
-            executable: current,
-            runtime_digest: sha256.clone(),
-            artifact_sha256: sha256,
-            codex_home: manifest.official.codex_home.clone(),
-        },
-        true,
+        official_identity(manifest, current, sha256),
+        OfficialSource::Drifted,
     ))
+}
+
+fn approved_successor(
+    manifest: &LaunchManifestV1,
+    candidate: &Path,
+) -> Option<RuntimeBinaryIdentity> {
+    let sha256 = sha256_file(candidate).ok()?;
+    if !missing_official_helpers(candidate, &expected_helpers(manifest, &sha256)).is_empty() {
+        return None;
+    }
+    (manifest.accepts_official_successor(&sha256) || sha256 == manifest.official.artifact_sha256)
+        .then(|| official_identity(manifest, candidate.to_path_buf(), sha256))
+}
+
+/// An Official core's runtime digest is its file digest; see
+/// `desktop_manager::verify_settings`.
+fn official_identity(
+    manifest: &LaunchManifestV1,
+    executable: PathBuf,
+    sha256: String,
+) -> RuntimeBinaryIdentity {
+    RuntimeBinaryIdentity {
+        executable,
+        runtime_digest: sha256.clone(),
+        artifact_sha256: sha256,
+        codex_home: manifest.official.codex_home.clone(),
+    }
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// Cores Desktop might move to next: a version the Store has staged but not yet
+/// registered, then the ones Desktop already unpacked. Vellum checks these
+/// against a launch before Desktop starts any of them, so an update can find
+/// its core already approved instead of drifting.
+pub fn successor_candidates() -> Vec<PathBuf> {
+    let mut candidates = staged_desktop_cores();
+    candidates.extend(desktop_official_candidates());
+    candidates
+}
+
+/// A Store update stages the whole new package beside the running one, long
+/// before Desktop restarts into it, and its core runs from there as is.
+#[cfg(windows)]
+fn staged_desktop_cores() -> Vec<PathBuf> {
+    /// How many staged versions are worth checking. Older ones are leftovers
+    /// the Store has not removed yet; nothing will start them again.
+    const NEWEST: usize = 2;
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "x64",
+    };
+    let suffix = format!("_{arch}__2p2nqsd0c76g0");
+    let Some(root) = std::env::var_os("ProgramW6432")
+        .or_else(|| std::env::var_os("ProgramFiles"))
+        .map(|root| PathBuf::from(root).join("WindowsApps"))
+    else {
+        return Vec::new();
+    };
+    let mut staged = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version = name
+                .strip_prefix("OpenAI.Codex_")?
+                .strip_suffix(suffix.as_str())?
+                .split('.')
+                .map(|part| part.parse::<u64>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            let core = entry.path().join("app").join("resources").join("codex.exe");
+            core.is_file().then_some((version, core))
+        })
+        .collect::<Vec<_>>();
+    staged.sort_by(|left, right| right.0.cmp(&left.0));
+    staged
+        .into_iter()
+        .take(NEWEST)
+        .map(|(_, core)| core)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn staged_desktop_cores() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Only cores that belong to Codex Desktop itself, newest first. Package
@@ -157,6 +341,8 @@ mod tests {
             attestation_path: root.join("bridge-attestation.json"),
             qualification_journal_path: root.join("journal.jsonl"),
             relay: None,
+            official_successors: Vec::new(),
+            official_helpers: Vec::new(),
         }
     }
 
@@ -168,8 +354,8 @@ mod tests {
         fs::write(&official, b"official v1").unwrap();
         let manifest = manifest(temp.path(), official.clone());
 
-        let (resolved, drifted) = resolve_official_with(&manifest, Vec::new()).unwrap();
-        assert!(!drifted);
+        let (resolved, source) = resolve_official_with(&manifest, Vec::new()).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
         assert_eq!(resolved.executable, official);
         assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
     }
@@ -186,9 +372,9 @@ mod tests {
         let manifest = manifest(temp.path(), old.clone());
         fs::remove_file(&old).unwrap();
 
-        let (resolved, drifted) =
+        let (resolved, source) =
             resolve_official_with(&manifest, vec![old.clone(), new.clone()]).unwrap();
-        assert!(drifted);
+        assert_eq!(source, OfficialSource::Drifted);
         assert_eq!(resolved.executable, new);
         assert_eq!(resolved.artifact_sha256, sha256_file(&new).unwrap());
         assert_eq!(resolved.codex_home, manifest.official.codex_home);
@@ -222,8 +408,8 @@ mod tests {
         assert_eq!(before.len(), after.len());
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
 
-        let (resolved, drifted) = resolve_official_with(&manifest, vec![official.clone()]).unwrap();
-        assert!(drifted);
+        let (resolved, source) = resolve_official_with(&manifest, vec![official.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Drifted);
         assert_eq!(resolved.executable, official);
         assert_ne!(resolved.artifact_sha256, manifest.official.artifact_sha256);
     }
@@ -251,5 +437,188 @@ mod tests {
 
         manifest.launch_id = "01NEWER".into();
         assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    fn successor(path: &Path) -> crate::enhanced_runtime::launch_manifest::OfficialSuccessor {
+        crate::enhanced_runtime::launch_manifest::OfficialSuccessor {
+            artifact_sha256: sha256_file(path).unwrap(),
+            source: path.to_path_buf(),
+            helpers: super::super::launch_manifest::official_helpers(path),
+        }
+    }
+
+    fn write_all(files: &[(&PathBuf, &str)]) {
+        for (path, body) in files {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_approved_update_runs_as_a_successor_even_while_the_old_core_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("bin").join("old").join("codex.exe");
+        let new = temp.path().join("bin").join("new").join("codex.exe");
+        let staged = temp.path().join("WindowsApps").join("codex.exe");
+        write_all(&[(&old, "v1"), (&new, "v2"), (&staged, "v2")]);
+        let mut manifest = manifest(temp.path(), old.clone());
+        manifest.official_successors.push(successor(&staged));
+
+        let (resolved, source) =
+            resolve_official_with(&manifest, vec![new.clone(), old.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(resolved.executable, new);
+        assert_eq!(resolved.runtime_digest, resolved.artifact_sha256);
+        assert_eq!(resolved.codex_home, manifest.official.codex_home);
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn an_unapproved_newer_core_does_not_displace_a_verified_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("bin").join("old").join("codex.exe");
+        let new = temp.path().join("bin").join("new").join("codex.exe");
+        let other = temp.path().join("other.exe");
+        write_all(&[(&old, "v1"), (&new, "v2"), (&other, "v3")]);
+        let mut manifest = manifest(temp.path(), old.clone());
+        manifest.official_successors.push(successor(&other));
+
+        let (resolved, source) =
+            resolve_official_with(&manifest, vec![new.clone(), old.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(resolved.executable, old);
+    }
+
+    #[test]
+    fn a_deleted_pin_prefers_any_approved_successor_over_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("bin").join("old").join("codex.exe");
+        let unknown = temp.path().join("bin").join("unknown").join("codex.exe");
+        let approved = temp.path().join("bin").join("approved").join("codex.exe");
+        write_all(&[(&old, "v1"), (&unknown, "v9"), (&approved, "v2")]);
+        let mut manifest = manifest(temp.path(), old.clone());
+        manifest.official_successors.push(successor(&approved));
+        fs::remove_file(&old).unwrap();
+
+        let (resolved, source) =
+            resolve_official_with(&manifest, vec![unknown, approved.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(resolved.executable, approved);
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    fn helper_fixture(root: &Path) -> (LaunchManifestV1, PathBuf, PathBuf) {
+        let old = root.join("old/codex.exe");
+        let new = root.join("new/codex.exe");
+        write_all(&[(&old, "v1"), (&new, "v2")]);
+        let helper = old.parent().unwrap().join("codex-code-mode-host.exe");
+        fs::write(&helper, "host").unwrap();
+        let mut manifest = manifest(root, old);
+        manifest.official_helpers =
+            super::super::launch_manifest::official_helpers(&manifest.official.executable);
+        (manifest, helper, new)
+    }
+
+    #[test]
+    fn a_complete_pin_with_recorded_helpers_stays_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let (_, source) = resolve_official_with(&manifest, Vec::new()).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert!(missing_official_helpers(
+            &manifest.official.executable,
+            &manifest.official_helpers
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_hash_valid_incomplete_pin_uses_a_complete_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, helper, new) = helper_fixture(temp.path());
+        fs::remove_file(helper).unwrap();
+        let new_helper = new
+            .parent()
+            .unwrap()
+            .join("resources/codex-code-mode-host.exe");
+        fs::create_dir_all(new_helper.parent().unwrap()).unwrap();
+        fs::write(new_helper, "host").unwrap();
+        manifest.official_successors.push(successor(&new));
+        let (official, source) = resolve_official_with(&manifest, vec![new.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(official.executable, new);
+    }
+
+    #[test]
+    fn an_incomplete_pin_without_a_complete_replacement_keeps_its_missing_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, helper, _) = helper_fixture(temp.path());
+        fs::remove_file(helper).unwrap();
+        let (official, source) = resolve_official_with(&manifest, Vec::new()).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(
+            missing_official_helpers(&official.executable, &manifest.official_helpers),
+            vec!["codex-code-mode-host.exe"]
+        );
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn a_successor_still_unpacking_its_helpers_is_never_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, helper, new) = helper_fixture(temp.path());
+        manifest.official_successors.push(successor(&new));
+        fs::remove_file(helper).unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new]).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(official, manifest.official);
+    }
+
+    #[test]
+    fn an_incomplete_pin_can_use_a_complete_desktop_core_as_plain_official() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, helper, new) = helper_fixture(temp.path());
+        fs::remove_file(helper).unwrap();
+        fs::write(
+            new.parent().unwrap().join("codex-code-mode-host.exe"),
+            "host",
+        )
+        .unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Drifted);
+        assert_eq!(official.executable, new);
+    }
+
+    #[test]
+    fn a_complete_copy_with_the_same_digest_remains_trusted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, helper, new) = helper_fixture(temp.path());
+        fs::copy(&manifest.official.executable, &new).unwrap();
+        fs::remove_file(helper).unwrap();
+        fs::write(
+            new.parent().unwrap().join("codex-code-mode-host.exe"),
+            "host",
+        )
+        .unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new.clone()]).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(official.executable, new);
+        assert_eq!(official.artifact_sha256, manifest.official.artifact_sha256);
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn successor_specific_helpers_are_required_even_when_the_pin_has_fewer() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, _, new) = helper_fixture(temp.path());
+        let host = new.parent().unwrap().join("codex-code-mode-host.exe");
+        let extra = new.parent().unwrap().join("codex-extra.exe");
+        fs::write(host, "host").unwrap();
+        fs::write(&extra, "extra").unwrap();
+        manifest.official_successors.push(successor(&new));
+        fs::remove_file(extra).unwrap();
+        let (official, source) = resolve_official_with(&manifest, vec![new]).unwrap();
+        assert_eq!(source, OfficialSource::Pinned);
+        assert_eq!(official, manifest.official);
     }
 }

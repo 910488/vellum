@@ -188,8 +188,7 @@ pub use official_identity::{
     ChatGptWorkspaceKind,
 };
 pub use opencode::{
-    infer_provider_profile, is_opencode_endpoint, OPENCODE_GO_BASE_URL, OPENCODE_PUBLIC_TOKEN,
-    OPENCODE_ZEN_BASE_URL,
+    infer_provider_profile, is_opencode_endpoint, OPENCODE_GO_BASE_URL, OPENCODE_ZEN_BASE_URL,
 };
 pub use outbound::{
     validate_outbound_url_async, validate_outbound_url_sync, AddressClass, InsecureHttpPolicy,

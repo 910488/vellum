@@ -118,8 +118,9 @@ all three components into each installer.
 
 `Publish signed hot update` is different: its selector publishes exactly one
 of `desktop-v*`, `remote-v*`, or `core-v*`. For the `desktop` choice,
-`src-tauri/tauri.hot-update.conf.json` keeps only the Desktop bridge and relay resources,
-and `VELLUM_DESKTOP_HOT_UPDATE=1` prevents `build-sidecar` from staging Core:
+`src-tauri/tauri.hot-update.conf.json` keeps the Remote Manager payload and the
+Desktop bridge and relay resources, and `VELLUM_DESKTOP_HOT_UPDATE=1` prevents
+`build-sidecar` from staging Core:
 
 ```
 VELLUM_DESKTOP_HOT_UPDATE=1 pnpm tauri build --bundles nsis --config src-tauri/tauri.hot-update.conf.json
@@ -127,14 +128,21 @@ VELLUM_DESKTOP_HOT_UPDATE=1 pnpm tauri build --bundles nsis --config src-tauri/t
 
 Arrays are replaced rather than merged, so the full-installer default remains
 explicit while the Desktop hot update cannot accidentally absorb a previously
-staged Remote or Core payload.
+staged Core payload.
 
-The Remote screen is still present in the UI. Asked to do anything, it reports
-`ReleaseManifestUnavailable` — an honest failure, not a crash, but not a hidden
-feature either. One caveat when checking this locally: `release_resource_roots()`
-also looks at the compile-time `CARGO_MANIFEST_DIR`, so on the machine that
-built it the app still finds the manifest in the source tree and behaves as if
-the payload shipped. Only a clean machine shows the real behaviour.
+The Remote Manager payload has to ride along with every Desktop build:
+`build.rs` compiles the SHA-256 of `resources/remote/manifest.json` into the
+executable, so a Desktop update without its own payload reports
+`ReleaseManifestUnavailable` for every one-click deploy, and a payload left on
+disk by an earlier version fails that hash. The release workflow's
+`desktop-remote-payload` jobs therefore stage the Linux payload
+(`build-local-release.sh stage-only`) and then the Darwin ARM64 one
+(`stage-remote-darwin-payload.sh`) before either Desktop updater builds.
+
+When checking a build locally, note that `release_resource_roots()` also looks
+at the compile-time `CARGO_MANIFEST_DIR`, so on the machine that built it the
+app finds the manifest in the source tree and behaves as if the payload
+shipped. Only a clean machine shows the real behaviour.
 
 ### Releases
 

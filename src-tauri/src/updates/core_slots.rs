@@ -74,11 +74,21 @@ impl CoreSlots {
         root.join("updates").join("core-slots.json")
     }
 
+    /// For readers: an index that cannot be read shows no slots.
     pub fn load(root: &Path) -> Self {
-        let Ok(bytes) = std::fs::read(Self::path(root)) else {
-            return Self::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        Self::load_for_update(root).unwrap_or_default()
+    }
+
+    /// For read-modify-write and pruning: an index that exists but cannot be
+    /// read is an error, so it is never replaced by an empty one.
+    pub fn load_for_update(root: &Path) -> std::io::Result<Self> {
+        match super::read_stored_json(&Self::path(root)) {
+            super::StoredJson::Parsed(slots) => Ok(slots),
+            super::StoredJson::Missing | super::StoredJson::SetAside => Ok(Self::default()),
+            super::StoredJson::Unreadable => Err(std::io::Error::other(
+                "core-slots.json could not be read; not overwriting it",
+            )),
+        }
     }
 
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
@@ -128,7 +138,7 @@ pub fn load_signed_core_trust(root: &Path, version: &str) -> Option<(Vec<u8>, Ve
 /// Staging a candidate only writes `pending`. Active launch identity is
 /// untouched, including any recorded launch id / lease.
 pub fn set_pending(root: &Path, pending: CoreSlot) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     let previous_active = slots.active.clone();
     slots.pending = Some(pending);
     slots.save(root)?;
@@ -173,7 +183,7 @@ pub fn conclude_pending_core(
 }
 
 pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(pending) = slots.pending.take() {
         if let Some(active) = slots.active.take() {
             slots.previous = Some(active);
@@ -184,8 +194,20 @@ pub fn promote_pending(root: &Path) -> std::io::Result<CoreSlots> {
     Ok(slots)
 }
 
+/// Promotes `pending` but leaves `previous` alone. A core settled without a
+/// restart keeps the running launch on its old tree, and that tree has to
+/// stay a signed slot for the launch to keep verifying.
+pub fn promote_pending_keeping_previous(root: &Path) -> std::io::Result<CoreSlots> {
+    let mut slots = CoreSlots::load_for_update(root)?;
+    if let Some(pending) = slots.pending.take() {
+        slots.active = Some(pending);
+    }
+    slots.save(root)?;
+    Ok(slots)
+}
+
 pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if let Some(previous) = slots.previous.take() {
         let rolled_back = slots.active.take();
         slots.active = Some(previous);
@@ -200,7 +222,7 @@ pub fn rollback_to_previous(root: &Path) -> std::io::Result<CoreSlots> {
 /// Next-start apply never promoted, so "rollback before the user turn" means
 /// drop `pending` and keep the running `active` identity.
 fn abort_unpromoted_pending(root: &Path) -> std::io::Result<CoreSlots> {
-    let mut slots = CoreSlots::load(root);
+    let mut slots = CoreSlots::load_for_update(root)?;
     if slots.previous.is_some() && slots.pending.is_none() {
         return rollback_to_previous(root);
     }
@@ -393,6 +415,123 @@ pub(super) fn bundled_tree_matches(slot: &CoreSlot, bundled: &Path) -> bool {
         })
 }
 
+/// Compare signed metadata first, and verify a matching source exactly once.
+/// Full relative paths matter: two helpers with the same basename are distinct.
+pub(super) type LocalCoreFiles = Vec<(String, PathBuf)>;
+
+pub(super) fn matching_local_core(
+    root: &Path,
+    core: &super::manifest::CoreManifest,
+    target: &CoreTarget,
+    trust: &TrustStore,
+    bundled: Option<&Path>,
+) -> Option<(String, LocalCoreFiles)> {
+    matching_local_core_with(root, target, trust, bundled, |tree, version| {
+        super::core_package::build_slot(tree, version, core, target)
+    })
+}
+
+fn matching_local_core_with(
+    root: &Path,
+    target: &CoreTarget,
+    trust: &TrustStore,
+    bundled: Option<&Path>,
+    mut build_slot: impl FnMut(&Path, &str) -> Result<CoreSlot, String>,
+) -> Option<(String, LocalCoreFiles)> {
+    let slots = CoreSlots::load(root);
+    for slot in [slots.active, slots.pending].into_iter().flatten() {
+        let tree = slot_tree_root(root, &slot.version);
+        let Ok(expected) = build_slot(&tree, &slot.version) else {
+            continue;
+        };
+        let metadata_matches = slot.path == expected.path
+            && slot.helpers == expected.helpers
+            && slot.files.len() == expected.files.len()
+            && slot.files.iter().all(|file| {
+                expected.files.iter().any(|other| {
+                    file.path == other.path
+                        && file.size == other.size
+                        && file
+                            .sha256
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&file.sha256)
+                            .eq_ignore_ascii_case(
+                                other
+                                    .sha256
+                                    .strip_prefix("sha256:")
+                                    .unwrap_or(&other.sha256),
+                            )
+                })
+            });
+        if metadata_matches && verified_slot(root, &slot, trust) {
+            return Some((
+                slot.version,
+                target
+                    .files
+                    .iter()
+                    .map(|file| (file.path.clone(), tree.join(&file.path)))
+                    .collect(),
+            ));
+        }
+    }
+    let bundled = bundled?;
+    let sources = target
+        .files
+        .iter()
+        .map(|file| {
+            let path = if file.path == target.executable {
+                bundled.to_path_buf()
+            } else {
+                bundled.parent()?.join(&file.path)
+            };
+            (std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == file.size)
+                && file_matches_digest(&path, &file.sha256))
+            .then(|| (file.path.clone(), path))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(("bundled".into(), sources))
+}
+
+/// Nightly releases re-label one core build, so a "new" core is often the
+/// running one under another version: same signed files, same protocol.
+/// Switching to it changes no byte that runs, so it needs no restart.
+pub(super) fn same_core_tree(a: &CoreSlot, b: &CoreSlot) -> bool {
+    fn bare(digest: &str) -> String {
+        digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase()
+    }
+    fn files(slot: &CoreSlot) -> Option<HashSet<(std::ffi::OsString, u64, String)>> {
+        slot.files
+            .iter()
+            .map(|file| {
+                Some((
+                    file.path.file_name()?.to_os_string(),
+                    file.size,
+                    bare(&file.sha256),
+                ))
+            })
+            .collect()
+    }
+    let names = |slot: &CoreSlot| {
+        slot.helpers
+            .iter()
+            .map(|helper| helper.file_name().map(|name| name.to_os_string()))
+            .collect::<Vec<_>>()
+    };
+    !a.files.is_empty()
+        && a.files.len() == b.files.len()
+        && bare(&a.digest) == bare(&b.digest)
+        && a.path.file_name() == b.path.file_name()
+        && a.protocol == b.protocol
+        && a.protocol_compat == b.protocol_compat
+        && a.enhanced_commit == b.enhanced_commit
+        && a.feature_profile == b.feature_profile
+        && names(a) == names(b)
+        && files(a).is_some_and(|left| files(b).is_some_and(|right| left == right))
+}
+
 /// Every status read verifies the active slot, and the macOS tree is about
 /// 400 MB. Read whole on each poll it held a core busy for seconds at a time.
 /// The launch digest cache streams the file and reuses a digest while path,
@@ -556,6 +695,22 @@ mod tests {
             feature_profile: "profile".into(),
             launch_id: Some("launch-live".into()),
         }
+    }
+
+    #[test]
+    fn promoting_while_the_launch_runs_from_previous_keeps_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        CoreSlots {
+            active: Some(slot("relabelled")),
+            pending: Some(slot("relabelled-again")),
+            previous: Some(slot("launched")),
+        }
+        .save(dir.path())
+        .unwrap();
+        let after = promote_pending_keeping_previous(dir.path()).unwrap();
+        assert_eq!(after.active.unwrap().version, "relabelled-again");
+        assert_eq!(after.previous.unwrap().version, "launched");
+        assert!(after.pending.is_none());
     }
 
     #[test]
@@ -732,6 +887,51 @@ mod tests {
             feature_profile: "enhanced-mvp-v1".into(),
             launch_id: None,
         }
+    }
+
+    #[test]
+    fn failed_active_slot_build_still_reuses_a_matching_pending_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let trust = TrustStore::from_key("test-key", signing.verifying_key());
+        let (exe, digest) = write_planted_tree(dir.path(), "9.9.9", false);
+        let (raw, sig, manifest) = signed_core_fixture(&signing, false);
+        persist_signed_core_trust(dir.path(), "9.9.9", &raw, &sig).unwrap();
+        let pending = planted_slot(dir.path(), "9.9.9", &exe, &digest);
+        CoreSlots {
+            active: Some(slot("broken")),
+            pending: Some(pending.clone()),
+            ..CoreSlots::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let core = manifest.core.unwrap();
+        let target = &core.targets[0];
+        let mut attempted = Vec::new();
+        // build_slot currently derives metadata from a shared target. Inject
+        // a per-candidate failure to exercise this defensive fallback path.
+        let (source, files) =
+            matching_local_core_with(dir.path(), target, &trust, None, |tree, version| {
+                attempted.push(version.to_string());
+                if version == "broken" {
+                    return Err("active slot build failed".into());
+                }
+                super::super::core_package::build_slot(tree, version, &core, target)
+            })
+            .expect("matching pending files must remain available without downloading");
+        assert_eq!(attempted, ["broken", "9.9.9"]);
+        assert_eq!(source, pending.version);
+        assert_eq!(
+            files,
+            target
+                .files
+                .iter()
+                .map(|file| (
+                    file.path.clone(),
+                    slot_tree_root(dir.path(), "9.9.9").join(&file.path)
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

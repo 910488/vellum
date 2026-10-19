@@ -4,6 +4,7 @@
 //! 邏輯放在各自的模組裡，才測得動（指令本身需要 Tauri runtime 才能跑）。
 
 pub mod budget;
+pub(crate) mod launch_steward;
 pub mod codex_oauth;
 pub mod claude_code;
 pub mod grok_accounts;

@@ -44,6 +44,12 @@ textarea {
   color: inherit;
 }
 
+/* 勾選框、radio、range 預設是系統亮藍，
+   跟兩個主題都不搭；統一走主色。 */
+:root {
+  accent-color: var(--accent-to);
+}
+
 :focus-visible {
   outline: 2px solid var(--lavender-deep);
   outline-offset: 3px;

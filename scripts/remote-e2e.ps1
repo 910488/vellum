@@ -1,6 +1,6 @@
 # Remote Manager end-to-end loop against the disposable dev host.
 #
-# fast : rebuild the Agent and Broker only, hand them to bootstrap through the
+# fast : rebuild the musl Agent and native proxy, hand them to bootstrap through the
 #        VELLUM_REMOTE_*_AMD64 seam, and converge a pristine host. No manifest,
 #        no pinned Codex, no proxy image, no installer.
 # full : stage a complete dev payload first, rebuild the Desktop so build.rs
@@ -45,9 +45,9 @@ if ($Lane -eq "full") {
         cargo build --manifest-path (Join-Path $repo "src-tauri\Cargo.toml") -p vellum --lib
     }
 } elseif (-not $SkipComponentBuild) {
-    Invoke-Checked "Build Linux amd64 Agent and Broker" {
+    Invoke-Checked "Build Linux amd64 musl Agent and native Proxy" {
         docker buildx build `
-            --platform linux/amd64 `
+            --build-arg "REMOTE_ARCH=amd64" `
             --file (Join-Path $repo "deploy\remote-bundle\Dockerfile") `
             --target export `
             --output "type=local,dest=$componentRoot" `
@@ -59,14 +59,13 @@ if ($Lane -eq "full") {
 # full lane deliberately leaves these unset so the staged payload is exercised.
 if ($Lane -eq "fast") {
     $agent = Join-Path $componentRoot "vellum-remote-agent"
-    $broker = Join-Path $componentRoot "vellum-remote-broker"
-    foreach ($artifact in @($agent, $broker)) {
+    foreach ($artifact in @($agent)) {
         if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
             throw "missing $artifact; drop -SkipComponentBuild"
         }
     }
     $env:VELLUM_REMOTE_AGENT_AMD64 = $agent
-    $env:VELLUM_REMOTE_BROKER_AMD64 = $broker
+    Remove-Item Env:\VELLUM_REMOTE_BROKER_AMD64 -ErrorAction SilentlyContinue
 } else {
     Remove-Item Env:\VELLUM_REMOTE_AGENT_AMD64 -ErrorAction SilentlyContinue
     Remove-Item Env:\VELLUM_REMOTE_BROKER_AMD64 -ErrorAction SilentlyContinue

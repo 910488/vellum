@@ -489,7 +489,7 @@ fn enhanced_commit_guard(
     Ok(guard)
 }
 
-fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
+pub(crate) fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     if !state.is_generation_current(generation) {
         log::warn!("[Enhanced] arming cancelled kind=StaleProxyGeneration generation={generation}");
         return;

@@ -16,6 +16,8 @@ import { Context } from "@/screens/Context";
 import { Log } from "@/screens/Log";
 import { Models } from "@/screens/Models";
 import { Remote } from "@/screens/Remote";
+import { HandoffNotifications } from "@/components/HandoffNotifications";
+import { requestHandoffReview } from "@/lib/handoffNavigation";
 import {
   Onboarding,
   type ConnectKind,
@@ -544,6 +546,10 @@ export function App() {
         />
 
         <main className="canvas">
+          <HandoffNotifications onReview={(host, id) => {
+            requestHandoffReview(host, id);
+            navigate("remote");
+          }} />
           {mountedScreens.has("enhanced") ? <div className="screen-slot" hidden={screen !== "enhanced"}><EnhancedCore status={status.enhancedRuntime ?? null} refreshVersion={refreshVersions.enhanced ?? 0} onRefreshComplete={pageRefreshComplete} onOpenUpdates={() => setUpdatesOpen(true)} /></div> : null}
           {mountedScreens.has("today") ? (
             <div className="screen-slot" hidden={screen !== "today"}>
