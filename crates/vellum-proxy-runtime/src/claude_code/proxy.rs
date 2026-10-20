@@ -17,6 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use super::UsageObservation;
+
 const HOST: &str = "api.anthropic.com";
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
@@ -30,6 +32,8 @@ pub struct AccountToken {
 pub trait ClaudeAccounts: Send + Sync {
     /// Snapshot the selection for this request. None explicitly means A→A probe.
     async fn selected_token(&self) -> Result<Option<AccountToken>, String>;
+    /// Attribute a response to the account captured at request admission.
+    async fn observe_usage(&self, _account_id: &str, _usage: UsageObservation) {}
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -325,6 +329,7 @@ impl ClaudeCodeProxy {
         let desktop = is_desktop_code(&parts.headers);
         let mut headers = end_to_end_headers(&parts.headers);
         let mut guard = None;
+        let mut response_account = None;
         if inference && desktop {
             self.status.lock().unwrap().last_error = None;
             let session = match session_key(&parts.headers, &bytes) {
@@ -341,6 +346,7 @@ impl ClaudeCodeProxy {
                 }
             };
             let account_id = lease.as_ref().map(|l| l.account_id.clone());
+            response_account = account_id.clone();
             if let Some(lease) = lease {
                 let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", lease.access_token))
                 else {
@@ -377,6 +383,12 @@ impl ClaudeCodeProxy {
             Ok(response) => response,
             Err(_) => return failure(StatusCode::BAD_GATEWAY, "claude_upstream_transport_failed"),
         };
+        if let Some(account_id) = response_account {
+            let usage = UsageObservation::from_headers(upstream.headers());
+            if !usage.is_empty() {
+                self.accounts.observe_usage(&account_id, usage).await;
+            }
+        }
         let status = upstream.status();
         if let Some(guard) = guard.as_ref() {
             guard.update("streaming", Some(status.as_u16()));

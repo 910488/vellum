@@ -4,9 +4,15 @@ use axum::{extract::State, routing::any, Router};
 use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 
-struct Accounts(RwLock<Option<String>>);
+struct Accounts(
+    RwLock<Option<String>>,
+    Mutex<Vec<(String, UsageObservation)>>,
+);
 #[async_trait]
 impl ClaudeAccounts for Accounts {
+    async fn observe_usage(&self, id: &str, usage: UsageObservation) {
+        self.1.lock().unwrap().push((id.to_owned(), usage));
+    }
     async fn selected_token(&self) -> Result<Option<AccountToken>, String> {
         Ok(self.0.read().await.clone().map(|id| AccountToken {
             access_token: format!("token-{id}"),
@@ -58,12 +64,22 @@ impl Fixture {
                 response.headers_mut().insert(header::CONTENT_TYPE,HeaderValue::from_static("text/event-stream"));
                 return response;
             }
-            Response::new(Body::from("upstream-response"))
+            let mut response = Response::new(Body::from("upstream-response"));
+            for (name, value) in [
+                ("anthropic-ratelimit-unified-5h-utilization", "0.85"),
+                ("anthropic-ratelimit-unified-5h-reset", "1900000000"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+                ("anthropic-ratelimit-unified-7d-reset", "1900600000"),
+            ] { response.headers_mut().insert(name, value.parse().unwrap()); }
+            response
         })).with_state(send);
         let upstream = tokio::spawn(async move {
             axum::serve(upstream_listener, app).await.unwrap();
         });
-        let accounts = Arc::new(Accounts(RwLock::new(Some("B".into()))));
+        let accounts = Arc::new(Accounts(
+            RwLock::new(Some("B".into())),
+            Mutex::new(Vec::new()),
+        ));
         let proxy =
             ClaudeCodeProxy::build("test-secret", accounts.clone(), format!("http://{address}"))
                 .unwrap();
@@ -620,4 +636,60 @@ async fn connect_requires_secret_and_rejects_private_destinations() {
     let _ = stop.send(true);
     task.await.unwrap();
     f.stop().await;
+}
+
+#[tokio::test]
+async fn usage_headers_only_observe_the_desktop_inference_execution_account() {
+    let mut fixture = Fixture::new().await;
+    let body =
+        serde_json::to_vec(&json!({"metadata":{"user_id":"user_session_12345678"}})).unwrap();
+    fixture
+        .request("/v1/messages", body.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    fixture.captured.recv().await.unwrap();
+    {
+        let observations = fixture.accounts.1.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].0, "B");
+        assert_eq!(observations[0].1.five_hour.unwrap().utilization, 85.0);
+    }
+    for (path, ua) in [
+        ("/v1/messages", "claude-cli/2.1.299 (external, cli)"),
+        (
+            "/api/oauth/usage",
+            "claude-cli/2.1.299 (external, claude-desktop)",
+        ),
+    ] {
+        fixture
+            .request(path, body.clone())
+            .header(header::USER_AGENT, ua)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let captured = fixture.captured.recv().await.unwrap();
+        assert_eq!(captured.headers[header::AUTHORIZATION], "Bearer original-A");
+        assert_eq!(captured.body.as_ref(), body.as_slice());
+    }
+    *fixture.accounts.0.write().await = None;
+    fixture
+        .request("/v1/messages", body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    fixture.captured.recv().await.unwrap();
+    assert_eq!(fixture.accounts.1.lock().unwrap().len(), 1);
+    assert!(!serde_json::to_string(&fixture.proxy.status())
+        .unwrap()
+        .contains("utilization"));
 }

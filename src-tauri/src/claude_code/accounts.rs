@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use vellum_proxy_runtime::claude_code::{AccountToken, ClaudeAccounts};
+use vellum_proxy_runtime::claude_code::{AccountToken, ClaudeAccounts, UsageObservation};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
@@ -503,6 +503,45 @@ impl CodeAccounts {
 
 #[async_trait]
 impl ClaudeAccounts for CodeAccounts {
+    async fn observe_usage(&self, id: &str, observation: UsageObservation) {
+        if observation.is_empty() {
+            return;
+        }
+        let mut stored = self.stored.lock().await;
+        // A response cannot resurrect a removed account or load credentials.
+        let Some(account) = stored
+            .as_mut()
+            .and_then(|s| s.accounts.iter_mut().find(|a| a.id == id))
+        else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp();
+        let complete = observation.five_hour.is_some() && observation.seven_day.is_some();
+        let usage = account.usage.get_or_insert(AccountUsage {
+            observed_at: 0,
+            five_hour: None,
+            seven_day: None,
+        });
+        for (target, observed) in [
+            (&mut usage.five_hour, observation.five_hour),
+            (&mut usage.seven_day, observation.seven_day),
+        ] {
+            if let Some(window) = observed {
+                *target = Some(UsageWindow {
+                    utilization: window.utilization,
+                    resets_at: chrono::DateTime::from_timestamp(window.resets_at, 0)
+                        .map(|at| at.to_rfc3339()),
+                });
+            }
+        }
+        // Partial headers update their window immediately, but cannot make an
+        // old unobserved window fresh and suppress the existing API fallback.
+        if complete {
+            usage.observed_at = now;
+            account.usage_checked_at = now;
+        }
+    }
+
     async fn selected_token(&self) -> Result<Option<AccountToken>, String> {
         let mut stored = self.stored.lock().await;
         self.load(&mut stored)?;
@@ -907,6 +946,83 @@ mod tests {
         };
         manager.save(&data).unwrap();
         *manager.stored.lock().await = Some(data);
+    }
+    #[tokio::test]
+    async fn response_usage_updates_original_account_and_gates_without_api_polling() {
+        use vellum_proxy_runtime::claude_code::UsageWindowObservation;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        install(
+            &manager,
+            vec![
+                account("A", FIVE_HOUR_20, 10.0, None),
+                account("B", FIVE_HOUR_20, 10.0, None),
+            ],
+        )
+        .await;
+        let window = UsageWindowObservation {
+            utilization: 85.0,
+            resets_at: chrono::Utc::now().timestamp() + 3600,
+        };
+        manager
+            .observe_usage(
+                "A",
+                UsageObservation {
+                    five_hour: Some(window),
+                    seven_day: Some(window),
+                },
+            )
+            .await;
+        assert_eq!(
+            manager.selected_token().await.unwrap().unwrap().account_id,
+            "B"
+        );
+        manager
+            .observe_usage(
+                "A",
+                UsageObservation {
+                    five_hour: Some(UsageWindowObservation {
+                        utilization: 99.0,
+                        ..window
+                    }),
+                    seven_day: None,
+                },
+            )
+            .await;
+        let view = manager.view().await.unwrap();
+        assert_eq!(
+            view.accounts[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .five_hour
+                .as_ref()
+                .unwrap()
+                .utilization,
+            99.0
+        );
+        assert_eq!(
+            view.accounts[1]
+                .usage
+                .as_ref()
+                .unwrap()
+                .five_hour
+                .as_ref()
+                .unwrap()
+                .utilization,
+            10.0
+        );
+        manager
+            .observe_usage(
+                "removed",
+                UsageObservation {
+                    five_hour: Some(window),
+                    seven_day: Some(window),
+                },
+            )
+            .await;
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains("anthropic-ratelimit"));
     }
     const FIVE_HOUR_20: AccountGate = AccountGate {
         five_hour: 20,
