@@ -25,7 +25,10 @@ export interface ClaudeCodeStatus {
   };
 }
 
+export interface ClaudeCodeRecentProject { path: string; sessions: number; lastActivityAt: number | null }
+
 export const claudeCodeApi = {
+  recentProjects: () => invoke<ClaudeCodeRecentProject[]>("claude_code_recent_projects"),
   status: () => invoke<ClaudeCodeStatus>("claude_code_status"),
   prepareCertificate: () => invoke<ClaudeCodeStatus>("claude_code_prepare_certificate"),
   trustCertificate: (expectedSha256: string) => invoke<ClaudeCodeStatus>("claude_code_trust_certificate", { expectedSha256 }),

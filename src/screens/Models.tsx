@@ -455,7 +455,7 @@ export function Models({
   const markRefreshPart = (part: string) => {
     if (refreshVersion <= 0 || refreshParts.current.version !== refreshVersion) return;
     refreshParts.current.done.add(part);
-    if (["main", "grokQuota", "openaiQuota", "resetCredits"].every((key) => refreshParts.current.done.has(key))) {
+    if (["main", "grokQuota", "openaiQuota", "resetCredits", "claudeQuota"].every((key) => refreshParts.current.done.has(key))) {
       onRefreshComplete(refreshVersion);
     }
   };
@@ -1990,7 +1990,7 @@ export function Models({
         />
       </Card>
 
-      <ClaudeCodeCard active={active} />
+      <ClaudeCodeCard active={active} refreshVersion={refreshVersion} onRefreshed={() => markRefreshPart("claudeQuota")} />
 
       {grokRoute ? (
         <Card>

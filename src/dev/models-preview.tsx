@@ -28,21 +28,51 @@ import "@/styles/components.css";
 const ACCOUNT = "acct_01HZX9K3QW";
 
 // Display-only local fixture; never opens OAuth or accesses real credentials.
-claudeCodeApi.status = async () => ({
-  running: false, project: null, port: null, settingsMatch: false,
-  recoveryRequired: false, notice: null,
-  trust: { supported: true, sha256: null, trusted: false, managed: false, recoveryRequired: false },
-  routing: { activeRequests: 0, desktopRequests: 0, records: [] },
-  accounts: {
-    selected: "claude-preview-a", loginPending: false, loginError: null,
-    accounts: [
-      { id: "claude-preview-a", label: "claude.personal@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
-        usage: { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null } } },
-      { id: "claude-preview-b", label: "claude.work@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
-        usage: { observedAt: 1, fiveHour: { utilization: 8, resetsAt: null }, sevenDay: { utilization: 41, resetsAt: null } } },
-    ],
-  },
-});
+const CLAUDE_SCENES = {
+  setup: "Claude：尚未接入（需要憑證）",
+  trustReview: "Claude：核對憑證指紋",
+  waiting: "Claude：已接入、等待工作階段",
+  routing: "Claude：路由中（B）",
+  tls: "Claude：Code 不信任憑證",
+  repair: "Claude：需要修復",
+} as const;
+type ClaudeScene = keyof typeof CLAUDE_SCENES;
+let claudeScene: ClaudeScene = "setup";
+const CLAUDE_PROJECT = "E:\\code_E\\vellum";
+claudeCodeApi.recentProjects = async () => [
+  { path: CLAUDE_PROJECT, sessions: 62, lastActivityAt: 3 },
+  { path: "C:\\Users\\demo\\OneDrive\\文件\\code\\lumen-site", sessions: 18, lastActivityAt: 2 },
+  { path: "D:\\work\\trading-notebooks", sessions: 4, lastActivityAt: 1 },
+];
+claudeCodeApi.status = async () => {
+  const running = ["waiting", "routing", "tls"].includes(claudeScene);
+  return {
+    running, project: running || claudeScene === "repair" ? CLAUDE_PROJECT : null, port: running ? 52039 : null,
+    settingsMatch: running, recoveryRequired: claudeScene === "repair", notice: null,
+    trust: {
+      supported: true,
+      sha256: claudeScene === "setup" ? null : "b60fcf617a09c74e157816b5b8d8e1ad327c18c28bc812390ed4e90641ecee9b",
+      trusted: running || claudeScene === "repair", managed: running || claudeScene === "repair", recoveryRequired: false,
+    },
+    routing: {
+      activeRequests: 0, desktopRequests: claudeScene === "routing" ? 4 : 0,
+      lastError: claudeScene === "tls" ? "client_ca_untrusted" : null,
+      records: claudeScene === "routing" ? [
+        { id: "r1", sessionHash: "5fc665ba7c0ab85e", accountId: "claude-preview-b", operation: "count_tokens", state: "completed", upstreamStatus: 200 },
+        { id: "r2", sessionHash: "5fc665ba7c0ab85e", accountId: "claude-preview-b", operation: "messages", state: "completed", upstreamStatus: 200 },
+      ] : [],
+    },
+    accounts: {
+      selected: claudeScene === "setup" || claudeScene === "trustReview" ? null : "claude-preview-b", loginPending: false, loginError: null,
+      accounts: [
+        { id: "claude-preview-a", label: "claude.personal@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
+          usage: { observedAt: 1, fiveHour: { utilization: 62, resetsAt: new Date(Date.now() + 2.5 * 3600_000).toISOString() }, sevenDay: { utilization: 27, resetsAt: new Date(Date.now() + 4 * 86400_000).toISOString() } } },
+        { id: "claude-preview-b", label: "claude.work@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
+          usage: { observedAt: 1, fiveHour: { utilization: 8, resetsAt: new Date(Date.now() + 4.2 * 3600_000).toISOString() }, sevenDay: { utilization: 41, resetsAt: new Date(Date.now() + 2 * 86400_000).toISOString() } } },
+      ],
+    },
+  };
+};
 
 /* 額度池要看的是「好幾個帳號擺在一起」的樣子，所以池的場景另外給一組
    帳號：一個週額度很鬆、一個 5 小時見底但週還有、一個已經到閘門。
@@ -219,6 +249,7 @@ const THEMES = ["light", "dark"] as const;
 function Harness() {
   usePreviewCaptureReady();
   const [scene, setScene] = useState<Scene>("pool");
+  const [claude, setClaude] = useState<ClaudeScene>(claudeScene);
   const [pref, setPref] = useState<LocalePreference>(getLocalePreference());
   const [theme, setTheme] = useState<(typeof THEMES)[number]>("light");
   const [nonce, setNonce] = useState(0);
@@ -228,6 +259,11 @@ function Harness() {
     else installFixture(() => scene);
     setNonce((current) => current + 1);
   }, [scene]);
+
+  useEffect(() => {
+    claudeScene = claude;
+    setNonce((current) => current + 1);
+  }, [claude]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -240,6 +276,14 @@ function Harness() {
           <span>場景</span>
           <select value={scene} onChange={(event) => setScene(event.target.value as Scene)}>
             {Object.entries(SCENES).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Claude</span>
+          <select value={claude} onChange={(event) => setClaude(event.target.value as ClaudeScene)}>
+            {Object.entries(CLAUDE_SCENES).map(([value, label]) => (
               <option key={value} value={value}>{label}</option>
             ))}
           </select>
