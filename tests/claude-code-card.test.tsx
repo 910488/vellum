@@ -5,7 +5,7 @@ import "@/i18n";
 import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
 import { claudeCodeApi, type ClaudeCodeStatus } from "@/lib/claudeCode";
 
-vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
+vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
 
 function status(): ClaudeCodeStatus {
   return { running: false, project: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
@@ -166,5 +166,22 @@ describe("Claude Desktop Code", () => {
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "D:\\other" } });
     fireEvent.click(screen.getByText("接入此專案"));
     await waitFor(() => expect(claudeCodeApi.start).toHaveBeenLastCalledWith("D:\\other"));
+  });
+  it("drags a gate on one window, saves it on release and marks a gated account", async () => {
+    const value = status(); value.accounts.selected = null; value.accounts.switchedFrom = "B";
+    value.accounts.accounts[0]!.gate = { fiveHour: 0, sevenDay: 30 };
+    value.accounts.accounts[0]!.gated = true;
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 75, resetsAt: null } };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("閘門 30% · 已到閘門");
+    expect(screen.getAllByText("已到閘門").length).toBeGreaterThan(0);
+    expect(screen.getByText("無閘門 · 拖曳量條設定")).toBeTruthy();
+    const slider = screen.getByLabelText("Account B 的5 小時閘門");
+    fireEvent.change(slider, { target: { value: "25" } });
+    expect(screen.getByText("閘門 25% · 可燒 13%")).toBeTruthy();
+    expect(claudeCodeApi.setGate).not.toHaveBeenCalled();
+    fireEvent.pointerUp(slider, { target: { value: "25" } });
+    await waitFor(() => expect(claudeCodeApi.setGate).toHaveBeenCalledWith("B", { fiveHour: 25, sevenDay: 30 }));
   });
 });

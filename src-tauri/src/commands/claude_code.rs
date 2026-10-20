@@ -1,4 +1,4 @@
-use crate::claude_code::{CodeStatus, RecentProject};
+use crate::claude_code::{AccountGate, CodeStatus, RecentProject};
 use crate::state::AppState;
 use tauri::State;
 
@@ -99,6 +99,21 @@ pub async fn claude_code_refresh_usage(
         .claude_code()
         .accounts
         .refresh_usage(&account_id)
+        .await?;
+    state.claude_code().status().await
+}
+
+/// Applies to the next inference request; requests in flight keep their account.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn claude_code_set_gate(
+    account_id: String,
+    gate: AccountGate,
+    state: State<'_, AppState>,
+) -> Result<CodeStatus, String> {
+    state
+        .claude_code()
+        .accounts
+        .set_gate(&account_id, gate)
         .await?;
     state.claude_code().status().await
 }

@@ -13,11 +13,18 @@ use vellum_proxy_runtime::claude_code::{AccountToken, ClaudeAccounts};
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 const STORAGE_ID: &str = "claudecodeaccounts";
+/// A gate decision may use usage this old; past it the usage is read again.
+const USAGE_FRESH_SECS: i64 = 120;
+/// A gate check never stalls an inference request for longer than this.
+const GATE_USAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default, Serialize, Deserialize)]
 struct StoredAccounts {
     accounts: Vec<StoredAccount>,
     selected: Option<String>,
+    /// The account a gate moved the selection away from, until a manual pick.
+    #[serde(skip)]
+    switched_from: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct StoredAccount {
@@ -28,8 +35,28 @@ struct StoredAccount {
     expires_at: i64,
     #[serde(default)]
     refresh_blocked: bool,
+    #[serde(default)]
+    gate: AccountGate,
     #[serde(skip)]
     usage: Option<AccountUsage>,
+    /// Last usage read attempt, so a failing read is not retried per request.
+    #[serde(skip)]
+    usage_checked_at: i64,
+}
+/// Percent of each window to keep: automatic use stops once the remaining
+/// share reaches it. 0 leaves that window ungated.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountGate {
+    #[serde(default)]
+    pub five_hour: u8,
+    #[serde(default)]
+    pub seven_day: u8,
+}
+impl AccountGate {
+    fn is_set(&self) -> bool {
+        self.five_hour > 0 || self.seven_day > 0
+    }
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +66,9 @@ pub struct AccountView {
     pub expires_at: i64,
     pub reauthorize_required: bool,
     pub usage: Option<AccountUsage>,
+    pub gate: AccountGate,
+    /// Remaining usage, as last read, is at or below a gate.
+    pub gated: bool,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +88,7 @@ pub struct AccountUsage {
 pub struct AccountsView {
     pub accounts: Vec<AccountView>,
     pub selected: Option<String>,
+    pub switched_from: Option<String>,
     pub login_pending: bool,
     pub login_error: Option<String>,
 }
@@ -129,6 +160,7 @@ impl CodeAccounts {
         self.load(&mut stored)?;
         let data = stored.as_ref().unwrap();
         let login = self.login.lock().await;
+        let now = chrono::Utc::now().timestamp();
         Ok(AccountsView {
             accounts: data
                 .accounts
@@ -139,9 +171,12 @@ impl CodeAccounts {
                     expires_at: a.expires_at,
                     reauthorize_required: a.refresh_blocked,
                     usage: a.usage.clone(),
+                    gate: a.gate,
+                    gated: gate_reached(a, now),
                 })
                 .collect(),
             selected: data.selected.clone(),
+            switched_from: data.switched_from.clone(),
             login_pending: login.pending.is_some(),
             login_error: login.error.clone(),
         })
@@ -159,6 +194,29 @@ impl CodeAccounts {
         let previous = std::mem::replace(&mut data.selected, id);
         if let Err(error) = self.save(data) {
             data.selected = previous;
+            return Err(error);
+        }
+        data.switched_from = None;
+        Ok(())
+    }
+    pub async fn set_gate(&self, id: &str, gate: AccountGate) -> Result<(), String> {
+        let gate = AccountGate {
+            five_hour: gate.five_hour.min(100),
+            seven_day: gate.seven_day.min(100),
+        };
+        let mut stored = self.stored.lock().await;
+        self.load(&mut stored)?;
+        let data = stored.as_mut().unwrap();
+        let account = data
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or("Claude account not found")?;
+        let previous = std::mem::replace(&mut account.gate, gate);
+        if let Err(error) = self.save(data) {
+            if let Some(account) = data.accounts.iter_mut().find(|a| a.id == id) {
+                account.gate = previous;
+            }
             return Err(error);
         }
         Ok(())
@@ -322,15 +380,7 @@ impl CodeAccounts {
             .chars()
             .take(160)
             .collect();
-        let account = StoredAccount {
-            id: id.clone(),
-            label,
-            access_token: access,
-            refresh_token: required(&response, "refresh_token")?,
-            expires_at: expiry(&response),
-            refresh_blocked: false,
-            usage: None,
-        };
+        let refresh_token = required(&response, "refresh_token")?;
         let mut stored = self.stored.lock().await;
         self.load(&mut stored)?;
         let data = stored.as_mut().unwrap();
@@ -339,7 +389,18 @@ impl CodeAccounts {
             .iter()
             .position(|a| a.id == id)
             .map(|index| data.accounts.remove(index));
-        data.accounts.push(account);
+        data.accounts.push(StoredAccount {
+            id: id.clone(),
+            label,
+            access_token: access,
+            refresh_token,
+            expires_at: expiry(&response),
+            refresh_blocked: false,
+            // Authorizing again keeps the gates set for this account.
+            gate: old.as_ref().map(|a| a.gate).unwrap_or_default(),
+            usage: None,
+            usage_checked_at: 0,
+        });
         if let Err(error) = self.save(data) {
             data.accounts.pop();
             if let Some(old) = old {
@@ -357,7 +418,12 @@ impl CodeAccounts {
     pub async fn refresh_usage(&self, id: &str) -> Result<(), String> {
         let mut stored = self.stored.lock().await;
         self.load(&mut stored)?;
-        let data = stored.as_mut().unwrap();
+        self.read_usage(stored.as_mut().unwrap(), id).await
+    }
+    async fn read_usage(&self, data: &mut StoredAccounts, id: &str) -> Result<(), String> {
+        if let Some(account) = data.accounts.iter_mut().find(|a| a.id == id) {
+            account.usage_checked_at = chrono::Utc::now().timestamp();
+        }
         let lease = self.token_for(data, id).await?;
         let response = client()?
             .get("https://api.anthropic.com/api/oauth/usage")
@@ -444,8 +510,74 @@ impl ClaudeAccounts for CodeAccounts {
         let Some(selected) = data.selected.clone() else {
             return Ok(None);
         };
+        if self.gate_closed(data, &selected).await {
+            let candidates: Vec<String> = data
+                .accounts
+                .iter()
+                .filter(|a| a.id != selected && !a.refresh_blocked)
+                .map(|a| a.id.clone())
+                .collect();
+            for id in candidates {
+                if self.gate_closed(data, &id).await {
+                    continue;
+                }
+                data.selected = Some(id.clone());
+                if self.save(data).is_err() {
+                    data.selected = Some(selected.clone());
+                    break;
+                }
+                data.switched_from = Some(selected);
+                return self.token_for(data, &id).await.map(Some);
+            }
+            // Every account is at its gate: keep the current one, so the
+            // request still runs and any upstream limit is reported as is.
+        }
         self.token_for(data, &selected).await.map(Some)
     }
+}
+impl CodeAccounts {
+    /// Re-reads usage for a gated account when it is stale, best effort.
+    async fn gate_closed(&self, data: &mut StoredAccounts, id: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let Some(account) = data.accounts.iter().find(|a| a.id == id) else {
+            return false;
+        };
+        let stale = account
+            .usage
+            .as_ref()
+            .is_none_or(|u| now - u.observed_at > USAGE_FRESH_SECS);
+        if account.gate.is_set() && stale && now - account.usage_checked_at > USAGE_FRESH_SECS {
+            let _ = tokio::time::timeout(GATE_USAGE_TIMEOUT, self.read_usage(data, id)).await;
+        }
+        data.accounts
+            .iter()
+            .find(|a| a.id == id)
+            .is_some_and(|a| gate_reached(a, now))
+    }
+}
+/// Remaining percent of a window; a window past its reset is whole again.
+fn remaining(window: Option<&UsageWindow>, now: i64) -> Option<f64> {
+    let window = window?;
+    let reset = window
+        .resets_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at.timestamp() <= now);
+    Some(if reset {
+        100.0
+    } else {
+        100.0 - window.utilization
+    })
+}
+fn gate_reached(account: &StoredAccount, now: i64) -> bool {
+    let Some(usage) = account.usage.as_ref() else {
+        return false;
+    };
+    let closed = |floor: u8, window: Option<&UsageWindow>| {
+        floor > 0 && remaining(window, now).is_some_and(|left| left <= f64::from(floor))
+    };
+    closed(account.gate.five_hour, usage.five_hour.as_ref())
+        || closed(account.gate.seven_day, usage.seven_day.as_ref())
 }
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
@@ -623,8 +755,11 @@ mod tests {
                     refresh_token: "secret-refresh-B".into(),
                     expires_at: chrono::Utc::now().timestamp() + if expired { -10 } else { 3600 },
                     refresh_blocked: false,
+                    gate: AccountGate::default(),
                     usage: None,
+                    usage_checked_at: 0,
                 }],
+                switched_from: None,
             })
             .unwrap();
     }
@@ -735,6 +870,130 @@ mod tests {
         assert!(view.login_error.is_some());
         assert!(view.accounts.is_empty());
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    }
+    fn account(
+        id: &str,
+        gate: AccountGate,
+        five_hour_used: f64,
+        resets_at: Option<String>,
+    ) -> StoredAccount {
+        StoredAccount {
+            id: id.into(),
+            label: format!("{id} display"),
+            access_token: format!("secret-access-{id}"),
+            refresh_token: format!("secret-refresh-{id}"),
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            refresh_blocked: false,
+            gate,
+            usage: Some(AccountUsage {
+                observed_at: chrono::Utc::now().timestamp(),
+                five_hour: Some(UsageWindow {
+                    utilization: five_hour_used,
+                    resets_at,
+                }),
+                seven_day: Some(UsageWindow {
+                    utilization: 10.0,
+                    resets_at: None,
+                }),
+            }),
+            usage_checked_at: 0,
+        }
+    }
+    async fn install(manager: &CodeAccounts, accounts: Vec<StoredAccount>) {
+        let data = StoredAccounts {
+            selected: Some(accounts[0].id.clone()),
+            accounts,
+            switched_from: None,
+        };
+        manager.save(&data).unwrap();
+        *manager.stored.lock().await = Some(data);
+    }
+    const FIVE_HOUR_20: AccountGate = AccountGate {
+        five_hour: 20,
+        seven_day: 0,
+    };
+    #[tokio::test]
+    async fn gate_moves_the_next_request_to_an_account_under_its_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        install(
+            &manager,
+            vec![
+                account("A", FIVE_HOUR_20, 85.0, None),
+                account("B", FIVE_HOUR_20, 90.0, None),
+                account("C", AccountGate::default(), 99.0, None),
+            ],
+        )
+        .await;
+        assert_eq!(
+            manager.selected_token().await.unwrap().unwrap().account_id,
+            "C"
+        );
+        let view = manager.view().await.unwrap();
+        assert_eq!(view.selected.as_deref(), Some("C"));
+        assert_eq!(view.switched_from.as_deref(), Some("A"));
+        assert_eq!(
+            view.accounts.iter().map(|a| a.gated).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let restarted = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        let view = restarted.view().await.unwrap();
+        assert_eq!(view.selected.as_deref(), Some("C"));
+        assert_eq!(view.accounts[0].gate, FIVE_HOUR_20);
+        manager.select(Some("A".into())).await.unwrap();
+        assert!(manager.view().await.unwrap().switched_from.is_none());
+    }
+    #[tokio::test]
+    async fn gate_reopens_after_reset_and_keeps_the_account_when_all_are_gated() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        install(
+            &manager,
+            vec![
+                account("A", FIVE_HOUR_20, 95.0, Some(past)),
+                account("B", FIVE_HOUR_20, 90.0, None),
+            ],
+        )
+        .await;
+        assert_eq!(
+            manager.selected_token().await.unwrap().unwrap().account_id,
+            "A"
+        );
+        install(
+            &manager,
+            vec![
+                account("A", FIVE_HOUR_20, 95.0, None),
+                account(
+                    "B",
+                    AccountGate {
+                        five_hour: 0,
+                        seven_day: 95,
+                    },
+                    0.0,
+                    None,
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            manager.selected_token().await.unwrap().unwrap().account_id,
+            "A"
+        );
+        let view = manager.view().await.unwrap();
+        assert!(view.switched_from.is_none());
+        manager
+            .set_gate(
+                "A",
+                AccountGate {
+                    five_hour: 0,
+                    seven_day: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!manager.view().await.unwrap().accounts[0].gated);
+        assert!(manager.set_gate("missing", FIVE_HOUR_20).await.is_err());
     }
     #[test]
     fn usage_is_typed_and_unknown_shapes_are_unavailable() {

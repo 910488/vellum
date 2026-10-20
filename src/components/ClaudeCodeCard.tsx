@@ -25,6 +25,14 @@ function lastInference(status: ClaudeCodeStatus) {
     && record.upstreamStatus >= 200 && record.upstreamStatus < 300);
 }
 
+type GateKey = "fiveHour" | "sevenDay";
+
+/** Matches the backend: a window past its reset is whole again. */
+function windowRemaining(window: { utilization: number; resetsAt: string | null }) {
+  if (window.resetsAt && Date.parse(window.resetsAt) <= Date.now()) return 100;
+  return Math.max(0, Math.min(100, 100 - window.utilization));
+}
+
 function folderName(path: string) {
   return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
 }
@@ -48,6 +56,8 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
   const [trustAccepted, setTrustAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [removeId, setRemoveId] = useState<string | null>(null);
+  /** A gate being dragged: shown at once, saved on release. */
+  const [draft, setDraft] = useState<{ id: string; key: GateKey; floor: number } | null>(null);
   const revision = useRef(0);
   const mounted = useRef(false);
   const load = useCallback(async () => {
@@ -127,6 +137,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
       <span role="status"><State tone={headTone} label={headline} /></span>
     </div>
     <p className="prose">{t("claudeCode.accountsHint")}</p>
+    <p className="field__hint">{t("claudeCode.gateHint")}</p>
 
     <Rows className="official-account-list">
       <Row label={t("claudeCode.original")}>
@@ -145,16 +156,45 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
         const current = selected === account.id;
         return <Row key={account.id} label={account.label}>
           <span className="acct">
-            <State tone={account.reauthorizeRequired ? "warn" : current ? "ok" : "quiet"}
-              label={account.reauthorizeRequired ? t("claudeCode.reauthorize") : current ? t("claudeCode.selected") : t("claudeCode.standby")} />
+            <State tone={account.reauthorizeRequired || account.gated ? "warn" : current ? "ok" : "quiet"}
+              label={account.reauthorizeRequired ? t("claudeCode.reauthorize") : account.gated ? t("claudeCode.atGate")
+                : current ? t("claudeCode.selected") : t("claudeCode.standby")} />
             <span className="acct__quota">
               {account.usage ? (["fiveHour", "sevenDay"] as const).map((key) => {
                 const window = account.usage![key];
                 if (!window) return null;
-                const remaining = Math.max(0, Math.min(100, 100 - window.utilization));
+                const remaining = Math.round(windowRemaining(window));
+                const saved = account.gate?.[key] ?? 0;
+                const floor = draft?.id === account.id && draft.key === key ? draft.floor : saved;
+                const burnable = Math.max(0, remaining - floor);
+                const valueText = t("claudeCode.gateValue", { floor, left: remaining });
+                const commit = (next: number) => {
+                  setDraft(null);
+                  if (next === saved) return;
+                  const gate = { fiveHour: account.gate?.fiveHour ?? 0, sevenDay: account.gate?.sevenDay ?? 0, [key]: next };
+                  void act(() => claudeCodeApi.setGate(account.id, gate));
+                };
                 return <span className="acct__quota-window" key={key}>
-                  <span className="acct__quota-line"><strong>{Math.round(remaining)}%</strong><Meter percent={remaining} tone={remaining <= 10 ? "coral" : "default"} /></span>
+                  <span className="acct__quota-line">
+                    <strong>{remaining}%</strong>
+                    <span className={`acct__gate${floor > 0 && floor >= remaining ? " acct__gate--over" : ""}`}>
+                      <Meter percent={remaining} tone={remaining <= 10 ? "coral" : "default"} markAt={floor || undefined} markLabel={floor ? valueText : undefined} />
+                      <span className="acct__gate-keep" style={{ width: `${floor}%` }} />
+                      <input className="acct__gate-input" type="range" min="0" max="100" step="1" value={floor}
+                        disabled={busy || account.reauthorizeRequired}
+                        aria-label={t("claudeCode.gateLabel", { account: account.label, window: t(`claudeCode.${key}Name`) })}
+                        aria-valuetext={valueText}
+                        onChange={(event) => setDraft({ id: account.id, key, floor: Number(event.currentTarget.value) })}
+                        onPointerUp={(event) => commit(Number(event.currentTarget.value))}
+                        onKeyUp={(event) => commit(Number(event.currentTarget.value))}
+                        onBlur={(event) => commit(Number(event.currentTarget.value))} />
+                      <span className="acct__gate-focus" />
+                    </span>
+                  </span>
                   <small>{t(`claudeCode.${key}`)}{window.resetsAt ? ` · ${resetLabel(window.resetsAt)}` : ""}</small>
+                  <small>{floor > 0
+                    ? `${t("claudeCode.gateRead", { floor })} · ${burnable > 0 ? t("claudeCode.burnable", { value: burnable }) : t("claudeCode.atGate")}`
+                    : t("claudeCode.noGate")}</small>
                 </span>;
               }) : <span className="field__hint">{t("claudeCode.usageNotLoaded")}</span>}
             </span>
@@ -169,6 +209,9 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
         </Row>;
       })}
     </Rows>
+    {status?.accounts.switchedFrom && selected && <p className="field__hint" role="status">
+      {t("claudeCode.switchedFrom", { from: label(status.accounts.switchedFrom), to: label(selected) })}
+    </p>}
     <div className="rowline claude-code__login">
       <Btn soft disabled={busy || !status || status.accounts.loginPending} onClick={() => void act(() => claudeCodeApi.login())}>
         {t(status?.accounts.loginPending ? "models.ui.oauth.waitingBrowser" : "claudeCode.login")}

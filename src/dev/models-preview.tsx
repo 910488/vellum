@@ -38,6 +38,14 @@ const CLAUDE_SCENES = {
 } as const;
 type ClaudeScene = keyof typeof CLAUDE_SCENES;
 let claudeScene: ClaudeScene = "setup";
+const claudeGates: Record<string, { fiveHour: number; sevenDay: number }> = {
+  "claude-preview-a": { fiveHour: 40, sevenDay: 20 },
+  "claude-preview-b": { fiveHour: 0, sevenDay: 30 },
+};
+claudeCodeApi.setGate = async (accountId, gate) => {
+  claudeGates[accountId] = gate;
+  return claudeCodeApi.status();
+};
 const CLAUDE_PROJECT = "E:\\code_E\\vellum";
 claudeCodeApi.recentProjects = async () => [
   { path: CLAUDE_PROJECT, sessions: 62, lastActivityAt: 3 },
@@ -64,10 +72,13 @@ claudeCodeApi.status = async () => {
     },
     accounts: {
       selected: claudeScene === "setup" || claudeScene === "trustReview" ? null : "claude-preview-b", loginPending: false, loginError: null,
+      switchedFrom: claudeScene === "routing" ? "claude-preview-a" : null,
       accounts: [
         { id: "claude-preview-a", label: "claude.personal@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
+          gate: claudeGates["claude-preview-a"], gated: 38 <= claudeGates["claude-preview-a"]!.fiveHour || 73 <= claudeGates["claude-preview-a"]!.sevenDay,
           usage: { observedAt: 1, fiveHour: { utilization: 62, resetsAt: new Date(Date.now() + 2.5 * 3600_000).toISOString() }, sevenDay: { utilization: 27, resetsAt: new Date(Date.now() + 4 * 86400_000).toISOString() } } },
         { id: "claude-preview-b", label: "claude.work@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
+          gate: claudeGates["claude-preview-b"], gated: false,
           usage: { observedAt: 1, fiveHour: { utilization: 8, resetsAt: new Date(Date.now() + 4.2 * 3600_000).toISOString() }, sevenDay: { utilization: 41, resetsAt: new Date(Date.now() + 2 * 86400_000).toISOString() } } },
       ],
     },

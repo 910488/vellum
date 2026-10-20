@@ -18,12 +18,16 @@ export interface ClaudeCodeStatus {
     records: { id: string; sessionHash: string; accountId: string | null; operation?: "messages" | "count_tokens"; state: string; upstreamStatus: number | null }[];
   };
   accounts: {
-    accounts: { id: string; label: string; expiresAt: number; reauthorizeRequired: boolean; usage?: { observedAt: number; fiveHour: { utilization: number; resetsAt: string | null } | null; sevenDay: { utilization: number; resetsAt: string | null } | null } | null }[];
+    accounts: { id: string; label: string; expiresAt: number; reauthorizeRequired: boolean; gate?: ClaudeCodeGate; gated?: boolean; usage?: { observedAt: number; fiveHour: { utilization: number; resetsAt: string | null } | null; sevenDay: { utilization: number; resetsAt: string | null } | null } | null }[];
     selected: string | null;
+    switchedFrom?: string | null;
     loginPending: boolean;
     loginError: string | null;
   };
 }
+
+/** Percent of each window to keep; 0 leaves it ungated. */
+export interface ClaudeCodeGate { fiveHour: number; sevenDay: number }
 
 export interface ClaudeCodeRecentProject { path: string; sessions: number; lastActivityAt: number | null }
 
@@ -39,5 +43,6 @@ export const claudeCodeApi = {
   login: () => invoke<void>("claude_code_begin_login"),
   cancelLogin: () => invoke<void>("claude_code_cancel_login"),
   remove: (accountId: string) => invoke<ClaudeCodeStatus>("claude_code_remove_account", { accountId }),
+  setGate: (accountId: string, gate: ClaudeCodeGate) => invoke<ClaudeCodeStatus>("claude_code_set_gate", { accountId, gate }),
   usage: (accountId: string) => invoke<ClaudeCodeStatus>("claude_code_refresh_usage", { accountId }),
 };

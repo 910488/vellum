@@ -1,5 +1,6 @@
 const en = {
     standby: "Standby", passThrough: "Direct to Anthropic; authorization is not replaced", routingVia: "Routing · {{account}}", lastInference: "Last inference", noInferenceYet: "None yet", waitingHint: "Settings are in place. Reopen the Code session in Desktop so it starts with the new settings, then send a message.", repairHint: "Vellum stopped while routing was on. Reconnect the same project or restore its settings.", stepProject: "Project", recentProjects: "Recent Desktop Code projects", sessionCount: "{{count}} sessions", otherFolder: "Another folder…", projectHint: "Listed from Claude Desktop's recent Code sessions. Only this folder's .claude/settings.local.json is changed.", stepTrust: "Certificate", stepEnable: "Connect", enableHint: "Sessions already open keep their old settings until you reopen them in Desktop.", advanced: "Details and records",
+  fiveHourName: "5-hour", sevenDayName: "weekly", gateRead: "{{floor}}% gate", burnable: "{{value}}% spendable", atGate: "At gate", noGate: "No gate · drag the bar", gateLabel: "{{window}} gate for {{account}}", gateValue: "{{floor}}% gate, {{left}}% left", gateHint: "Drag the mark on a bar to keep that share of the 5-hour or weekly window. When either one reaches its gate, the next inference moves to the next account still under its gate; if every account is at its gate, the current one keeps going.", switchedFrom: "{{from}} reached its gate; now using {{to}}.",
   login: "Sign in to Claude",
   accountsHint: "Sign in with Claude in your browser and choose an account for Desktop Code inference. Your Desktop login and conversations stay in place.",
   selected: "Selected", fiveHour: "5 hours left", sevenDay: "Weekly left", usageNotLoaded: "Use Refresh at the top of the page to read usage", noAccounts: "Sign in to add a Claude account.", connectionSettings: "Project connection settings", removeAccountTitle: "Remove this Claude account?",
@@ -22,6 +23,7 @@ export const claudeCodeMessages: Record<"zh-TW" | "zh-CN" | "en" | "ja", Message
   en,
   "zh-TW": {
     standby: "待命", passThrough: "直連 Anthropic，不替換授權", routingVia: "路由中 · {{account}}", lastInference: "最近推論", noInferenceYet: "尚無", waitingHint: "設定已就緒。到 Desktop 重新開啟這個專案的 Code 工作階段，讓它用新設定啟動，再送出一則訊息。", repairHint: "Vellum 在接入期間結束過。可對同一專案重新接入，或還原它的設定。", stepProject: "專案", recentProjects: "Desktop 最近的 Code 專案", sessionCount: "{{count}} 個工作階段", otherFolder: "其他資料夾…", projectHint: "清單取自 Claude Desktop 最近的 Code 工作階段。只會修改這個資料夾的 .claude/settings.local.json。", stepTrust: "憑證", stepEnable: "接入", enableHint: "已經開著的工作階段要在 Desktop 重新開啟後才會套用。", advanced: "說明與紀錄",
+    fiveHourName: "5 小時", sevenDayName: "每週", gateRead: "閘門 {{floor}}%", burnable: "可燒 {{value}}%", atGate: "已到閘門", noGate: "無閘門 · 拖曳量條設定", gateLabel: "{{account}} 的{{window}}閘門", gateValue: "閘門 {{floor}}%，剩 {{left}}%", gateHint: "拖曳量條上的刻度，替 5 小時或每週額度留下一段不燒。任一條到達閘門，下一個推論就換到下一個還沒到閘門的帳號；全部都到了則沿用目前帳號。", switchedFrom: "{{from}} 到達閘門，已改用 {{to}}。",
     login: "登入 Claude",
     accountsHint: "透過瀏覽器登入 Claude，選擇 Desktop Code 的推論帳號。保留 Desktop 目前登入與既有對話。",
     selected: "已選擇", fiveHour: "5 小時剩餘", sevenDay: "每週剩餘", usageNotLoaded: "按頁面左上角的重新整理讀取用量", noAccounts: "登入以新增 Claude 帳號。", connectionSettings: "專案接入設定", removeAccountTitle: "移除此 Claude 帳號？",
@@ -38,6 +40,7 @@ export const claudeCodeMessages: Record<"zh-TW" | "zh-CN" | "en" | "ja", Message
   },
   "zh-CN": {
     standby: "待命", passThrough: "直连 Anthropic，不替换授权", routingVia: "路由中 · {{account}}", lastInference: "最近推理", noInferenceYet: "暂无", waitingHint: "设置已就绪。到 Desktop 重新打开这个项目的 Code 会话，让它用新设置启动，再发送一条消息。", repairHint: "Vellum 在接入期间退出过。可对同一项目重新接入，或还原它的设置。", stepProject: "项目", recentProjects: "Desktop 最近的 Code 项目", sessionCount: "{{count}} 个会话", otherFolder: "其他文件夹…", projectHint: "列表取自 Claude Desktop 最近的 Code 会话。只会修改这个文件夹的 .claude/settings.local.json。", stepTrust: "证书", stepEnable: "接入", enableHint: "已经打开的会话要在 Desktop 重新打开后才会生效。", advanced: "说明与记录",
+    fiveHourName: "5 小时", sevenDayName: "每周", gateRead: "闸门 {{floor}}%", burnable: "可烧 {{value}}%", atGate: "已到闸门", noGate: "无闸门 · 拖动量条设置", gateLabel: "{{account}} 的{{window}}闸门", gateValue: "闸门 {{floor}}%，剩 {{left}}%", gateHint: "拖动量条上的刻度，为 5 小时或每周额度留下一段不烧。任一条到达闸门，下一个推理就换到下一个还没到闸门的账号；全部都到了则沿用当前账号。", switchedFrom: "{{from}} 到达闸门，已改用 {{to}}。",
     login: "登录 Claude",
     accountsHint: "通过浏览器登录 Claude，选择 Desktop Code 的推理账号。保留 Desktop 当前登录和已有对话。",
     selected: "已选择", fiveHour: "5 小时剩余", sevenDay: "每周剩余", usageNotLoaded: "点击页面左上角的刷新读取用量", noAccounts: "登录以添加 Claude 账号。", connectionSettings: "项目接入设置", removeAccountTitle: "移除此 Claude 账号？",
@@ -54,6 +57,7 @@ export const claudeCodeMessages: Record<"zh-TW" | "zh-CN" | "en" | "ja", Message
   },
   ja: {
     standby: "待機", passThrough: "Anthropic へ直接接続し、認証は置き換えません", routingVia: "ルーティング中 · {{account}}", lastInference: "直近の推論", noInferenceYet: "まだありません", waitingHint: "設定は準備できています。Desktop でこのプロジェクトの Code セッションを開き直して新しい設定で起動し、メッセージを送ってください。", repairHint: "接続中に Vellum が終了しました。同じプロジェクトに再接続するか、設定を復元してください。", stepProject: "プロジェクト", recentProjects: "Desktop の最近の Code プロジェクト", sessionCount: "{{count}} セッション", otherFolder: "別のフォルダー…", projectHint: "Claude Desktop の最近の Code セッションから表示しています。変更するのはこのフォルダーの .claude/settings.local.json だけです。", stepTrust: "証明書", stepEnable: "接続", enableHint: "開いているセッションは Desktop で開き直すまで以前の設定のままです。", advanced: "説明と記録",
+    fiveHourName: "5時間", sevenDayName: "週間", gateRead: "ゲート {{floor}}%", burnable: "使用可 {{value}}%", atGate: "ゲート到達", noGate: "ゲートなし · バーをドラッグ", gateLabel: "{{account}} の{{window}}ゲート", gateValue: "ゲート {{floor}}%、残り {{left}}%", gateHint: "バー上の目盛りをドラッグすると、5時間または週間の枠の一部を残せます。どちらかがゲートに達すると、次の推論はまだゲートに達していない次のアカウントに移ります。すべて達している場合は現在のアカウントを使い続けます。", switchedFrom: "{{from}} がゲートに達したため {{to}} に切り替えました。",
     login: "Claude にログイン",
     accountsHint: "ブラウザーで Claude にログインし、Desktop Code の推論アカウントを選択します。Desktop のログインと既存の会話は保持されます。",
     selected: "選択済み", fiveHour: "5時間の残量", sevenDay: "週間の残量", usageNotLoaded: "ページ左上の更新で利用状況を読み込みます", noAccounts: "ログインして Claude アカウントを追加してください。", connectionSettings: "プロジェクト接続設定", removeAccountTitle: "この Claude アカウントを削除しますか？",

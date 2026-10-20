@@ -279,6 +279,7 @@ pub fn run() {
             commands::claude_code_cancel_login,
             commands::claude_code_remove_account,
             commands::claude_code_refresh_usage,
+            commands::claude_code_set_gate,
             commands::get_overview,
             commands::get_provider_overviews,
             commands::get_request_log,
