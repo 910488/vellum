@@ -38,6 +38,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::scoped(ProxyScope::Project).await
+    }
+    async fn scoped(scope: ProxyScope) -> Self {
         let (send, captured) = mpsc::channel(32);
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream_listener.local_addr().unwrap();
@@ -80,9 +83,13 @@ impl Fixture {
             RwLock::new(Some("B".into())),
             Mutex::new(Vec::new()),
         ));
-        let proxy =
-            ClaudeCodeProxy::build("test-secret", accounts.clone(), format!("http://{address}"))
-                .unwrap();
+        let proxy = ClaudeCodeProxy::build_scoped(
+            "test-secret",
+            accounts.clone(),
+            format!("http://{address}"),
+            scope,
+        )
+        .unwrap();
         let certificate = CodeCertificate::generate().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -692,4 +699,147 @@ async fn usage_headers_only_observe_the_desktop_inference_execution_account() {
     assert!(!serde_json::to_string(&fixture.proxy.status())
         .unwrap()
         .contains("utilization"));
+}
+
+// Read only the CONNECT response head: the following bytes belong to the
+// opaque protocol and must not be consumed by a buffered HTTP reader.
+async fn connect_tunnel(f: &Fixture, target: &str, authenticated: bool) -> (TcpStream, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = f.proxy_url.rsplit_once('@').unwrap().1;
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    let auth = if authenticated {
+        "Proxy-Authorization: Basic dmVsbHVtOnRlc3Qtc2VjcmV0\r\n"
+    } else {
+        ""
+    };
+    socket
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+            assert!(head.len() < 4096);
+        }
+    })
+    .await
+    .unwrap();
+    (socket, String::from_utf8(head).unwrap())
+}
+
+async fn echo_target() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (socket, _) = accepted.unwrap();
+                    connections.spawn(async move {
+                        let (mut read, mut write) = socket.into_split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    (address, task)
+}
+
+#[tokio::test]
+async fn user_scope_private_tunnels_are_authenticated_opaque_and_not_limited_by_mitm_slots() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::scoped(ProxyScope::User).await;
+    let (target, echo) = echo_target().await;
+    let (_, denied) = connect_tunnel(&f, &target.to_string(), false).await;
+    assert!(denied.starts_with("HTTP/1.1 407"));
+    // Deliberately exhaust all 64 MITM slots. More than 64 raw tunnels must
+    // still succeed concurrently, including loopback on a nonstandard port.
+    let slots = f
+        .proxy
+        .tunnel_slots
+        .clone()
+        .acquire_many_owned(64)
+        .await
+        .unwrap();
+    let mut pending = JoinSet::new();
+    for _ in 0..96 {
+        let address = target.to_string();
+        let proxy = &f;
+        // Own a minimal handle for 'static spawning without duplicating Fixture.
+        let proxy_address = proxy.proxy_url.rsplit_once('@').unwrap().1.to_owned();
+        pending.spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address).await.unwrap();
+            socket.write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: {address}\r\nProxy-Authorization: Basic dmVsbHVtOnRlc3Qtc2VjcmV0\r\n\r\n").as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+                assert!(head.len() < 4096);
+            }
+            assert!(String::from_utf8(head).unwrap().starts_with("HTTP/1.1 200"));
+            socket
+        });
+    }
+    let mut sockets = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(result) = pending.join_next().await {
+            sockets.push(result.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sockets.len(), 96);
+    for socket in &mut sockets {
+        // Opaque bytes round-trip; the proxy never interprets or MITMs them.
+        socket.write_all(b"opaque TLS bytes").await.unwrap();
+        let mut bytes = [0u8; 16];
+        socket.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"opaque TLS bytes");
+    }
+    let (mut local, head) = connect_tunnel(&f, &format!("localhost:{}", target.port()), true).await;
+    assert!(head.starts_with("HTTP/1.1 200"));
+    local.write_all(b"x").await.unwrap();
+    assert_eq!(local.read_u8().await.unwrap(), b'x');
+    let (_, limited) = connect_tunnel(&f, "api.anthropic.com:443", true).await;
+    assert!(limited.starts_with("HTTP/1.1 503"));
+    let (_, port_denied) = connect_tunnel(&f, "api.anthropic.com:8443", true).await;
+    assert!(port_denied.starts_with("HTTP/1.1 403"));
+    assert_eq!(f.proxy.status().api_requests, 0);
+    assert_eq!(f.proxy.status().tls_failures, 0);
+    drop(slots);
+    drop(sockets);
+    drop(local);
+    f.stop().await;
+    echo.abort();
+    let _ = echo.await;
+}
+
+#[tokio::test]
+async fn project_scope_keeps_private_port_and_tunnel_limits() {
+    let f = Fixture::new().await;
+    let (target, echo) = echo_target().await;
+    for target in [
+        target.to_string(),
+        "127.0.0.1:443".into(),
+        "localhost:443".into(),
+    ] {
+        let (_, head) = connect_tunnel(&f, &target, true).await;
+        assert!(head.starts_with("HTTP/1.1 403"));
+    }
+    let slots = f
+        .proxy
+        .tunnel_slots
+        .clone()
+        .acquire_many_owned(64)
+        .await
+        .unwrap();
+    let (_, head) = connect_tunnel(&f, "api.anthropic.com:443", true).await;
+    assert!(head.starts_with("HTTP/1.1 503"));
+    drop(slots);
+    f.stop().await;
+    echo.abort();
+    let _ = echo.await;
 }

@@ -59,9 +59,19 @@ pub struct CodeRequestRecord {
     pub upstream_status: Option<u16>,
 }
 
+/// User settings also affect CLI tool children. Authenticated opaque tunnels
+/// in that scope must support their private services and package downloads.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum ProxyScope {
+    #[default]
+    Project,
+    User,
+}
+
 /// Does not own settings or Desktop. Stopping it never touches a Code process.
 pub struct ClaudeCodeProxy {
     authorization: String,
+    scope: ProxyScope,
     accounts: Arc<dyn ClaudeAccounts>,
     client: reqwest::Client,
     upstream: String,
@@ -74,13 +84,22 @@ pub struct ClaudeCodeProxy {
 
 impl ClaudeCodeProxy {
     pub fn new(secret: &str, accounts: Arc<dyn ClaudeAccounts>) -> Result<Arc<Self>, String> {
-        Self::build(secret, accounts, "https://api.anthropic.com".into())
+        Self::with_scope(secret, accounts, ProxyScope::Project)
     }
 
-    fn build(
+    pub fn with_scope(
+        secret: &str,
+        accounts: Arc<dyn ClaudeAccounts>,
+        scope: ProxyScope,
+    ) -> Result<Arc<Self>, String> {
+        Self::build_scoped(secret, accounts, "https://api.anthropic.com".into(), scope)
+    }
+
+    fn build_scoped(
         secret: &str,
         accounts: Arc<dyn ClaudeAccounts>,
         upstream: String,
+        scope: ProxyScope,
     ) -> Result<Arc<Self>, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -90,6 +109,7 @@ impl ClaudeCodeProxy {
             .build()
             .map_err(|_| "Cannot create Claude upstream transport")?;
         Ok(Arc::new(Self {
+            scope,
             authorization: format!("Basic {}", STANDARD.encode(format!("vellum:{secret}"))),
             accounts,
             client,
@@ -190,36 +210,55 @@ impl ClaudeCodeProxy {
         if request.method() != Method::CONNECT {
             return failure(StatusCode::METHOD_NOT_ALLOWED, "connect_required");
         }
-        let Ok(tunnel_slot) = self.tunnel_slots.clone().try_acquire_owned() else {
-            return failure(StatusCode::SERVICE_UNAVAILABLE, "claude_tunnel_limit");
-        };
         let Some(authority) = request.uri().authority() else {
             return failure(StatusCode::BAD_REQUEST, "invalid_connect_target");
         };
-        let host = authority.host().to_ascii_lowercase();
-        if authority.port_u16() != Some(443) || host.is_empty() {
+        // URI authority keeps IPv6 brackets; lookup_host expects the bare IP.
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let port = authority.port_u16().unwrap_or(443);
+        let opaque_user = self.scope == ProxyScope::User && host != HOST;
+        if host.is_empty() || port == 0 || (!opaque_user && authority.port_u16() != Some(443)) {
             return failure(StatusCode::FORBIDDEN, "https_port_required");
         }
+        // Keep MITM and project admission bounded. Opaque user tunnels do not
+        // consume this budget: inherited proxy env must not cap cargo/npm work.
+        let tunnel_slot = if opaque_user {
+            None
+        } else {
+            match self.tunnel_slots.clone().try_acquire_owned() {
+                Ok(slot) => Some(slot),
+                Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "claude_tunnel_limit"),
+            }
+        };
         self.status.lock().unwrap().connect_requests += 1;
-        // Offline fixtures never establish a real external tunnel, including
-        // when exercising the installed native CLI against a fake upstream.
-        #[cfg(test)]
-        if self.upstream.starts_with("http://127.0.0.1:") && host != HOST {
-            return failure(StatusCode::FORBIDDEN, "offline_external_tunnel_refused");
-        }
-        // Resolve before acknowledging a raw tunnel. No private-network forward proxy.
+        // Resolve once and connect to those exact addresses. Only the user
+        // scope permits private destinations, after proxy-secret validation.
         let raw = if host != HOST {
             let addresses = match tokio::time::timeout(
                 Duration::from_secs(10),
-                tokio::net::lookup_host((host.as_str(), 443)),
+                tokio::net::lookup_host((host.as_str(), port)),
             )
             .await
             {
                 Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
                 _ => return failure(StatusCode::BAD_GATEWAY, "tunnel_dns_failed"),
             };
-            if addresses.is_empty() || addresses.iter().any(|a| !public_address(a.ip())) {
+            if addresses.is_empty()
+                || (!opaque_user && addresses.iter().any(|a| !public_address(a.ip())))
+            {
                 return failure(StatusCode::FORBIDDEN, "private_tunnel_refused");
+            }
+            // Offline fixtures can exercise real loopback tunnels, but must
+            // never reach an external/private service on the developer's LAN.
+            #[cfg(test)]
+            if self.upstream.starts_with("http://127.0.0.1:")
+                && addresses.iter().any(|a| !a.ip().is_loopback())
+            {
+                return failure(StatusCode::FORBIDDEN, "offline_external_tunnel_refused");
             }
             match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addresses[..]))
                 .await

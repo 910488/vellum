@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 use vellum_proxy_runtime::claude_code::{
     certificate::CodeCertificate, settings::SettingsLease, ClaudeCodeProxy, CodeRouteStatus,
+    ProxyScope,
 };
 
 const LEASE_ID: &str = "claudecodelease";
@@ -346,7 +347,14 @@ impl CodeManager {
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|_| "Cannot create health client")?;
-        let proxy = ClaudeCodeProxy::new(&lease.secret, self.accounts.clone())?;
+        let proxy = ClaudeCodeProxy::with_scope(
+            &lease.secret,
+            self.accounts.clone(),
+            match scope {
+                CodeScope::Project => ProxyScope::Project,
+                CodeScope::User => ProxyScope::User,
+            },
+        )?;
         let (stop, wait) = watch::channel(false);
         let task = tokio::spawn(proxy.clone().serve(listener, tls, wait));
         // Authenticated health check before reporting a running integration.

@@ -7,5 +7,5 @@ mod usage;
 pub use usage::{UsageObservation, UsageWindowObservation};
 
 pub use proxy::{
-    AccountToken, ClaudeAccounts, ClaudeCodeProxy, CodeRequestRecord, CodeRouteStatus,
+    AccountToken, ClaudeAccounts, ClaudeCodeProxy, CodeRequestRecord, CodeRouteStatus, ProxyScope,
 };
