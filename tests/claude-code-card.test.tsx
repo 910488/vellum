@@ -5,10 +5,10 @@ import "@/i18n";
 import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
 import { claudeCodeApi, type ClaudeCodeStatus } from "@/lib/claudeCode";
 
-vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
+vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
 
 function status(): ClaudeCodeStatus {
-  return { running: false, project: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
+  return { running: false, project: null, scope: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
     trust: { supported: false, sha256: null, trusted: false, managed: false, recoveryRequired: false },
     routing: { activeRequests: 0, desktopRequests: 0, records: [] },
     accounts: { selected: "B", accounts: [{ id: "B", label: "Account B", expiresAt: 9999999999, reauthorizeRequired: false }], loginPending: false, loginError: null } };
@@ -80,6 +80,7 @@ describe("Claude Desktop Code", () => {
     vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
     render(<ClaudeCodeCard active />);
     await screen.findByText("reviewed-fingerprint");
+    fireEvent.click(screen.getByRole("button", { name: "單一專案" }));
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "E:\\project" } });
     expect((screen.getByText("接入此專案") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByText("暫時信任此 CA") as HTMLButtonElement).disabled).toBe(true);
@@ -99,6 +100,7 @@ describe("Claude Desktop Code", () => {
     render(<ClaudeCodeCard active />);
     await screen.findByText("已停用");
     expect(screen.getByText(/本機 Code 工作階段/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "單一專案" }));
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "E:\\project" } });
     fireEvent.click(screen.getByText("接入此專案"));
     await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith("E:\\project"));
@@ -156,6 +158,7 @@ describe("Claude Desktop Code", () => {
       { path: "E:\\beta", sessions: 1, lastActivityAt: 1 },
     ]);
     render(<ClaudeCodeCard active />);
+    fireEvent.click(await screen.findByRole("button", { name: "單一專案" }));
     const picker = await screen.findByLabelText("Desktop 最近的 Code 專案");
     await waitFor(() => expect((picker as HTMLSelectElement).value).toBe("E:\\alpha"));
     expect(screen.queryByLabelText("專案資料夾")).toBeNull();
@@ -166,6 +169,30 @@ describe("Claude Desktop Code", () => {
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "D:\\other" } });
     fireEvent.click(screen.getByText("接入此專案"));
     await waitFor(() => expect(claudeCodeApi.start).toHaveBeenLastCalledWith("D:\\other"));
+  });
+  it("defaults to all sessions and starts the user-settings lease without a project", async () => {
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("已停用");
+    expect(screen.getByRole("button", { name: "所有工作階段" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByLabelText("專案資料夾")).toBeNull();
+    expect(screen.getByText(/CLI 版 Claude Code/)).toBeTruthy();
+    fireEvent.click(screen.getByText("接入所有工作階段"));
+    await waitFor(() => expect(claudeCodeApi.startUser).toHaveBeenCalledOnce());
+    expect(claudeCodeApi.start).not.toHaveBeenCalled();
+  });
+  it("shows the user-settings lease while running and pins the scope while it is held", async () => {
+    const value = status(); value.running = true; value.scope = "user"; value.settingsMatch = true;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    const { unmount } = render(<ClaudeCodeCard active />);
+    await screen.findByText("~/.claude/settings.json");
+    expect(screen.getByText(/開啟或重新開啟 Code 工作階段/)).toBeTruthy();
+    unmount();
+    value.running = false; value.recoveryRequired = true;
+    render(<ClaudeCodeCard active />);
+    await screen.findByText(/還原 ~\/\.claude\/settings\.json/);
+    expect(screen.queryByRole("button", { name: "單一專案" })).toBeNull();
+    fireEvent.click(screen.getByText("重新接入"));
+    await waitFor(() => expect(claudeCodeApi.startUser).toHaveBeenCalledOnce());
   });
   it("drags a gate on one window, saves it on release and marks a gated account", async () => {
     const value = status(); value.accounts.selected = null; value.accounts.switchedFrom = "B";

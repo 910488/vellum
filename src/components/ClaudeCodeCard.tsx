@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Btn, Cap, Card, Confirm, Meter, Notice, Row, Rows, State } from "@/components/ui";
+import { Btn, Cap, Card, Confirm, Meter, Notice, Row, Rows, Segment, State } from "@/components/ui";
 import { useLocaleFormat } from "@/i18n/useLocaleFormat";
-import { claudeCodeApi, type ClaudeCodeRecentProject, type ClaudeCodeStatus } from "@/lib/claudeCode";
+import { claudeCodeApi, type ClaudeCodeRecentProject, type ClaudeCodeScope, type ClaudeCodeStatus } from "@/lib/claudeCode";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 
 type Phase = "loading" | "repair" | "stopped" | "resume" | "connected" | "waiting";
@@ -51,6 +51,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
   const [status, setStatus] = useState<ClaudeCodeStatus | null>(null);
   const [recent, setRecent] = useState<ClaudeCodeRecentProject[]>([]);
   const [project, setProject] = useState("");
+  const [scope, setScope] = useState<ClaudeCodeScope>("user");
   const [typing, setTyping] = useState(false);
   const [busy, setBusy] = useState(false);
   const [trustAccepted, setTrustAccepted] = useState(false);
@@ -67,6 +68,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
       if (!mounted.current || generation !== revision.current) return;
       setStatus(next);
       setProject((current) => current || next.project || "");
+      if (next.scope) setScope(next.scope);
     } catch (cause) {
       if (mounted.current && generation === revision.current) setError(String(cause));
     }
@@ -125,7 +127,10 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
   const inference = status ? lastInference(status) : undefined;
   const trust = status?.trust;
   const needsTrust = Boolean(trust?.supported && !trust.trusted);
-  const leased = Boolean(status?.project);
+  /** A lease pins the scope until it is restored. */
+  const leasedScope = status?.scope ?? (status?.project ? "project" : null);
+  const leased = leasedScope !== null;
+  const userScope = (leasedScope ?? scope) === "user";
   const headline = phase === "connected" ? t("claudeCode.routingVia", { account: label(inference?.accountId ?? null) }) : t(`claudeCode.${phase}`);
   const headTone = phase === "connected" ? "ok" : phase === "repair" || phase === "resume" ? "warn" : "quiet";
   const known = recent.some((entry) => entry.path === project);
@@ -224,21 +229,32 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
       <Cap>{t("claudeCode.connectionSettings")}</Cap>
       {status?.running ? <>
         <Rows>
-          <Row label={t("claudeCode.project")}><code className="claude-code__path" title={status.project ?? undefined}>{status.project}</code></Row>
+          {userScope
+            ? <Row label={t("claudeCode.stepScope")}>{t("claudeCode.scopeUser")} · <code className="claude-code__path">~/.claude/settings.json</code></Row>
+            : <Row label={t("claudeCode.project")}><code className="claude-code__path" title={status.project ?? undefined}>{status.project}</code></Row>}
           <Row label={t("claudeCode.lastInference")}>
             {inference ? `${label(inference.accountId)} · HTTP ${inference.upstreamStatus}` : t("claudeCode.noInferenceYet")}
           </Row>
         </Rows>
-        {phase === "waiting" && <p className="field__hint">{t("claudeCode.waitingHint")}</p>}
+        {phase === "waiting" && <p className="field__hint">{t(userScope ? "claudeCode.waitingHintUser" : "claudeCode.waitingHint")}</p>}
         {phase === "resume" && <Notice tone="warn">{t("claudeCode.resumeHint")}</Notice>}
         <div className="rowline">
           <Btn soft disabled={busy || Boolean(status.routing.activeRequests)} onClick={() => void act(() => claudeCodeApi.stop())}>{t("claudeCode.restore")}</Btn>
           {Boolean(status.routing.activeRequests) && <Btn danger disabled={busy} onClick={() => void act(() => claudeCodeApi.stop(true))}>{t("claudeCode.forceStop")}</Btn>}
         </div>
       </> : <>
-        {phase === "repair" && <Notice tone="warn">{t("claudeCode.repairHint")}</Notice>}
+        {phase === "repair" && <Notice tone="warn">{t(userScope ? "claudeCode.repairHintUser" : "claudeCode.repairHint")}</Notice>}
         <ol className="claude-code__steps">
           <li className="claude-code__step">
+            <span className="claude-code__step-title">{t("claudeCode.stepScope")}</span>
+            {leased ? <span>{t(userScope ? "claudeCode.scopeUser" : "claudeCode.scopeProject")}</span>
+              : <Segment value={scope} onChange={setScope} options={[
+                { value: "user", label: t("claudeCode.scopeUser") },
+                { value: "project", label: t("claudeCode.scopeProject") },
+              ]} />}
+            {userScope && <small className="field__hint">{t("claudeCode.scopeUserHint")}</small>}
+          </li>
+          {!userScope && <li className="claude-code__step">
             <span className="claude-code__step-title">{t("claudeCode.stepProject")}</span>
             {recent.length > 0 && !leased && <select className="input" aria-label={t("claudeCode.recentProjects")} disabled={busy}
               value={showTyped ? OTHER : project}
@@ -254,7 +270,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
             {(showTyped || leased) && <input className="input" aria-label={t("claudeCode.project")} value={project}
               placeholder={"E:\\code\\project"} disabled={busy || leased} onChange={(event) => setProject(event.target.value)} />}
             <small className="field__hint">{t("claudeCode.projectHint")}</small>
-          </li>
+          </li>}
           {trust?.supported && <li className="claude-code__step">
             <span className="claude-code__step-title">{t("claudeCode.stepTrust")}</span>
             {trust.trusted ? <span className="field__hint">{t(trust.managed ? "claudeCode.trustManaged" : "claudeCode.trustExternal")}</span> : <>
@@ -278,8 +294,9 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
           <li className="claude-code__step">
             <span className="claude-code__step-title">{t("claudeCode.stepEnable")}</span>
             <div className="rowline">
-              <Btn disabled={busy || !status || !project.trim() || needsTrust} onClick={() => void act(() => claudeCodeApi.start(project.trim()))}>
-                {t(status?.recoveryRequired ? "claudeCode.reconnect" : "claudeCode.enable")}
+              <Btn disabled={busy || !status || (!userScope && !project.trim()) || needsTrust}
+                onClick={() => void act(() => userScope ? claudeCodeApi.startUser() : claudeCodeApi.start(project.trim()))}>
+                {t(status?.recoveryRequired ? "claudeCode.reconnect" : userScope ? "claudeCode.enableUser" : "claudeCode.enable")}
               </Btn>
               {leased && <Btn soft disabled={busy} onClick={() => void act(() => claudeCodeApi.stop())}>{t("claudeCode.restore")}</Btn>}
             </div>
