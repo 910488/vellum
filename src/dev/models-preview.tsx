@@ -32,6 +32,7 @@ const CLAUDE_SCENES = {
   setup: "Claude：尚未接入（需要憑證）",
   trustReview: "Claude：核對憑證指紋",
   waiting: "Claude：已接入、等待工作階段",
+  user: "Claude：所有工作階段、等待中",
   routing: "Claude：路由中（B）",
   tls: "Claude：Code 不信任憑證",
   repair: "Claude：需要修復",
@@ -53,9 +54,10 @@ claudeCodeApi.recentProjects = async () => [
   { path: "D:\\work\\trading-notebooks", sessions: 4, lastActivityAt: 1 },
 ];
 claudeCodeApi.status = async () => {
-  const running = ["waiting", "routing", "tls"].includes(claudeScene);
+  const running = ["waiting", "user", "routing", "tls"].includes(claudeScene);
+  const scope = claudeScene === "user" ? "user" : running || claudeScene === "repair" ? "project" : null;
   return {
-    running, project: running || claudeScene === "repair" ? CLAUDE_PROJECT : null, port: running ? 52039 : null,
+    running, scope, projects: scope === "project" ? [CLAUDE_PROJECT, "D:\\work\\trading-notebooks"] : [], port: running ? 52039 : null,
     settingsMatch: running, recoveryRequired: claudeScene === "repair", notice: null,
     trust: {
       supported: true,

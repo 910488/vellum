@@ -2,7 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface ClaudeCodeStatus {
   running: boolean;
-  project: string | null;
+  /** Leased project folders; empty for the user scope. */
+  projects: string[];
+  /** Whose settings the lease wrote: `~/.claude/settings.json` or one project's. */
+  scope: ClaudeCodeScope | null;
   port: number | null;
   settingsMatch: boolean;
   recoveryRequired: boolean;
@@ -26,6 +29,8 @@ export interface ClaudeCodeStatus {
   };
 }
 
+export type ClaudeCodeScope = "user" | "project";
+
 /** Percent of each window to keep; 0 leaves it ungated. */
 export interface ClaudeCodeGate { fiveHour: number; sevenDay: number }
 
@@ -37,7 +42,8 @@ export const claudeCodeApi = {
   prepareCertificate: () => invoke<ClaudeCodeStatus>("claude_code_prepare_certificate"),
   trustCertificate: (expectedSha256: string) => invoke<ClaudeCodeStatus>("claude_code_trust_certificate", { expectedSha256 }),
   restoreTrust: () => invoke<ClaudeCodeStatus>("claude_code_restore_trust"),
-  start: (project: string) => invoke<ClaudeCodeStatus>("claude_code_start", { project }),
+  start: (projects: string[]) => invoke<ClaudeCodeStatus>("claude_code_start", { projects }),
+  startUser: () => invoke<ClaudeCodeStatus>("claude_code_start_user"),
   stop: (force = false) => invoke<ClaudeCodeStatus>("claude_code_stop", { force }),
   select: (accountId: string | null) => invoke<ClaudeCodeStatus>("claude_code_select_account", { accountId }),
   login: () => invoke<void>("claude_code_begin_login"),
