@@ -46,6 +46,12 @@ pub async fn claude_code_start(
     state.claude_code().start(project.into()).await?;
     state.claude_code().status().await
 }
+/// No folder selection: journaled diversion in ~/.claude/settings.json.
+#[tauri::command]
+pub async fn claude_code_start_user(state: State<'_, AppState>) -> Result<CodeStatus, String> {
+    state.claude_code().start_user().await?;
+    state.claude_code().status().await
+}
 #[tauri::command(rename_all = "camelCase")]
 pub async fn claude_code_stop(
     force: bool,

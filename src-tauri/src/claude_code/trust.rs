@@ -41,6 +41,13 @@ impl CodeTrust {
             store: Arc::new(PlatformStore),
         }
     }
+    #[cfg(test)]
+    pub(super) fn isolated(root: PathBuf) -> Self {
+        // Constructing the native adapter does no I/O; replace it before use.
+        let mut trust = Self::new(root);
+        trust.store = Arc::new(tests::FakeStore::default());
+        trust
+    }
     fn lease(&self) -> Result<Option<Lease>, String> {
         crate::credentials::load(&self.root, JOURNAL)
             .map_err(|_| "Cannot decrypt Code CA trust journal")?
@@ -269,7 +276,11 @@ mod windows_store {
         }
         let count = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         data.len().checked_sub(24) == count.checked_mul(20)
-            && data[24..].as_chunks::<20>().0.iter().any(|entry| entry == hash)
+            && data[24..]
+                .as_chunks::<20>()
+                .0
+                .iter()
+                .any(|entry| entry == hash)
     }
     fn find(store: &StoreHandle, der: &[u8]) -> Result<Option<Context>, String> {
         let mut previous = std::ptr::null_mut();
@@ -489,7 +500,7 @@ mod tests {
         assert!(!trust.has_lease().unwrap());
     }
     #[derive(Default)]
-    struct FakeStore {
+    pub(super) struct FakeStore {
         entry: Mutex<Option<(Vec<u8>, Option<String>)>>,
     }
     impl Store for FakeStore {
