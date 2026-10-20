@@ -40,10 +40,13 @@ pub async fn claude_code_status(state: State<'_, AppState>) -> Result<CodeStatus
 }
 #[tauri::command(rename_all = "camelCase")]
 pub async fn claude_code_start(
-    project: String,
+    projects: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<CodeStatus, String> {
-    state.claude_code().start(project.into()).await?;
+    state
+        .claude_code()
+        .start_projects(projects.into_iter().map(Into::into).collect())
+        .await?;
     state.claude_code().status().await
 }
 /// No folder selection: journaled diversion in ~/.claude/settings.json.

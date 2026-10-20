@@ -25,17 +25,58 @@ pub enum CodeScope {
     Project,
     User,
 }
-#[derive(Serialize, Deserialize)]
-struct Lease {
-    /// Missing in project journals from older versions.
-    #[serde(default)]
-    scope: CodeScope,
+/// One diverted settings file. Every target shares the lease's proxy.
+#[derive(Clone, Serialize, Deserialize)]
+struct Target {
     project: PathBuf,
     settings: PathBuf,
     settings_existed: bool,
     fields: SettingsLease,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "LeaseJournal")]
+struct Lease {
+    scope: CodeScope,
+    targets: Vec<Target>,
     port: u16,
     secret: String,
+}
+#[derive(Deserialize)]
+struct LeaseJournal {
+    /// Missing in project journals from older versions.
+    #[serde(default)]
+    scope: CodeScope,
+    #[serde(default)]
+    targets: Vec<Target>,
+    /// Single-target journals written before multi-project leases.
+    project: Option<PathBuf>,
+    settings: Option<PathBuf>,
+    #[serde(default)]
+    settings_existed: bool,
+    fields: Option<SettingsLease>,
+    port: u16,
+    secret: String,
+}
+impl From<LeaseJournal> for Lease {
+    fn from(journal: LeaseJournal) -> Self {
+        let mut targets = journal.targets;
+        if let (Some(project), Some(settings), Some(fields)) =
+            (journal.project, journal.settings, journal.fields)
+        {
+            targets.push(Target {
+                project,
+                settings,
+                settings_existed: journal.settings_existed,
+                fields,
+            });
+        }
+        Self {
+            scope: journal.scope,
+            targets,
+            port: journal.port,
+            secret: journal.secret,
+        }
+    }
 }
 struct Running {
     proxy: Arc<ClaudeCodeProxy>,
@@ -54,7 +95,8 @@ struct Control {
 #[serde(rename_all = "camelCase")]
 pub struct CodeStatus {
     pub running: bool,
-    pub project: Option<String>,
+    /// Leased project folders; empty for the user scope.
+    pub projects: Vec<String>,
     pub scope: Option<CodeScope>,
     pub port: Option<u16>,
     pub settings_match: bool,
@@ -94,9 +136,11 @@ impl CodeManager {
     pub async fn status(&self) -> Result<CodeStatus, String> {
         let control = self.control.lock().await;
         let lease = self.load_lease()?;
-        let settings_match = lease
-            .as_ref()
-            .is_some_and(|l| read_settings(&l.settings).is_ok_and(|v| l.fields.matches(&v)));
+        let settings_match = lease.as_ref().is_some_and(|l| {
+            l.targets
+                .iter()
+                .all(|t| read_settings(&t.settings).is_ok_and(|v| t.fields.matches(&v)))
+        });
         let running = control
             .running
             .as_ref()
@@ -107,10 +151,16 @@ impl CodeManager {
             .status(certificate.as_ref().map(CodeCertificate::ca_der), running)?;
         Ok(CodeStatus {
             running,
-            project: lease
+            projects: lease
                 .as_ref()
                 .filter(|l| l.scope == CodeScope::Project)
-                .map(|l| l.project.to_string_lossy().into_owned()),
+                .map(|l| {
+                    l.targets
+                        .iter()
+                        .map(|t| t.project.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
             scope: lease.as_ref().map(|l| l.scope),
             port: lease.as_ref().map(|l| l.port),
             settings_match,
@@ -214,12 +264,26 @@ impl CodeManager {
     }
 
     pub async fn start(&self, project: PathBuf) -> Result<(), String> {
-        let project =
-            std::fs::canonicalize(project).map_err(|_| "Choose an existing project directory")?;
-        if !project.is_dir() {
-            return Err("Choose a project directory".into());
+        self.start_projects(vec![project]).await
+    }
+
+    /// One proxy, one journal, one settings.local.json diversion per project.
+    pub async fn start_projects(&self, projects: Vec<PathBuf>) -> Result<(), String> {
+        let mut roots: Vec<PathBuf> = Vec::with_capacity(projects.len());
+        for project in projects {
+            let project = std::fs::canonicalize(project)
+                .map_err(|_| "Choose existing project directories")?;
+            if !project.is_dir() {
+                return Err("Choose project directories".into());
+            }
+            if !roots.contains(&project) {
+                roots.push(project);
+            }
         }
-        self.start_scoped(project, CodeScope::Project).await
+        if roots.is_empty() {
+            return Err("Choose at least one project".into());
+        }
+        self.start_scoped(roots, CodeScope::Project).await
     }
 
     /// Applies to subsequently launched Code sessions reading user settings.
@@ -238,10 +302,10 @@ impl CodeManager {
             .map_err(|_| "Cannot create Claude user settings directory")?;
         let directory = std::fs::canonicalize(directory)
             .map_err(|_| "Cannot resolve Claude user settings directory")?;
-        self.start_scoped(directory, CodeScope::User).await
+        self.start_scoped(vec![directory], CodeScope::User).await
     }
 
-    async fn start_scoped(&self, project: PathBuf, scope: CodeScope) -> Result<(), String> {
+    async fn start_scoped(&self, roots: Vec<PathBuf>, scope: CodeScope) -> Result<(), String> {
         let mut control = self.control.lock().await;
         if control
             .running
@@ -261,49 +325,59 @@ impl CodeManager {
             self.manager_lock()?
         };
         let existing = self.load_lease()?;
-        if existing
-            .as_ref()
-            .is_some_and(|l| l.project != project || l.scope != scope)
-        {
+        if existing.as_ref().is_some_and(|l| {
+            l.scope != scope
+                || l.targets.len() != roots.len()
+                || !l.targets.iter().all(|t| roots.contains(&t.project))
+        }) {
             return Err("Restore the previous Claude Code settings lease first".into());
         }
         let certificate = self.certificate()?;
         let tls = certificate.server_config()?;
         self.trust.validate_for_routing(certificate.ca_der())?;
-        let directory = match scope {
-            CodeScope::Project => project.join(".claude"),
-            CodeScope::User => project.clone(),
-        };
-        std::fs::create_dir_all(&directory)
-            .map_err(|_| "Cannot create project Claude settings directory")?;
-        let canonical_directory = std::fs::canonicalize(&directory)
-            .map_err(|_| "Cannot resolve Claude settings directory")?;
-        if !canonical_directory.starts_with(&project) {
-            return Err("Claude settings directory points outside the project".into());
-        }
-        let settings = directory.join(match scope {
-            CodeScope::Project => "settings.local.json",
-            CodeScope::User => self
-                .user_settings
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .ok_or("Invalid Claude user settings file name")?,
-        });
-        if settings.is_symlink() {
-            return Err("Refusing to replace linked Claude settings".into());
+        let mut prepared = Vec::with_capacity(roots.len());
+        for project in &roots {
+            let directory = match scope {
+                CodeScope::Project => project.join(".claude"),
+                CodeScope::User => project.clone(),
+            };
+            std::fs::create_dir_all(&directory)
+                .map_err(|_| "Cannot create project Claude settings directory")?;
+            let canonical_directory = std::fs::canonicalize(&directory)
+                .map_err(|_| "Cannot resolve Claude settings directory")?;
+            if !canonical_directory.starts_with(project) {
+                return Err("Claude settings directory points outside the project".into());
+            }
+            let settings = directory.join(match scope {
+                CodeScope::Project => "settings.local.json",
+                CodeScope::User => self
+                    .user_settings
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .ok_or("Invalid Claude user settings file name")?,
+            });
+            if settings.is_symlink() {
+                return Err("Refusing to replace linked Claude settings".into());
+            }
+            prepared.push((project.clone(), settings));
         }
         // Lease locks serialize Vellum writers. External changes are checked again
         // before publication and restoration merges only fields still owned by us.
-        let _lock = self.settings_lock(&project)?;
+        let _locks = roots
+            .iter()
+            .map(|project| self.settings_lock(project))
+            .collect::<Result<Vec<_>, _>>()?;
         let ca_path = self.root.join("claude-code").join("ca.pem");
         crate::enhanced_runtime::atomic::write_atomic(&ca_path, certificate.ca_pem.as_bytes())
             .map_err(|_| "Cannot write Claude Code CA certificate")?;
-        let (lease, listener, publication) = if let Some(lease) = existing {
-            if !lease.fields.matches(&read_settings(&lease.settings)?) {
-                return Err(
-                    "Claude Code settings changed; restore them before reconnecting".into(),
-                );
+        let (lease, listener, publications) = if let Some(lease) = existing {
+            for target in &lease.targets {
+                if !target.fields.matches(&read_settings(&target.settings)?) {
+                    return Err(
+                        "Claude Code settings changed; restore them before reconnecting".into(),
+                    );
+                }
             }
             let listener =
                 tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, lease.port))
@@ -311,10 +385,12 @@ impl CodeManager {
                     .map_err(|_| {
                         "Saved Claude Code proxy port is occupied; restore settings first"
                     })?;
-            (lease, listener, None)
+            (lease, listener, Vec::new())
         } else {
             if scope == CodeScope::Project {
-                reject_inherited_settings(&project, self.user_settings.as_deref())?;
+                for project in &roots {
+                    reject_inherited_settings(project, self.user_settings.as_deref())?;
+                }
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -324,23 +400,30 @@ impl CodeManager {
                 .map_err(|_| "Cannot read Claude Code listener")?
                 .port();
             let secret = accounts::random_secret()?;
-            let before = std::fs::read(&settings).ok();
-            let mut value = read_settings(&settings)?;
-            let fields = SettingsLease::apply(
-                &mut value,
-                &format!("http://vellum:{secret}@127.0.0.1:{port}"),
-                &ca_path.to_string_lossy(),
-            )?;
+            let proxy_url = format!("http://vellum:{secret}@127.0.0.1:{port}");
+            let mut targets = Vec::with_capacity(prepared.len());
+            let mut publications = Vec::with_capacity(prepared.len());
+            for (project, settings) in prepared {
+                let before = std::fs::read(&settings).ok();
+                let mut value = read_settings(&settings)?;
+                let fields =
+                    SettingsLease::apply(&mut value, &proxy_url, &ca_path.to_string_lossy())
+                        .map_err(|error| format!("{error} ({})", settings.display()))?;
+                targets.push(Target {
+                    project,
+                    settings_existed: settings.exists(),
+                    settings: settings.clone(),
+                    fields,
+                });
+                publications.push((settings, before, value));
+            }
             let lease = Lease {
                 scope,
-                project: project.clone(),
-                settings: settings.clone(),
-                settings_existed: settings.exists(),
-                fields,
+                targets,
                 port,
                 secret,
             };
-            (lease, listener, Some((before, value)))
+            (lease, listener, publications)
         };
         let health_client = reqwest::Client::builder()
             .no_proxy()
@@ -381,15 +464,22 @@ impl CodeManager {
             );
         }
         let publish = (|| -> Result<(), String> {
-            if let Some((before, value)) = publication {
-                if std::fs::read(&settings).ok() != before {
-                    return Err("Claude settings changed while enabling; retry".into());
-                }
-                // Ready first, journal second, diversion last. A crash at any step
-                // leaves either untouched settings or a recoverable owned lease.
-                self.save_lease(&lease)?;
-                if let Err(error) = write_settings(&settings, &value) {
-                    let _ = crate::credentials::remove(&self.root, LEASE_ID);
+            if publications.is_empty() {
+                return Ok(());
+            }
+            if publications
+                .iter()
+                .any(|(settings, before, _)| std::fs::read(settings).ok() != *before)
+            {
+                return Err("Claude settings changed while enabling; retry".into());
+            }
+            // Ready first, journal second, diversion last. A crash at any step
+            // leaves either untouched settings or a recoverable owned lease.
+            self.save_lease(&lease)?;
+            for (settings, _, value) in &publications {
+                if let Err(error) = write_settings(settings, value) {
+                    // Undo the files already diverted; unwritten ones are left as is.
+                    let _ = self.restore_locked(lease.clone());
                     return Err(error);
                 }
             }
@@ -407,7 +497,7 @@ impl CodeManager {
             _lease_lock: lease_lock,
         });
         control.notice = Some(match scope {
-            CodeScope::Project => "Waiting for this project's local Desktop Code request. Resume the original Code session if it still uses its previous network settings.",
+            CodeScope::Project => "Waiting for a local Desktop Code request from the chosen projects. Resume the original Code session if it still uses its previous network settings.",
             CodeScope::User => "User settings routing enabled. New Desktop Code sessions use this proxy; resume existing sessions to reload settings. CLI requests keep their original authorization.",
         }.into());
         Ok(())
@@ -526,42 +616,40 @@ impl CodeManager {
         let Some(lease) = self.load_lease()? else {
             return Ok(vec![]);
         };
-        if lease.settings.is_symlink() {
-            return Err("Claude settings became a link; repair manually".into());
-        }
-        let _lock = self.settings_lock(&lease.project)?;
-        if !lease
-            .settings
-            .try_exists()
-            .map_err(|_| "Cannot inspect leased Claude settings")?
-        {
-            crate::credentials::remove(&self.root, LEASE_ID)
-                .map_err(|_| "Cannot remove Claude Code lease")?;
-            return Ok(vec![]);
-        }
-        let parent = lease
-            .settings
-            .parent()
-            .ok_or("Invalid Claude settings path")?;
-        if !std::fs::canonicalize(parent)
-            .map_err(|_| "Cannot resolve leased Claude settings")?
-            .starts_with(&lease.project)
-        {
-            return Err("Claude settings moved outside the project; repair manually".into());
-        }
-        let before = std::fs::read(&lease.settings).ok();
-        let mut value = read_settings(&lease.settings)?;
-        let conflicts = lease.fields.restore(&mut value)?;
-        if std::fs::read(&lease.settings).ok() != before {
-            return Err("Claude settings changed during restore; retry".into());
-        }
-        if !lease.settings_existed && value.as_object().is_some_and(|v| v.is_empty()) {
-            if lease.settings.exists() {
-                std::fs::remove_file(&lease.settings)
-                    .map_err(|_| "Cannot remove Vellum-created Claude settings")?;
+        let _locks = lease
+            .targets
+            .iter()
+            .map(|target| self.settings_lock(&target.project))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.restore_locked(lease)
+    }
+
+    /// Restores every target it can. The journal keeps only the targets that
+    /// failed, so one broken project never strands the others' diversion.
+    fn restore_locked(&self, mut lease: Lease) -> Result<Vec<String>, String> {
+        let several = lease.targets.len() > 1;
+        let mut conflicts = vec![];
+        let mut failed = vec![];
+        let mut first_error = None;
+        for target in std::mem::take(&mut lease.targets) {
+            match restore_target(&target) {
+                Ok(kept) => conflicts.extend(kept.into_iter().map(|key| {
+                    if several {
+                        format!("{key} ({})", target.project.display())
+                    } else {
+                        key
+                    }
+                })),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    failed.push(target);
+                }
             }
-        } else {
-            write_settings(&lease.settings, &value)?;
+        }
+        if let Some(error) = first_error {
+            lease.targets = failed;
+            self.save_lease(&lease)?;
+            return Err(error);
         }
         crate::credentials::remove(&self.root, LEASE_ID)
             .map_err(|_| "Cannot remove Claude Code lease")?;
@@ -611,6 +699,47 @@ impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.0);
     }
+}
+
+fn restore_target(target: &Target) -> Result<Vec<String>, String> {
+    if target.settings.is_symlink() {
+        return Err("Claude settings became a link; repair manually".into());
+    }
+    if !target
+        .settings
+        .try_exists()
+        .map_err(|_| "Cannot inspect leased Claude settings")?
+    {
+        return Ok(vec![]);
+    }
+    let parent = target
+        .settings
+        .parent()
+        .ok_or("Invalid Claude settings path")?;
+    if !std::fs::canonicalize(parent)
+        .map_err(|_| "Cannot resolve leased Claude settings")?
+        .starts_with(&target.project)
+    {
+        return Err("Claude settings moved outside the project; repair manually".into());
+    }
+    let before = std::fs::read(&target.settings).ok();
+    let original = read_settings(&target.settings)?;
+    let mut value = original.clone();
+    let conflicts = target.fields.restore(&mut value)?;
+    if std::fs::read(&target.settings).ok() != before {
+        return Err("Claude settings changed during restore; retry".into());
+    }
+    if value == original {
+        // Never diverted (enabling stopped first): keep the user's formatting.
+        return Ok(conflicts);
+    }
+    if !target.settings_existed && value.as_object().is_some_and(|v| v.is_empty()) {
+        std::fs::remove_file(&target.settings)
+            .map_err(|_| "Cannot remove Vellum-created Claude settings")?;
+    } else {
+        write_settings(&target.settings, &value)?;
+    }
+    Ok(conflicts)
 }
 
 fn read_settings(path: &Path) -> Result<Value, String> {
@@ -722,7 +851,7 @@ mod tests {
         let status = manager.status().await.unwrap();
         assert!(status.running && status.settings_match);
         assert!(matches!(status.scope, Some(CodeScope::User)));
-        assert!(status.project.is_none());
+        assert!(status.projects.is_empty());
         assert!(!project.join(".claude").exists());
         assert!(manager.start(project).await.is_err());
         let mut value = read_settings(settings).unwrap();
@@ -809,7 +938,13 @@ mod tests {
         let (_dir, manager, project) = fixture();
         manager.start(project.clone()).await.unwrap();
         let mut old = serde_json::to_value(manager.load_lease().unwrap().unwrap()).unwrap();
-        old.as_object_mut().unwrap().remove("scope");
+        let journal = old.as_object_mut().unwrap();
+        journal.remove("scope");
+        // Flatten back to the single-target shape older versions wrote.
+        let target = journal.remove("targets").unwrap()[0].clone();
+        for (key, value) in target.as_object().unwrap() {
+            journal.insert(key.clone(), value.clone());
+        }
         crate::credentials::save(&manager.root, LEASE_ID, &old.to_string()).unwrap();
         let next =
             CodeManager::with_user_settings(manager.root.clone(), manager.user_settings.clone());
@@ -876,6 +1011,74 @@ mod tests {
         assert_eq!(std::fs::read(root.join("claude-code/ca.pem")).unwrap(), ca);
         manager.stop(false).await.unwrap();
         assert!(!project.join(".claude/settings.local.json").exists());
+    }
+    #[tokio::test]
+    async fn several_projects_share_one_lease_and_reconnect_only_as_the_same_set() {
+        let (dir, manager, project) = fixture();
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(second.join(".claude")).unwrap();
+        let untouched = second.join(".claude/settings.local.json");
+        std::fs::write(&untouched, br#"{"model":"kept"}"#).unwrap();
+        manager
+            .start_projects(vec![project.clone(), second.clone(), project.clone()])
+            .await
+            .unwrap();
+        let status = manager.status().await.unwrap();
+        assert!(status.running && status.settings_match);
+        assert_eq!(status.projects.len(), 2);
+        let first_env =
+            read_settings(&project.join(".claude/settings.local.json")).unwrap()["env"].clone();
+        let second_value = read_settings(&untouched).unwrap();
+        assert_eq!(second_value["env"], first_env);
+        assert_eq!(second_value["model"], json!("kept"));
+
+        let root = manager.root.clone();
+        let user_settings = manager.user_settings.clone();
+        let port = status.port.unwrap();
+        drop(manager);
+        for _ in 0..100 {
+            if let Ok(listener) =
+                tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+            {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let manager = CodeManager::with_user_settings(root, user_settings);
+        assert!(manager.start_projects(vec![second.clone()]).await.is_err());
+        manager
+            .start_projects(vec![second.clone(), project.clone()])
+            .await
+            .unwrap();
+        assert_eq!(manager.status().await.unwrap().port, Some(port));
+        manager.stop(false).await.unwrap();
+        assert!(!project.join(".claude/settings.local.json").exists());
+        assert_eq!(read_settings(&untouched).unwrap(), json!({"model":"kept"}));
+        assert!(manager.status().await.unwrap().projects.is_empty());
+    }
+    #[tokio::test]
+    async fn one_failed_project_restore_keeps_only_that_project_in_the_journal() {
+        let (dir, manager, project) = fixture();
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        manager
+            .start_projects(vec![project.clone(), second.clone()])
+            .await
+            .unwrap();
+        let broken = second.join(".claude/settings.local.json");
+        std::fs::write(&broken, b"not json").unwrap();
+        assert!(manager.stop(false).await.is_err());
+        assert!(!project.join(".claude/settings.local.json").exists());
+        let lease = manager.load_lease().unwrap().unwrap();
+        assert_eq!(lease.targets.len(), 1);
+        assert_eq!(
+            lease.targets[0].project,
+            std::fs::canonicalize(&second).unwrap()
+        );
+        std::fs::write(&broken, b"{}").unwrap();
+        manager.stop(false).await.unwrap();
+        assert!(manager.load_lease().unwrap().is_none());
     }
     #[tokio::test]
     async fn finished_listener_can_reconnect_in_the_same_manager_without_losing_its_lease() {
