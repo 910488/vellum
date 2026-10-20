@@ -160,6 +160,9 @@ pub fn run() {
                     log::warn!("[Window] cannot maximize the main window at launch: {error}");
                 }
             }
+            if let Err(error) = app.state::<AppState>().claude_code().recover_stale_settings() {
+                log::warn!("[ClaudeCode] startup settings recovery failed: {error}");
+            }
             let data_root = app.state::<AppState>().data_root();
             // Before the auto check: a check rewrites the Desktop layer, and
             // only this launch can tell whether the last installer worked.
@@ -273,6 +276,7 @@ pub fn run() {
             commands::claude_code_trust_certificate,
             commands::claude_code_restore_trust,
             commands::claude_code_start,
+            commands::claude_code_start_user,
             commands::claude_code_stop,
             commands::claude_code_select_account,
             commands::claude_code_begin_login,
@@ -481,6 +485,9 @@ static EXIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 fn cleanup_on_loop_exit(app: &tauri::AppHandle) {
     const SESSION_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
     let state = app.state::<AppState>().clone();
+    if let Err(error) = state.claude_code().restore_settings_for_session_end() {
+        log::warn!("[ClaudeCode] session-end settings restore failed: {error}");
+    }
     let finished = tauri::async_runtime::block_on(async move {
         tokio::time::timeout(SESSION_END_BUDGET, shutdown_for_exit(&state, false))
             .await

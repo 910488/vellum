@@ -4,14 +4,38 @@ use axum::{extract::State, routing::any, Router};
 use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 
-struct Accounts(RwLock<Option<String>>);
+struct Accounts(
+    RwLock<Option<String>>,
+    Mutex<Vec<(String, UsageObservation)>>,
+    tokio::sync::Mutex<()>,
+    tokio::sync::Notify,
+);
 #[async_trait]
 impl ClaudeAccounts for Accounts {
+    async fn observe_usage(&self, id: &str, usage: UsageObservation) {
+        self.3.notify_one();
+        let _lock = self.2.lock().await;
+        self.1.lock().unwrap().push((id.to_owned(), usage));
+    }
     async fn selected_token(&self) -> Result<Option<AccountToken>, String> {
         Ok(self.0.read().await.clone().map(|id| AccountToken {
             access_token: format!("token-{id}"),
             account_id: id,
         }))
+    }
+}
+impl Accounts {
+    async fn wait_observations(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if self.1.lock().unwrap().len() >= count {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 struct Captured {
@@ -32,6 +56,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::scoped(ProxyScope::Project).await
+    }
+    async fn scoped(scope: ProxyScope) -> Self {
         let (send, captured) = mpsc::channel(32);
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream_listener.local_addr().unwrap();
@@ -58,15 +85,31 @@ impl Fixture {
                 response.headers_mut().insert(header::CONTENT_TYPE,HeaderValue::from_static("text/event-stream"));
                 return response;
             }
-            Response::new(Body::from("upstream-response"))
+            let mut response = Response::new(Body::from("upstream-response"));
+            for (name, value) in [
+                ("anthropic-ratelimit-unified-5h-utilization", "0.85"),
+                ("anthropic-ratelimit-unified-5h-reset", "1900000000"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+                ("anthropic-ratelimit-unified-7d-reset", "1900600000"),
+            ] { response.headers_mut().insert(name, value.parse().unwrap()); }
+            response
         })).with_state(send);
         let upstream = tokio::spawn(async move {
             axum::serve(upstream_listener, app).await.unwrap();
         });
-        let accounts = Arc::new(Accounts(RwLock::new(Some("B".into()))));
-        let proxy =
-            ClaudeCodeProxy::build("test-secret", accounts.clone(), format!("http://{address}"))
-                .unwrap();
+        let accounts = Arc::new(Accounts(
+            RwLock::new(Some("B".into())),
+            Mutex::new(Vec::new()),
+            tokio::sync::Mutex::new(()),
+            tokio::sync::Notify::new(),
+        ));
+        let proxy = ClaudeCodeProxy::build_scoped(
+            "test-secret",
+            accounts.clone(),
+            format!("http://{address}"),
+            scope,
+        )
+        .unwrap();
         let certificate = CodeCertificate::generate().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -620,4 +663,235 @@ async fn connect_requires_secret_and_rejects_private_destinations() {
     let _ = stop.send(true);
     task.await.unwrap();
     f.stop().await;
+}
+
+#[tokio::test]
+async fn usage_headers_only_observe_the_desktop_inference_execution_account() {
+    let mut fixture = Fixture::new().await;
+    let body =
+        serde_json::to_vec(&json!({"metadata":{"user_id":"user_session_12345678"}})).unwrap();
+    fixture
+        .request("/v1/messages", body.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    fixture.captured.recv().await.unwrap();
+    fixture.accounts.wait_observations(1).await;
+    {
+        let observations = fixture.accounts.1.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].0, "B");
+        assert_eq!(observations[0].1.five_hour.unwrap().utilization, 85.0);
+    }
+    for (path, ua) in [
+        ("/v1/messages", "claude-cli/2.1.299 (external, cli)"),
+        (
+            "/api/oauth/usage",
+            "claude-cli/2.1.299 (external, claude-desktop)",
+        ),
+    ] {
+        fixture
+            .request(path, body.clone())
+            .header(header::USER_AGENT, ua)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let captured = fixture.captured.recv().await.unwrap();
+        assert_eq!(captured.headers[header::AUTHORIZATION], "Bearer original-A");
+        assert_eq!(captured.body.as_ref(), body.as_slice());
+    }
+    *fixture.accounts.0.write().await = None;
+    fixture
+        .request("/v1/messages", body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    fixture.captured.recv().await.unwrap();
+    assert_eq!(fixture.accounts.1.lock().unwrap().len(), 1);
+    assert!(!serde_json::to_string(&fixture.proxy.status())
+        .unwrap()
+        .contains("utilization"));
+}
+
+// Read only the CONNECT response head: the following bytes belong to the
+// opaque protocol and must not be consumed by a buffered HTTP reader.
+async fn connect_tunnel(f: &Fixture, target: &str, authenticated: bool) -> (TcpStream, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = f.proxy_url.rsplit_once('@').unwrap().1;
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    let auth = if authenticated {
+        "Proxy-Authorization: Basic dmVsbHVtOnRlc3Qtc2VjcmV0\r\n"
+    } else {
+        ""
+    };
+    socket
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+            assert!(head.len() < 4096);
+        }
+    })
+    .await
+    .unwrap();
+    (socket, String::from_utf8(head).unwrap())
+}
+
+async fn echo_target() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (socket, _) = accepted.unwrap();
+                    connections.spawn(async move {
+                        let (mut read, mut write) = socket.into_split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    (address, task)
+}
+
+#[tokio::test]
+async fn user_scope_private_tunnels_are_authenticated_opaque_and_not_limited_by_mitm_slots() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::scoped(ProxyScope::User).await;
+    let (target, echo) = echo_target().await;
+    let (_, denied) = connect_tunnel(&f, &target.to_string(), false).await;
+    assert!(denied.starts_with("HTTP/1.1 407"));
+    // Deliberately exhaust all 64 MITM slots. More than 64 raw tunnels must
+    // still succeed concurrently, including loopback on a nonstandard port.
+    let slots = f
+        .proxy
+        .tunnel_slots
+        .clone()
+        .acquire_many_owned(64)
+        .await
+        .unwrap();
+    let mut pending = JoinSet::new();
+    for _ in 0..96 {
+        let address = target.to_string();
+        let proxy = &f;
+        // Own a minimal handle for 'static spawning without duplicating Fixture.
+        let proxy_address = proxy.proxy_url.rsplit_once('@').unwrap().1.to_owned();
+        pending.spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address).await.unwrap();
+            socket.write_all(format!("CONNECT {address} HTTP/1.1\r\nHost: {address}\r\nProxy-Authorization: Basic dmVsbHVtOnRlc3Qtc2VjcmV0\r\n\r\n").as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+                assert!(head.len() < 4096);
+            }
+            assert!(String::from_utf8(head).unwrap().starts_with("HTTP/1.1 200"));
+            socket
+        });
+    }
+    let mut sockets = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(result) = pending.join_next().await {
+            sockets.push(result.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sockets.len(), 96);
+    for socket in &mut sockets {
+        // Opaque bytes round-trip; the proxy never interprets or MITMs them.
+        socket.write_all(b"opaque TLS bytes").await.unwrap();
+        let mut bytes = [0u8; 16];
+        socket.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"opaque TLS bytes");
+    }
+    let (mut local, head) = connect_tunnel(&f, &format!("localhost:{}", target.port()), true).await;
+    assert!(head.starts_with("HTTP/1.1 200"));
+    local.write_all(b"x").await.unwrap();
+    assert_eq!(local.read_u8().await.unwrap(), b'x');
+    let (_, limited) = connect_tunnel(&f, "api.anthropic.com:443", true).await;
+    assert!(limited.starts_with("HTTP/1.1 503"));
+    let (_, port_denied) = connect_tunnel(&f, "api.anthropic.com:8443", true).await;
+    assert!(port_denied.starts_with("HTTP/1.1 403"));
+    assert_eq!(f.proxy.status().api_requests, 0);
+    assert_eq!(f.proxy.status().tls_failures, 0);
+    drop(slots);
+    drop(sockets);
+    drop(local);
+    f.stop().await;
+    echo.abort();
+    let _ = echo.await;
+}
+
+#[tokio::test]
+async fn project_scope_keeps_private_port_and_tunnel_limits() {
+    let f = Fixture::new().await;
+    let (target, echo) = echo_target().await;
+    for target in [
+        target.to_string(),
+        "127.0.0.1:443".into(),
+        "localhost:443".into(),
+    ] {
+        let (_, head) = connect_tunnel(&f, &target, true).await;
+        assert!(head.starts_with("HTTP/1.1 403"));
+    }
+    let slots = f
+        .proxy
+        .tunnel_slots
+        .clone()
+        .acquire_many_owned(64)
+        .await
+        .unwrap();
+    let (_, head) = connect_tunnel(&f, "api.anthropic.com:443", true).await;
+    assert!(head.starts_with("HTTP/1.1 503"));
+    drop(slots);
+    f.stop().await;
+    echo.abort();
+    let _ = echo.await;
+}
+
+#[tokio::test]
+async fn response_headers_and_body_do_not_wait_for_a_blocked_usage_observer() {
+    let mut fixture = Fixture::new().await;
+    let accounts = fixture.accounts.clone();
+    let lock = accounts.2.lock().await;
+    // The observer cannot finish until explicitly released. Awaiting it in
+    // forward would time out here, even though upstream has already replied.
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.request("/v1/messages", body()).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(1), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(text, "upstream-response");
+    tokio::time::timeout(Duration::from_secs(1), accounts.3.notified())
+        .await
+        .unwrap();
+    assert!(accounts.1.lock().unwrap().is_empty());
+    fixture.captured.recv().await.unwrap();
+    *accounts.0.write().await = Some("C".into());
+    drop(lock);
+    accounts.wait_observations(1).await;
+    assert_eq!(accounts.1.lock().unwrap()[0].0, "B");
+    fixture.stop().await;
 }
