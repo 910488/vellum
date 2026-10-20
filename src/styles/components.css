@@ -5630,6 +5630,15 @@ html[data-performance="low"] .settings-index {
 .claude-code__step > .rowline { justify-self: start; }
 .claude-code__step-title { font-size: 13px; font-weight: 600; color: var(--ink-soft); line-height: 1.6; }
 .claude-code__path { font-size: 12px; overflow-wrap: anywhere; }
+.claude-code__projects { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.claude-code__project { display: grid; grid-template-columns: auto auto 1fr; column-gap: 8px; align-items: baseline; padding: 4px 0; cursor: pointer; }
+.claude-code__project > .claude-code__path { grid-column: 2 / -1; color: var(--ink-faint); background: none; padding: 0; }
+.claude-code__project-name { font-size: 13px; font-weight: 600; }
+.claude-code__project:has(input:disabled) { cursor: default; }
+.claude-code__add { flex-wrap: nowrap; }
+.claude-code__add .input { min-width: 0; flex: 1 1 22em; }
+.claude-code__step > .claude-code__add { justify-self: stretch; }
+.claude-code__leased { display: grid; gap: 2px; justify-items: end; }
 .claude-code__consent { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
 .claude-code__more { margin-top: 18px; }
 .claude-code__more > summary { cursor: pointer; font-size: 12.5px; color: var(--ink-faint); }

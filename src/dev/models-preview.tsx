@@ -57,7 +57,7 @@ claudeCodeApi.status = async () => {
   const running = ["waiting", "user", "routing", "tls"].includes(claudeScene);
   const scope = claudeScene === "user" ? "user" : running || claudeScene === "repair" ? "project" : null;
   return {
-    running, scope, project: scope === "project" ? CLAUDE_PROJECT : null, port: running ? 52039 : null,
+    running, scope, projects: scope === "project" ? [CLAUDE_PROJECT, "D:\\work\\trading-notebooks"] : [], port: running ? 52039 : null,
     settingsMatch: running, recoveryRequired: claudeScene === "repair", notice: null,
     trust: {
       supported: true,

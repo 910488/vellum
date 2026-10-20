@@ -8,7 +8,7 @@ import { claudeCodeApi, type ClaudeCodeStatus } from "@/lib/claudeCode";
 vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
 
 function status(): ClaudeCodeStatus {
-  return { running: false, project: null, scope: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
+  return { running: false, projects: [], scope: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
     trust: { supported: false, sha256: null, trusted: false, managed: false, recoveryRequired: false },
     routing: { activeRequests: 0, desktopRequests: 0, records: [] },
     accounts: { selected: "B", accounts: [{ id: "B", label: "Account B", expiresAt: 9999999999, reauthorizeRequired: false }], loginPending: false, loginError: null } };
@@ -80,9 +80,10 @@ describe("Claude Desktop Code", () => {
     vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
     render(<ClaudeCodeCard active />);
     await screen.findByText("reviewed-fingerprint");
-    fireEvent.click(screen.getByRole("button", { name: "單一專案" }));
+    fireEvent.click(screen.getByRole("button", { name: "選擇專案" }));
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "E:\\project" } });
-    expect((screen.getByText("接入此專案") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText("加入"));
+    expect((screen.getByText("接入 1 個專案") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByText("暫時信任此 CA") as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByLabelText("我同意為目前 Windows 使用者暫時信任此 CA"));
     fireEvent.click(screen.getByText("暫時信任此 CA"));
@@ -100,21 +101,23 @@ describe("Claude Desktop Code", () => {
     render(<ClaudeCodeCard active />);
     await screen.findByText("已停用");
     expect(screen.getByText(/本機 Code 工作階段/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "單一專案" }));
+    fireEvent.click(screen.getByRole("button", { name: "選擇專案" }));
+    expect((screen.getByText("接入 0 個專案") as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "E:\\project" } });
-    fireEvent.click(screen.getByText("接入此專案"));
-    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith("E:\\project"));
+    fireEvent.keyDown(screen.getByLabelText("專案資料夾"), { key: "Enter" });
+    fireEvent.click(screen.getByText("接入 1 個專案"));
+    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith(["E:\\project"]));
   });
   it("shows waiting instead of claiming that a running listener proves Desktop integration", async () => {
-    const value = status(); value.running = true; value.project = "E:\\project"; value.settingsMatch = true;
+    const value = status(); value.running = true; value.projects = ["E:\\project"]; value.scope = "project"; value.settingsMatch = true;
     vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
     render(<ClaudeCodeCard active />);
     await screen.findByText("等待本機 Desktop Code");
-    expect(screen.queryByText("接入此專案")).toBeNull();
+    expect(screen.queryByText(/個專案$/)).toBeNull();
     expect(screen.getByText("E:\\project")).toBeTruthy();
   });
   it("requires an explicit immediate stop while inference is active and reports errors", async () => {
-    const value = status(); value.running = true; value.project = "E:\\project"; value.routing.activeRequests = 1;
+    const value = status(); value.running = true; value.projects = ["E:\\project"]; value.scope = "project"; value.routing.activeRequests = 1;
     vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
     vi.mocked(claudeCodeApi.stop).mockRejectedValue(new Error("settings conflict"));
     render(<ClaudeCodeCard active />);
@@ -152,23 +155,36 @@ describe("Claude Desktop Code", () => {
     expect(claudeCodeApi.usage).toHaveBeenCalledWith("B");
     await screen.findByText(/usage unavailable/);
   });
-  it("offers recent Desktop Code folders and still accepts another folder", async () => {
+  it("checks several recent Desktop Code folders, adds another and sends them together", async () => {
     vi.mocked(claudeCodeApi.recentProjects).mockResolvedValue([
       { path: "E:\\alpha", sessions: 3, lastActivityAt: 2 },
       { path: "E:\\beta", sessions: 1, lastActivityAt: 1 },
     ]);
     render(<ClaudeCodeCard active />);
-    fireEvent.click(await screen.findByRole("button", { name: "單一專案" }));
-    const picker = await screen.findByLabelText("Desktop 最近的 Code 專案");
-    await waitFor(() => expect((picker as HTMLSelectElement).value).toBe("E:\\alpha"));
-    expect(screen.queryByLabelText("專案資料夾")).toBeNull();
-    fireEvent.change(picker, { target: { value: "E:\\beta" } });
-    fireEvent.click(screen.getByText("接入此專案"));
-    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith("E:\\beta"));
-    fireEvent.change(picker, { target: { value: "<other>" } });
+    fireEvent.click(await screen.findByRole("button", { name: "選擇專案" }));
+    const list = await screen.findByRole("list", { name: "Desktop 最近的 Code 專案" });
+    const boxes = within(list).getAllByRole("checkbox") as HTMLInputElement[];
+    expect(boxes.map((box) => box.checked)).toEqual([false, false]);
+    fireEvent.click(within(list).getByRole("checkbox", { name: /alpha/ }));
+    fireEvent.click(within(list).getByRole("checkbox", { name: /beta/ }));
     fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "D:\\other" } });
-    fireEvent.click(screen.getByText("接入此專案"));
-    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenLastCalledWith("D:\\other"));
+    fireEvent.click(screen.getByText("加入"));
+    expect((within(list).getByRole("checkbox", { name: /other/ }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(within(list).getByRole("checkbox", { name: /beta/ }));
+    fireEvent.click(screen.getByText("接入 2 個專案"));
+    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith(["E:\\alpha", "D:\\other"]));
+  });
+  it("reconnects exactly the leased projects after Vellum stopped", async () => {
+    const value = status(); value.scope = "project"; value.projects = ["E:\\alpha", "E:\\beta"]; value.recoveryRequired = true;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    vi.mocked(claudeCodeApi.recentProjects).mockResolvedValue([{ path: "E:\\gamma", sessions: 2, lastActivityAt: 1 }]);
+    render(<ClaudeCodeCard active />);
+    const list = await screen.findByRole("list", { name: "Desktop 最近的 Code 專案" });
+    const boxes = within(list).getAllByRole("checkbox") as HTMLInputElement[];
+    expect(boxes.map((box) => [box.checked, box.disabled])).toEqual([[true, true], [true, true]]);
+    expect(screen.queryByLabelText("專案資料夾")).toBeNull();
+    fireEvent.click(screen.getByText("重新接入"));
+    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith(["E:\\alpha", "E:\\beta"]));
   });
   it("defaults to all sessions and starts the user-settings lease without a project", async () => {
     render(<ClaudeCodeCard active />);
@@ -190,7 +206,7 @@ describe("Claude Desktop Code", () => {
     value.running = false; value.recoveryRequired = true;
     render(<ClaudeCodeCard active />);
     await screen.findByText(/還原 ~\/\.claude\/settings\.json/);
-    expect(screen.queryByRole("button", { name: "單一專案" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "選擇專案" })).toBeNull();
     fireEvent.click(screen.getByText("重新接入"));
     await waitFor(() => expect(claudeCodeApi.startUser).toHaveBeenCalledOnce());
   });

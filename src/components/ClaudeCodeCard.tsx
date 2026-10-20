@@ -6,8 +6,6 @@ import { claudeCodeApi, type ClaudeCodeRecentProject, type ClaudeCodeScope, type
 import { startVisiblePoll } from "@/lib/visiblePoll";
 
 type Phase = "loading" | "repair" | "stopped" | "resume" | "connected" | "waiting";
-/** `<` cannot appear in a Windows or POSIX folder path we would list. */
-const OTHER = "<other>";
 
 function phaseOf(status: ClaudeCodeStatus | null): Phase {
   if (!status) return "loading";
@@ -50,9 +48,11 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
   const { resetLabel } = useLocaleFormat();
   const [status, setStatus] = useState<ClaudeCodeStatus | null>(null);
   const [recent, setRecent] = useState<ClaudeCodeRecentProject[]>([]);
-  const [project, setProject] = useState("");
   const [scope, setScope] = useState<ClaudeCodeScope>("user");
-  const [typing, setTyping] = useState(false);
+  /** Folders checked for the next connection; typed ones join the list. */
+  const [chosen, setChosen] = useState<string[]>([]);
+  const [added, setAdded] = useState<string[]>([]);
+  const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [trustAccepted, setTrustAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,7 +67,6 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
       const next = await claudeCodeApi.status();
       if (!mounted.current || generation !== revision.current) return;
       setStatus(next);
-      setProject((current) => current || next.project || "");
       if (next.scope) setScope(next.scope);
     } catch (cause) {
       if (mounted.current && generation === revision.current) setError(String(cause));
@@ -85,8 +84,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
     claudeCodeApi.recentProjects().then((list) => {
       if (!live) return;
       setRecent(list);
-      setProject((current) => current || list[0]?.path || "");
-    }).catch(() => { /* The picker falls back to a typed path. */ });
+    }).catch(() => { /* Typed folders still work. */ });
     return () => { live = false; };
   }, [active]);
   useEffect(() => setTrustAccepted(false), [status?.trust.sha256]);
@@ -128,13 +126,24 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
   const trust = status?.trust;
   const needsTrust = Boolean(trust?.supported && !trust.trusted);
   /** A lease pins the scope until it is restored. */
-  const leasedScope = status?.scope ?? (status?.project ? "project" : null);
+  const leasedProjects = status?.projects ?? [];
+  const leasedScope = status?.scope ?? (leasedProjects.length ? "project" : null);
   const leased = leasedScope !== null;
   const userScope = (leasedScope ?? scope) === "user";
   const headline = phase === "connected" ? t("claudeCode.routingVia", { account: label(inference?.accountId ?? null) }) : t(`claudeCode.${phase}`);
   const headTone = phase === "connected" ? "ok" : phase === "repair" || phase === "resume" ? "warn" : "quiet";
-  const known = recent.some((entry) => entry.path === project);
-  const showTyped = typing || recent.length === 0 || (project !== "" && !known);
+  /** A held lease reconnects exactly its own projects. */
+  const candidates = leased ? leasedProjects : [...new Set([...added, ...recent.map((entry) => entry.path)])];
+  const picked = leased ? leasedProjects : chosen.filter((path) => candidates.includes(path));
+  const toggle = (path: string, on: boolean) =>
+    setChosen((current) => on ? [...current.filter((item) => item !== path), path] : current.filter((item) => item !== path));
+  const addTyped = () => {
+    const path = typed.trim();
+    if (!path) return;
+    setAdded((current) => current.includes(path) ? current : [path, ...current]);
+    toggle(path, true);
+    setTyped("");
+  };
 
   return <Card>
     <div className="claude-code__head">
@@ -231,7 +240,9 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
         <Rows>
           {userScope
             ? <Row label={t("claudeCode.stepScope")}>{t("claudeCode.scopeUser")} · <code className="claude-code__path">~/.claude/settings.json</code></Row>
-            : <Row label={t("claudeCode.project")}><code className="claude-code__path" title={status.project ?? undefined}>{status.project}</code></Row>}
+            : <Row label={t("claudeCode.project")}>
+              <span className="claude-code__leased">{leasedProjects.map((path) => <code key={path} className="claude-code__path" title={path}>{path}</code>)}</span>
+            </Row>}
           <Row label={t("claudeCode.lastInference")}>
             {inference ? `${label(inference.accountId)} · HTTP ${inference.upstreamStatus}` : t("claudeCode.noInferenceYet")}
           </Row>
@@ -256,19 +267,26 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
           </li>
           {!userScope && <li className="claude-code__step">
             <span className="claude-code__step-title">{t("claudeCode.stepProject")}</span>
-            {recent.length > 0 && !leased && <select className="input" aria-label={t("claudeCode.recentProjects")} disabled={busy}
-              value={showTyped ? OTHER : project}
-              onChange={(event) => {
-                if (event.target.value === OTHER) { setTyping(true); setProject(""); }
-                else { setTyping(false); setProject(event.target.value); }
-              }}>
-              {recent.map((entry) => <option key={entry.path} value={entry.path}>
-                {folderName(entry.path)} · {t("claudeCode.sessionCount", { count: entry.sessions })} — {entry.path}
-              </option>)}
-              <option value={OTHER}>{t("claudeCode.otherFolder")}</option>
-            </select>}
-            {(showTyped || leased) && <input className="input" aria-label={t("claudeCode.project")} value={project}
-              placeholder={"E:\\code\\project"} disabled={busy || leased} onChange={(event) => setProject(event.target.value)} />}
+            {candidates.length > 0 && <ul className="claude-code__projects" aria-label={t("claudeCode.recentProjects")}>
+              {candidates.map((path) => {
+                const entry = recent.find((item) => item.path === path);
+                return <li key={path}>
+                  <label className="claude-code__project">
+                    <input type="checkbox" checked={picked.includes(path)} disabled={busy || leased}
+                      onChange={(event) => toggle(path, event.target.checked)} />
+                    <span className="claude-code__project-name">{folderName(path)}</span>
+                    {entry && <small className="field__hint">{t("claudeCode.sessionCount", { count: entry.sessions })}</small>}
+                    <code className="claude-code__path" title={path}>{path}</code>
+                  </label>
+                </li>;
+              })}
+            </ul>}
+            {!leased && <div className="rowline claude-code__add">
+              <input className="input" aria-label={t("claudeCode.project")} value={typed} placeholder={"E:\\code\\project"} disabled={busy}
+                onChange={(event) => setTyped(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addTyped(); } }} />
+              <Btn soft disabled={busy || !typed.trim()} onClick={addTyped}>{t("claudeCode.addFolder")}</Btn>
+            </div>}
             <small className="field__hint">{t("claudeCode.projectHint")}</small>
           </li>}
           {trust?.supported && <li className="claude-code__step">
@@ -294,9 +312,9 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
           <li className="claude-code__step">
             <span className="claude-code__step-title">{t("claudeCode.stepEnable")}</span>
             <div className="rowline">
-              <Btn disabled={busy || !status || (!userScope && !project.trim()) || needsTrust}
-                onClick={() => void act(() => userScope ? claudeCodeApi.startUser() : claudeCodeApi.start(project.trim()))}>
-                {t(status?.recoveryRequired ? "claudeCode.reconnect" : userScope ? "claudeCode.enableUser" : "claudeCode.enable")}
+              <Btn disabled={busy || !status || (!userScope && picked.length === 0) || needsTrust}
+                onClick={() => void act(() => userScope ? claudeCodeApi.startUser() : claudeCodeApi.start(picked))}>
+                {status?.recoveryRequired ? t("claudeCode.reconnect") : userScope ? t("claudeCode.enableUser") : t("claudeCode.enable", { count: picked.length })}
               </Btn>
               {leased && <Btn soft disabled={busy} onClick={() => void act(() => claudeCodeApi.stop())}>{t("claudeCode.restore")}</Btn>}
             </div>
