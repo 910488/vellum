@@ -41,7 +41,7 @@ struct Running {
     proxy: Arc<ClaudeCodeProxy>,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
-    _lease_lock: std::fs::File,
+    _lease_lock: LockGuard,
 }
 #[derive(Default)]
 struct Control {
@@ -568,7 +568,7 @@ impl CodeManager {
         Ok(conflicts)
     }
 
-    fn settings_lock(&self, project: &Path) -> Result<std::fs::File, String> {
+    fn settings_lock(&self, project: &Path) -> Result<LockGuard, String> {
         use sha2::{Digest, Sha256};
         let directory = self.root.join("claude-code");
         std::fs::create_dir_all(&directory)
@@ -583,10 +583,10 @@ impl CodeManager {
             .map_err(|_| "Cannot lock Claude settings")?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .map_err(|_| "Claude settings are being changed by another Vellum operation")?;
-        Ok(lock)
+        Ok(LockGuard(lock))
     }
 
-    fn manager_lock(&self) -> Result<std::fs::File, String> {
+    fn manager_lock(&self) -> Result<LockGuard, String> {
         let directory = self.root.join("claude-code");
         std::fs::create_dir_all(&directory)
             .map_err(|_| "Cannot create Claude Code control directory")?;
@@ -599,9 +599,20 @@ impl CodeManager {
             .map_err(|_| "Cannot open Claude Code manager lock")?;
         fs2::FileExt::try_lock_exclusive(&file)
             .map_err(|_| "Another Vellum process owns Claude Code routing")?;
-        Ok(file)
+        Ok(LockGuard(file))
     }
 }
+/// flock belongs to the open file description. A child forked elsewhere in
+/// this process holds that description until exec, so closing our handle alone
+/// can leave the lock held. Unlock explicitly before closing.
+struct LockGuard(std::fs::File);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 fn read_settings(path: &Path) -> Result<Value, String> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
