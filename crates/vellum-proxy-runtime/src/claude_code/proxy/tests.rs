@@ -7,10 +7,14 @@ use tokio::sync::{mpsc, RwLock};
 struct Accounts(
     RwLock<Option<String>>,
     Mutex<Vec<(String, UsageObservation)>>,
+    tokio::sync::Mutex<()>,
+    tokio::sync::Notify,
 );
 #[async_trait]
 impl ClaudeAccounts for Accounts {
     async fn observe_usage(&self, id: &str, usage: UsageObservation) {
+        self.3.notify_one();
+        let _lock = self.2.lock().await;
         self.1.lock().unwrap().push((id.to_owned(), usage));
     }
     async fn selected_token(&self) -> Result<Option<AccountToken>, String> {
@@ -18,6 +22,20 @@ impl ClaudeAccounts for Accounts {
             access_token: format!("token-{id}"),
             account_id: id,
         }))
+    }
+}
+impl Accounts {
+    async fn wait_observations(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if self.1.lock().unwrap().len() >= count {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 struct Captured {
@@ -82,6 +100,8 @@ impl Fixture {
         let accounts = Arc::new(Accounts(
             RwLock::new(Some("B".into())),
             Mutex::new(Vec::new()),
+            tokio::sync::Mutex::new(()),
+            tokio::sync::Notify::new(),
         ));
         let proxy = ClaudeCodeProxy::build_scoped(
             "test-secret",
@@ -659,6 +679,7 @@ async fn usage_headers_only_observe_the_desktop_inference_execution_account() {
         .await
         .unwrap();
     fixture.captured.recv().await.unwrap();
+    fixture.accounts.wait_observations(1).await;
     {
         let observations = fixture.accounts.1.lock().unwrap();
         assert_eq!(observations.len(), 1);
@@ -842,4 +863,35 @@ async fn project_scope_keeps_private_port_and_tunnel_limits() {
     f.stop().await;
     echo.abort();
     let _ = echo.await;
+}
+
+#[tokio::test]
+async fn response_headers_and_body_do_not_wait_for_a_blocked_usage_observer() {
+    let mut fixture = Fixture::new().await;
+    let accounts = fixture.accounts.clone();
+    let lock = accounts.2.lock().await;
+    // The observer cannot finish until explicitly released. Awaiting it in
+    // forward would time out here, even though upstream has already replied.
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.request("/v1/messages", body()).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(1), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(text, "upstream-response");
+    tokio::time::timeout(Duration::from_secs(1), accounts.3.notified())
+        .await
+        .unwrap();
+    assert!(accounts.1.lock().unwrap().is_empty());
+    fixture.captured.recv().await.unwrap();
+    *accounts.0.write().await = Some("C".into());
+    drop(lock);
+    accounts.wait_observations(1).await;
+    assert_eq!(accounts.1.lock().unwrap()[0].0, "B");
+    fixture.stop().await;
 }

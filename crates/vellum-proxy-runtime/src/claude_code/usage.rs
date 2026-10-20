@@ -1,9 +1,12 @@
 //! Verified against Desktop's bundled Claude Code 2.1.299 (see PR evidence).
 use axum::http::HeaderMap;
+use std::time::Instant;
 
 /// Numeric observations only: never retain raw header values in diagnostics.
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct UsageObservation {
+    /// Captured before dispatch, so scheduling/lock waits cannot reorder data.
+    pub observed_at: Instant,
     pub five_hour: Option<UsageWindowObservation>,
     pub seven_day: Option<UsageWindowObservation>,
 }
@@ -11,6 +14,15 @@ pub struct UsageObservation {
 pub struct UsageWindowObservation {
     pub utilization: f64,
     pub resets_at: i64,
+}
+impl Default for UsageObservation {
+    fn default() -> Self {
+        Self {
+            observed_at: Instant::now(),
+            five_hour: None,
+            seven_day: None,
+        }
+    }
 }
 impl UsageObservation {
     pub(super) fn from_headers(headers: &HeaderMap) -> Self {
@@ -39,6 +51,7 @@ impl UsageObservation {
             })
         };
         Self {
+            observed_at: Instant::now(),
             five_hour: window(
                 "anthropic-ratelimit-unified-5h-utilization",
                 "anthropic-ratelimit-unified-5h-reset",

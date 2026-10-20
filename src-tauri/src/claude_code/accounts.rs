@@ -73,6 +73,9 @@ pub struct AccountView {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
+    /// In-memory ordering fence, shared by API reads and response observations.
+    #[serde(skip)]
+    observed_at: Option<std::time::Instant>,
     pub utilization: f64,
     pub resets_at: Option<String>,
 }
@@ -517,6 +520,7 @@ impl ClaudeAccounts for CodeAccounts {
         };
         let now = chrono::Utc::now().timestamp();
         let complete = observation.five_hour.is_some() && observation.seven_day.is_some();
+        let mut updated = 0;
         let usage = account.usage.get_or_insert(AccountUsage {
             observed_at: 0,
             five_hour: None,
@@ -527,18 +531,31 @@ impl ClaudeAccounts for CodeAccounts {
             (&mut usage.seven_day, observation.seven_day),
         ] {
             if let Some(window) = observed {
+                if target
+                    .as_ref()
+                    .and_then(|w| w.observed_at)
+                    .is_some_and(|at| at >= observation.observed_at)
+                {
+                    continue;
+                }
                 *target = Some(UsageWindow {
+                    observed_at: Some(observation.observed_at),
                     utilization: window.utilization,
                     resets_at: chrono::DateTime::from_timestamp(window.resets_at, 0)
                         .map(|at| at.to_rfc3339()),
                 });
+                updated += 1;
             }
         }
         // Partial headers update their window immediately, but cannot make an
         // old unobserved window fresh and suppress the existing API fallback.
-        if complete {
-            usage.observed_at = now;
-            account.usage_checked_at = now;
+        if complete && updated == 2 {
+            // A task that waited on the account lock must retain the age of
+            // the response, rather than minting a fresh snapshot on dispatch.
+            let age =
+                i64::try_from(observation.observed_at.elapsed().as_secs()).unwrap_or(i64::MAX);
+            usage.observed_at = now.saturating_sub(age);
+            account.usage_checked_at = usage.observed_at;
         }
     }
 
@@ -676,6 +693,7 @@ fn usage_window(value: &Value, key: &str) -> Option<UsageWindow> {
         .filter(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
         .map(str::to_owned);
     Some(UsageWindow {
+        observed_at: Some(std::time::Instant::now()),
         utilization,
         resets_at,
     })
@@ -927,10 +945,12 @@ mod tests {
             usage: Some(AccountUsage {
                 observed_at: chrono::Utc::now().timestamp(),
                 five_hour: Some(UsageWindow {
+                    observed_at: None,
                     utilization: five_hour_used,
                     resets_at,
                 }),
                 seven_day: Some(UsageWindow {
+                    observed_at: None,
                     utilization: 10.0,
                     resets_at: None,
                 }),
@@ -968,6 +988,7 @@ mod tests {
             .observe_usage(
                 "A",
                 UsageObservation {
+                    observed_at: std::time::Instant::now(),
                     five_hour: Some(window),
                     seven_day: Some(window),
                 },
@@ -981,6 +1002,7 @@ mod tests {
             .observe_usage(
                 "A",
                 UsageObservation {
+                    observed_at: std::time::Instant::now(),
                     five_hour: Some(UsageWindowObservation {
                         utilization: 99.0,
                         ..window
@@ -1016,6 +1038,7 @@ mod tests {
             .observe_usage(
                 "removed",
                 UsageObservation {
+                    observed_at: std::time::Instant::now(),
                     five_hour: Some(window),
                     seven_day: Some(window),
                 },
@@ -1024,6 +1047,85 @@ mod tests {
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains("anthropic-ratelimit"));
     }
+    #[tokio::test]
+    async fn delayed_observations_cannot_overwrite_newer_windows_or_api_reads() {
+        use std::time::Instant;
+        use vellum_proxy_runtime::claude_code::UsageWindowObservation;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        install(&manager, vec![account("A", FIVE_HOUR_20, 10.0, None)]).await;
+        let base = Instant::now() - Duration::from_secs(300);
+        let reset = chrono::Utc::now().timestamp() + 3600;
+        let window = |utilization, resets_at| UsageWindowObservation {
+            utilization,
+            resets_at,
+        };
+        let apply = |at, five_hour, seven_day| UsageObservation {
+            observed_at: base + Duration::from_secs(at),
+            five_hour,
+            seven_day,
+        };
+        // A newer partial response arrives first. The older complete one can
+        // still fill the other window, but must not roll back the newer five-hour value.
+        manager
+            .observe_usage("A", apply(2, Some(window(90.0, reset)), None))
+            .await;
+        manager
+            .observe_usage(
+                "A",
+                apply(1, Some(window(20.0, reset)), Some(window(40.0, reset))),
+            )
+            .await;
+        {
+            let stored = manager.stored.lock().await;
+            let usage = stored.as_ref().unwrap().accounts[0].usage.as_ref().unwrap();
+            assert_eq!(usage.five_hour.as_ref().unwrap().utilization, 90.0);
+            assert_eq!(usage.seven_day.as_ref().unwrap().utilization, 40.0);
+        }
+        // A new reset may legitimately lower utilization. Replaying an old
+        // window after that must not resurrect exhaustion from the old period.
+        manager
+            .observe_usage(
+                "A",
+                apply(
+                    3,
+                    Some(window(5.0, reset + 18000)),
+                    Some(window(10.0, reset)),
+                ),
+            )
+            .await;
+        manager
+            .observe_usage(
+                "A",
+                apply(2, Some(window(99.0, reset)), Some(window(99.0, reset))),
+            )
+            .await;
+        {
+            let mut stored = manager.stored.lock().await;
+            let usage = stored.as_mut().unwrap().accounts[0].usage.as_mut().unwrap();
+            assert_eq!(usage.five_hour.as_ref().unwrap().utilization, 5.0);
+            assert_eq!(usage.seven_day.as_ref().unwrap().utilization, 10.0);
+            assert!(chrono::Utc::now().timestamp() - usage.observed_at >= 297);
+            // API snapshots use the same ordering fence.
+            usage.five_hour = usage_window(&json!({"five_hour":{"utilization":55}}), "five_hour");
+        }
+        manager
+            .observe_usage("A", apply(4, Some(window(1.0, reset)), None))
+            .await;
+        let view = manager.view().await.unwrap();
+        assert_eq!(
+            view.accounts[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .five_hour
+                .as_ref()
+                .unwrap()
+                .utilization,
+            55.0
+        );
+    }
+
     const FIVE_HOUR_20: AccountGate = AccountGate {
         five_hour: 20,
         seven_day: 0,

@@ -425,7 +425,12 @@ impl ClaudeCodeProxy {
         if let Some(account_id) = response_account {
             let usage = UsageObservation::from_headers(upstream.headers());
             if !usage.is_empty() {
-                self.accounts.observe_usage(&account_id, usage).await;
+                let accounts = self.accounts.clone();
+                // Account refresh/usage API reads may hold their lock for
+                // seconds. Never delay response headers or streaming for it.
+                tokio::spawn(async move {
+                    accounts.observe_usage(&account_id, usage).await;
+                });
             }
         }
         let status = upstream.status();
