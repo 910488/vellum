@@ -268,6 +268,7 @@ pub fn run() {
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::claude_code_status,
+            commands::claude_code_recent_projects,
             commands::claude_code_prepare_certificate,
             commands::claude_code_trust_certificate,
             commands::claude_code_restore_trust,
@@ -278,6 +279,7 @@ pub fn run() {
             commands::claude_code_cancel_login,
             commands::claude_code_remove_account,
             commands::claude_code_refresh_usage,
+            commands::claude_code_set_gate,
             commands::get_overview,
             commands::get_provider_overviews,
             commands::get_request_log,

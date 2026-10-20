@@ -1,7 +1,9 @@
 //! Local Claude Desktop Code integration; never changes Desktop's login.
 mod accounts;
+mod recent_projects;
 mod trust;
-pub use accounts::{AccountView, AccountsView, CodeAccounts};
+pub use accounts::{AccountGate, AccountView, AccountsView, CodeAccounts};
+pub use recent_projects::{recent_projects, RecentProject};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

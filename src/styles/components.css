@@ -5615,3 +5615,22 @@ html[data-performance="low"] .settings-index {
     transition: none;
   }
 }
+
+/* Claude Desktop Code：帳號在上、接入在下。接入是一次性的設定，平常只需要
+   看「現在走哪個帳號」—— 所以狀態放進標題列，步驟只在未接入時出現，
+   接入後收成兩列讀數。 */
+.claude-code__head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.claude-code__login { margin-top: 14px; align-items: center; flex-wrap: wrap; }
+.claude-code__login .field__hint { flex: 1 1 18em; min-width: 0; }
+.claude-code__connect { display: grid; gap: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid color-mix(in srgb, var(--ink) 10%, transparent); }
+.claude-code__steps { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; counter-reset: cc-step; }
+.claude-code__step { position: relative; display: grid; gap: 8px; padding-left: 1.8em; counter-increment: cc-step; }
+.claude-code__step::before { content: counter(cc-step); position: absolute; left: 0; top: 0; font-family: var(--font-display); font-size: 13px; font-weight: 700; color: var(--ink-ghost); line-height: 1.6; }
+.claude-code__step > * { min-width: 0; }
+.claude-code__step > .rowline { justify-self: start; }
+.claude-code__step-title { font-size: 13px; font-weight: 600; color: var(--ink-soft); line-height: 1.6; }
+.claude-code__path { font-size: 12px; overflow-wrap: anywhere; }
+.claude-code__consent { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.claude-code__more { margin-top: 18px; }
+.claude-code__more > summary { cursor: pointer; font-size: 12.5px; color: var(--ink-faint); }
+.claude-code__more[open] { display: grid; gap: 10px; }
