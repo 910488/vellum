@@ -17,7 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use super::UsageObservation;
+use super::usage::ResponseInspector;
+use super::{account_hash, TokenUsage, UsageObservation};
 
 const HOST: &str = "api.anthropic.com";
 const MAX_BODY: usize = 32 * 1024 * 1024;
@@ -34,6 +35,29 @@ pub trait ClaudeAccounts: Send + Sync {
     async fn selected_token(&self) -> Result<Option<AccountToken>, String>;
     /// Attribute a response to the account captured at request admission.
     async fn observe_usage(&self, _account_id: &str, _usage: UsageObservation) {}
+    /// One finished Desktop inference request. Called from a drop path, so it
+    /// must not wait on async work.
+    fn record_request(&self, _record: &CodeUsageRecord) {}
+}
+
+/// What one Desktop inference request did, for usage rows and logs. Carries no
+/// credential or content: only the account id and already hashed identities.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CodeUsageRecord {
+    pub request_id: String,
+    pub session_hash: String,
+    /// Raw execution account id; None means the original authorization passed.
+    pub account_id: Option<String>,
+    pub operation: String,
+    pub model: Option<String>,
+    pub upstream_status: Option<u16>,
+    /// completed, upstream_rejected, interrupted or transport_failed.
+    pub outcome: String,
+    pub error_type: Option<String>,
+    pub retry_after: Option<u64>,
+    pub usage: TokenUsage,
+    pub duration_ms: u64,
+    pub first_byte_ms: Option<u64>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -371,17 +395,21 @@ impl ClaudeCodeProxy {
         let mut response_account = None;
         if inference && desktop {
             self.status.lock().unwrap().last_error = None;
-            let session = match session_key(&parts.headers, &bytes) {
-                Ok(session) => session,
-                Err(code) => return failure(StatusCode::CONFLICT, code),
+            let (session, model) = match session_key(&parts.headers, &bytes) {
+                Ok(identity) => identity,
+                Err(code) => {
+                    log::warn!("[ClaudeCode] request refused: {code}");
+                    return failure(StatusCode::CONFLICT, code);
+                }
             };
             let lease = match self.accounts.selected_token().await {
                 Ok(lease) => lease,
-                Err(_) => {
+                Err(error) => {
+                    log::warn!("[ClaudeCode] execution account unavailable: {error}");
                     return failure(
                         StatusCode::UNAUTHORIZED,
                         "claude_execution_account_unavailable",
-                    )
+                    );
                 }
             };
             let account_id = lease.as_ref().map(|l| l.account_id.clone());
@@ -404,6 +432,7 @@ impl ClaudeCodeProxy {
                 session,
                 account_id,
                 operation,
+                model,
             ));
         }
         let path = parts
@@ -420,7 +449,17 @@ impl ClaudeCodeProxy {
             .await;
         let upstream = match result {
             Ok(response) => response,
-            Err(_) => return failure(StatusCode::BAD_GATEWAY, "claude_upstream_transport_failed"),
+            Err(error) => {
+                log::warn!(
+                    "[ClaudeCode] upstream transport failed timeout={} connect={}",
+                    error.is_timeout(),
+                    error.is_connect()
+                );
+                if let Some(guard) = guard.as_mut() {
+                    guard.finish("transport_failed");
+                }
+                return failure(StatusCode::BAD_GATEWAY, "claude_upstream_transport_failed");
+            }
         };
         if let Some(account_id) = response_account {
             let usage = UsageObservation::from_headers(upstream.headers());
@@ -434,8 +473,9 @@ impl ClaudeCodeProxy {
             }
         }
         let status = upstream.status();
-        if let Some(guard) = guard.as_ref() {
+        if let Some(guard) = guard.as_mut() {
             guard.update("streaming", Some(status.as_u16()));
+            guard.response(upstream.headers(), status.as_u16());
         }
         let expected_length = upstream.content_length();
         if expected_length == Some(0) {
@@ -457,12 +497,13 @@ impl ClaudeCodeProxy {
                 match chunk {
                     Ok(chunk) => {
                         received=received.saturating_add(chunk.len() as u64);
+                        if let Some(guard)=guard.as_mut(){guard.inspect(&chunk);}
                         // Hyper can drop a fixed-length body after its last bytes
                         // without polling EOF; commit upstream completion first.
                         if expected_length==Some(received) {if let Some(guard)=guard.as_mut(){guard.finish(if status.is_success(){"completed"}else{"upstream_rejected"});}}
                         yield Ok::<Bytes,std::io::Error>(chunk);
                     }
-                    Err(_) => { yield Err(std::io::Error::other("Claude upstream stream interrupted")); return; }
+                    Err(_) => { log::warn!("[ClaudeCode] upstream stream interrupted"); yield Err(std::io::Error::other("Claude upstream stream interrupted")); return; }
                 }
             }
             if let Some(guard) = guard.as_mut() { guard.finish(if status.is_success() {"completed"} else {"upstream_rejected"}); }
@@ -478,6 +519,9 @@ struct RequestGuard {
     proxy: Arc<ClaudeCodeProxy>,
     id: String,
     done: bool,
+    started: std::time::Instant,
+    inspector: Option<ResponseInspector>,
+    record: CodeUsageRecord,
 }
 impl RequestGuard {
     fn new(
@@ -485,8 +529,17 @@ impl RequestGuard {
         session_hash: String,
         account_id: Option<String>,
         operation: &str,
+        model: Option<String>,
     ) -> Self {
         let id = ulid::Ulid::new().to_string();
+        let record = CodeUsageRecord {
+            request_id: id.clone(),
+            session_hash: session_hash.clone(),
+            account_id: account_id.clone(),
+            operation: operation.into(),
+            model,
+            ..Default::default()
+        };
         {
             let mut status = proxy.status.lock().unwrap();
             status.active_requests += 1;
@@ -514,6 +567,23 @@ impl RequestGuard {
             proxy,
             id,
             done: false,
+            started: std::time::Instant::now(),
+            inspector: None,
+            record,
+        }
+    }
+    fn response(&mut self, headers: &HeaderMap, status: u16) {
+        self.record.upstream_status = Some(status);
+        self.record.first_byte_ms = Some(elapsed_ms(self.started));
+        self.record.retry_after = headers
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok());
+        self.inspector = Some(ResponseInspector::new(headers));
+    }
+    fn inspect(&mut self, chunk: &[u8]) {
+        if let Some(inspector) = self.inspector.as_mut() {
+            inspector.feed(chunk);
         }
     }
     fn update(&self, state: &str, code: Option<u16>) {
@@ -535,15 +605,69 @@ impl RequestGuard {
     fn finish(&mut self, state: &str) {
         self.update(state, None);
         self.done = true;
+        self.record.outcome = state.into();
     }
 }
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         if !self.done {
             self.update("interrupted", None);
+            self.record.outcome = "interrupted".into();
         }
-        let mut status = self.proxy.status.lock().unwrap();
-        status.active_requests = status.active_requests.saturating_sub(1);
+        {
+            let mut status = self.proxy.status.lock().unwrap();
+            status.active_requests = status.active_requests.saturating_sub(1);
+        }
+        if let Some(mut inspector) = self.inspector.take() {
+            inspector.finish();
+            self.record.usage = inspector.usage;
+            self.record.error_type = inspector.error_type;
+        }
+        self.record.duration_ms = elapsed_ms(self.started);
+        log_record(&self.record);
+        self.proxy.accounts.record_request(&self.record);
+    }
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One line per Desktop inference request. The account column, request after
+/// request, is what shows a switch.
+fn log_record(record: &CodeUsageRecord) {
+    let account = record
+        .account_id
+        .as_deref()
+        .map(account_hash)
+        .unwrap_or_else(|| "passthrough".into());
+    let status = record
+        .upstream_status
+        .map_or_else(|| "-".into(), |s| s.to_string());
+    let usage = record.usage;
+    let line = format!(
+        "[ClaudeCode] request={} op={} session={} account={account} model={} status={status} outcome={} input={} cache_read={} cache_write={} output={} duration_ms={}",
+        record.request_id,
+        record.operation,
+        record.session_hash,
+        record.model.as_deref().unwrap_or("-"),
+        record.outcome,
+        usage.input_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        usage.output_tokens,
+        record.duration_ms,
+    );
+    if record.outcome == "completed" {
+        log::info!("{line}");
+    } else {
+        log::warn!(
+            "{line} error={} retry_after={}",
+            record.error_type.as_deref().unwrap_or("-"),
+            record
+                .retry_after
+                .map_or_else(|| "-".into(), |s| s.to_string())
+        );
     }
 }
 
@@ -561,7 +685,11 @@ fn is_desktop_code(headers: &HeaderMap) -> bool {
             .any(|part| part == "claude-desktop")
 }
 
-fn session_key(headers: &HeaderMap, bytes: &[u8]) -> Result<String, &'static str> {
+/// Hashed session identity and the requested model.
+fn session_key(
+    headers: &HeaderMap,
+    bytes: &[u8],
+) -> Result<(String, Option<String>), &'static str> {
     let mut decoded = Vec::new();
     let bytes = match headers
         .get(header::CONTENT_ENCODING)
@@ -602,7 +730,20 @@ fn session_key(headers: &HeaderMap, bytes: &[u8]) -> Result<String, &'static str
     {
         return Err("claude_session_identity_invalid");
     }
-    Ok(hex::encode(Sha256::digest(id.as_bytes()))[..16].into())
+    let model = value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| {
+            !m.is_empty()
+                && m.len() <= 128
+                && m.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.:@[]".contains(&c))
+        })
+        .map(str::to_owned);
+    Ok((
+        hex::encode(Sha256::digest(id.as_bytes()))[..16].into(),
+        model,
+    ))
 }
 
 fn end_to_end_headers(source: &HeaderMap) -> HeaderMap {

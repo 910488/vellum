@@ -9,6 +9,7 @@ struct Accounts(
     Mutex<Vec<(String, UsageObservation)>>,
     tokio::sync::Mutex<()>,
     tokio::sync::Notify,
+    Mutex<Vec<CodeUsageRecord>>,
 );
 #[async_trait]
 impl ClaudeAccounts for Accounts {
@@ -23,8 +24,24 @@ impl ClaudeAccounts for Accounts {
             account_id: id,
         }))
     }
+    fn record_request(&self, record: &CodeUsageRecord) {
+        self.4.lock().unwrap().push(record.clone());
+    }
 }
 impl Accounts {
+    async fn wait_records(&self, count: usize) -> Vec<CodeUsageRecord> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if self.4.lock().unwrap().len() >= count {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        self.4.lock().unwrap().clone()
+    }
     async fn wait_observations(&self, count: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -102,6 +119,7 @@ impl Fixture {
             Mutex::new(Vec::new()),
             tokio::sync::Mutex::new(()),
             tokio::sync::Notify::new(),
+            Mutex::new(Vec::new()),
         ));
         let proxy = ClaudeCodeProxy::build_scoped(
             "test-secret",
@@ -622,6 +640,67 @@ async fn quota_rejection_is_preserved_without_replaying_or_falling_back() {
     let _ = f.captured.recv().await.unwrap();
     assert!(f.captured.try_recv().is_err());
     assert_eq!(f.proxy.status().records[0].state, "upstream_rejected");
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn each_desktop_inference_reports_account_model_status_and_tokens() {
+    let mut f = Fixture::new().await;
+    let mut streamed: serde_json::Value = serde_json::from_slice(&body()).unwrap();
+    streamed["stream"] = json!(true);
+    let text = f
+        .request("/v1/messages", serde_json::to_vec(&streamed).unwrap())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("OFFLINE_OK"));
+    f.captured.recv().await.unwrap();
+    let records = f.accounts.wait_records(1).await;
+    let first = &records[0];
+    assert_eq!(first.account_id.as_deref(), Some("B"));
+    assert_eq!(first.model.as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(first.operation, "messages");
+    assert_eq!(first.upstream_status, Some(200));
+    assert_eq!(first.outcome, "completed");
+    assert_eq!(first.usage.input_tokens, 10);
+    assert_eq!(first.usage.output_tokens, 5);
+    assert_eq!(first.request_id, f.proxy.status().records[0].id);
+    assert!(first.first_byte_ms.is_some());
+
+    f.request("/v1/messages", body())
+        .header("x-test-reject", "1")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    f.captured.recv().await.unwrap();
+    let rejected = f.accounts.wait_records(2).await.pop().unwrap();
+    assert_eq!(rejected.upstream_status, Some(429));
+    assert_eq!(rejected.outcome, "upstream_rejected");
+    // The proxy's own failure body uses its error type; upstream would say
+    // rate_limit_error. Either way it is read from the body, not guessed.
+    assert_eq!(
+        rejected.error_type.as_deref(),
+        Some("vellum_claude_code_error")
+    );
+
+    // A CLI request keeps its own authorization and is not recorded.
+    f.request("/v1/messages", body())
+        .header(header::USER_AGENT, "claude-cli/2.1.299 (external, cli)")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    f.captured.recv().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.accounts.4.lock().unwrap().len(), 2);
     f.stop().await;
 }
 

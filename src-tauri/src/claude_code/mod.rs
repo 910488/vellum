@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 use vellum_proxy_runtime::claude_code::{
-    certificate::CodeCertificate, settings::SettingsLease, ClaudeCodeProxy, CodeRouteStatus,
-    ProxyScope,
+    account_hash, certificate::CodeCertificate, settings::SettingsLease, ClaudeCodeProxy,
+    CodeRouteStatus, ProxyScope,
 };
 
 const LEASE_ID: &str = "claudecodelease";
@@ -24,6 +24,14 @@ pub enum CodeScope {
     #[default]
     Project,
     User,
+}
+impl CodeScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            CodeScope::Project => "project",
+            CodeScope::User => "user",
+        }
+    }
 }
 /// One diverted settings file. Every target shares the lease's proxy.
 #[derive(Clone, Serialize, Deserialize)]
@@ -120,6 +128,12 @@ impl CodeManager {
             root,
             dirs::home_dir().map(|home| home.join(".claude/settings.json")),
         )
+    }
+    /// Also records each proxied request in the app's request_usage.
+    pub fn with_usage_store(root: PathBuf, usage: Arc<crate::usage::UsageStore>) -> Arc<Self> {
+        let manager = Self::new(root);
+        manager.accounts.attach_usage_store(usage);
+        manager
     }
     fn with_user_settings(root: PathBuf, user_settings: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
@@ -232,11 +246,19 @@ impl CodeManager {
         if control.running.is_some() {
             return Err("Code routing is still owned by this process".into());
         }
-        if self.load_lease()?.is_none() {
+        let Some(lease) = self.load_lease()? else {
             return Ok(());
-        }
+        };
         let _lock = self.manager_lock()?;
-        let conflicts = self.restore()?;
+        let conflicts = self.restore().inspect_err(|error| {
+            log::warn!("[ClaudeCode] stale lease recovery failed: {error}");
+        })?;
+        log::info!(
+            "[ClaudeCode] lease recovered from previous process scope={} projects={} kept_fields={}",
+            lease.scope.as_str(),
+            lease.targets.len(),
+            conflicts.len()
+        );
         control.notice = Some(if conflicts.is_empty() {
             "Recovered Claude Code settings left by the previous Vellum process.".into()
         } else {
@@ -260,7 +282,16 @@ impl CodeManager {
         } else {
             None
         };
-        self.restore().map(|_| ())
+        match self.restore() {
+            Ok(_) => {
+                log::info!("[ClaudeCode] settings restored for session end");
+                Ok(())
+            }
+            Err(error) => {
+                log::warn!("[ClaudeCode] session-end settings restore failed: {error}");
+                Err(error)
+            }
+        }
     }
 
     pub async fn start(&self, project: PathBuf) -> Result<(), String> {
@@ -306,6 +337,36 @@ impl CodeManager {
     }
 
     async fn start_scoped(&self, roots: Vec<PathBuf>, scope: CodeScope) -> Result<(), String> {
+        let projects = roots.len();
+        match self.start_locked(roots, scope).await {
+            Ok((port, resumed)) => {
+                let selected = self.accounts.view().await.ok().and_then(|v| v.selected);
+                log::info!(
+                    "[ClaudeCode] lease {} scope={} projects={projects} port={port} account={}",
+                    if resumed { "restored" } else { "started" },
+                    scope.as_str(),
+                    selected
+                        .as_deref()
+                        .map_or_else(|| "passthrough".into(), account_hash)
+                );
+                Ok(())
+            }
+            Err(error) => {
+                log::warn!(
+                    "[ClaudeCode] lease start failed scope={} projects={projects}: {error}",
+                    scope.as_str()
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns the proxy port and whether an existing journal was resumed.
+    async fn start_locked(
+        &self,
+        roots: Vec<PathBuf>,
+        scope: CodeScope,
+    ) -> Result<(u16, bool), String> {
         let mut control = self.control.lock().await;
         if control
             .running
@@ -425,6 +486,8 @@ impl CodeManager {
             };
             (lease, listener, publications)
         };
+        // A new lease always diverts at least one file; a resumed one none.
+        let resumed = publications.is_empty();
         let health_client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
@@ -500,10 +563,19 @@ impl CodeManager {
             CodeScope::Project => "Waiting for a local Desktop Code request from the chosen projects. Resume the original Code session if it still uses its previous network settings.",
             CodeScope::User => "User settings routing enabled. New Desktop Code sessions use this proxy; resume existing sessions to reload settings. CLI requests keep their original authorization.",
         }.into());
-        Ok(())
+        Ok((lease.port, resumed))
     }
 
     pub async fn stop(&self, force: bool) -> Result<(), String> {
+        let result = self.stop_locked(force).await;
+        match &result {
+            Ok(()) => log::info!("[ClaudeCode] lease stopped force={force}"),
+            Err(error) => log::warn!("[ClaudeCode] lease stop failed force={force}: {error}"),
+        }
+        result
+    }
+
+    async fn stop_locked(&self, force: bool) -> Result<(), String> {
         let mut control = self.control.lock().await;
         if control.running.is_none() && self.load_lease()?.is_none() {
             if !self.trust.has_lease()? {

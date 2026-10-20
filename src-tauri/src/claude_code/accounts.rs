@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use vellum_proxy_runtime::claude_code::{AccountToken, ClaudeAccounts, UsageObservation};
+use vellum_proxy_runtime::claude_code::{
+    account_hash, AccountToken, ClaudeAccounts, CodeUsageRecord, UsageObservation,
+};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
@@ -25,6 +27,9 @@ struct StoredAccounts {
     /// The account a gate moved the selection away from, until a manual pick.
     #[serde(skip)]
     switched_from: Option<String>,
+    /// Logs "every account gated" once per episode, not once per request.
+    #[serde(skip)]
+    all_gated_logged: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct StoredAccount {
@@ -123,6 +128,8 @@ pub struct CodeAccounts {
     stored: Mutex<Option<StoredAccounts>>,
     login: Mutex<LoginState>,
     tokens: Arc<dyn TokenTransport>,
+    /// request_usage, shared with the Codex runtime. Unset in isolated tests.
+    usage_store: std::sync::OnceLock<Arc<crate::usage::UsageStore>>,
 }
 impl CodeAccounts {
     pub fn new(root: PathBuf) -> Arc<Self> {
@@ -134,7 +141,11 @@ impl CodeAccounts {
             stored: Mutex::new(None),
             login: Mutex::new(LoginState::default()),
             tokens,
+            usage_store: std::sync::OnceLock::new(),
         })
+    }
+    pub fn attach_usage_store(&self, store: Arc<crate::usage::UsageStore>) {
+        let _ = self.usage_store.set(store);
     }
     fn load(&self, stored: &mut Option<StoredAccounts>) -> Result<(), String> {
         if stored.is_none() {
@@ -199,7 +210,13 @@ impl CodeAccounts {
             data.selected = previous;
             return Err(error);
         }
+        log::info!(
+            "[ClaudeCode] account selected reason=manual from={} to={}",
+            hash_or_none(previous.as_deref()),
+            hash_or_none(data.selected.as_deref())
+        );
         data.switched_from = None;
+        data.all_gated_logged = false;
         Ok(())
     }
     pub async fn set_gate(&self, id: &str, gate: AccountGate) -> Result<(), String> {
@@ -496,6 +513,10 @@ impl CodeAccounts {
                 data.accounts[index].refresh_blocked = true;
                 return Err(error);
             }
+            log::info!(
+                "[ClaudeCode] token refreshed account={}",
+                account_hash(selected)
+            );
         }
         Ok(AccountToken {
             account_id: selected.into(),
@@ -520,6 +541,12 @@ impl ClaudeAccounts for CodeAccounts {
         };
         let now = chrono::Utc::now().timestamp();
         let complete = observation.five_hour.is_some() && observation.seven_day.is_some();
+        let percent = |usage: Option<&AccountUsage>| {
+            usage.map(|u| {
+                [&u.five_hour, &u.seven_day].map(|w| w.as_ref().map(|w| w.utilization.round()))
+            })
+        };
+        let before = percent(account.usage.as_ref()).unwrap_or_default();
         let mut updated = 0;
         let usage = account.usage.get_or_insert(AccountUsage {
             observed_at: 0,
@@ -557,6 +584,32 @@ impl ClaudeAccounts for CodeAccounts {
             usage.observed_at = now.saturating_sub(age);
             account.usage_checked_at = usage.observed_at;
         }
+        // Whole percent steps only: every response carries these headers.
+        let after = percent(account.usage.as_ref()).unwrap_or_default();
+        if after != before {
+            let show = |value: Option<f64>| value.map_or_else(|| "-".into(), |v| format!("{v}%"));
+            log::info!(
+                "[ClaudeCode] usage observed account={} five_hour={} (was {}) seven_day={} (was {}) gated={}",
+                account_hash(id),
+                show(after[0]),
+                show(before[0]),
+                show(after[1]),
+                show(before[1]),
+                gate_reached(account, now)
+            );
+        }
+    }
+
+    fn record_request(&self, record: &CodeUsageRecord) {
+        let Some(store) = self.usage_store.get() else {
+            return;
+        };
+        if let Err(error) = store.record(&usage_row(record)) {
+            log::warn!(
+                "[ClaudeCode] request_usage write failed request={}: {error}",
+                record.request_id
+            );
+        }
     }
 
     async fn selected_token(&self) -> Result<Option<AccountToken>, String> {
@@ -567,6 +620,13 @@ impl ClaudeAccounts for CodeAccounts {
             return Ok(None);
         };
         if self.gate_closed(data, &selected).await {
+            let now = chrono::Utc::now().timestamp();
+            let reason = data
+                .accounts
+                .iter()
+                .find(|a| a.id == selected)
+                .and_then(|a| gate_reason(a, now))
+                .unwrap_or("gate");
             let candidates: Vec<String> = data
                 .accounts
                 .iter()
@@ -578,15 +638,35 @@ impl ClaudeAccounts for CodeAccounts {
                     continue;
                 }
                 data.selected = Some(id.clone());
-                if self.save(data).is_err() {
+                if let Err(error) = self.save(data) {
+                    log::warn!(
+                        "[ClaudeCode] account switch not saved reason={reason} from={} to={}: {error}",
+                        account_hash(&selected),
+                        account_hash(&id)
+                    );
                     data.selected = Some(selected.clone());
                     break;
                 }
+                log::info!(
+                    "[ClaudeCode] account switched reason={reason} from={} to={}",
+                    account_hash(&selected),
+                    account_hash(&id)
+                );
                 data.switched_from = Some(selected);
+                data.all_gated_logged = false;
                 return self.token_for(data, &id).await.map(Some);
             }
             // Every account is at its gate: keep the current one, so the
             // request still runs and any upstream limit is reported as is.
+            if !data.all_gated_logged {
+                data.all_gated_logged = true;
+                log::warn!(
+                    "[ClaudeCode] every account gated; keeping account={} reason={reason}",
+                    account_hash(&selected)
+                );
+            }
+        } else {
+            data.all_gated_logged = false;
         }
         self.token_for(data, &selected).await.map(Some)
     }
@@ -626,14 +706,75 @@ fn remaining(window: Option<&UsageWindow>, now: i64) -> Option<f64> {
     })
 }
 fn gate_reached(account: &StoredAccount, now: i64) -> bool {
-    let Some(usage) = account.usage.as_ref() else {
-        return false;
-    };
+    gate_reason(account, now).is_some()
+}
+/// Which gated window is closed, if any.
+fn gate_reason(account: &StoredAccount, now: i64) -> Option<&'static str> {
+    let usage = account.usage.as_ref()?;
     let closed = |floor: u8, window: Option<&UsageWindow>| {
         floor > 0 && remaining(window, now).is_some_and(|left| left <= f64::from(floor))
     };
-    closed(account.gate.five_hour, usage.five_hour.as_ref())
-        || closed(account.gate.seven_day, usage.seven_day.as_ref())
+    match (
+        closed(account.gate.five_hour, usage.five_hour.as_ref()),
+        closed(account.gate.seven_day, usage.seven_day.as_ref()),
+    ) {
+        (true, true) => Some("5h_and_7d_gate"),
+        (true, false) => Some("5h_gate"),
+        (false, true) => Some("7d_gate"),
+        (false, false) => None,
+    }
+}
+fn hash_or_none(id: Option<&str>) -> String {
+    id.map_or_else(|| "none".into(), account_hash)
+}
+pub(super) const USAGE_ROUTE_ID: &str = "claude-code";
+pub(super) const USAGE_PROVIDER: &str = "anthropic";
+/// Same shape as the Codex rows: `input_tokens` includes cached input and
+/// `cached_input_tokens` is the cache-read part of it.
+fn usage_row(record: &CodeUsageRecord) -> crate::usage::UsageRecord {
+    let usage = record.usage;
+    let counted = record.operation == "messages";
+    let input = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+    crate::usage::UsageRecord {
+        route_id: USAGE_ROUTE_ID.into(),
+        provider: USAGE_PROVIDER.into(),
+        model: record.model.clone().unwrap_or_default(),
+        // count_tokens only measures a prompt; it consumes nothing.
+        input_tokens: if counted { input } else { 0 },
+        output_tokens: if counted { usage.output_tokens } else { 0 },
+        cached_input_tokens: if counted {
+            usage.cache_read_input_tokens
+        } else {
+            0
+        },
+        status: match (record.upstream_status, record.outcome.as_str()) {
+            (Some(status), _) => status,
+            (None, "transport_failed") => 502,
+            (None, _) => 0,
+        },
+        error: record.error_type.clone(),
+        duration_ms: record.duration_ms,
+        first_byte_ms: record.first_byte_ms,
+        request_id: Some(record.request_id.clone()),
+        conversation_identity: Some(format!("claude-code:session:{}", record.session_hash)),
+        outcome: Some(record.outcome.clone()),
+        execution_account_hash: record.account_id.as_deref().map(account_hash),
+        auth_mode: Some(
+            if record.account_id.is_some() {
+                "claude_oauth"
+            } else {
+                "passthrough"
+            }
+            .into(),
+        ),
+        provider_profile: Some(format!("claude-code:{}", record.operation)),
+        upstream_attempted: Some(true),
+        retry_after: record.retry_after,
+        ..Default::default()
+    }
 }
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
@@ -817,6 +958,7 @@ mod tests {
                     usage_checked_at: 0,
                 }],
                 switched_from: None,
+                all_gated_logged: false,
             })
             .unwrap();
     }
@@ -963,6 +1105,7 @@ mod tests {
             selected: Some(accounts[0].id.clone()),
             accounts,
             switched_from: None,
+            all_gated_logged: false,
         };
         manager.save(&data).unwrap();
         *manager.stored.lock().await = Some(data);
@@ -1222,5 +1365,69 @@ mod tests {
         .is_some());
         assert!(usage_window(&json!({"five_hour":{"utilization":500}}), "five_hour").is_none());
         assert!(usage_window(&json!({}), "five_hour").is_none());
+    }
+    #[tokio::test]
+    async fn proxied_requests_land_in_request_usage_with_hashed_execution_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(crate::usage::UsageStore::open(temp.path().join("usage.sqlite3")).unwrap());
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        let record = CodeUsageRecord {
+            request_id: "01JREQUEST".into(),
+            session_hash: "0123456789abcdef".into(),
+            account_id: Some("B".into()),
+            operation: "messages".into(),
+            model: Some("claude-sonnet-4-6".into()),
+            upstream_status: Some(200),
+            outcome: "completed".into(),
+            usage: vellum_proxy_runtime::claude_code::TokenUsage {
+                input_tokens: 12,
+                output_tokens: 44,
+                cache_read_input_tokens: 900,
+                cache_creation_input_tokens: 30,
+            },
+            duration_ms: 1500,
+            first_byte_ms: Some(400),
+            ..Default::default()
+        };
+        // Without a store (isolated managers) nothing is written or panics.
+        manager.record_request(&record);
+        manager.attach_usage_store(store.clone());
+        manager.record_request(&record);
+        manager.record_request(&CodeUsageRecord {
+            request_id: "01JCOUNT".into(),
+            operation: "count_tokens".into(),
+            account_id: None,
+            ..record.clone()
+        });
+        manager.record_request(&CodeUsageRecord {
+            request_id: "01JREJECT".into(),
+            upstream_status: Some(429),
+            outcome: "upstream_rejected".into(),
+            error_type: Some("rate_limit_error".into()),
+            retry_after: Some(30),
+            usage: Default::default(),
+            ..record.clone()
+        });
+        let log = store.request_log(10).unwrap();
+        assert_eq!(log.entries.len(), 3);
+        let by_status = |status| log.entries.iter().find(|e| e.status == status).unwrap();
+        let rejected = by_status(429);
+        assert_eq!(rejected.error.as_deref(), Some("rate_limit_error"));
+        assert_eq!(rejected.retry_after, Some(30));
+        let rows: Vec<_> = log.entries.iter().filter(|e| e.status == 200).collect();
+        let completed = rows.iter().find(|e| e.input_tokens > 0).unwrap();
+        assert_eq!(completed.route_id, USAGE_ROUTE_ID);
+        assert_eq!(completed.provider, USAGE_PROVIDER);
+        assert_eq!(completed.model, "claude-sonnet-4-6");
+        assert_eq!(completed.input_tokens, 942);
+        assert_eq!(completed.cached_input_tokens, 900);
+        assert_eq!(completed.output_tokens, 44);
+        let hash = completed.execution_account_hash.as_deref().unwrap();
+        assert_eq!(hash, account_hash("B"));
+        assert!(hash.starts_with("sha256:") && !hash.contains('B'));
+        let counted = rows.iter().find(|e| e.input_tokens == 0).unwrap();
+        assert_eq!(counted.output_tokens, 0);
+        assert_eq!(counted.execution_account_hash, None);
     }
 }
