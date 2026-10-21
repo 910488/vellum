@@ -5,7 +5,7 @@ import "@/i18n";
 import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
 import { claudeCodeApi, type ClaudeCodeStatus } from "@/lib/claudeCode";
 
-vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
+vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), setFiveHour: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
 
 function status(): ClaudeCodeStatus {
   return { running: false, projects: [], scope: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
@@ -71,6 +71,24 @@ describe("Claude Desktop Code", () => {
     value.accounts.accounts[0]!.usage = { ...value.accounts.accounts[0]!.usage!, creditsEnabled: false };
     render(<ClaudeCodeCard active />);
     await screen.findByText(i18n.t("claudeCode.creditsOff"));
+  });
+  it("toggles the 5-hour auto reset per account and says when a trigger failed", async () => {
+    const value = status();
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 0, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null } };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    vi.mocked(claudeCodeApi.setFiveHour).mockResolvedValue(value);
+    const { unmount } = render(<ClaudeCodeCard active />);
+    fireEvent.click(await screen.findByRole("button", { name: i18n.t("tabPolish.fiveHourOff") }));
+    await waitFor(() => expect(claudeCodeApi.setFiveHour).toHaveBeenCalledWith("B", true));
+    expect(screen.queryByText(i18n.t("claudeCode.fiveHourFailed"))).toBeNull();
+    unmount();
+
+    value.accounts.accounts[0] = { ...value.accounts.accounts[0]!, maintainFiveHour: true, fiveHourError: "Claude Desktop's bundled Claude Code was not found" };
+    render(<ClaudeCodeCard active />);
+    const failed = await screen.findByText(i18n.t("claudeCode.fiveHourFailed"));
+    expect(failed.getAttribute("title")).toContain("bundled Claude Code");
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("tabPolish.fiveHourOn") }));
+    await waitFor(() => expect(claudeCodeApi.setFiveHour).toHaveBeenLastCalledWith("B", false));
   });
   it("asks for confirmation before removing an unselected account", async () => {
     const value = status(); value.accounts.selected = null;

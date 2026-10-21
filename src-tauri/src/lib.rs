@@ -187,6 +187,9 @@ pub fn run() {
             crate::commands::launch_steward::spawn((*app.state::<AppState>()).clone());
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
+            crate::claude_code::cadence::spawn(
+                app.state::<AppState>().claude_code().accounts.clone(),
+            );
             let boot = crate::boot::record_boot(&data_root);
             crate::trace::install(&data_root);
             log::info!(
@@ -284,6 +287,7 @@ pub fn run() {
             commands::claude_code_remove_account,
             commands::claude_code_refresh_usage,
             commands::claude_code_set_gate,
+            commands::claude_code_set_five_hour,
             commands::get_overview,
             commands::get_provider_overviews,
             commands::get_request_log,
