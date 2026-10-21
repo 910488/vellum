@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Btn, Cap, Card, Confirm, Meter, Notice, Row, Rows, Segment, State } from "@/components/ui";
 import { useLocaleFormat } from "@/i18n/useLocaleFormat";
-import { claudeCodeApi, type ClaudeCodeRecentProject, type ClaudeCodeScope, type ClaudeCodeStatus } from "@/lib/claudeCode";
+import { claudeCodeApi, type ClaudeCodeRecentProject, type ClaudeCodeScope, type ClaudeCodeStatus, type ClaudeCodeWindow } from "@/lib/claudeCode";
 import { startVisiblePoll } from "@/lib/visiblePoll";
 
 type Phase = "loading" | "repair" | "stopped" | "resume" | "connected" | "waiting";
@@ -24,6 +24,24 @@ function lastInference(status: ClaudeCodeStatus) {
 }
 
 type GateKey = "fiveHour" | "sevenDay";
+
+/** Fable's included weekly share: shown, never gated. Whether credits are on
+ *  decides what happens past it, so that sits right under the bar. */
+function FableWindow({ window, credits }: { window: ClaudeCodeWindow; credits: boolean | null }) {
+  const { t } = useTranslation();
+  const { resetLabel } = useLocaleFormat();
+  const remaining = Math.round(windowRemaining(window));
+  return <span className="acct__quota-window acct__quota-window--fable">
+    <span className="acct__quota-line">
+      <strong>{remaining}%</strong>
+      <Meter percent={remaining} tone={remaining <= 10 ? "coral" : "default"} />
+    </span>
+    <small>{t("claudeCode.fable")}{window.resetsAt ? ` · ${resetLabel(window.resetsAt)}` : ""}</small>
+    <small className={credits ? "acct__credits--on" : undefined}>
+      {credits === null ? t("claudeCode.fableShown") : t(credits ? "claudeCode.creditsOn" : "claudeCode.creditsOff")}
+    </small>
+  </span>;
+}
 
 /** Matches the backend: a window past its reset is whole again. */
 function windowRemaining(window: { utilization: number; resetsAt: string | null }) {
@@ -174,7 +192,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
               label={account.reauthorizeRequired ? t("claudeCode.reauthorize") : account.gated ? t("claudeCode.atGate")
                 : current ? t("claudeCode.selected") : t("claudeCode.standby")} />
             <span className="acct__quota">
-              {account.usage ? (["fiveHour", "sevenDay"] as const).map((key) => {
+              {account.usage ? <>{(["fiveHour", "sevenDay"] as const).map((key) => {
                 const window = account.usage![key];
                 if (!window) return null;
                 const remaining = Math.round(windowRemaining(window));
@@ -210,7 +228,9 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
                     ? `${t("claudeCode.gateRead", { floor })} · ${burnable > 0 ? t("claudeCode.burnable", { value: burnable }) : t("claudeCode.atGate")}`
                     : t("claudeCode.noGate")}</small>
                 </span>;
-              }) : <span className="field__hint">{t("claudeCode.usageNotLoaded")}</span>}
+              })}
+              {account.usage.fable && <FableWindow window={account.usage.fable} credits={account.usage.creditsEnabled ?? null} />}
+              </> : <span className="field__hint">{t("claudeCode.usageNotLoaded")}</span>}
             </span>
             <span className="acct__resets">
               <Btn mini soft disabled={busy || current || account.reauthorizeRequired} onClick={() => void act(() => claudeCodeApi.select(account.id))}>

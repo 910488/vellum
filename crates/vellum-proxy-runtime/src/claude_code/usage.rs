@@ -1,4 +1,5 @@
-//! Verified against Desktop's bundled Claude Code 2.1.299 (see PR evidence).
+//! Verified against Desktop's bundled Claude Code 2.1.299 (see PR evidence);
+//! the `7d_oi` Fable window against 2.1.304.
 use axum::http::HeaderMap;
 use std::time::Instant;
 
@@ -9,6 +10,10 @@ pub struct UsageObservation {
     pub observed_at: Instant,
     pub five_hour: Option<UsageWindowObservation>,
     pub seven_day: Option<UsageWindowObservation>,
+    /// Weekly share a plan includes for Fable before usage credits apply.
+    /// Claude Code calls it `seven_day_overage_included` ("Fable limit"); the
+    /// headers carry it only for accounts that have that window.
+    pub fable: Option<UsageWindowObservation>,
 }
 #[derive(Clone, Copy, PartialEq)]
 pub struct UsageWindowObservation {
@@ -21,6 +26,7 @@ impl Default for UsageObservation {
             observed_at: Instant::now(),
             five_hour: None,
             seven_day: None,
+            fable: None,
         }
     }
 }
@@ -60,10 +66,14 @@ impl UsageObservation {
                 "anthropic-ratelimit-unified-7d-utilization",
                 "anthropic-ratelimit-unified-7d-reset",
             ),
+            fable: window(
+                "anthropic-ratelimit-unified-7d_oi-utilization",
+                "anthropic-ratelimit-unified-7d_oi-reset",
+            ),
         }
     }
     pub fn is_empty(&self) -> bool {
-        self.five_hour.is_none() && self.seven_day.is_none()
+        self.five_hour.is_none() && self.seven_day.is_none() && self.fable.is_none()
     }
 }
 /// Token counts as Anthropic reports them: `input_tokens` excludes cache reads
@@ -340,5 +350,25 @@ mod tests {
         );
         assert!(UsageObservation::from_headers(&h).is_empty());
         assert!(UsageObservation::from_headers(&HeaderMap::new()).is_empty());
+    }
+    #[test]
+    fn fable_window_is_read_on_its_own() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            "0.4".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            "1900000000".parse().unwrap(),
+        );
+        let observed = UsageObservation::from_headers(&h);
+        assert!(!observed.is_empty());
+        assert!(observed.five_hour.is_none() && observed.seven_day.is_none());
+        let fable = observed.fable.unwrap();
+        assert_eq!(fable.utilization, 40.0);
+        assert_eq!(fable.resets_at, 1900000000);
+        h.remove("anthropic-ratelimit-unified-7d_oi-reset");
+        assert!(UsageObservation::from_headers(&h).is_empty());
     }
 }
