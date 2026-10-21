@@ -296,7 +296,7 @@ impl AppState {
                 }
             }
         }
-        let usage = UsageStore::open(root.join("usage.sqlite3"))?;
+        let usage = Arc::new(UsageStore::open(root.join("usage.sqlite3"))?);
         let history = open_history(&root)?;
         if let Err(error) = history.evict_older_than_days(DEFAULT_RETENTION_DAYS) {
             log::warn!("[History] startup retention cleanup failed: {error}");
@@ -309,9 +309,12 @@ impl AppState {
             eval_mode: false,
             codex_oauth: Arc::new(crate::codex_oauth::CodexOAuthManager::new(root.clone())),
             grok_accounts: Arc::new(crate::grok_accounts::GrokAccountManager::new(root.clone())),
-            claude_code: crate::claude_code::CodeManager::new(root.clone()),
+            claude_code: crate::claude_code::CodeManager::with_usage_store(
+                root.clone(),
+                usage.clone(),
+            ),
             quota: Arc::new(QuotaService::with_grok(root)),
-            usage: Arc::new(usage),
+            usage,
             history: Arc::new(history),
             remote: Arc::new(remote),
             grok_rewrite_error: Arc::new(Mutex::new(grok_rewrite_error)),
