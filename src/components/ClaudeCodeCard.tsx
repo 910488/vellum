@@ -227,12 +227,18 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
                   <small>{floor > 0
                     ? `${t("claudeCode.gateRead", { floor })} · ${burnable > 0 ? t("claudeCode.burnable", { value: burnable }) : t("claudeCode.atGate")}`
                     : t("claudeCode.noGate")}</small>
+                  {key === "fiveHour" && account.maintainFiveHour && account.fiveHourError
+                    && <small className="acct__cadence-error" title={account.fiveHourError}>{t("claudeCode.fiveHourFailed")}</small>}
                 </span>;
               })}
               {account.usage.fable && <FableWindow window={account.usage.fable} credits={account.usage.creditsEnabled ?? null} />}
               </> : <span className="field__hint">{t("claudeCode.usageNotLoaded")}</span>}
             </span>
             <span className="acct__resets">
+              <Btn mini soft disabled={busy || account.reauthorizeRequired} title={t("claudeCode.fiveHourHint")}
+                onClick={() => void act(() => claudeCodeApi.setFiveHour(account.id, !account.maintainFiveHour))}>
+                {t(account.maintainFiveHour ? "tabPolish.fiveHourOn" : "tabPolish.fiveHourOff")}
+              </Btn>
               <Btn mini soft disabled={busy || current || account.reauthorizeRequired} onClick={() => void act(() => claudeCodeApi.select(account.id))}>
                 {t(current ? "models.ui.account.current" : "models.ui.account.useThis")}
               </Btn>

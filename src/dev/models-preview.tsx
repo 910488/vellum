@@ -47,6 +47,12 @@ claudeCodeApi.setGate = async (accountId, gate) => {
   claudeGates[accountId] = gate;
   return claudeCodeApi.status();
 };
+/* b 開著但上次觸發失敗：看錯誤那行長怎樣。 */
+const claudeFiveHour: Record<string, boolean> = { "claude-preview-a": false, "claude-preview-b": true };
+claudeCodeApi.setFiveHour = async (accountId, enabled) => {
+  claudeFiveHour[accountId] = enabled;
+  return claudeCodeApi.status();
+};
 const CLAUDE_PROJECT = "E:\\code_E\\vellum";
 claudeCodeApi.recentProjects = async () => [
   { path: CLAUDE_PROJECT, sessions: 62, lastActivityAt: 3 },
@@ -78,10 +84,12 @@ claudeCodeApi.status = async () => {
       accounts: [
         { id: "claude-preview-a", label: "claude.personal@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
           gate: claudeGates["claude-preview-a"], gated: 38 <= claudeGates["claude-preview-a"]!.fiveHour || 73 <= claudeGates["claude-preview-a"]!.sevenDay,
+          maintainFiveHour: claudeFiveHour["claude-preview-a"], fiveHourError: null,
           usage: { observedAt: 1, fiveHour: { utilization: 62, resetsAt: new Date(Date.now() + 2.5 * 3600_000).toISOString() }, sevenDay: { utilization: 27, resetsAt: new Date(Date.now() + 4 * 86400_000).toISOString() },
             fable: { utilization: 36, resetsAt: new Date(Date.now() + 4 * 86400_000).toISOString() }, creditsEnabled: false } },
         { id: "claude-preview-b", label: "claude.work@example.com", expiresAt: 9999999999, reauthorizeRequired: false,
           gate: claudeGates["claude-preview-b"], gated: false,
+          maintainFiveHour: claudeFiveHour["claude-preview-b"], fiveHourError: "Claude Desktop's bundled Claude Code was not found",
           usage: { observedAt: 1, fiveHour: { utilization: 8, resetsAt: new Date(Date.now() + 4.2 * 3600_000).toISOString() }, sevenDay: { utilization: 41, resetsAt: new Date(Date.now() + 2 * 86400_000).toISOString() },
             fable: { utilization: 93, resetsAt: new Date(Date.now() + 2 * 86400_000).toISOString() }, creditsEnabled: true } },
       ],

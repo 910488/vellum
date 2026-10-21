@@ -126,3 +126,18 @@ pub async fn claude_code_set_gate(
         .await?;
     state.claude_code().status().await
 }
+
+/// Starts the next 5-hour window right after each reset (one Haiku turn).
+#[tauri::command(rename_all = "camelCase")]
+pub async fn claude_code_set_five_hour(
+    account_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<CodeStatus, String> {
+    state
+        .claude_code()
+        .accounts
+        .set_maintain_five_hour(&account_id, enabled)
+        .await?;
+    state.claude_code().status().await
+}

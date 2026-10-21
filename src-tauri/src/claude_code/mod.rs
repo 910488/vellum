@@ -1,5 +1,6 @@
 //! Local Claude Desktop Code integration; never changes Desktop's login.
 mod accounts;
+pub mod cadence;
 mod recent_projects;
 mod trust;
 pub use accounts::{AccountGate, AccountView, AccountsView, CodeAccounts};

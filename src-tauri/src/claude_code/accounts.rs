@@ -42,11 +42,17 @@ struct StoredAccount {
     refresh_blocked: bool,
     #[serde(default)]
     gate: AccountGate,
+    /// Start the next 5-hour window as soon as the current one resets.
+    #[serde(default)]
+    maintain_five_hour: bool,
     #[serde(skip)]
     usage: Option<AccountUsage>,
     /// Last usage read attempt, so a failing read is not retried per request.
     #[serde(skip)]
     usage_checked_at: i64,
+    /// Why the last 5-hour trigger failed; cleared by the next success.
+    #[serde(skip)]
+    five_hour_error: Option<String>,
 }
 /// Percent of each window to keep: automatic use stops once the remaining
 /// share reaches it. 0 leaves that window ungated.
@@ -74,6 +80,8 @@ pub struct AccountView {
     pub gate: AccountGate,
     /// Remaining usage, as last read, is at or below a gate.
     pub gated: bool,
+    pub maintain_five_hour: bool,
+    pub five_hour_error: Option<String>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +91,16 @@ pub struct UsageWindow {
     observed_at: Option<std::time::Instant>,
     pub utilization: f64,
     pub resets_at: Option<String>,
+}
+#[cfg(test)]
+impl UsageWindow {
+    pub(super) fn for_test(utilization: f64, resets_at: Option<String>) -> Self {
+        Self {
+            observed_at: None,
+            utilization,
+            resets_at,
+        }
+    }
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,6 +154,8 @@ pub struct CodeAccounts {
     tokens: Arc<dyn TokenTransport>,
     /// request_usage, shared with the Codex runtime. Unset in isolated tests.
     usage_store: std::sync::OnceLock<Arc<crate::usage::UsageStore>>,
+    /// Wakes the 5-hour scheduler when an account's toggle changes.
+    cadence_notify: Arc<tokio::sync::Notify>,
 }
 impl CodeAccounts {
     pub fn new(root: PathBuf) -> Arc<Self> {
@@ -148,6 +168,7 @@ impl CodeAccounts {
             login: Mutex::new(LoginState::default()),
             tokens,
             usage_store: std::sync::OnceLock::new(),
+            cadence_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
     pub fn attach_usage_store(&self, store: Arc<crate::usage::UsageStore>) {
@@ -193,6 +214,8 @@ impl CodeAccounts {
                     usage: a.usage.clone(),
                     gate: a.gate,
                     gated: gate_reached(a, now),
+                    maintain_five_hour: a.maintain_five_hour,
+                    five_hour_error: a.five_hour_error.clone(),
                 })
                 .collect(),
             selected: data.selected.clone(),
@@ -245,6 +268,30 @@ impl CodeAccounts {
             }
             return Err(error);
         }
+        Ok(())
+    }
+    pub async fn set_maintain_five_hour(&self, id: &str, enabled: bool) -> Result<(), String> {
+        let mut stored = self.stored.lock().await;
+        self.load(&mut stored)?;
+        let data = stored.as_mut().unwrap();
+        let account = data
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or("Claude account not found")?;
+        let previous = std::mem::replace(&mut account.maintain_five_hour, enabled);
+        account.five_hour_error = None;
+        if let Err(error) = self.save(data) {
+            if let Some(account) = data.accounts.iter_mut().find(|a| a.id == id) {
+                account.maintain_five_hour = previous;
+            }
+            return Err(error);
+        }
+        log::info!(
+            "[ClaudeCode] five_hour cadence account={} enabled={enabled}",
+            account_hash(id)
+        );
+        self.cadence_notify.notify_one();
         Ok(())
     }
     pub async fn remove(&self, id: &str) -> Result<(), String> {
@@ -422,10 +469,12 @@ impl CodeAccounts {
             refresh_token,
             expires_at: expiry(&response),
             refresh_blocked: false,
-            // Authorizing again keeps the gates set for this account.
+            // Authorizing again keeps the gates and 5-hour choice for this account.
             gate: old.as_ref().map(|a| a.gate).unwrap_or_default(),
+            maintain_five_hour: old.as_ref().is_some_and(|a| a.maintain_five_hour),
             usage: None,
             usage_checked_at: 0,
+            five_hour_error: None,
         });
         if let Err(error) = self.save(data) {
             data.accounts.pop();
@@ -451,22 +500,7 @@ impl CodeAccounts {
             account.usage_checked_at = chrono::Utc::now().timestamp();
         }
         let lease = self.token_for(data, id).await?;
-        let response = client()?
-            .get("https://api.anthropic.com/api/oauth/usage")
-            .bearer_auth(lease.access_token)
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .send()
-            .await
-            .map_err(|_| "Claude usage transport failed")?;
-        if !response.status().is_success() {
-            return Err(format!("Claude usage HTTP {}", response.status().as_u16()));
-        }
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|_| "Invalid Claude usage response")?;
-        let usage = parse_usage(&value)
-            .ok_or("Claude subscription usage is unavailable for this account")?;
+        let usage = fetch_usage(&lease.access_token).await?;
         data.accounts
             .iter_mut()
             .find(|a| a.id == id)
@@ -698,8 +732,75 @@ impl CodeAccounts {
             .is_some_and(|a| gate_reached(a, now))
     }
 }
+/// What the 5-hour scheduler needs; it never sees refresh tokens.
+impl CodeAccounts {
+    pub(super) fn cadence_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.cadence_notify)
+    }
+    pub(super) fn cadence_home(&self) -> PathBuf {
+        self.root.join("claude-code").join("five-hour")
+    }
+    /// Opted-in accounts that can still refresh, with their weekly gate.
+    pub(super) async fn cadence_members(&self) -> Result<Vec<(String, u8)>, String> {
+        let mut stored = self.stored.lock().await;
+        self.load(&mut stored)?;
+        Ok(stored
+            .as_ref()
+            .unwrap()
+            .accounts
+            .iter()
+            .filter(|a| a.maintain_five_hour && !a.refresh_blocked)
+            .map(|a| (a.id.clone(), a.gate.seven_day))
+            .collect())
+    }
+    /// Reads usage from the API now, whatever the cached age. The account
+    /// lock is held only for the token: a slow read must not stall routed
+    /// inference waiting on the same lock.
+    pub(super) async fn read_usage_now(&self, id: &str) -> Result<AccountUsage, String> {
+        let token = self.access_token(id).await?;
+        let sent = std::time::Instant::now();
+        let usage = fetch_usage(&token).await;
+        let mut stored = self.stored.lock().await;
+        let account = stored
+            .as_mut()
+            .and_then(|s| s.accounts.iter_mut().find(|a| a.id == id))
+            .ok_or("Claude account missing")?;
+        account.usage_checked_at = chrono::Utc::now().timestamp();
+        let usage = usage?;
+        // Response headers observed while this read was out are newer.
+        let newer = account.usage.as_ref().is_some_and(|u| {
+            [&u.five_hour, &u.seven_day]
+                .into_iter()
+                .flatten()
+                .any(|w| w.observed_at.is_some_and(|at| at > sent))
+        });
+        if !newer {
+            account.usage = Some(usage.clone());
+        }
+        Ok(usage)
+    }
+    pub(super) async fn access_token(&self, id: &str) -> Result<String, String> {
+        let mut stored = self.stored.lock().await;
+        self.load(&mut stored)?;
+        Ok(self
+            .token_for(stored.as_mut().unwrap(), id)
+            .await?
+            .access_token)
+    }
+    pub(super) async fn set_five_hour_error(&self, id: &str, error: Option<String>) {
+        if let Some(account) = self
+            .stored
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|s| s.accounts.iter_mut().find(|a| a.id == id))
+        {
+            account.five_hour_error = error;
+        }
+    }
+}
 /// Remaining percent of a window; a window past its reset is whole again.
-fn remaining(window: Option<&UsageWindow>, now: i64) -> Option<f64> {
+pub(super) fn remaining(window: Option<&UsageWindow>, now: i64) -> Option<f64> {
     let window = window?;
     let reset = window
         .resets_at
@@ -828,6 +929,24 @@ pub fn random_secret() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|_| "OS randomness unavailable")?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+async fn fetch_usage(access_token: &str) -> Result<AccountUsage, String> {
+    let response = client()?
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .bearer_auth(access_token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .map_err(|_| "Claude usage transport failed")?;
+    if !response.status().is_success() {
+        return Err(format!("Claude usage HTTP {}", response.status().as_u16()));
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| "Invalid Claude usage response")?;
+    parse_usage(&value)
+        .ok_or_else(|| "Claude subscription usage is unavailable for this account".into())
 }
 /// The `/api/oauth/usage` answer, or None when it has no plan windows.
 fn parse_usage(value: &Value) -> Option<AccountUsage> {
@@ -992,8 +1111,10 @@ mod tests {
                     expires_at: chrono::Utc::now().timestamp() + if expired { -10 } else { 3600 },
                     refresh_blocked: false,
                     gate: AccountGate::default(),
+                    maintain_five_hour: false,
                     usage: None,
                     usage_checked_at: 0,
+                    five_hour_error: None,
                 }],
                 switched_from: None,
                 all_gated_logged: false,
@@ -1122,6 +1243,7 @@ mod tests {
             expires_at: chrono::Utc::now().timestamp() + 3600,
             refresh_blocked: false,
             gate,
+            maintain_five_hour: false,
             usage: Some(AccountUsage {
                 observed_at: chrono::Utc::now().timestamp(),
                 five_hour: Some(UsageWindow {
@@ -1138,6 +1260,7 @@ mod tests {
                 credits_enabled: None,
             }),
             usage_checked_at: 0,
+            five_hour_error: None,
         }
     }
     async fn install(manager: &CodeAccounts, accounts: Vec<StoredAccount>) {
@@ -1545,5 +1668,54 @@ mod tests {
         );
         // One gated window plus Fable is still a partial observation.
         assert_eq!(account.usage_checked_at, checked_before);
+    }
+    #[tokio::test]
+    async fn five_hour_choice_persists_and_only_opted_in_accounts_are_scheduled() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        let mut blocked = account("C", AccountGate::default(), 0.0, None);
+        blocked.refresh_blocked = true;
+        blocked.maintain_five_hour = true;
+        let weekly = AccountGate {
+            five_hour: 0,
+            seven_day: 15,
+        };
+        install(
+            &manager,
+            vec![
+                account("A", AccountGate::default(), 0.0, None),
+                account("B", weekly, 0.0, None),
+                blocked,
+            ],
+        )
+        .await;
+        manager.set_five_hour_error("B", Some("old".into())).await;
+        manager.set_maintain_five_hour("B", true).await.unwrap();
+        assert!(manager
+            .set_maintain_five_hour("missing", true)
+            .await
+            .is_err());
+        // A toggle wakes the scheduler even if it was not waiting yet.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.cadence_notifier().notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.cadence_members().await.unwrap(),
+            vec![("B".to_string(), 15)]
+        );
+        let view = manager.view().await.unwrap();
+        assert!(view.accounts[1].maintain_five_hour && view.accounts[1].five_hour_error.is_none());
+        assert!(!view.accounts[0].maintain_five_hour);
+
+        let restarted = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        assert_eq!(
+            restarted.cadence_members().await.unwrap(),
+            vec![("B".to_string(), 15)]
+        );
+        restarted.set_maintain_five_hour("B", false).await.unwrap();
+        assert!(restarted.cadence_members().await.unwrap().is_empty());
     }
 }

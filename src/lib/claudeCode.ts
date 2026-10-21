@@ -21,7 +21,9 @@ export interface ClaudeCodeStatus {
     records: { id: string; sessionHash: string; accountId: string | null; operation?: "messages" | "count_tokens"; state: string; upstreamStatus: number | null }[];
   };
   accounts: {
-    accounts: { id: string; label: string; expiresAt: number; reauthorizeRequired: boolean; gate?: ClaudeCodeGate; gated?: boolean; usage?: ClaudeCodeUsage | null }[];
+    accounts: { id: string; label: string; expiresAt: number; reauthorizeRequired: boolean; gate?: ClaudeCodeGate; gated?: boolean; usage?: ClaudeCodeUsage | null;
+      /** Start the next 5-hour window right after each reset. */
+      maintainFiveHour?: boolean; fiveHourError?: string | null }[];
     selected: string | null;
     switchedFrom?: string | null;
     loginPending: boolean;
@@ -62,4 +64,5 @@ export const claudeCodeApi = {
   remove: (accountId: string) => invoke<ClaudeCodeStatus>("claude_code_remove_account", { accountId }),
   setGate: (accountId: string, gate: ClaudeCodeGate) => invoke<ClaudeCodeStatus>("claude_code_set_gate", { accountId, gate }),
   usage: (accountId: string) => invoke<ClaudeCodeStatus>("claude_code_refresh_usage", { accountId }),
+  setFiveHour: (accountId: string, enabled: boolean) => invoke<ClaudeCodeStatus>("claude_code_set_five_hour", { accountId, enabled }),
 };
