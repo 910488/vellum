@@ -2511,6 +2511,11 @@ html[data-performance="low"] .card {
 }
 /* 不釘 nowrap：視窗長度加重置時刻，換成英文或日文就是一整句，
    釘住不折行的結果是它長到欄位外面去。 */
+/* Fable 的內含額度只讀不設閘門：沒有拖得動的刻度，所以多一行字講清楚
+   用完之後是停下來還是開始扣 credit —— 那才是看這條量條的理由。 */
+.acct__quota small.acct__credits--on {
+  color: var(--warn-ink);
+}
 .acct__quota small {
   grid-column: 2;
   text-align: left;

@@ -90,6 +90,12 @@ pub struct AccountUsage {
     pub observed_at: i64,
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
+    /// Weekly Fable share the plan includes before usage credits apply.
+    /// Shown only; no gate reads it.
+    pub fable: Option<UsageWindow>,
+    /// Whether usage credits (extra usage) are on, as the usage endpoint last
+    /// said. With them on, Fable keeps running past its share and is billed.
+    pub credits_enabled: Option<bool>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -459,14 +465,8 @@ impl CodeAccounts {
             .json()
             .await
             .map_err(|_| "Invalid Claude usage response")?;
-        let usage = AccountUsage {
-            observed_at: chrono::Utc::now().timestamp(),
-            five_hour: usage_window(&value, "five_hour"),
-            seven_day: usage_window(&value, "seven_day"),
-        };
-        if usage.five_hour.is_none() && usage.seven_day.is_none() {
-            return Err("Claude subscription usage is unavailable for this account".into());
-        }
+        let usage = parse_usage(&value)
+            .ok_or("Claude subscription usage is unavailable for this account")?;
         data.accounts
             .iter_mut()
             .find(|a| a.id == id)
@@ -543,7 +543,8 @@ impl ClaudeAccounts for CodeAccounts {
         let complete = observation.five_hour.is_some() && observation.seven_day.is_some();
         let percent = |usage: Option<&AccountUsage>| {
             usage.map(|u| {
-                [&u.five_hour, &u.seven_day].map(|w| w.as_ref().map(|w| w.utilization.round()))
+                [&u.five_hour, &u.seven_day, &u.fable]
+                    .map(|w| w.as_ref().map(|w| w.utilization.round()))
             })
         };
         let before = percent(account.usage.as_ref()).unwrap_or_default();
@@ -552,10 +553,13 @@ impl ClaudeAccounts for CodeAccounts {
             observed_at: 0,
             five_hour: None,
             seven_day: None,
+            fable: None,
+            credits_enabled: None,
         });
-        for (target, observed) in [
-            (&mut usage.five_hour, observation.five_hour),
-            (&mut usage.seven_day, observation.seven_day),
+        for (gated, target, observed) in [
+            (true, &mut usage.five_hour, observation.five_hour),
+            (true, &mut usage.seven_day, observation.seven_day),
+            (false, &mut usage.fable, observation.fable),
         ] {
             if let Some(window) = observed {
                 if target
@@ -571,7 +575,8 @@ impl ClaudeAccounts for CodeAccounts {
                     resets_at: chrono::DateTime::from_timestamp(window.resets_at, 0)
                         .map(|at| at.to_rfc3339()),
                 });
-                updated += 1;
+                // Freshness is about the gated windows only.
+                updated += usize::from(gated);
             }
         }
         // Partial headers update their window immediately, but cannot make an
@@ -589,12 +594,14 @@ impl ClaudeAccounts for CodeAccounts {
         if after != before {
             let show = |value: Option<f64>| value.map_or_else(|| "-".into(), |v| format!("{v}%"));
             log::info!(
-                "[ClaudeCode] usage observed account={} five_hour={} (was {}) seven_day={} (was {}) gated={}",
+                "[ClaudeCode] usage observed account={} five_hour={} (was {}) seven_day={} (was {}) fable={} (was {}) gated={}",
                 account_hash(id),
                 show(after[0]),
                 show(before[0]),
                 show(after[1]),
                 show(before[1]),
+                show(after[2]),
+                show(before[2]),
                 gate_reached(account, now)
             );
         }
@@ -822,14 +829,45 @@ pub fn random_secret() -> Result<String, String> {
     getrandom::fill(&mut bytes).map_err(|_| "OS randomness unavailable")?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
+/// The `/api/oauth/usage` answer, or None when it has no plan windows.
+fn parse_usage(value: &Value) -> Option<AccountUsage> {
+    let usage = AccountUsage {
+        observed_at: chrono::Utc::now().timestamp(),
+        five_hour: usage_window(value, "five_hour"),
+        seven_day: usage_window(value, "seven_day"),
+        fable: fable_window(value),
+        credits_enabled: value
+            .pointer("/extra_usage/is_enabled")
+            .and_then(Value::as_bool),
+    };
+    (usage.five_hour.is_some() || usage.seven_day.is_some()).then_some(usage)
+}
+/// The per-model weekly row Claude Code shows as "Current week (Fable)":
+/// a `weekly_scoped` entry of `limits[]` whose model is Fable.
+fn fable_window(value: &Value) -> Option<UsageWindow> {
+    value
+        .get("limits")?
+        .as_array()?
+        .iter()
+        .filter(|limit| limit.get("kind").and_then(Value::as_str) == Some("weekly_scoped"))
+        .find(|limit| {
+            limit
+                .pointer("/scope/model/display_name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.trim().to_ascii_lowercase().starts_with("fable"))
+        })
+        .and_then(|limit| window_from(limit.get("percent")?, limit.get("resets_at")))
+}
 fn usage_window(value: &Value, key: &str) -> Option<UsageWindow> {
     let value = value.get(key)?;
-    let utilization = value.get("utilization")?.as_f64()?;
+    window_from(value.get("utilization")?, value.get("resets_at"))
+}
+fn window_from(utilization: &Value, resets_at: Option<&Value>) -> Option<UsageWindow> {
+    let utilization = utilization.as_f64()?;
     if !utilization.is_finite() || !(0.0..=100.0).contains(&utilization) {
         return None;
     }
-    let resets_at = value
-        .get("resets_at")
+    let resets_at = resets_at
         .and_then(Value::as_str)
         .filter(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
         .map(str::to_owned);
@@ -1096,6 +1134,8 @@ mod tests {
                     utilization: 10.0,
                     resets_at: None,
                 }),
+                fable: None,
+                credits_enabled: None,
             }),
             usage_checked_at: 0,
         }
@@ -1134,6 +1174,7 @@ mod tests {
                     observed_at: std::time::Instant::now(),
                     five_hour: Some(window),
                     seven_day: Some(window),
+                    fable: None,
                 },
             )
             .await;
@@ -1151,6 +1192,7 @@ mod tests {
                         ..window
                     }),
                     seven_day: None,
+                    fable: None,
                 },
             )
             .await;
@@ -1184,6 +1226,7 @@ mod tests {
                     observed_at: std::time::Instant::now(),
                     five_hour: Some(window),
                     seven_day: Some(window),
+                    fable: None,
                 },
             )
             .await;
@@ -1207,6 +1250,7 @@ mod tests {
             observed_at: base + Duration::from_secs(at),
             five_hour,
             seven_day,
+            fable: None,
         };
         // A newer partial response arrives first. The older complete one can
         // still fill the other window, but must not roll back the newer five-hour value.
@@ -1429,5 +1473,77 @@ mod tests {
         let counted = rows.iter().find(|e| e.input_tokens == 0).unwrap();
         assert_eq!(counted.output_tokens, 0);
         assert_eq!(counted.execution_account_hash, None);
+    }
+    #[test]
+    fn usage_endpoint_fable_row_and_credit_switch_are_read() {
+        // Shape as Claude Code 2.1.304 parses it: per-model rows live in
+        // limits[] with kind weekly_scoped and a model display name.
+        let value = json!({
+            "five_hour": {"utilization": 12.0, "resets_at": "2026-10-21T10:00:00Z"},
+            "seven_day": {"utilization": 30.0, "resets_at": "2026-10-25T00:00:00Z"},
+            "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null},
+            "limits": [
+                {"kind": "weekly", "group": "g", "percent": 30, "resets_at": null, "severity": "ok", "is_active": true},
+                {"kind": "weekly_scoped", "group": "g", "percent": 55, "resets_at": "2026-10-25T00:00:00Z",
+                 "severity": "ok", "is_active": true, "scope": {"model": {"display_name": "Opus"}}},
+                {"kind": "weekly_scoped", "group": "g", "percent": 64, "resets_at": "2026-10-25T00:00:00Z",
+                 "severity": "ok", "is_active": true, "scope": {"model": {"display_name": "Fable"}}}
+            ]
+        });
+        let usage = parse_usage(&value).unwrap();
+        let fable = usage.fable.unwrap();
+        assert_eq!(fable.utilization, 64.0);
+        assert_eq!(fable.resets_at.as_deref(), Some("2026-10-25T00:00:00Z"));
+        assert_eq!(usage.credits_enabled, Some(false));
+
+        // No Fable row, no credit field: both stay unknown, not zero.
+        let plain =
+            parse_usage(&json!({"five_hour": {"utilization": 1.0, "resets_at": null}})).unwrap();
+        assert!(plain.fable.is_none() && plain.credits_enabled.is_none());
+        // A Fable row alone is not plan usage.
+        assert!(parse_usage(&json!({"limits": value["limits"].clone()})).is_none());
+        // Out-of-range percent is dropped like any other window.
+        let mut bad = value.clone();
+        bad["limits"][2]["percent"] = json!(140);
+        assert!(parse_usage(&bad).unwrap().fable.is_none());
+    }
+    #[tokio::test]
+    async fn fable_headers_update_the_window_without_freshening_gates() {
+        use vellum_proxy_runtime::claude_code::UsageWindowObservation;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        install(&manager, vec![account("A", FIVE_HOUR_20, 10.0, None)]).await;
+        let checked_before =
+            manager.stored.lock().await.as_ref().unwrap().accounts[0].usage_checked_at;
+        let window = UsageWindowObservation {
+            utilization: 70.0,
+            resets_at: chrono::Utc::now().timestamp() + 86400,
+        };
+        manager
+            .observe_usage(
+                "A",
+                UsageObservation {
+                    observed_at: std::time::Instant::now(),
+                    five_hour: None,
+                    seven_day: Some(window),
+                    fable: Some(window),
+                },
+            )
+            .await;
+        let stored = manager.stored.lock().await;
+        let account = &stored.as_ref().unwrap().accounts[0];
+        assert_eq!(
+            account
+                .usage
+                .as_ref()
+                .unwrap()
+                .fable
+                .as_ref()
+                .unwrap()
+                .utilization,
+            70.0
+        );
+        // One gated window plus Fable is still a partial observation.
+        assert_eq!(account.usage_checked_at, checked_before);
     }
 }

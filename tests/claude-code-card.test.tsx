@@ -55,6 +55,23 @@ describe("Claude Desktop Code", () => {
     await waitFor(() => expect(claudeCodeApi.select).toHaveBeenCalledWith("B"));
     expect(claudeCodeApi.start).not.toHaveBeenCalled();
   });
+  it("shows Fable's weekly share without a gate and says what credits will do past it", async () => {
+    const value = status(); value.accounts.selected = null;
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null },
+      fable: { utilization: 64, resetsAt: null }, creditsEnabled: true };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    const { unmount } = render(<ClaudeCodeCard active />);
+    await screen.findByText("36%");
+    expect(screen.getAllByRole("progressbar").map((bar) => bar.getAttribute("aria-valuenow"))).toEqual(["38", "73", "36"]);
+    expect(screen.getAllByRole("slider")).toHaveLength(2);
+    expect(screen.getByText(i18n.t("claudeCode.fable"))).toBeTruthy();
+    expect(screen.getByText(i18n.t("claudeCode.creditsOn"))).toBeTruthy();
+    unmount();
+
+    value.accounts.accounts[0]!.usage = { ...value.accounts.accounts[0]!.usage!, creditsEnabled: false };
+    render(<ClaudeCodeCard active />);
+    await screen.findByText(i18n.t("claudeCode.creditsOff"));
+  });
   it("asks for confirmation before removing an unselected account", async () => {
     const value = status(); value.accounts.selected = null;
     vi.mocked(claudeCodeApi.status).mockResolvedValue(value);

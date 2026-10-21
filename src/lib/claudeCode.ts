@@ -21,7 +21,7 @@ export interface ClaudeCodeStatus {
     records: { id: string; sessionHash: string; accountId: string | null; operation?: "messages" | "count_tokens"; state: string; upstreamStatus: number | null }[];
   };
   accounts: {
-    accounts: { id: string; label: string; expiresAt: number; reauthorizeRequired: boolean; gate?: ClaudeCodeGate; gated?: boolean; usage?: { observedAt: number; fiveHour: { utilization: number; resetsAt: string | null } | null; sevenDay: { utilization: number; resetsAt: string | null } | null } | null }[];
+    accounts: { id: string; label: string; expiresAt: number; reauthorizeRequired: boolean; gate?: ClaudeCodeGate; gated?: boolean; usage?: ClaudeCodeUsage | null }[];
     selected: string | null;
     switchedFrom?: string | null;
     loginPending: boolean;
@@ -30,6 +30,17 @@ export interface ClaudeCodeStatus {
 }
 
 export type ClaudeCodeScope = "user" | "project";
+
+export interface ClaudeCodeWindow { utilization: number; resetsAt: string | null }
+export interface ClaudeCodeUsage {
+  observedAt: number;
+  fiveHour: ClaudeCodeWindow | null;
+  sevenDay: ClaudeCodeWindow | null;
+  /** Weekly Fable share included in the plan; absent when the account has none. */
+  fable?: ClaudeCodeWindow | null;
+  /** Usage credits (extra usage) on or off, as the usage endpoint last said. */
+  creditsEnabled?: boolean | null;
+}
 
 /** Percent of each window to keep; 0 leaves it ungated. */
 export interface ClaudeCodeGate { fiveHour: number; sevenDay: number }
