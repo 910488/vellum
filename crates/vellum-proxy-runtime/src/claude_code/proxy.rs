@@ -422,6 +422,12 @@ impl ClaudeCodeProxy {
                 headers.insert(header::AUTHORIZATION, value);
                 headers.remove("x-api-key");
             }
+            // Usage is read from the response as it streams past. Anthropic's
+            // edge compresses whenever the client allows it, which hides it.
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
             let operation = if parts.uri.path() == "/v1/messages" {
                 "messages"
             } else {

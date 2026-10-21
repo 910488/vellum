@@ -85,11 +85,12 @@ impl Fixture {
             let is_reject=parts.headers.contains_key("x-test-reject");
             let streaming=parts.headers.contains_key("x-test-stream");
             let native_stream=serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|v|v["stream"]==true);
+            let gzip=parts.headers.get(header::ACCEPT_ENCODING).and_then(|v|v.to_str().ok()).is_some_and(|v|v.contains("gzip"));
             let path=parts.uri.path().to_string();
             let method=parts.method.clone();
             send.send(Captured {path:parts.uri.to_string(),headers:parts.headers,body:bytes}).await.unwrap();
             if is_reject {return failure(StatusCode::TOO_MANY_REQUESTS,"rate_limit_error");}
-            if native_stream {return native_completion();}
+            if native_stream {return native_completion(gzip);}
             if method==Method::GET {return Response::new(Body::from("{}"));}
             if path=="/v1/messages/count_tokens" {return Response::new(Body::from("{\"input_tokens\":10}"));}
             if streaming {
@@ -181,7 +182,8 @@ impl Fixture {
     }
 }
 
-fn native_completion() -> Response {
+/// Like Anthropic's edge, compresses whenever the client accepts gzip.
+fn native_completion(gzip: bool) -> Response {
     let events = [
         (
             "message_start",
@@ -209,11 +211,24 @@ fn native_completion() -> Response {
         .iter()
         .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
         .collect::<String>();
-    let mut response = Response::new(Body::from(text));
+    let body = if gzip {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    } else {
+        text.into_bytes()
+    };
+    let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
+    if gzip {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    }
     response
 }
 
@@ -473,7 +488,7 @@ async fn untrusted_client_ca_is_observable_before_any_inference() {
 }
 
 #[tokio::test]
-async fn desktop_inference_changes_only_auth_and_keeps_existing_history() {
+async fn desktop_inference_changes_only_auth_and_encoding_and_keeps_existing_history() {
     let mut f = Fixture::new().await;
     let bytes = body();
     let response = f
@@ -648,8 +663,11 @@ async fn each_desktop_inference_reports_account_model_status_and_tokens() {
     let mut f = Fixture::new().await;
     let mut streamed: serde_json::Value = serde_json::from_slice(&body()).unwrap();
     streamed["stream"] = json!(true);
+    // Claude Code accepts compressed responses; usage is only readable in an
+    // uncompressed one, so the proxy asks upstream for identity.
     let text = f
         .request("/v1/messages", serde_json::to_vec(&streamed).unwrap())
+        .header(header::ACCEPT_ENCODING, "gzip, deflate, br, zstd")
         .send()
         .await
         .unwrap()
@@ -657,7 +675,8 @@ async fn each_desktop_inference_reports_account_model_status_and_tokens() {
         .await
         .unwrap();
     assert!(text.contains("OFFLINE_OK"));
-    f.captured.recv().await.unwrap();
+    let sent = f.captured.recv().await.unwrap();
+    assert_eq!(sent.headers[header::ACCEPT_ENCODING], "identity");
     let records = f.accounts.wait_records(1).await;
     let first = &records[0];
     assert_eq!(first.account_id.as_deref(), Some("B"));
@@ -689,16 +708,20 @@ async fn each_desktop_inference_reports_account_model_status_and_tokens() {
         Some("vellum_claude_code_error")
     );
 
-    // A CLI request keeps its own authorization and is not recorded.
+    // A CLI request keeps its own authorization and encoding and is not recorded.
     f.request("/v1/messages", body())
         .header(header::USER_AGENT, "claude-cli/2.1.299 (external, cli)")
+        .header(header::ACCEPT_ENCODING, "gzip, br")
         .send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
-    f.captured.recv().await.unwrap();
+    assert_eq!(
+        f.captured.recv().await.unwrap().headers[header::ACCEPT_ENCODING],
+        "gzip, br"
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(f.accounts.4.lock().unwrap().len(), 2);
     f.stop().await;
