@@ -383,22 +383,38 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                             force_official_handoff: false,
                         };
                         track_http_response_id = true;
-                    } else if request
+                    } else if let Some(previous) = request
                         .get("previous_response_id")
                         .and_then(Value::as_str)
-                        .is_some_and(|id| http_response_ids.iter().any(|known| known == id))
+                        .filter(|id| http_response_ids.iter().any(|known| known == id))
+                        .map(str::to_owned)
                     {
-                        // The previous response was created over HTTP, so a
-                        // fresh upstream socket cannot resume it. Replay the
-                        // full history over HTTP as well.
+                        // The previous response was created over HTTP, so no
+                        // upstream socket can resume it. A history rebuilt
+                        // here is what Official rejected ("Function
+                        // 'collaboration.followup_task' is reserved", every
+                        // turn of a 30 MB thread on 2026-10-22); Codex holds
+                        // the exact full input, which the oversize check
+                        // above then serves over HTTP untouched.
+                        if official
+                            .as_ref()
+                            .is_some_and(|segment| !segment.pending.is_empty())
+                        {
+                            deferred_account_handoffs.push_back(request);
+                            continue;
+                        }
                         log::info!(
-                            "[OfficialSocket] chained frame follows an HTTP-served turn; replaying over HTTP connection={connection_id}"
+                            "[OfficialSocket] chained frame follows an HTTP-served turn; asking Codex for full input connection={connection_id}"
                         );
-                        runtime_request.metadata.force_portable_official_handoff = true;
-                        turn_dispatch = WebSocketTurnDispatch::PortableReplay {
-                            force_official_handoff: true,
-                        };
-                        track_http_response_id = true;
+                        if send_runtime_failure(
+                            &mut client,
+                            &RuntimeError::PreviousResponseNotFound(previous),
+                        )
+                        .await
+                        {
+                            frames_out += 1;
+                        }
+                        continue;
                     }
                 }
                 let live_account_handoff = matches!(
@@ -2091,6 +2107,15 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             }
         }
         Err(error) => {
+            let error = match rejected_portable_replay(&error, &request, force_official_handoff) {
+                Some((previous, message)) => {
+                    log::warn!(
+                        "[OfficialSocket] portable handoff replay rejected; asking Codex for full input connection={connection_id} error={message:?}"
+                    );
+                    RuntimeError::PreviousResponseNotFound(previous)
+                }
+                None => error,
+            };
             if send_runtime_failure(client, &error).await {
                 *frames_out += 1;
             }
@@ -2101,6 +2126,31 @@ async fn execute_portable_turn<S: ProxyRuntimeState>(
             }
         }
     }
+}
+
+/// As on the socket path: a history rebuilt for an account handoff that
+/// Official rejects outright is retried from Codex's own full input instead
+/// of ending the turn. Returns the chained id and the upstream message.
+fn rejected_portable_replay(
+    error: &RuntimeError,
+    request: &Value,
+    force_official_handoff: bool,
+) -> Option<(String, String)> {
+    let RuntimeError::ProviderRequestRejected {
+        upstream_status: 400,
+        message,
+    } = error
+    else {
+        return None;
+    };
+    if !force_official_handoff {
+        return None;
+    }
+    request
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(|previous| (previous.to_owned(), message.clone()))
 }
 
 /// A `generate=false` prewarm answered locally on the portable path. Codex
@@ -3878,6 +3928,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_http_bridge_replay_asks_codex_for_full_input() {
+        run_official_websocket_account_switch(false, "bridge_rejected").await;
+    }
+
+    #[tokio::test]
     async fn official_websocket_switches_users_in_the_same_workspace() {
         run_official_websocket_account_switch(true, "switch").await;
     }
@@ -4019,6 +4074,7 @@ mod tests {
         let post_capture = capture.clone();
         let check_contract = mode != "missing";
         let reject_replay = mode == "switch_rejected";
+        let reject_http_replay = mode == "bridge_rejected";
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
@@ -4099,7 +4155,18 @@ mod tests {
                         capture.http_headers.lock().unwrap().push(headers.clone());
                         let account = execution_from_headers(&headers);
                         let streaming = body["stream"] == true;
+                        let rebuilt_replay = capture.http_requests.lock().unwrap().is_empty();
                         capture.http_requests.lock().unwrap().push((account, body));
+                        if reject_http_replay && rebuilt_replay {
+                            // The answer to every rebuilt replay of thread
+                            // 01a16221 on 2026-10-22.
+                            return axum::response::IntoResponse::into_response((
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(json!({"error":{
+                                    "type":"invalid_request_error","param":"tools","code":null,
+                                    "message":"Invalid Value: 'tools'. Function 'collaboration.followup_task' is reserved for use by this model and must match the configured schema."}})),
+                            ));
+                        }
                         let response = json!({
                             "id": "resp_account_b",
                             "object": "response",
@@ -4250,7 +4317,7 @@ mod tests {
                 .unwrap();
             if let TungsteniteMessage::Text(text) = frame {
                 let event: Value = serde_json::from_str(&text).unwrap();
-                if reject_replay && event["type"] == "error" {
+                if (reject_replay || reject_http_replay) && event["type"] == "error" {
                     // Codex's handling of this code: drop the incremental
                     // request and resend its own full input, unchained.
                     assert_eq!(
@@ -4270,7 +4337,9 @@ mod tests {
                         "text":{"format":{"type":"text"}},
                         "reasoning":{"effort":"high","summary":"auto"},
                         "prompt_cache_key":"account-switch-contract",
-                        "instructions": "be brief",
+                        "instructions": if reject_http_replay {
+                            "You are judging one planned coding-agent action. # User Authorization Scoring # Outcome Policy"
+                        } else { "be brief" },
                         "input": [{"role": "user", "content": "first question"},
                             {"role": "assistant", "content": "answer from A"},
                             {"role": "user", "content": "follow-up question"}],
@@ -4414,9 +4483,18 @@ mod tests {
         }
         assert_eq!(
             requests.len(),
-            1,
+            if reject_http_replay { 2 } else { 1 },
             "account handoff must use one portable POST"
         );
+        if reject_http_replay {
+            let retry = &requests[1].1;
+            assert!(retry.get("previous_response_id").is_none());
+            assert_eq!(
+                retry["input"].as_array().map(Vec::len),
+                Some(3),
+                "Codex's full input reaches upstream unchanged: {retry}"
+            );
+        }
         assert_eq!(
             requests[0].0,
             if mode.starts_with("bridge") || mode == "revision" {
@@ -4500,9 +4578,10 @@ mod tests {
 
     /// A full-input frame above the threshold must never reach the upstream
     /// WebSocket (chatgpt.com drops it); it is served over HTTP with the body
-    /// untouched, and a chained follow-up on the same connection stays on HTTP
-    /// because a fresh socket never saw that response id. A small full-input
-    /// frame still uses the socket.
+    /// untouched. A chained follow-up cannot resume that response on any
+    /// socket, so Codex is asked to resend its full input, which is again
+    /// served over HTTP untouched. A small full-input frame still uses the
+    /// socket.
     #[tokio::test]
     async fn oversize_full_input_frame_is_served_over_http() {
         use axum::extract::Json;
@@ -4618,20 +4697,61 @@ mod tests {
             assert!(bodies[0].get("type").is_none());
         }
 
-        let chained = complete(
-            &mut client,
-            json!({"type":"response.create","model":"vellum-official","stream":false,
-                "previous_response_id":"resp_http",
-                "input":[{"role":"user","content":"next"}]}),
-        )
-        .await;
-        assert_eq!(chained["response"]["id"], "resp_http");
+        // A chain on the HTTP response is not rebuilt from local history:
+        // Codex is asked for its own full input instead.
+        client
+            .send(TungsteniteMessage::Text(
+                json!({"type":"response.create","model":"vellum-official","stream":false,
+                    "previous_response_id":"resp_http",
+                    "input":[{"role":"user","content":"next"}]})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let retry_requested = loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(20), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let TungsteniteMessage::Text(text) = message {
+                break serde_json::from_str::<Value>(&text).unwrap();
+            }
+        };
+        assert_eq!(retry_requested["type"], "error", "{retry_requested}");
+        assert_eq!(
+            retry_requested["error"]["code"], "previous_response_not_found",
+            "{retry_requested}"
+        );
         assert_eq!(
             ws_frames.lock().unwrap().len(),
             1,
             "a chain created over HTTP must not be sent to the open socket"
         );
-        assert_eq!(http_bodies.lock().unwrap().len(), 2);
+        assert_eq!(http_bodies.lock().unwrap().len(), 1);
+
+        let full = complete(
+            &mut client,
+            json!({"type":"response.create","model":"vellum-official","stream":false,
+                "prompt_cache_key":"oversize-cache",
+                "input":[{"role":"user","content":padding},
+                    {"role":"user","content":"next"}]}),
+        )
+        .await;
+        assert_eq!(full["response"]["id"], "resp_http");
+        assert_eq!(ws_frames.lock().unwrap().len(), 1);
+        {
+            let bodies = http_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2);
+            assert!(bodies[1].get("previous_response_id").is_none());
+            assert_eq!(bodies[1]["input"].as_array().map(Vec::len), Some(2));
+            assert_eq!(
+                bodies[1]["input"][0]["content"].as_str().unwrap().len(),
+                padding.len()
+            );
+            assert_eq!(bodies[1]["input"][1]["content"], "next");
+        }
 
         let small = complete(
             &mut client,
