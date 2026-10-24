@@ -92,13 +92,12 @@ pub fn resolve_official(
 /// see the core that Desktop ships.
 ///
 /// Desktop copies its core into `bin\<hash>\` only some time after it starts,
-/// so right after an update the newest copy there is still the pinned one,
-/// and the first App Server the new Desktop starts (its startup policy read,
-/// before any window opens) got a core older than the Desktop. On 2026-10-24
-/// Codex Desktop 26.1021 stopped at "Organization settings could not be
-/// loaded" on that answer, and Retry asked the same bridge again. The core
-/// Desktop ships is the one it would run without Vellum, so one that nobody
-/// approved for this launch is served as plain Official instead of the pin.
+/// so right after an update the newest copy there is still the pinned one and
+/// the new Desktop's first App Server got a core older than the Desktop. While
+/// Desktop is held at a startup dialog it never makes that copy at all. The
+/// core Desktop ships is the one it would run without Vellum, so one that
+/// nobody approved for this launch is served as plain Official instead of the
+/// pin.
 pub fn resolve_official_for_desktop(
     manifest: &LaunchManifestV1,
     desktop: Option<&Path>,
@@ -110,6 +109,11 @@ pub fn resolve_official_for_desktop(
         return Ok(chosen);
     }
     resolve_official(manifest)
+}
+
+/// [`shipped_core`], when the file is there.
+pub fn desktop_shipped_core(desktop: &Path) -> Option<PathBuf> {
+    shipped_core(desktop).filter(|core| core.is_absolute() && core.is_file())
 }
 
 /// The core a Codex Desktop executable ships beside it: the Store package has
@@ -776,6 +780,11 @@ mod tests {
             resolve_official_for_desktop(&manifest, Some(desktop.as_path())).unwrap();
         assert_eq!(source, OfficialSource::Drifted);
         assert_eq!(official.executable, shipped);
+        assert_eq!(desktop_shipped_core(&desktop), Some(shipped));
+        assert_eq!(
+            desktop_shipped_core(&temp.path().join("elsewhere/app/ChatGPT.exe")),
+            None
+        );
     }
 
     #[test]
