@@ -230,9 +230,17 @@ fn recycle_reason(
     }
     match attestation.fallback.as_deref() {
         Some("leaseReleased") => Some("leaseRestored"),
-        Some(_) => Some("successorApproved"),
-        None => None,
+        // A fresh bridge serves the core Desktop ships, so recycling only helps
+        // once that core is the one this launch accepts. The pin surviving on
+        // disk is not enough: Desktop moved past it.
+        Some(_) if serves_accepted_core(manifest, attestation) => Some("successorApproved"),
+        Some(_) | None => None,
     }
+}
+
+fn serves_accepted_core(manifest: &LaunchManifestV1, attestation: &BridgeAttestationV1) -> bool {
+    let served = attestation.official.binary_sha256.as_str();
+    served == manifest.official.artifact_sha256 || manifest.accepts_official_successor(served)
 }
 
 fn recycle_target(
@@ -575,13 +583,27 @@ mod tests {
 
     #[test]
     fn a_fallback_bridge_gives_way_once_the_launch_can_be_served() {
-        let manifest = manifest("L2");
+        let mut manifest = manifest("L2");
         assert_eq!(
             recycle_reason(&manifest, &attestation("L2", Some("leaseReleased")), false),
             Some("leaseRestored")
         );
+        let mut drifted = attestation("L2", Some("officialDrift"));
+        drifted.official.binary_sha256 = "sha256:desktop".into();
         assert_eq!(
-            recycle_reason(&manifest, &attestation("L2", Some("officialDrift")), false),
+            recycle_reason(&manifest, &drifted, false),
+            None,
+            "Desktop's core is not approved yet; a new bridge would fall back again"
+        );
+        manifest.official_successors.push(
+            crate::enhanced_runtime::launch_manifest::OfficialSuccessor {
+                artifact_sha256: "sha256:desktop".into(),
+                source: "C:/WindowsApps/codex.exe".into(),
+                helpers: Vec::new(),
+            },
+        );
+        assert_eq!(
+            recycle_reason(&manifest, &drifted, false),
             Some("successorApproved")
         );
     }

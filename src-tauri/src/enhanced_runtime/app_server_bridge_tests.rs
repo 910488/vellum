@@ -294,6 +294,55 @@ fn native_tool_delegation_preserves_native_auth_and_policy_without_remote_owners
 }
 
 #[test]
+fn desktops_startup_config_read_runs_once_on_the_core_it_names() {
+    // Codex Desktop 26.1021's startup policy read, as `application-network-startup`
+    // builds it, and the sign-out variant it prepares beside it.
+    let read: Vec<String> = vec![
+        "app-server".into(),
+        "--analytics-default-enabled".into(),
+        "--print-startup-config".into(),
+        "--startup-client-info".into(),
+        r#"{"name":"codex_desktop","title":"Codex Desktop","version":"26.1021.3705"}"#.into(),
+        "-c".into(),
+        "features.windows_sandbox_service=true".into(),
+    ];
+    let mut sign_out = read.clone();
+    sign_out.push("--startup-sign-out".into());
+    assert!(is_startup_config_read(&read));
+    assert!(is_startup_config_read(&sign_out));
+    assert!(!is_startup_config_read(&[
+        "app-server".into(),
+        "--analytics-default-enabled".into(),
+    ]));
+    // A config value that only mentions the flag is still a session.
+    assert!(!is_startup_config_read(&[
+        "app-server".into(),
+        "-c".into(),
+        "notes=--print-startup-config".into(),
+    ]));
+
+    let command = startup_config_command(
+        Path::new("shipped-codex"),
+        Path::new("shared-codex-home"),
+        &sign_out,
+    );
+    assert_eq!(command.get_program(), std::ffi::OsStr::new("shipped-codex"));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        sign_out
+            .iter()
+            .map(std::ffi::OsStr::new)
+            .collect::<Vec<_>>()
+    );
+    let overrides = command.get_envs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        overrides[std::ffi::OsStr::new("CODEX_HOME")],
+        Some(std::ffi::OsStr::new("shared-codex-home"))
+    );
+    assert_eq!(overrides[std::ffi::OsStr::new("CODEX_CLI_PATH")], None);
+}
+
+#[test]
 fn desktop_feature_flags_map_to_the_session_loader_profile() {
     for profile in [
         AblationProfile::E0,

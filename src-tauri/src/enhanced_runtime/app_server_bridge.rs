@@ -200,6 +200,13 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     }
     let parent_executable = super::process_info::parent_pid(std::process::id())
         .and_then(super::process_info::executable_of);
+    if is_startup_config_read(&child_args) {
+        return delegate_startup_config_read(
+            &manifest_path,
+            parent_executable.as_deref(),
+            &child_args,
+        );
+    }
     if is_native_tool_helper(parent_executable.as_deref()) {
         let manifest = LaunchManifestV1::read(&manifest_path)?;
         let (official, _) = super::official_drift::resolve_official(&manifest)?;
@@ -207,7 +214,10 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     }
     if bridge_is_started_by_codex_desktop() {
         let mut manifest = LaunchManifestV1::read(&manifest_path)?;
-        let (official, source) = super::official_drift::resolve_official(&manifest)?;
+        let (official, source) = super::official_drift::resolve_official_for_desktop(
+            &manifest,
+            parent_executable.as_deref(),
+        )?;
         manifest.official_helpers =
             super::official_drift::expected_helpers(&manifest, &official.artifact_sha256);
         // Desktop replaced its core with one this launch never checked, or
@@ -351,6 +361,56 @@ fn delegate_non_app_server(manifest_path: &Path, args: Vec<String>) -> Result<()
     let mut command = Command::new(official);
     command.args(args);
     wait_for_delegated_command(command)
+}
+
+/// Codex Desktop 26.1021 reads its startup policy before any window opens by
+/// running `app-server --print-startup-config ...` once and parsing the JSON
+/// the core prints. Despite the `app-server` token this is a one-shot command,
+/// not an App Server session: bridged, it printed nothing Desktop could parse,
+/// and on 2026-10-24 Desktop stopped at "Organization settings could not be
+/// loaded" with Retry asking the same bridge again.
+fn is_startup_config_read(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--print-startup-config")
+}
+
+/// Only a core as new as the Desktop asking knows the startup flags; the
+/// launch pin and the Enhanced core may predate them. The read goes to the
+/// core Desktop ships, as it would without Vellum, and to the resolved
+/// Official core only where Desktop's own cannot be found.
+fn delegate_startup_config_read(
+    manifest_path: &Path,
+    parent: Option<&Path>,
+    args: &[String],
+) -> Result<(), BridgeError> {
+    let manifest = LaunchManifestV1::read(manifest_path)?;
+    let shipped = parent
+        .filter(|parent| super::desktop_manager::is_known_codex_desktop_executable(parent))
+        .and_then(super::official_drift::desktop_shipped_core);
+    let executable = match shipped {
+        Some(shipped) => shipped,
+        None => super::official_drift::resolve_official(&manifest)
+            .map(|(official, _)| official.executable)
+            .unwrap_or_else(|_| manifest.official.executable.clone()),
+    };
+    wait_for_delegated_command(startup_config_command(
+        &executable,
+        &manifest.official.codex_home,
+        args,
+    ))
+}
+
+fn startup_config_command(executable: &Path, codex_home: &Path, args: &[String]) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env("CODEX_HOME", codex_home)
+        .env_remove("CODEX_CLI_PATH");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
 }
 
 fn wait_for_delegated_command(mut command: Command) -> Result<(), BridgeError> {
