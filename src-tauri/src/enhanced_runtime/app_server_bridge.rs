@@ -207,7 +207,10 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     }
     if bridge_is_started_by_codex_desktop() {
         let mut manifest = LaunchManifestV1::read(&manifest_path)?;
-        let (official, source) = super::official_drift::resolve_official(&manifest)?;
+        let (official, source) = super::official_drift::resolve_official_for_desktop(
+            &manifest,
+            parent_executable.as_deref(),
+        )?;
         manifest.official_helpers =
             super::official_drift::expected_helpers(&manifest, &official.artifact_sha256);
         // Desktop replaced its core with one this launch never checked, or

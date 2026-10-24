@@ -88,6 +88,78 @@ pub fn resolve_official(
     resolve_official_with(manifest, desktop_official_candidates())
 }
 
+/// [`resolve_official`] for a bridge Codex Desktop itself started, which can
+/// see the core that Desktop ships.
+///
+/// Desktop copies its core into `bin\<hash>\` only some time after it starts,
+/// so right after an update the newest copy there is still the pinned one,
+/// and the first App Server the new Desktop starts (its startup policy read,
+/// before any window opens) got a core older than the Desktop. On 2026-10-24
+/// Codex Desktop 26.1021 stopped at "Organization settings could not be
+/// loaded" on that answer, and Retry asked the same bridge again. The core
+/// Desktop ships is the one it would run without Vellum, so one that nobody
+/// approved for this launch is served as plain Official instead of the pin.
+pub fn resolve_official_for_desktop(
+    manifest: &LaunchManifestV1,
+    desktop: Option<&Path>,
+) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
+    if let Some(chosen) = desktop
+        .and_then(shipped_core)
+        .and_then(|shipped| choose_shipped(manifest, &shipped))
+    {
+        return Ok(chosen);
+    }
+    resolve_official(manifest)
+}
+
+/// The core a Codex Desktop executable ships beside it: the Store package has
+/// `app\ChatGPT.exe` and `app\resources\codex.exe`.
+#[cfg(windows)]
+fn shipped_core(desktop: &Path) -> Option<PathBuf> {
+    Some(desktop.parent()?.join("resources").join("codex.exe"))
+}
+
+/// macOS overwrites the core in place, which the pin's hash check already
+/// catches; there is no stale copy for Desktop to be served from.
+#[cfg(not(windows))]
+fn shipped_core(_desktop: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Desktop's shipped core when it is not the pin, or `None` to leave the
+/// choice to [`resolve_official`].
+fn choose_shipped(
+    manifest: &LaunchManifestV1,
+    shipped: &Path,
+) -> Option<(RuntimeBinaryIdentity, OfficialSource)> {
+    if !shipped.is_absolute() || !shipped.is_file() {
+        return None;
+    }
+    let sha256 = sha256_file(shipped).ok()?;
+    if sha256 == manifest.official.artifact_sha256 {
+        return None;
+    }
+    if !missing_official_helpers(shipped, &expected_helpers(manifest, &sha256)).is_empty() {
+        return None;
+    }
+    if manifest.accepts_official_successor(&sha256) {
+        return Some((
+            official_identity(manifest, shipped.to_path_buf(), sha256),
+            OfficialSource::Successor,
+        ));
+    }
+    record_drift(
+        manifest,
+        shipped,
+        &sha256,
+        "Codex Desktop ships an Official core this launch never checked".into(),
+    );
+    Some((
+        official_identity(manifest, shipped.to_path_buf(), sha256),
+        OfficialSource::Drifted,
+    ))
+}
+
 pub(crate) fn observe_official(
     manifest: &LaunchManifestV1,
 ) -> Result<(RuntimeBinaryIdentity, OfficialSource), super::LaunchManifestError> {
@@ -182,21 +254,25 @@ fn resolve_official_inner(
         .map(|error| error.to_string())
         .unwrap_or_else(|| format!("Official core missing helpers: {}", incomplete.join(", ")));
     if record {
-        OfficialDriftRecord {
-            launch_id: manifest.launch_id.clone(),
-            observed_at: chrono::Utc::now().timestamp(),
-            recorded_executable: manifest.official.executable.clone(),
-            recorded_sha256: manifest.official.artifact_sha256.clone(),
-            current_executable: current.clone(),
-            current_sha256: sha256.clone(),
-            reason: error,
-        }
-        .write_beside(&manifest.attestation_path);
+        record_drift(manifest, &current, &sha256, error);
     }
     Ok((
         official_identity(manifest, current, sha256),
         OfficialSource::Drifted,
     ))
+}
+
+fn record_drift(manifest: &LaunchManifestV1, current: &Path, sha256: &str, reason: String) {
+    OfficialDriftRecord {
+        launch_id: manifest.launch_id.clone(),
+        observed_at: chrono::Utc::now().timestamp(),
+        recorded_executable: manifest.official.executable.clone(),
+        recorded_sha256: manifest.official.artifact_sha256.clone(),
+        current_executable: current.to_path_buf(),
+        current_sha256: sha256.to_owned(),
+        reason,
+    }
+    .write_beside(&manifest.attestation_path);
 }
 
 fn approved_successor(
@@ -605,6 +681,101 @@ mod tests {
         assert_eq!(official.executable, new);
         assert_eq!(official.artifact_sha256, manifest.official.artifact_sha256);
         assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn desktops_own_unchecked_core_displaces_a_pin_that_survived_the_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let shipped = temp.path().join("app/resources/codex.exe");
+        write_all(&[
+            (&shipped, "v2"),
+            (
+                &shipped.parent().unwrap().join("codex-code-mode-host.exe"),
+                "host",
+            ),
+        ]);
+        // The pin is intact and complete, which on its own keeps it pinned.
+        assert_eq!(
+            resolve_official_with(&manifest, Vec::new()).unwrap().1,
+            OfficialSource::Pinned
+        );
+
+        let (official, source) = choose_shipped(&manifest, &shipped).unwrap();
+        assert_eq!(source, OfficialSource::Drifted);
+        assert_eq!(official.executable, shipped);
+        assert_eq!(official.artifact_sha256, sha256_file(&shipped).unwrap());
+        assert_eq!(official.codex_home, manifest.official.codex_home);
+        let record = OfficialDriftRecord::for_launch(&manifest).unwrap();
+        assert_eq!(record.recorded_executable, manifest.official.executable);
+        assert_eq!(record.current_executable, shipped);
+    }
+
+    #[test]
+    fn desktops_own_approved_core_runs_as_a_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, _, _) = helper_fixture(temp.path());
+        let shipped = temp.path().join("app/resources/codex.exe");
+        write_all(&[
+            (&shipped, "v2"),
+            (
+                &shipped.parent().unwrap().join("codex-code-mode-host.exe"),
+                "host",
+            ),
+        ]);
+        manifest.official_successors.push(successor(&shipped));
+
+        let (official, source) = choose_shipped(&manifest, &shipped).unwrap();
+        assert_eq!(source, OfficialSource::Successor);
+        assert_eq!(official.executable, shipped);
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[test]
+    fn desktops_own_core_defers_when_it_is_the_pin_incomplete_or_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let same = temp.path().join("same/app/resources/codex.exe");
+        let incomplete = temp.path().join("incomplete/app/resources/codex.exe");
+        write_all(&[(&same, "v1"), (&incomplete, "v2")]);
+        let same_host = same.parent().unwrap().join("codex-code-mode-host.exe");
+        fs::write(same_host, "host").unwrap();
+
+        assert!(
+            choose_shipped(&manifest, &same).is_none(),
+            "already the pin"
+        );
+        assert!(
+            choose_shipped(&manifest, &incomplete).is_none(),
+            "missing codex-code-mode-host.exe"
+        );
+        assert!(choose_shipped(&manifest, &temp.path().join("absent/codex.exe")).is_none());
+        assert!(choose_shipped(&manifest, Path::new("codex.exe")).is_none());
+        assert!(OfficialDriftRecord::for_launch(&manifest).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_shipped_core_sits_in_resources_beside_desktop() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let desktop = temp
+            .path()
+            .join("OpenAI.Codex_26.1021.0.0_x64/app/ChatGPT.exe");
+        let shipped = desktop.parent().unwrap().join("resources/codex.exe");
+        write_all(&[
+            (&desktop, "desktop"),
+            (&shipped, "v2"),
+            (
+                &shipped.parent().unwrap().join("codex-code-mode-host.exe"),
+                "host",
+            ),
+        ]);
+
+        let (official, source) =
+            resolve_official_for_desktop(&manifest, Some(desktop.as_path())).unwrap();
+        assert_eq!(source, OfficialSource::Drifted);
+        assert_eq!(official.executable, shipped);
     }
 
     #[test]
