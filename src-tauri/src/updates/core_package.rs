@@ -128,7 +128,7 @@ fn mark_executables(root: &Path, target: &CoreTarget) -> Result<(), String> {
     Ok(())
 }
 
-fn build_slot(
+pub(super) fn build_slot(
     current: &Path,
     version: &str,
     manifest: &CoreManifest,
@@ -171,6 +171,41 @@ fn build_slot(
         feature_profile: manifest.feature_profile.clone(),
         launch_id: None,
     })
+}
+
+/// The source has already passed signed-tree verification. Relabel its bytes
+/// without rehashing or unpacking them; only signed files enter the new tree.
+pub(super) fn stage_local_core(
+    root: &Path,
+    version: &str,
+    manifest: &CoreManifest,
+    target: &CoreTarget,
+    sources: &[(String, std::path::PathBuf)],
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<CoreSlot, String> {
+    let slot_root = super::core_slots::slot_root(root, version);
+    let candidate = slot_root.join("candidate");
+    if candidate.exists() {
+        fs::remove_dir_all(&candidate).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&candidate).map_err(|error| error.to_string())?;
+    let staged = (|| {
+        for (relative, source) in sources {
+            let dest = candidate.join(relative);
+            fs::create_dir_all(dest.parent().ok_or("missing core file parent")?)
+                .map_err(|error| error.to_string())?;
+            if link(source, &dest).is_err() {
+                fs::copy(source, &dest).map_err(|error| error.to_string())?;
+            }
+        }
+        mark_complete(&candidate).map_err(|error| error.to_string())?;
+        commit_candidate(&slot_root).map_err(|error| error.to_string())?;
+        build_slot(&slot_root.join("current"), version, manifest, target)
+    })();
+    if staged.is_err() {
+        let _ = fs::remove_dir_all(candidate);
+    }
+    staged
 }
 
 #[cfg(test)]
@@ -253,6 +288,40 @@ mod tests {
         assert_eq!(fs::read(slot.path).unwrap(), b"core");
         assert_eq!(slot.helpers.len(), 1);
         assert_eq!(slot.files.len(), 2);
+    }
+
+    #[test]
+    fn local_core_falls_back_to_copy_when_hard_links_are_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("core.zip");
+        write_zip(&archive, false);
+        let core = manifest(false);
+        let old = stage_verified_core(dir.path(), &archive, "1.0.0", &core).unwrap();
+        let target = &core.targets[0];
+        let sources = target
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    super::super::core_slots::slot_tree_root(dir.path(), "1.0.0").join(&file.path),
+                )
+            })
+            .collect::<Vec<_>>();
+        let copied = stage_local_core(dir.path(), "1.0.1", &core, target, &sources, |_, _| {
+            Err(std::io::Error::other("cross-device link"))
+        })
+        .unwrap();
+        assert!(super::super::core_slots::same_core_tree(&old, &copied));
+        assert_eq!(fs::read(&copied.path).unwrap(), b"core");
+        assert_eq!(fs::read(&copied.helpers[0]).unwrap(), b"helper");
+        verify_runnable_tree_files_after_copy(&copied, target);
+    }
+
+    fn verify_runnable_tree_files_after_copy(slot: &CoreSlot, target: &CoreTarget) {
+        for file in &target.files {
+            verify_asset_file(&slot.path.parent().unwrap().join(&file.path), &file.sha256).unwrap();
+        }
     }
 
     #[test]

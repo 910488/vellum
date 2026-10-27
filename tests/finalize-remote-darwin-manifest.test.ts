@@ -2,6 +2,7 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { finalizeRemoteDarwinManifest } from "../scripts/finalize-remote-darwin-manifest.mjs";
 
@@ -15,12 +16,12 @@ describe("Darwin remote manifest finalizer", () => {
         JSON.stringify({
           schemaVersion: 3,
           protocolVersion: 3,
-          codex: { artifacts: {} },
+          codex: { pinnedVersion: "0.147.0", artifacts: {} },
           agent: { artifacts: {} },
           proxy: { artifacts: {} },
         }),
       );
-      writeFileSync(join(root, "darwin-arm64", "codex"), "darwin codex");
+      writeFileSync(join(root, "darwin-arm64", "codex-package.tar.gz"), gzipSync("darwin codex"));
       writeFileSync(join(root, "darwin-arm64", "vellum-remote-agent"), "darwin agent");
       writeFileSync(
         join(root, "darwin-arm64", "vellum-proxy-daemon"),
@@ -33,7 +34,9 @@ describe("Darwin remote manifest finalizer", () => {
       expect(persisted.protocolVersion).toBe(4);
       for (const section of ["codex", "agent", "proxy"]) {
         const artifact = persisted[section].artifacts["darwin-arm64"];
-        expect(artifact.url).toMatch(/^bundle:\/\/darwin-arm64\//);
+        expect(artifact.url).toMatch(section === "codex"
+          ? /^https:\/\/github.com\/openai\/codex\/releases\/download\/rust-v0.147.0\/codex-package-aarch64-apple-darwin.tar.gz$/
+          : /^bundle:\/\/darwin-arm64\//);
         expect(artifact.sha256).toMatch(/^[0-9a-f]{64}$/);
       }
     } finally {

@@ -1,6 +1,137 @@
 use super::*;
 
 #[test]
+fn async_compaction_config_downgrades_only_enhanced_thread_methods() {
+    for method in ["thread/start", "thread/resume", "thread/fork"] {
+        for (config, expected) in [
+            (
+                json!({"features.async_compaction":{"enabled":true,"future":42}}),
+                json!({"features.async_compaction":true}),
+            ),
+            (
+                json!({"features.async_compaction":{"enabled":false}}),
+                json!({"features.async_compaction":false}),
+            ),
+            (
+                json!({"features.async_compaction":{}}),
+                json!({"features.async_compaction":false}),
+            ),
+            (
+                json!({"features.async_compaction":{"enabled":"true"}}),
+                json!({"features.async_compaction":false}),
+            ),
+            (
+                json!({"features.async_compaction":true}),
+                json!({"features.async_compaction":true}),
+            ),
+            (
+                json!({"features.async_compaction":false}),
+                json!({"features.async_compaction":false}),
+            ),
+            (
+                json!({"features":{"async_compaction":{"enabled":true},"guardianv2":{"enabled":true},"multi_agent_v2":{"enabled":true}}}),
+                json!({"features":{"async_compaction":true,"guardianv2":{"enabled":true},"multi_agent_v2":{"enabled":true}}}),
+            ),
+            (
+                json!({"features":{"async_compaction":{"enabled":false}}}),
+                json!({"features":{"async_compaction":false}}),
+            ),
+            (
+                json!({"features":{"async_compaction":true}}),
+                json!({"features":{"async_compaction":true}}),
+            ),
+            (
+                json!({"features":{"async_compaction":false}}),
+                json!({"features":{"async_compaction":false}}),
+            ),
+            (
+                json!({"features.async_compaction.enabled":true,"features.async_compaction.future":{"nested":true}}),
+                json!({"features.async_compaction":true}),
+            ),
+            (
+                json!({"features.async_compaction.enabled":false,"features.async_compaction.future":true}),
+                json!({"features.async_compaction":false}),
+            ),
+            (
+                json!({"features.async_compaction.enabled":{"enabled":true}}),
+                json!({}),
+            ),
+            (json!({"features.async_compaction.future":false}), json!({})),
+            (
+                json!({"features.async_compaction":false,"features.async_compaction.enabled":true}),
+                json!({"features.async_compaction":false}),
+            ),
+        ] {
+            let original = json!({"id":1,"method":method,"params":{"config":config,"baseInstructions":"features.async_compaction stays literal"}});
+            let mut official = original.clone();
+            normalize_enhanced_guardian_config(ExecutionPlane::OfficialCodex, &mut official);
+            assert_eq!(official, original);
+            let mut enhanced = original;
+            normalize_enhanced_guardian_config(ExecutionPlane::EnhancedCodex, &mut enhanced);
+            assert_eq!(enhanced["params"]["config"], expected, "{method}");
+            assert_eq!(
+                enhanced["params"]["baseInstructions"],
+                "features.async_compaction stays literal"
+            );
+        }
+    }
+    let mut other = json!({"method":"config/write","params":{"config":{"features.async_compaction":{"enabled":true}}}});
+    let before = other.clone();
+    normalize_enhanced_guardian_config(ExecutionPlane::EnhancedCodex, &mut other);
+    assert_eq!(other, before);
+}
+
+#[test]
+fn async_compaction_is_normalized_on_real_start_resume_and_fork_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = state(&temp);
+    let start = json!({"id":201,"method":"thread/start","params":{"modelProvider":"qwen","model":"qwen3-coder",
+        "config":{"features.async_compaction":{"enabled":true},"features.guardianv2":{"enabled":true,"thread_context":true}}}});
+    let actions = bridge.on_client_line(&start.to_string()).unwrap();
+    let BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, forwarded) = &actions[0] else {
+        panic!("expected Enhanced");
+    };
+    assert_eq!(
+        forwarded["params"]["config"]["features.async_compaction"],
+        true
+    );
+    assert_eq!(
+        forwarded["params"]["config"]["features.guardianv2"],
+        json!({"enabled":true})
+    );
+    bridge
+        .on_child_line(
+            ExecutionPlane::EnhancedCodex,
+            &json!({"id":201,"result":{"thread":{"id":"async-thread"}}}).to_string(),
+        )
+        .unwrap();
+    for method in ["thread/resume", "thread/fork"] {
+        let request = json!({"id":202,"method":method,"params":{"threadId":"async-thread",
+            "config":{"features":{"async_compaction":{"enabled":true},"multi_agent_v2":{"enabled":true}}}}});
+        let actions = bridge.on_client_line(&request.to_string()).unwrap();
+        let BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, forwarded) = &actions[0] else {
+            panic!("expected Enhanced");
+        };
+        assert_eq!(
+            forwarded["params"]["config"]["features"]["async_compaction"],
+            true
+        );
+        assert_eq!(
+            forwarded["params"]["config"]["features"]["multi_agent_v2"],
+            json!({"enabled":true})
+        );
+    }
+    let request = json!({"id":203,"method":"thread/start","params":{"modelProvider":"openai","model":"gpt-5",
+        "config":{"features.async_compaction":{"enabled":true},"features.async_compaction.future":true}}});
+    let actions = bridge.on_client_line(&request.to_string()).unwrap();
+    let BridgeAction::ToChild(ExecutionPlane::OfficialCodex, forwarded) = &actions[0] else {
+        panic!("expected Official");
+    };
+    assert_eq!(forwarded["params"]["config"], request["params"]["config"]);
+}
+
+
+#[test]
 fn guardian_deprecated_context_is_translated_only_for_enhanced_config() {
     for method in ["thread/start", "thread/resume", "thread/fork"] {
         for config in [
@@ -160,6 +291,55 @@ fn native_tool_delegation_preserves_native_auth_and_policy_without_remote_owners
         browser_args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
     );
     assert_eq!(browser.get_envs().collect::<HashMap<_, _>>(), overrides);
+}
+
+#[test]
+fn desktops_startup_config_read_runs_once_on_the_core_it_names() {
+    // Codex Desktop 26.1021's startup policy read, as `application-network-startup`
+    // builds it, and the sign-out variant it prepares beside it.
+    let read: Vec<String> = vec![
+        "app-server".into(),
+        "--analytics-default-enabled".into(),
+        "--print-startup-config".into(),
+        "--startup-client-info".into(),
+        r#"{"name":"codex_desktop","title":"Codex Desktop","version":"26.1021.3705"}"#.into(),
+        "-c".into(),
+        "features.windows_sandbox_service=true".into(),
+    ];
+    let mut sign_out = read.clone();
+    sign_out.push("--startup-sign-out".into());
+    assert!(is_startup_config_read(&read));
+    assert!(is_startup_config_read(&sign_out));
+    assert!(!is_startup_config_read(&[
+        "app-server".into(),
+        "--analytics-default-enabled".into(),
+    ]));
+    // A config value that only mentions the flag is still a session.
+    assert!(!is_startup_config_read(&[
+        "app-server".into(),
+        "-c".into(),
+        "notes=--print-startup-config".into(),
+    ]));
+
+    let command = startup_config_command(
+        Path::new("shipped-codex"),
+        Path::new("shared-codex-home"),
+        &sign_out,
+    );
+    assert_eq!(command.get_program(), std::ffi::OsStr::new("shipped-codex"));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        sign_out
+            .iter()
+            .map(std::ffi::OsStr::new)
+            .collect::<Vec<_>>()
+    );
+    let overrides = command.get_envs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        overrides[std::ffi::OsStr::new("CODEX_HOME")],
+        Some(std::ffi::OsStr::new("shared-codex-home"))
+    );
+    assert_eq!(overrides[std::ffi::OsStr::new("CODEX_CLI_PATH")], None);
 }
 
 #[test]

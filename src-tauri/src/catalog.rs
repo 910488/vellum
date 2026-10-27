@@ -956,7 +956,6 @@ mod tests {
             context_window: None,
             model_capabilities: Vec::new(),
             insecure_http_policy: Default::default(),
-            catalog_scope: Default::default(),
         }
     }
 

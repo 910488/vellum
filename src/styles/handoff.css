@@ -1,0 +1,35 @@
+.ho { display: grid; gap: 16px; min-width: 0; }
+.ho h3 { margin: 0; font-size: 18px; font-weight: 600; }
+.ho p { margin-block: 0; line-height: 1.7; }
+.ho-head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.ho-head > div { flex: 1; min-width: 0; }
+.ho small, .ho-ledger small { display: block; color: var(--ink-faint); font-size: 12px; margin-top: 4px; }
+.ho-threads { border: 0; padding: 0; margin: 0; min-width: 0; max-height: 26rem; overflow: auto; }
+.ho-threads legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 13px; }
+.ho-thread { display: flex; align-items: baseline; gap: 12px; padding: 12px; border-radius: var(--r-md); cursor: pointer; }
+.ho-thread + .ho-thread { border-top: 1px solid var(--edge); }
+.ho-thread > span { flex: 1; min-width: 0; }
+.ho-thread--on { background: var(--surface-sunk); box-shadow: inset 2px 0 var(--lavender-deep); }
+.ho-thread input { accent-color: var(--lavender-deep); }
+.ho-cargo { display: flex; flex-wrap: wrap; background: var(--surface-sunk); border-radius: var(--r-md); padding: 14px; gap: 16px; }
+.ho-cargo > div { flex: 1; display: grid; gap: 4px; }
+.ho-cargo b { font-size: 24px; font-variant-numeric: tabular-nums; }
+.ho-cargo span { font-size: 12px; color: var(--ink-soft); }
+.ho-cargo ul { flex-basis: 100%; margin: 0; padding: 0; list-style: none; font-family: var(--font-mono); font-size: 12px; line-height: 1.9; }
+.ho-brief { display: grid; gap: 8px; font-weight: 600; }
+.ho-brief textarea { width: 100%; min-width: 0; resize: vertical; font-weight: 400; line-height: 1.7; box-sizing: border-box; }
+.ho-brief select { width: 100%; min-width: 0; }
+.ho-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.ho-relay { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding-block: 8px; }
+.ho-relay strong { display: block; margin-top: 4px; }
+.ho-relay i { flex: 1; height: 2px; background: linear-gradient(90deg, var(--edge), var(--lavender-deep)); }
+.ho-plan { margin: 0; padding-inline-start: 24px; line-height: 1.8; }
+.ho-log { margin: 0; padding: 14px; border-radius: var(--r-md); background: var(--surface-sunk); font: 12px/1.8 var(--font-mono); white-space: pre-wrap; max-height: 28rem; overflow: auto; }
+.ho-diff { padding: 8px 14px; border-radius: var(--r-md); background: var(--surface-sunk); }
+.ho-diff > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 14px; padding-block: 6px; font: 12px/1.5 var(--font-mono); }
+.ho-add, .ho-ok { color: var(--ok-ink); }
+.ho-del { color: var(--crit-ink); }
+.ho-ledger { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; width: 100%; text-align: start; padding: 12px 0; border: 0; border-top: 1px solid var(--edge); background: none; color: inherit; cursor: pointer; }
+.ho-ledger > span:first-child { min-width: 0; }
+.ho code, .ho small, .ho li, .ho-head, .ho-ledger { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .ho-thread { flex-wrap: wrap; } .ho-thread > small { flex-basis: 100%; } .ho-relay i { flex-basis: 20%; } }

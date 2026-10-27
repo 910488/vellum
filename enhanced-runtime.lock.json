@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "codexUpstreamCommit": "6bc50f104dcc0192e696cdeae721dfc19b507391",
-  "enhancedCodexCommit": "bc7959459995ff00763ee53f273ba7265b93456b",
+  "codexUpstreamCommit": "83086188ae0614bd882818ff1aa23f3194962012",
+  "enhancedCodexCommit": "17448b0c9845fc2522da89fa907774140f93cb74",
   "qwenCodeSourceCommit": "2b8f73c1e9cf8b355ec46c4623398c27b458b076",
   "deepseekHarnessSourceCommit": "dd6322d604e00eec1ba5e0c8541159906a21094a",
   "buildProfile": "enhanced-mvp-v1",
@@ -11,18 +11,18 @@
   "artifacts": {
     "aarch64-apple-darwin": {
       "archiveName": "enhanced-codex-core-aarch64-apple-darwin.tar.gz",
-      "archiveSha256": "sha256:008d0e3771072cac6329d852cf4c60172b53158d9b34f26d5560af14dc1d8870",
-      "artifactSha256": "sha256:bdf4a9f1db0031034d38b037207aba87952acc2c777826e809ae67516e6644a5"
+      "archiveSha256": "sha256:3ccb9ef35cbd01ccf61f61339cd183239d7c81f233168baeed2e558418e14696",
+      "artifactSha256": "sha256:67cc9e83b7a4bbc3c237f08a81a8e652dd9070a49907857674d90734c80c40ae"
     },
     "x86_64-apple-darwin": {
       "archiveName": "enhanced-codex-core-x86_64-apple-darwin.tar.gz",
-      "archiveSha256": "sha256:4c97e6a0eed0aaa4d0bfba2dacd523457f8e78f9717f674fb6b030a2f82ef615",
-      "artifactSha256": "sha256:452865f91eee7e48db111d09dc9f15c60e133611c06047287532eda3f36a5425"
+      "archiveSha256": "sha256:8d00690980b45c9b67763fde470014aef4de88502caa2cdb6a0439c15e96c16a",
+      "artifactSha256": "sha256:f6b0e2807b37aa9fbc7af135a27a7641534e661659238eacd51160c994f8e117"
     },
     "x86_64-pc-windows-msvc": {
       "archiveName": "enhanced-codex-core-x86_64-pc-windows-msvc.zip",
-      "archiveSha256": "sha256:2ad335444475e8f66d29104637558c836d956964651eeceed9ce7e3460b33a81",
-      "artifactSha256": "sha256:85dfc3727b9f9e270a521fe72eb2ec4865a7b0d5d867792ea8746cef09b5cbcd"
+      "archiveSha256": "sha256:0dc5a1bd0e2500bbd68f4e521cc993ce15a7d684a7759f970e30f535bc942121",
+      "artifactSha256": "sha256:c4c0c7a6bb656bf56b4dd8478fe162a642b268e349f898d8c4d483bd035a04a8"
     }
   }
 }

@@ -489,7 +489,7 @@ fn enhanced_commit_guard(
     Ok(guard)
 }
 
-fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
+pub(crate) fn arm_enhanced_runtime_for_proxy(state: &AppState, generation: u64) {
     if !state.is_generation_current(generation) {
         log::warn!("[Enhanced] arming cancelled kind=StaleProxyGeneration generation={generation}");
         return;
@@ -822,6 +822,11 @@ pub async fn repair_codex_config(state: State<'_, AppState>) -> AppResult<Restor
 
 #[tauri::command]
 pub async fn exit_vellum(app: tauri::AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    state
+        .claude_code()
+        .stop(true)
+        .await
+        .map_err(crate::error::AppError::Message)?;
     let _ = stop_proxy_gracefully(&state).await;
     stop_enhanced_sidecars();
     app.exit(0);

@@ -1,0 +1,17 @@
+[package]
+name = "vellum-codex-package"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verification and safe extraction of official Codex runtime packages"
+
+[features]
+test-support = []
+
+[dependencies]
+flate2 = "1"
+serde.workspace = true
+serde_json.workspace = true
+tar = "0.4"
+tempfile.workspace = true

@@ -1,0 +1,265 @@
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "i18next";
+import "@/i18n";
+import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
+import { claudeCodeApi, type ClaudeCodeStatus } from "@/lib/claudeCode";
+
+vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), setFiveHour: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
+
+function status(): ClaudeCodeStatus {
+  return { running: false, projects: [], scope: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
+    trust: { supported: false, sha256: null, trusted: false, managed: false, recoveryRequired: false },
+    routing: { activeRequests: 0, desktopRequests: 0, records: [] },
+    accounts: { selected: "B", accounts: [{ id: "B", label: "Account B", expiresAt: 9999999999, reauthorizeRequired: false }], loginPending: false, loginError: null } };
+}
+beforeEach(async () => { await i18n.changeLanguage("zh-TW"); vi.clearAllMocks(); vi.mocked(claudeCodeApi.status).mockResolvedValue(status()); vi.mocked(claudeCodeApi.recentProjects).mockResolvedValue([]);
+  vi.spyOn(HTMLDialogElement.prototype, "showModal").mockImplementation(function (this: HTMLDialogElement) { this.setAttribute("open", ""); });
+  vi.spyOn(HTMLDialogElement.prototype, "close").mockImplementation(function (this: HTMLDialogElement) { this.removeAttribute("open"); });
+});
+afterEach(cleanup);
+describe("Claude Desktop Code", () => {
+  it("does not report inference connected for a rejected request or a token estimate", async () => {
+    const value = status(); value.running = true; value.routing.desktopRequests = 2;
+    value.routing.records = [
+      { id: "r", sessionHash: "s", accountId: "B", operation: "messages", state: "upstream_rejected", upstreamStatus: 401 },
+      { id: "c", sessionHash: "s", accountId: "B", operation: "count_tokens", state: "completed", upstreamStatus: 200 },
+    ];
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText(i18n.t("claudeCode.waiting"));
+    expect(screen.queryByText(i18n.t("claudeCode.connected"))).toBeNull();
+  });
+  it("starts browser login and exposes cancellation without collecting credentials", async () => {
+    const value = status();
+    vi.mocked(claudeCodeApi.login).mockImplementation(async () => { value.accounts.loginPending = true; });
+    vi.mocked(claudeCodeApi.status).mockImplementation(async () => value);
+    render(<ClaudeCodeCard active />);
+    const login = await screen.findByText(i18n.t("claudeCode.login"));
+    fireEvent.click(login);
+    await screen.findByText(i18n.t("claudeCode.loginPending"));
+    expect(claudeCodeApi.login).toHaveBeenCalledOnce();
+    expect(screen.queryByLabelText(/token|password|密碼/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("common.cancel") }));
+    await waitFor(() => expect(claudeCodeApi.cancelLogin).toHaveBeenCalledOnce());
+  });
+  it("shows both remaining quota windows and selects the next inference account", async () => {
+    const value = status(); value.accounts.selected = null;
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null } };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("38%");
+    expect(screen.getByText("73%")).toBeTruthy();
+    expect(screen.getAllByRole("progressbar").map((bar) => bar.getAttribute("aria-valuenow"))).toEqual(["38", "73"]);
+    fireEvent.click(screen.getByText(i18n.t("models.ui.account.useThis")));
+    await waitFor(() => expect(claudeCodeApi.select).toHaveBeenCalledWith("B"));
+    expect(claudeCodeApi.start).not.toHaveBeenCalled();
+  });
+  it("shows Fable's weekly share without a gate and says what credits will do past it", async () => {
+    const value = status(); value.accounts.selected = null;
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null },
+      fable: { utilization: 64, resetsAt: null }, creditsEnabled: true };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    const { unmount } = render(<ClaudeCodeCard active />);
+    await screen.findByText("36%");
+    expect(screen.getAllByRole("progressbar").map((bar) => bar.getAttribute("aria-valuenow"))).toEqual(["38", "73", "36"]);
+    expect(screen.getAllByRole("slider")).toHaveLength(2);
+    expect(screen.getByText(i18n.t("claudeCode.fable"))).toBeTruthy();
+    expect(screen.getByText(i18n.t("claudeCode.creditsOn"))).toBeTruthy();
+    unmount();
+
+    value.accounts.accounts[0]!.usage = { ...value.accounts.accounts[0]!.usage!, creditsEnabled: false };
+    render(<ClaudeCodeCard active />);
+    await screen.findByText(i18n.t("claudeCode.creditsOff"));
+  });
+  it("toggles the 5-hour auto reset per account and says when a trigger failed", async () => {
+    const value = status();
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 0, resetsAt: null }, sevenDay: { utilization: 27, resetsAt: null } };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    vi.mocked(claudeCodeApi.setFiveHour).mockResolvedValue(value);
+    const { unmount } = render(<ClaudeCodeCard active />);
+    fireEvent.click(await screen.findByRole("button", { name: i18n.t("tabPolish.fiveHourOff") }));
+    await waitFor(() => expect(claudeCodeApi.setFiveHour).toHaveBeenCalledWith("B", true));
+    expect(screen.queryByText(i18n.t("claudeCode.fiveHourFailed"))).toBeNull();
+    unmount();
+
+    value.accounts.accounts[0] = { ...value.accounts.accounts[0]!, maintainFiveHour: true, fiveHourError: "Claude Desktop's bundled Claude Code was not found" };
+    render(<ClaudeCodeCard active />);
+    const failed = await screen.findByText(i18n.t("claudeCode.fiveHourFailed"));
+    expect(failed.getAttribute("title")).toContain("bundled Claude Code");
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("tabPolish.fiveHourOn") }));
+    await waitFor(() => expect(claudeCodeApi.setFiveHour).toHaveBeenLastCalledWith("B", false));
+  });
+  it("asks for confirmation before removing an unselected account", async () => {
+    const value = status(); value.accounts.selected = null;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    fireEvent.click(await screen.findByRole("button", { name: i18n.t("common.remove") }));
+    expect(claudeCodeApi.remove).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: i18n.t("common.remove") }));
+    await waitFor(() => expect(claudeCodeApi.remove).toHaveBeenCalledWith("B"));
+  });
+  it("distinguishes actual inference from token estimates in routing evidence", async () => {
+    const value=status(); value.routing.records=[
+      {id:"m",sessionHash:"same-session",accountId:"B",operation:"messages",state:"completed",upstreamStatus:200},
+      {id:"c",sessionHash:"same-session",accountId:"B",operation:"count_tokens",state:"completed",upstreamStatus:200},
+    ];
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText(/Account B · 推論 ·/);
+    expect(screen.getByText(/Account B · Token 估算 ·/)).toBeTruthy();
+  });
+  it("requires explicit fingerprint-bound consent before Windows trust and project routing", async () => {
+    const value = status(); value.trust = { supported: true, sha256: "reviewed-fingerprint", trusted: false, managed: false, recoveryRequired: false };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("reviewed-fingerprint");
+    fireEvent.click(screen.getByRole("button", { name: "選擇專案" }));
+    fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "E:\\project" } });
+    fireEvent.click(screen.getByText("加入"));
+    expect((screen.getByText("接入 1 個專案") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText("暫時信任此 CA") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText("我同意為目前 Windows 使用者暫時信任此 CA"));
+    fireEvent.click(screen.getByText("暫時信任此 CA"));
+    await waitFor(() => expect(claudeCodeApi.trustCertificate).toHaveBeenCalledWith("reviewed-fingerprint"));
+  });
+  it("offers recovery when trust remains without any project lease", async () => {
+    const value = status(); value.trust = { supported: true, sha256: "owned", trusted: true, managed: true, recoveryRequired: true };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("移除本次臨時信任");
+    fireEvent.click(screen.getByText("移除本次臨時信任"));
+    await waitFor(() => expect(claudeCodeApi.restoreTrust).toHaveBeenCalledOnce());
+  });
+  it("limits scope and sends the explicitly selected project to the backend", async () => {
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("已停用");
+    expect(screen.getByText(/本機 Code 工作階段/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "選擇專案" }));
+    expect((screen.getByText("接入 0 個專案") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "E:\\project" } });
+    fireEvent.keyDown(screen.getByLabelText("專案資料夾"), { key: "Enter" });
+    fireEvent.click(screen.getByText("接入 1 個專案"));
+    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith(["E:\\project"]));
+  });
+  it("shows waiting instead of claiming that a running listener proves Desktop integration", async () => {
+    const value = status(); value.running = true; value.projects = ["E:\\project"]; value.scope = "project"; value.settingsMatch = true;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("等待本機 Desktop Code");
+    expect(screen.queryByText(/個專案$/)).toBeNull();
+    expect(screen.getByText("E:\\project")).toBeTruthy();
+  });
+  it("requires an explicit immediate stop while inference is active and reports errors", async () => {
+    const value = status(); value.running = true; value.projects = ["E:\\project"]; value.scope = "project"; value.routing.activeRequests = 1;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    vi.mocked(claudeCodeApi.stop).mockRejectedValue(new Error("settings conflict"));
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("取消推論並還原");
+    expect((screen.getByText("停用並還原設定") as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => { fireEvent.click(screen.getByText("取消推論並還原")); });
+    expect(claudeCodeApi.stop).toHaveBeenCalledWith(true);
+    await screen.findByText(/settings conflict/);
+  });
+  it("distinguishes TLS rejection before the first HTTP inference from a waiting listener", async () => {
+    const value = status(); value.running = true; value.settingsMatch = true; value.routing.connectRequests = 1; value.routing.tlsFailures = 1; value.routing.lastError = "client_ca_untrusted";
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("Code 尚未信任代理憑證");
+    expect(screen.queryByText("已觀察到 Code 請求")).toBeNull();
+  });
+  it("routes back to the Desktop account from its own row", async () => {
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("Account B");
+    fireEvent.click(screen.getByText(i18n.t("models.ui.account.useThis")));
+    await waitFor(() => expect(claudeCodeApi.select).toHaveBeenCalledWith(null));
+  });
+  it("reads usage only from the page refresh and always reports completion", async () => {
+    const value = status(); value.accounts.accounts.push({ id: "C", label: "Account C", expiresAt: 1, reauthorizeRequired: true });
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    vi.mocked(claudeCodeApi.usage).mockRejectedValue(new Error("usage unavailable"));
+    const onRefreshed = vi.fn();
+    const { rerender } = render(<ClaudeCodeCard active refreshVersion={0} onRefreshed={onRefreshed} />);
+    await screen.findByText("Account B");
+    expect(claudeCodeApi.usage).not.toHaveBeenCalled();
+    expect(screen.queryByText(/更新訂閱用量/)).toBeNull();
+    rerender(<ClaudeCodeCard active refreshVersion={1} onRefreshed={onRefreshed} />);
+    await waitFor(() => expect(onRefreshed).toHaveBeenCalledOnce());
+    expect(claudeCodeApi.usage).toHaveBeenCalledTimes(1);
+    expect(claudeCodeApi.usage).toHaveBeenCalledWith("B");
+    await screen.findByText(/usage unavailable/);
+  });
+  it("checks several recent Desktop Code folders, adds another and sends them together", async () => {
+    vi.mocked(claudeCodeApi.recentProjects).mockResolvedValue([
+      { path: "E:\\alpha", sessions: 3, lastActivityAt: 2 },
+      { path: "E:\\beta", sessions: 1, lastActivityAt: 1 },
+    ]);
+    render(<ClaudeCodeCard active />);
+    fireEvent.click(await screen.findByRole("button", { name: "選擇專案" }));
+    const list = await screen.findByRole("list", { name: "Desktop 最近的 Code 專案" });
+    const boxes = within(list).getAllByRole("checkbox") as HTMLInputElement[];
+    expect(boxes.map((box) => box.checked)).toEqual([false, false]);
+    fireEvent.click(within(list).getByRole("checkbox", { name: /alpha/ }));
+    fireEvent.click(within(list).getByRole("checkbox", { name: /beta/ }));
+    fireEvent.change(screen.getByLabelText("專案資料夾"), { target: { value: "D:\\other" } });
+    fireEvent.click(screen.getByText("加入"));
+    expect((within(list).getByRole("checkbox", { name: /other/ }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(within(list).getByRole("checkbox", { name: /beta/ }));
+    fireEvent.click(screen.getByText("接入 2 個專案"));
+    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith(["E:\\alpha", "D:\\other"]));
+  });
+  it("reconnects exactly the leased projects after Vellum stopped", async () => {
+    const value = status(); value.scope = "project"; value.projects = ["E:\\alpha", "E:\\beta"]; value.recoveryRequired = true;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    vi.mocked(claudeCodeApi.recentProjects).mockResolvedValue([{ path: "E:\\gamma", sessions: 2, lastActivityAt: 1 }]);
+    render(<ClaudeCodeCard active />);
+    const list = await screen.findByRole("list", { name: "Desktop 最近的 Code 專案" });
+    const boxes = within(list).getAllByRole("checkbox") as HTMLInputElement[];
+    expect(boxes.map((box) => [box.checked, box.disabled])).toEqual([[true, true], [true, true]]);
+    expect(screen.queryByLabelText("專案資料夾")).toBeNull();
+    fireEvent.click(screen.getByText("重新接入"));
+    await waitFor(() => expect(claudeCodeApi.start).toHaveBeenCalledWith(["E:\\alpha", "E:\\beta"]));
+  });
+  it("defaults to all sessions and starts the user-settings lease without a project", async () => {
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("已停用");
+    expect(screen.getByRole("button", { name: "所有工作階段" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByLabelText("專案資料夾")).toBeNull();
+    expect(screen.getByText(/CLI 版 Claude Code/)).toBeTruthy();
+    fireEvent.click(screen.getByText("接入所有工作階段"));
+    await waitFor(() => expect(claudeCodeApi.startUser).toHaveBeenCalledOnce());
+    expect(claudeCodeApi.start).not.toHaveBeenCalled();
+  });
+  it("shows the user-settings lease while running and pins the scope while it is held", async () => {
+    const value = status(); value.running = true; value.scope = "user"; value.settingsMatch = true;
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    const { unmount } = render(<ClaudeCodeCard active />);
+    await screen.findByText("~/.claude/settings.json");
+    expect(screen.getByText(/開啟或重新開啟 Code 工作階段/)).toBeTruthy();
+    unmount();
+    value.running = false; value.recoveryRequired = true;
+    render(<ClaudeCodeCard active />);
+    await screen.findByText(/還原 ~\/\.claude\/settings\.json/);
+    expect(screen.queryByRole("button", { name: "選擇專案" })).toBeNull();
+    fireEvent.click(screen.getByText("重新接入"));
+    await waitFor(() => expect(claudeCodeApi.startUser).toHaveBeenCalledOnce());
+  });
+  it("drags a gate on one window, saves it on release and marks a gated account", async () => {
+    const value = status(); value.accounts.selected = null; value.accounts.switchedFrom = "B";
+    value.accounts.accounts[0]!.gate = { fiveHour: 0, sevenDay: 30 };
+    value.accounts.accounts[0]!.gated = true;
+    value.accounts.accounts[0]!.usage = { observedAt: 1, fiveHour: { utilization: 62, resetsAt: null }, sevenDay: { utilization: 75, resetsAt: null } };
+    vi.mocked(claudeCodeApi.status).mockResolvedValue(value);
+    render(<ClaudeCodeCard active />);
+    await screen.findByText("閘門 30% · 已到閘門");
+    expect(screen.getAllByText("已到閘門").length).toBeGreaterThan(0);
+    expect(screen.getByText("無閘門 · 拖曳量條設定")).toBeTruthy();
+    const slider = screen.getByLabelText("Account B 的5 小時閘門");
+    fireEvent.change(slider, { target: { value: "25" } });
+    expect(screen.getByText("閘門 25% · 可燒 13%")).toBeTruthy();
+    expect(claudeCodeApi.setGate).not.toHaveBeenCalled();
+    fireEvent.pointerUp(slider, { target: { value: "25" } });
+    await waitFor(() => expect(claudeCodeApi.setGate).toHaveBeenCalledWith("B", { fiveHour: 25, sevenDay: 30 }));
+  });
+});

@@ -2,6 +2,7 @@ import { useLocaleFormat } from "@/i18n/useLocaleFormat";
 import { useTranslation } from "react-i18next";
 import { operationalErrorKey } from "@/lib/operationalError";
 import { Notice } from "@/components/ui";
+import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
 /**
  * 模型 —— 換 Codex 用的模型，以及加供應商。
  *
@@ -25,11 +26,8 @@ import {
   type AccountQuotaPresentation,
   type Translate,
 } from "@/lib/quota";
-import { codexCompatibleProbeModels } from "@/lib/onboarding";
 import {
   isOpenCodeZenEndpoint,
-  OPENCODE_ZEN_BASE_URL,
-  OPENCODE_ZEN_NAME,
   providerPresetDraft,
 } from "@/lib/providerPresets";
 import {
@@ -370,10 +368,12 @@ function ResetLedger({
 }
 
 export function Models({
+  active = true,
   onChanged,
   refreshVersion,
   onRefreshComplete,
 }: {
+  active?: boolean;
   onChanged: () => void;
   refreshVersion: number;
   onRefreshComplete: (version: number) => void;
@@ -455,7 +455,7 @@ export function Models({
   const markRefreshPart = (part: string) => {
     if (refreshVersion <= 0 || refreshParts.current.version !== refreshVersion) return;
     refreshParts.current.done.add(part);
-    if (["main", "grokQuota", "openaiQuota", "resetCredits"].every((key) => refreshParts.current.done.has(key))) {
+    if (["main", "grokQuota", "openaiQuota", "resetCredits", "claudeQuota"].every((key) => refreshParts.current.done.has(key))) {
       onRefreshComplete(refreshVersion);
     }
   };
@@ -1351,44 +1351,24 @@ export function Models({
     }
   }
 
-  async function connectOpenCodeCatalog(
-    name: string,
-    baseUrl: string,
-    key: string,
-    filter?: (capability: ModelCapability) => boolean,
-    catalogScope: import("@/types").CatalogScope = "all",
-  ) {
-    const probeResult = await api.probeEndpoint(baseUrl, key || undefined);
-    const openCode = isOpenCodeZenEndpoint(baseUrl);
-    const compatible = (openCode
-      ? probeResult.modelCapabilities.filter(
-          (capability) => capability.wire !== null && capability.toolCalling !== false,
-        )
-      : codexCompatibleProbeModels(probeResult)
-    ).filter((capability) => !filter || filter(capability));
-    const [primary] = compatible;
+  async function connectOpenCodeCatalog(name: string, baseUrl: string, key: string) {
+    const probeResult = await api.probeEndpoint(baseUrl, key);
+    const compatible = probeResult.modelCapabilities.filter(
+      (capability) => capability.wire !== null && capability.toolCalling !== false,
+    );
+    // Retired models stay in the catalog, unchecked, for anyone who still
+    // wants them; only current ones are offered to Codex by default.
+    const current = compatible.filter((capability) => capability.deprecated !== true);
+    const offered = current.length > 0 ? current : compatible;
     // `primary` must exist and carry a wire: falling back to
     // `probeResult.models[0]` would pick whatever is first in the raw
     // catalog regardless of whether it passed verification, silently
     // creating a route pointed at an unverified (possibly
     // protocol-unsupported) model.
+    const [primary] = offered;
     if (!primary || !primary.wire) {
       throw new Error(t("onboarding.connect.codexToolProtocolUnavailable"));
     }
-    const selected = compatible.map((capability) => capability.model);
-    // When a filter narrows this connection to a subset (the free tier),
-    // that subset must also be the route's entire model catalog, not just
-    // what's pre-selected — otherwise every paid model still shows up
-    // unchecked in the model list, which is exactly the clutter the filter
-    // exists to avoid.
-    const capabilities = filter
-      ? probeResult.modelCapabilities.filter((capability) => filter(capability))
-      : probeResult.modelCapabilities;
-    const models = filter
-      ? probeResult.models.filter((model) =>
-          capabilities.some((capability) => capability.model === model),
-        )
-      : probeResult.models;
     setRoutes(
       await api.createRoute(
         name,
@@ -1400,65 +1380,29 @@ export function Models({
         probeResult.serverSideResume,
         key,
         "openAiCompatible",
-        models,
-        selected,
+        probeResult.models,
+        offered.map((capability) => capability.model),
         probeResult.contextWindow,
-        capabilities,
-        catalogScope,
+        probeResult.modelCapabilities,
       ),
     );
   }
 
-  // "OpenCode Zen" here always means the free tier: matches what OpenCode's
-  // own app shows by default (no special config needed, and it never shows
-  // paid Zen models at all). Paid Zen access requires purchased credits this
-  // account may not have, so the quick-connect card only ever offers what is
-  // guaranteed to work regardless of plan. A user who genuinely holds paid
-  // Zen credits and wants those models can still add them by hand through
-  // the generic "Add Provider" flow below, which shows the full catalog.
-  async function connectOpenCodeFreeModels(key: string, name: string = OPENCODE_ZEN_NAME) {
-    await connectOpenCodeCatalog(
-      name,
-      OPENCODE_ZEN_BASE_URL,
-      key,
-      (capability) => capability.free === true && capability.deprecated !== true,
-      "freeOnly",
-    );
-  }
-
+  // OpenCode's free models are not offered: OpenCode serves its free tier
+  // only to its own app and answers every other client with FreeTierError.
+  // Both catalogs therefore need an API key, and connect the paid models
+  // that key can reach.
   async function connectOpenCodeZen() {
     const key = opencodeApiKey.trim();
-    if (opencodePreset === "opencodeGo" && !key) {
+    if (!key) {
       setError(t("models.ui.errors.opencodeApiKeyRequired"));
       return;
     }
     setOpencodeBusy(true);
     setError(null);
     try {
-      if (opencodePreset === "opencodeGo") {
-        const { name, baseUrl } = providerPresetDraft(opencodePreset);
-        await connectOpenCodeCatalog(name, baseUrl, key);
-        // OpenCode Go's own endpoint genuinely rejects Zen's free models —
-        // verified live: a free model posted to zen/go/v1 comes back
-        // "Model ... is not supported" (401), the same way a Go-exclusive
-        // model posted to zen/v1 does. They are not the same catalog
-        // filtered by tier; a Go connection cannot reach the free models by
-        // picking different model ids, only by also talking to the Zen
-        // endpoint. So attach them as their own route instead of leaving a
-        // Go subscriber without any free models at all.
-        try {
-          await connectOpenCodeFreeModels(
-            key,
-            t("models.ui.opencode.freeRouteName", { name: OPENCODE_ZEN_NAME }),
-          );
-        } catch (cause) {
-          // Non-fatal: the Go connection above already succeeded, and free
-          // models are a bonus on top of it, not a requirement for it.
-          setError(t("models.ui.errors.opencodeFreeAttachFailed", { detail: String(cause) }));
-        }
-      } else {
-        await connectOpenCodeFreeModels(key);
-      }
+      const { name, baseUrl } = providerPresetDraft(opencodePreset);
+      await connectOpenCodeCatalog(name, baseUrl, key);
       setModelRoutes(await api.listModelRoutes());
       setCatalogStatus(await api.getCatalogStatus());
       setOpencodeApiKey("");
@@ -1514,6 +1458,7 @@ export function Models({
             <label>
               {t("models.ui.pool.strategyLabel")}{" "}
               <select
+                className="input"
                 value={normalizedQuotaPool.strategy}
                 disabled={quotaPoolBusy}
                 onChange={(event) => void saveQuotaPool({ ...normalizedQuotaPool,
@@ -2045,6 +1990,8 @@ export function Models({
         />
       </Card>
 
+      <ClaudeCodeCard active={active} refreshVersion={refreshVersion} onRefreshed={() => markRefreshPart("claudeQuota")} />
+
       {grokRoute ? (
         <Card>
           <Cap>{t("models.ui.grok.title")}</Cap>
@@ -2205,7 +2152,7 @@ export function Models({
           <div className="rowline" style={{ marginTop: 14 }}>
             <Btn
               type="submit"
-              disabled={opencodeBusy || (opencodePreset === "opencodeGo" && !opencodeApiKey.trim())}
+              disabled={opencodeBusy || !opencodeApiKey.trim()}
             >
               {opencodeBusy ? t("models.ui.opencode.connecting") : t("models.ui.opencode.connect")}
             </Btn>
@@ -2380,9 +2327,6 @@ export function Models({
                           }}
                         />
                         <code>{model}</code>
-                        {capability?.free && capability.deprecated !== true ? (
-                          <Pill tone="ok">{t("models.ui.modelCatalog.free")}</Pill>
-                        ) : null}
                         {capability?.deprecated ? (
                           <Pill tone="warn">{t("models.ui.modelCatalog.deprecated")}</Pill>
                         ) : null}
@@ -2753,7 +2697,7 @@ export function Models({
                                 onChange={() => void toggleRouteModel(route, model)}
                               />
                               {editingName ? null : (
-                                // Wrapped so the id and its optional Free badge
+                                // Wrapped so the id and its optional Retired badge
                                 // together still occupy exactly one grid cell —
                                 // `.menu__pick` is `display: contents`, so a bare
                                 // sibling here would land in the next column
@@ -2766,9 +2710,6 @@ export function Models({
                                   </code>
                                   {capability?.deprecated ? (
                                     <Pill tone="warn">{t("models.ui.modelCatalog.deprecated")}</Pill>
-                                  ) : null}
-                                  {capability?.free && capability.deprecated !== true ? (
-                                    <Pill tone="ok">{t("models.ui.modelCatalog.free")}</Pill>
                                   ) : null}
                                 </span>
                               )}

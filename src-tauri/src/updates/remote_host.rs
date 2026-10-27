@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use super::apply::IdleEvidence;
 use super::remote_helper::RemoteBackend;
 use crate::error::AppResult;
-use crate::process::background_command;
 use crate::remote::agent_client::RemoteAgentClient;
 use crate::remote::ssh_trust;
 use crate::state::AppState;
@@ -73,7 +72,10 @@ impl RunningSetIdentity {
             .clone()
             .filter(|value| !value.is_empty())?;
         if report.proxy_backend.as_deref() == Some("native")
-            || report.native_proxy_digest.as_deref().is_some_and(|d| !d.is_empty())
+            || report
+                .native_proxy_digest
+                .as_deref()
+                .is_some_and(|d| !d.is_empty())
         {
             return Some(Self {
                 agent_version,
@@ -145,7 +147,8 @@ fn identity_from_json(bytes: &[u8]) -> Option<RunningSetIdentity> {
         .or_else(|| pointer_string(&value, "/proxyBackend"));
     let native_digest = pointer_string(&value, "/proxy/nativeExecutableDigest")
         .or_else(|| pointer_string(&value, "/nativeProxyDigest"));
-    if backend.as_deref() == Some("native") || native_digest.as_deref().is_some_and(|d| !d.is_empty())
+    if backend.as_deref() == Some("native")
+        || native_digest.as_deref().is_some_and(|d| !d.is_empty())
     {
         return Some(RunningSetIdentity {
             agent_version: agent,
@@ -608,12 +611,15 @@ fn ssh_sh(destination: &str, script: &str) -> Result<String, String> {
         ssh_trust::resolve_ssh_target(destination).map_err(|error| error.to_string())?;
     ssh_trust::require_trust_or_error(&data_root, &trust_target)
         .map_err(|error| error.to_string())?;
-    let mut cmd = background_command("ssh");
+    let mut cmd = crate::remote::ssh_added::command(&data_root, destination);
     cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
-        .args(ssh_trust::strict_host_key_args(&data_root))
+        .args(ssh_trust::strict_host_key_args_for(
+            &data_root,
+            &trust_target,
+        ))
         .arg("-T")
         .arg(destination)
         .arg("sh")
@@ -930,8 +936,7 @@ mod tests {
             "native macOS helper path must use launchctl, not docker, for the LaunchAgent proxy"
         );
         assert!(
-            script.contains("require_replace_space")
-                && script.contains("insufficientDiskSpace"),
+            script.contains("require_replace_space") && script.contains("insufficientDiskSpace"),
             "helper must refuse extract when free space is below download+extract+rollback"
         );
         assert!(

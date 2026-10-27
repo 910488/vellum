@@ -99,6 +99,18 @@ pub async fn query(
     .await
 }
 
+/// Read the last in-memory observation without refreshing or waiting for an
+/// in-flight query. Active-turn routing must never add a quota HTTP request.
+/// The caller still checks window reset times and treats a miss as unknown.
+pub async fn cached_snapshot(access_token: &str, account_id: &str) -> Option<Vec<QuotaSnapshot>> {
+    let key = format!("{account_id}:{:x}", Sha256::digest(access_token.as_bytes()));
+    quota_cache()
+        .read()
+        .await
+        .get(&key)
+        .map(|cached| cached.windows.clone())
+}
+
 /// Query quota with a caller-selected cache age. UI/profile reads tolerate a
 /// short display cache, but request routing must react much sooner when a
 /// five-hour window reaches its edge.

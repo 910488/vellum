@@ -6,6 +6,7 @@ pub mod adapter;
 pub mod boot;
 pub mod budget;
 pub mod catalog;
+pub mod claude_code;
 pub mod codex;
 mod codex_restart;
 pub mod codex_oauth;
@@ -100,6 +101,9 @@ pub(crate) async fn shutdown_for_exit(
     state: &AppState,
     apply_desktop_update: bool,
 ) -> Option<error::AppResult<crate::updates::UpdateOperation>> {
+    if let Err(error) = state.claude_code().stop(true).await {
+        log::error!("[ClaudeCode] exit-time restore failed: {error}");
+    }
     if let Err(error) = crate::commands::proxy::stop_proxy_gracefully(state).await {
         log::error!("[Codex] 結束前還原 Proxy/Enhanced 啟動接管失敗：{error}");
     }
@@ -156,6 +160,9 @@ pub fn run() {
                     log::warn!("[Window] cannot maximize the main window at launch: {error}");
                 }
             }
+            if let Err(error) = app.state::<AppState>().claude_code().recover_stale_settings() {
+                log::warn!("[ClaudeCode] startup settings recovery failed: {error}");
+            }
             let data_root = app.state::<AppState>().data_root();
             // Before the auto check: a check rewrites the Desktop layer, and
             // only this launch can tell whether the last installer worked.
@@ -177,8 +184,12 @@ pub fn run() {
                     }
                 });
             }
+            crate::commands::launch_steward::spawn((*app.state::<AppState>()).clone());
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
+            crate::claude_code::cadence::spawn(
+                app.state::<AppState>().claude_code().accounts.clone(),
+            );
             let boot = crate::boot::record_boot(&data_root);
             crate::trace::install(&data_root);
             log::info!(
@@ -262,6 +273,21 @@ pub fn run() {
         })
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
+            commands::claude_code_status,
+            commands::claude_code_recent_projects,
+            commands::claude_code_prepare_certificate,
+            commands::claude_code_trust_certificate,
+            commands::claude_code_restore_trust,
+            commands::claude_code_start,
+            commands::claude_code_start_user,
+            commands::claude_code_stop,
+            commands::claude_code_select_account,
+            commands::claude_code_begin_login,
+            commands::claude_code_cancel_login,
+            commands::claude_code_remove_account,
+            commands::claude_code_refresh_usage,
+            commands::claude_code_set_gate,
+            commands::claude_code_set_five_hour,
             commands::get_overview,
             commands::get_provider_overviews,
             commands::get_request_log,
@@ -366,12 +392,31 @@ pub fn run() {
             remote::commands::get_desktop_codex_compatibility,
             remote::commands::update_remote_codex_for_desktop,
             remote::commands::discover_remote_connections,
+            remote::commands::add_remote_ssh_host,
             remote::commands::inspect_remote_host,
+            remote::commands::list_remote_handoff_threads,
+            remote::commands::get_remote_handoff_thread_link,
+            remote::commands::open_remote_handoff_thread,
+            remote::commands::preflight_remote_handoff,
+            remote::commands::start_remote_handoff,
+            remote::commands::resume_remote_handoff,
+            remote::commands::poll_remote_handoff,
+            remote::commands::list_remote_handoffs,
+            remote::commands::capture_remote_handoff,
+            remote::commands::review_remote_handoff,
+            remote::commands::settle_remote_handoff,
+            remote::commands::discard_remote_handoff,
+            remote::commands::acknowledge_remote_handoff,
             remote::commands::bootstrap_remote_host,
+            remote::commands::list_remote_host_models,
+            remote::commands::update_remote_host_models,
+            remote::commands::cancel_remote_deployment,
+            remote::commands::confirm_remote_deployment_takeover,
             remote::commands::plan_remote_deployment,
             remote::commands::reapply_remote_deployment,
             remote::commands::apply_remote_deployment,
             remote::commands::get_remote_operation,
+            remote::commands::get_remote_deploy_summary,
             remote::commands::restart_remote_native_codex,
             remote::commands::stop_remote_app_owned_codex,
             remote::commands::restore_remote_host,
@@ -444,6 +489,9 @@ static EXIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 fn cleanup_on_loop_exit(app: &tauri::AppHandle) {
     const SESSION_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
     let state = app.state::<AppState>().clone();
+    if let Err(error) = state.claude_code().restore_settings_for_session_end() {
+        log::warn!("[ClaudeCode] session-end settings restore failed: {error}");
+    }
     let finished = tauri::async_runtime::block_on(async move {
         tokio::time::timeout(SESSION_END_BUDGET, shutdown_for_exit(&state, false))
             .await

@@ -1,0 +1,663 @@
+//! Keeps Codex Desktop on the current Enhanced launch without restarting it.
+//!
+//! Codex Desktop reads `CODEX_CLI_PATH` once, but it starts the bridge that
+//! variable names every time its App Server exits, within a fraction of a
+//! second. The bridge in turn reads the launch manifest only when it starts.
+//! So whenever the live bridge is serving something other than the current
+//! launch -- a launch Vellum has since rebuilt, or plain Official because the
+//! lease was briefly gone or Desktop moved to a core nobody had checked --
+//! ending that one process is the whole repair. Desktop starts a fresh bridge
+//! and the fresh bridge reads the launch that is there now.
+//!
+//! Before this, the same states lit "restart Codex" and waited for the user,
+//! and every Vellum update and every Codex update produced one of them.
+//!
+//! The other half of the job is a bridge that is simply gone. An update
+//! restart ends every bundled sidecar, and Desktop usually starts a new bridge
+//! at once; when it does not, Desktop has no App Server and cannot send
+//! anything, while every check above reads the missing bridge as "nothing to
+//! recycle". [`LossWatch`] notices a dead bridge whose Desktop parent is still
+//! running, says so with a restart reason, and -- since no bridge means no
+//! open turn to lose -- restarts Desktop through the managed path after a
+//! grace period.
+//!
+//! The steward only ever ends a bridge with no turn open, on a launch Vellum
+//! holds the lease for, once per launch. Ending it mid-turn would cost the
+//! user the turn; ending it twice for the same launch means the first attempt
+//! found something a second one will not fix.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use crate::enhanced_runtime::attestation::BridgeAttestationV1;
+use crate::enhanced_runtime::LaunchManifestV1;
+use crate::model::RuntimeNotice;
+use crate::state::AppState;
+
+const FIRST_PASS: Duration = Duration::from_secs(10);
+const PASS_INTERVAL: Duration = Duration::from_secs(20);
+/// How long Desktop gets to start its own replacement bridge before the
+/// steward stops waiting for it.
+const LOSS_GRACE: Duration = Duration::from_secs(60);
+/// Managed restarts spent on one lost bridge. A restart that was refused is
+/// worth another look; one that ran and changed nothing is not.
+const LOSS_RESTART_ATTEMPTS: u8 = 3;
+const RECYCLE_READY_TIMEOUT: Duration = Duration::from_secs(90);
+const RECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+pub(crate) fn spawn(state: AppState) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FIRST_PASS).await;
+        let mut recycled = HashSet::<String>::new();
+        let mut loss = LossWatch::default();
+        loop {
+            if state.proxy_status().running {
+                steward_pass(&state, &mut recycled, &mut loss).await;
+            }
+            tokio::time::sleep(PASS_INTERVAL).await;
+        }
+    });
+}
+
+async fn steward_pass(state: &AppState, recycled: &mut HashSet<String>, loss: &mut LossWatch) {
+    let data_root = state.data_root();
+    let pass_root = data_root.clone();
+    let refresh_state = state.clone();
+    // Successor checks probe Codex binaries; none of it belongs on a runtime
+    // worker thread.
+    let refreshed = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = refresh_state.lifecycle_lock().try_lock() else {
+            return false;
+        };
+        if let Err(error) =
+            crate::enhanced_runtime::desktop_manager::refresh_official_successors(&pass_root)
+        {
+            log::warn!("[Enhanced] Official successor refresh failed kind={error:?}");
+        }
+        crate::enhanced_runtime::desktop_manager::roll_forward_official_successor(&pass_root)
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if refreshed {
+        state.record_live_applied(RuntimeNotice::new("enhancedLaunchFollowedCodexUpdate"));
+    }
+    let status_state = state.clone();
+    let Ok(status) = tokio::task::spawn_blocking(move || {
+        let guard = status_state.lifecycle_lock().try_lock();
+        let status = crate::enhanced_runtime::desktop_runtime_status(&status_state.data_root());
+        if guard.is_ok() {
+            status_state
+                .reconcile_codex_restart(crate::commands::runtime::codex_process_identity());
+            status_state.reconcile_enhanced_adoption(
+                (status.ready || status.bridge_protection_active) && !status.restart_required,
+            );
+        }
+        status
+    })
+    .await
+    else {
+        return;
+    };
+    // Rebuilding first and recycling second is the whole point of the order:
+    // the bridge Desktop starts next must find the new launch already there.
+    crate::commands::runtime::repair_superseded_launch(state, &status);
+    if let Some(target) = recycle_target(state, &data_root, &status, recycled) {
+        let launch_id = target.launch_id.clone();
+        if recycle(state, target).await {
+            recycled.insert(launch_id);
+        }
+    }
+    recover_lost_bridge(state, &status, loss).await;
+}
+
+/// What the steward owes a bridge that died under a running Desktop.
+#[derive(Debug, PartialEq, Eq)]
+enum LossStep {
+    Idle,
+    /// First sighting: tell the user, now, that Desktop is stuck.
+    Announce,
+    Restart,
+}
+
+#[derive(Default)]
+struct LossWatch {
+    seen: Option<(u32, Instant)>,
+    attempts: HashMap<u32, u8>,
+}
+
+impl LossWatch {
+    fn observe(&mut self, lost_pid: Option<u32>, now: Instant) -> LossStep {
+        let Some(pid) = lost_pid else {
+            self.seen = None;
+            return LossStep::Idle;
+        };
+        let since = match self.seen {
+            Some((seen_pid, since)) if seen_pid == pid => since,
+            _ => {
+                self.seen = Some((pid, now));
+                return LossStep::Announce;
+            }
+        };
+        let spent = self.attempts.get(&pid).copied().unwrap_or(0);
+        if now.duration_since(since) >= LOSS_GRACE && spent < LOSS_RESTART_ATTEMPTS {
+            self.attempts.insert(pid, spent + 1);
+            LossStep::Restart
+        } else {
+            LossStep::Idle
+        }
+    }
+}
+
+async fn recover_lost_bridge(
+    state: &AppState,
+    status: &crate::enhanced_runtime::DesktopRuntimeStatus,
+    loss: &mut LossWatch,
+) {
+    let lost =
+        if state.proxy_status().running && status.enabled && status.environment_state == "leased" {
+            let root = state.data_root();
+            tokio::task::spawn_blocking(move || {
+                crate::enhanced_runtime::desktop_manager::lost_bridge_attestation(&root)
+                    .map(|attestation| attestation.bridge_pid)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+    match loss.observe(lost, Instant::now()) {
+        LossStep::Idle => {}
+        LossStep::Announce => {
+            log::warn!(
+                "[Launch] bridge lost under a running Codex Desktop pid={}; restart in {}s unless Desktop recovers",
+                lost.unwrap_or_default(),
+                LOSS_GRACE.as_secs()
+            );
+            let notice = RuntimeNotice::new("enhancedBridgeLost");
+            match crate::commands::runtime::codex_process_identity() {
+                Some(identity) => state.mark_restart_required_for_process(notice, identity),
+                None => state.mark_restart_required(notice),
+            }
+        }
+        LossStep::Restart => {
+            log::warn!(
+                "[Launch] Codex Desktop still has no bridge after {}s; restarting it pid={}",
+                LOSS_GRACE.as_secs(),
+                lost.unwrap_or_default()
+            );
+            // Not forced: no bridge means no open turn, and anything that
+            // still objects (active requests, a lifecycle change) is a reason
+            // to ask again on a later pass.
+            match crate::commands::runtime::shared_restart_codex(state, false).await {
+                Ok(outcome) => state.record_live_applied(outcome.notice),
+                Err(error) => log::warn!("[Launch] bridge-loss restart failed: {error}"),
+            }
+        }
+    }
+}
+
+struct RecycleTarget {
+    launch_id: String,
+    attestation_path: std::path::PathBuf,
+    bridge_only: bool,
+    bridge_pid: u32,
+    reason: &'static str,
+}
+
+/// Why the live bridge should give way to the current launch, if it should.
+///
+/// Only the attestation and the manifest decide this; whether it is *safe*
+/// right now (lease, open turns, which process the pid is) is checked by the
+/// caller, separately, because those answers change by the second.
+fn recycle_reason(
+    manifest: &LaunchManifestV1,
+    attestation: &BridgeAttestationV1,
+    launch_would_drift: bool,
+) -> Option<&'static str> {
+    // A fresh bridge would only fall back again: the launch itself names a
+    // core Desktop no longer has, and rebuilding it is the repair's job.
+    if launch_would_drift {
+        return None;
+    }
+    if !attestation.matches_launch(&manifest.launch_id) {
+        return Some("supersededLaunch");
+    }
+    if !attestation.incomplete_official.is_empty() {
+        return Some("incompleteOfficial");
+    }
+    match attestation.fallback.as_deref() {
+        Some("leaseReleased") => Some("leaseRestored"),
+        // A fresh bridge serves the core Desktop ships, so recycling only helps
+        // once that core is the one this launch accepts. The pin surviving on
+        // disk is not enough: Desktop moved past it.
+        Some(_) if serves_accepted_core(manifest, attestation) => Some("successorApproved"),
+        Some(_) | None => None,
+    }
+}
+
+fn serves_accepted_core(manifest: &LaunchManifestV1, attestation: &BridgeAttestationV1) -> bool {
+    let served = attestation.official.binary_sha256.as_str();
+    served == manifest.official.artifact_sha256 || manifest.accepts_official_successor(served)
+}
+
+fn recycle_target(
+    state: &AppState,
+    data_root: &Path,
+    status: &crate::enhanced_runtime::DesktopRuntimeStatus,
+    recycled: &HashSet<String>,
+) -> Option<RecycleTarget> {
+    // A pending Enhanced core is promoted or rolled back by the managed
+    // restart, which watches the new launch through its first turn. Swapping
+    // the bridge underneath it here would skip that verdict.
+    if !state.proxy_status().running || !status.enabled || status.environment_state != "leased" {
+        return None;
+    }
+    let manifest = LaunchManifestV1::read(&LaunchManifestV1::path_in(data_root)).ok()?;
+    let Some(attestation) = crate::enhanced_runtime::live_bridge_attestation(data_root) else {
+        log::info!(
+            "[Launch] bridge recycle skipped reason=unreadableAttestation launch={}",
+            manifest.launch_id
+        );
+        return None;
+    };
+    if let Some(reason) = recycle_skip(
+        status.pending_core,
+        recycled.contains(&manifest.launch_id),
+        attestation.has_open_turn(),
+    ) {
+        log::info!(
+            "[Launch] bridge recycle skipped reason={reason} launch={} pid={}",
+            manifest.launch_id,
+            attestation.bridge_pid
+        );
+        return None;
+    }
+    let lease = crate::enhanced_runtime::env_lease::EnvironmentLease::read(data_root)?;
+    if lease.launch_id != manifest.launch_id {
+        return None;
+    }
+    let reason = recycle_reason(
+        &manifest,
+        &attestation,
+        crate::enhanced_runtime::official_drift::would_drift(&manifest)
+            || !crate::enhanced_runtime::official_drift::launch_is_complete(&manifest),
+    )?;
+    if !crate::enhanced_runtime::desktop_manager::adopted_by_codex_desktop(&attestation)
+        || attestation.has_open_turn()
+    {
+        return None;
+    }
+    Some(RecycleTarget {
+        launch_id: manifest.launch_id.clone(),
+        attestation_path: manifest.attestation_path.clone(),
+        bridge_only: manifest.enhanced.is_none(),
+        bridge_pid: attestation.bridge_pid,
+        reason,
+    })
+}
+
+fn recycle_skip(pending: bool, spent: bool, open: bool) -> Option<&'static str> {
+    if pending {
+        Some("pendingPromotion")
+    } else if spent {
+        Some("alreadyRecycled")
+    } else if open {
+        Some("openTurn")
+    } else {
+        None
+    }
+}
+
+/// True once the bridge was ended, whatever came back after it.
+async fn recycle(state: &AppState, target: RecycleTarget) -> bool {
+    let data_root = state.data_root();
+    let kill_state = state.clone();
+    let bridge_pid = target.bridge_pid;
+    let expected_launch = target.launch_id.clone();
+    let killed = tokio::task::spawn_blocking(move || {
+        // Launch publication and managed restarts own the bridge while they
+        // hold this; the next pass will look again.
+        let Ok(_guard) = kill_state.lifecycle_lock().try_lock() else {
+            return false;
+        };
+        // Read again immediately before acting: a turn opened since the pass
+        // began is the one thing this must never cut short.
+        let Some(current) = crate::enhanced_runtime::live_bridge_attestation(&data_root) else {
+            log::info!(
+                "[Launch] bridge recycle skipped reason=unreadableAttestation pid={bridge_pid}"
+            );
+            return false;
+        };
+        if current.bridge_pid != bridge_pid || current.has_open_turn() {
+            log::info!(
+                "[Launch] bridge recycle skipped reason=bridgeChangedOrOpenTurn pid={bridge_pid}"
+            );
+            return false;
+        }
+        let status = crate::enhanced_runtime::desktop_runtime_status(&data_root);
+        if status.pending_core {
+            log::info!("[Launch] bridge recycle skipped reason=pendingPromotion pid={bridge_pid}");
+            return false;
+        }
+        let Ok(manifest) = LaunchManifestV1::read(&LaunchManifestV1::path_in(&data_root)) else {
+            return false;
+        };
+        let lease = crate::enhanced_runtime::env_lease::EnvironmentLease::read(&data_root);
+        if manifest.launch_id != expected_launch
+            || !kill_state.proxy_status().running
+            || !status.enabled
+            || status.environment_state != "leased"
+            || !lease.is_some_and(|lease| lease.launch_id == manifest.launch_id)
+            || !crate::enhanced_runtime::desktop_manager::adopted_by_codex_desktop(&current)
+            || crate::enhanced_runtime::official_drift::would_drift(&manifest)
+            || !crate::enhanced_runtime::official_drift::launch_is_complete(&manifest)
+        {
+            return false;
+        }
+        let is_our_bridge = crate::enhanced_runtime::process_info::executable_of(bridge_pid)
+            .is_some_and(|path| {
+                crate::enhanced_runtime::process_info::is_bundled_sidecar_executable(&path)
+            });
+        if !is_our_bridge {
+            return false;
+        }
+        let Some(latest) = crate::enhanced_runtime::live_bridge_attestation(&data_root) else {
+            return false;
+        };
+        if latest.bridge_pid != bridge_pid || latest.has_open_turn() {
+            log::info!(
+                "[Launch] bridge recycle skipped reason=bridgeChangedOrOpenTurn pid={bridge_pid}"
+            );
+            return false;
+        }
+        match crate::enhanced_runtime::process_info::terminate_tree(bridge_pid) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("[Enhanced] cannot recycle bridge pid={bridge_pid}: {error}");
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !killed {
+        return false;
+    }
+    log::info!(
+        "[Launch] recycled idle bridge pid={} reason={} launch={}",
+        target.bridge_pid,
+        target.reason,
+        target.launch_id
+    );
+    let observed = await_launch_served(&target).await;
+    let status_state = state.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _guard = status_state.lifecycle_lock().blocking_lock();
+        let status = crate::enhanced_runtime::desktop_runtime_status(&status_state.data_root());
+        // #77 settles older reasons before any new process identity is bound.
+        // Bridge recycling itself does not satisfy catalog/config reasons.
+        status_state.reconcile_codex_restart(crate::commands::runtime::codex_process_identity());
+        status_state.reconcile_enhanced_adoption(
+            observed
+                && (status.ready || status.bridge_protection_active)
+                && !status.restart_required,
+        );
+    })
+    .await;
+    state.record_live_applied(
+        RuntimeNotice::new(if observed {
+            "enhancedBridgeRecycled"
+        } else {
+            "enhancedBridgeRecycleNotObserved"
+        })
+        .with("reason", target.reason)
+        .with("launchId", target.launch_id),
+    );
+    // Spent whatever the outcome: a bridge that does not come back ready has
+    // met a fault another recycle of the same launch will not fix.
+    true
+}
+
+fn served(attestation: &BridgeAttestationV1, launch_id: &str, bridge_only: bool) -> bool {
+    if bridge_only {
+        attestation.matches_launch(launch_id)
+            && attestation.fallback.is_none()
+            && attestation.incomplete_official.is_empty()
+            && attestation.is_live()
+            && attestation.official.initialized
+            && !attestation.official.exited
+    } else {
+        attestation.is_active_for(launch_id)
+    }
+}
+
+async fn await_launch_served(target: &RecycleTarget) -> bool {
+    let deadline = std::time::Instant::now() + RECYCLE_READY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if let Ok(attestation) = BridgeAttestationV1::read(&target.attestation_path) {
+            if attestation.bridge_pid != target.bridge_pid
+                && served(&attestation, &target.launch_id, target.bridge_only)
+                && crate::enhanced_runtime::desktop_manager::adopted_by_codex_desktop(&attestation)
+            {
+                return true;
+            }
+        }
+        tokio::time::sleep(RECYCLE_POLL_INTERVAL).await;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enhanced_runtime::attestation::{BridgeLifecycle, ChildAttestation};
+
+    fn manifest(launch_id: &str) -> LaunchManifestV1 {
+        serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "launchId": launch_id,
+            "createdAt": 1,
+            "official": {
+                "executable": "C:/codex.exe",
+                "artifactSha256": "sha256:a",
+                "runtimeDigest": "sha256:a",
+                "codexHome": "C:/home"
+            },
+            "modelProviderMapPath": "C:/map.json",
+            "modelProviderMapSha256": "sha256:m",
+            "bindingDb": "C:/bindings.sqlite3",
+            "officialProviderIds": ["openai-official"],
+            "thirdPartyProviderIds": [],
+            "featureProfile": {},
+            "enhancedCommit": "",
+            "attestationPath": "C:/bridge-attestation.json",
+            "qualificationJournalPath": "C:/journal.jsonl",
+            "relay": null
+        }))
+        .unwrap()
+    }
+
+    fn attestation(launch_id: &str, fallback: Option<&str>) -> BridgeAttestationV1 {
+        BridgeAttestationV1 {
+            schema_version: 1,
+            launch_id: launch_id.into(),
+            bridge_pid: std::process::id(),
+            parent_pid: 0,
+            parent_executable: None,
+            started_at: 0,
+            updated_at: 0,
+            state: BridgeLifecycle::Ready,
+            official: ChildAttestation::default(),
+            enhanced: ChildAttestation::default(),
+            model_provider_map_sha256: String::new(),
+            binding_db: "C:/bindings.sqlite3".into(),
+            binding_db_identity: String::new(),
+            enhanced_identity: None,
+            session_features_applied: 0,
+            open_turns: 0,
+            fallback: fallback.map(str::to_owned),
+            incomplete_official: Vec::new(),
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_lost_bridge_is_announced_then_restarted_after_the_grace_period() {
+        let start = Instant::now();
+        let mut watch = LossWatch::default();
+        assert_eq!(watch.observe(None, start), LossStep::Idle);
+        assert_eq!(watch.observe(Some(7), start), LossStep::Announce);
+        assert_eq!(
+            watch.observe(Some(7), start + Duration::from_secs(20)),
+            LossStep::Idle
+        );
+        assert_eq!(
+            watch.observe(Some(7), start + LOSS_GRACE),
+            LossStep::Restart
+        );
+    }
+
+    #[test]
+    fn a_bridge_that_comes_back_inside_the_grace_period_costs_nothing() {
+        let start = Instant::now();
+        let mut watch = LossWatch::default();
+        assert_eq!(watch.observe(Some(7), start), LossStep::Announce);
+        assert_eq!(
+            watch.observe(None, start + Duration::from_secs(20)),
+            LossStep::Idle
+        );
+        assert_eq!(
+            watch.observe(Some(7), start + LOSS_GRACE),
+            LossStep::Announce,
+            "a second loss starts its own grace period"
+        );
+    }
+
+    #[test]
+    fn restarting_for_one_lost_bridge_is_bounded() {
+        let start = Instant::now();
+        let mut watch = LossWatch::default();
+        watch.observe(Some(7), start);
+        let mut restarts = 0;
+        for pass in 0..20u64 {
+            let now = start + LOSS_GRACE + Duration::from_secs(20 * pass);
+            if watch.observe(Some(7), now) == LossStep::Restart {
+                restarts += 1;
+            }
+        }
+        assert_eq!(restarts, LOSS_RESTART_ATTEMPTS);
+    }
+
+    #[test]
+    fn only_an_unfinished_bridge_under_a_live_desktop_counts_as_lost() {
+        use crate::enhanced_runtime::desktop_manager::bridge_was_lost;
+        let mut bridge = attestation("L1", None);
+        assert!(bridge_was_lost(&bridge, false, true));
+        assert!(!bridge_was_lost(&bridge, true, true), "still serving");
+        assert!(
+            !bridge_was_lost(&bridge, false, false),
+            "Desktop is gone too"
+        );
+        bridge.state = BridgeLifecycle::Stopped;
+        assert!(!bridge_was_lost(&bridge, false, true), "stopped on its own");
+    }
+
+    #[test]
+    fn a_bridge_on_the_current_launch_is_left_alone() {
+        assert_eq!(
+            recycle_reason(&manifest("L2"), &attestation("L2", None), false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bridge_from_a_rebuilt_launch_gives_way() {
+        assert_eq!(
+            recycle_reason(&manifest("L2"), &attestation("L1", None), false),
+            Some("supersededLaunch")
+        );
+    }
+
+    #[test]
+    fn a_fallback_bridge_gives_way_once_the_launch_can_be_served() {
+        let mut manifest = manifest("L2");
+        assert_eq!(
+            recycle_reason(&manifest, &attestation("L2", Some("leaseReleased")), false),
+            Some("leaseRestored")
+        );
+        let mut drifted = attestation("L2", Some("officialDrift"));
+        drifted.official.binary_sha256 = "sha256:desktop".into();
+        assert_eq!(
+            recycle_reason(&manifest, &drifted, false),
+            None,
+            "Desktop's core is not approved yet; a new bridge would fall back again"
+        );
+        manifest.official_successors.push(
+            crate::enhanced_runtime::launch_manifest::OfficialSuccessor {
+                artifact_sha256: "sha256:desktop".into(),
+                source: "C:/WindowsApps/codex.exe".into(),
+                helpers: Vec::new(),
+            },
+        );
+        assert_eq!(
+            recycle_reason(&manifest, &drifted, false),
+            Some("successorApproved")
+        );
+    }
+
+    #[test]
+    fn nothing_is_recycled_into_a_launch_that_would_fall_back_again() {
+        let manifest = manifest("L2");
+        assert_eq!(
+            recycle_reason(&manifest, &attestation("L1", None), true),
+            None
+        );
+        assert_eq!(
+            recycle_reason(&manifest, &attestation("L2", Some("officialDrift")), true),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_superseded_launch_is_recycled_once_and_busy_passes_can_retry() {
+        let manifest = manifest("L2");
+        let mut bridge = attestation("L1", None);
+        assert_eq!(
+            recycle_reason(&manifest, &bridge, false),
+            Some("supersededLaunch")
+        );
+        let mut recycled = HashSet::new();
+        bridge.open_turns = 1;
+        assert_eq!(
+            recycle_skip(false, recycled.contains("L2"), bridge.has_open_turn()),
+            Some("openTurn")
+        );
+        bridge.open_turns = 0;
+        assert_eq!(
+            recycle_skip(false, recycled.contains("L2"), bridge.has_open_turn()),
+            None
+        );
+        recycled.insert("L2");
+        assert_eq!(
+            recycle_skip(false, recycled.contains("L2"), false),
+            Some("alreadyRecycled")
+        );
+        assert_eq!(recycle_skip(true, false, false), Some("pendingPromotion"));
+    }
+
+    #[test]
+    fn incomplete_official_is_recycled_only_into_a_complete_launch() {
+        let mut bridge = attestation("L2", None);
+        bridge
+            .incomplete_official
+            .push("codex-code-mode-host.exe".into());
+        assert_eq!(
+            recycle_reason(&manifest("L2"), &bridge, false),
+            Some("incompleteOfficial")
+        );
+        assert_eq!(recycle_reason(&manifest("L2"), &bridge, true), None);
+    }
+}

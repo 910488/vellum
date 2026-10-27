@@ -198,9 +198,74 @@ jobs:
           LOCK_BASE64="$(node -e 'process.stdout.write(require("node:fs").readFileSync("enhanced-runtime.lock.json").toString("base64"))')"
           echo "enhanced_core_lock=$LOCK_BASE64" >> "$GITHUB_OUTPUT"
 
+  # A Desktop update replaces the executable, and build.rs compiles the remote
+  # manifest's hash into it. Without this payload the installed app reports
+  # ReleaseManifestUnavailable for every one-click deploy, and an older payload
+  # left on disk fails that hash. So each Desktop update carries its own.
+  desktop-remote-payload:
+    name: Desktop remote payload (Linux)
+    needs: resolve
+    if: needs.resolve.outputs.component == 'desktop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build Linux remote payloads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/build-local-release.sh stage-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-remote-payload-linux
+          path: src-tauri/resources/remote
+          if-no-files-found: error
+          retention-days: 1
+
+  desktop-remote-payload-darwin:
+    name: Desktop remote payload (macOS ARM64)
+    needs: [resolve, desktop-remote-payload]
+    if: needs.resolve.outputs.component == 'desktop'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+      - uses: ./.github/actions/prepare-release-source
+        with:
+          tag: ${{ needs.resolve.outputs.tag }}
+          enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-remote-payload-linux
+          path: src-tauri/resources/remote
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build Darwin remote payload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/stage-remote-darwin-payload.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-remote-payload
+          path: src-tauri/resources/remote
+          if-no-files-found: error
+          retention-days: 1
+
   windows-updater:
     name: Windows NSIS updater asset
-    needs: resolve
+    needs: [resolve, desktop-remote-payload-darwin]
     if: needs.resolve.outputs.component == 'desktop'
     runs-on: windows-latest
     environment: release-signing
@@ -216,6 +281,11 @@ jobs:
         with:
           tag: ${{ needs.resolve.outputs.tag }}
           enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
+      - name: Download embedded remote payload
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-remote-payload
+          path: src-tauri/resources/remote
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -237,7 +307,7 @@ jobs:
 
   macos-updater:
     name: macOS updater archives
-    needs: resolve
+    needs: [resolve, desktop-remote-payload-darwin]
     if: needs.resolve.outputs.component == 'desktop'
     runs-on: macos-latest
     environment: release-signing
@@ -253,6 +323,11 @@ jobs:
         with:
           tag: ${{ needs.resolve.outputs.tag }}
           enhanced-core-lock: ${{ needs.resolve.outputs.enhanced_core_lock }}
+      - name: Download embedded remote payload
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-remote-payload
+          path: src-tauri/resources/remote
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -307,6 +382,8 @@ jobs:
         with:
           node-version: 22
       - name: Build Linux remote payloads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/build-local-release.sh stage-only
       - name: Pack architecture set
         run: |
@@ -456,6 +533,8 @@ jobs:
       - resolve
       - windows-updater
       - macos-updater
+      - desktop-remote-payload
+      - desktop-remote-payload-darwin
       - remote-linux
       - remote-darwin
       - core-from-lockfile

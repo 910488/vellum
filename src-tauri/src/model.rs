@@ -44,14 +44,15 @@ pub enum AuthKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AccessMode {
-    AnonymousFree,
+    /// Settings written while Vellum still offered OpenCode's free tier say
+    /// `anonymousFree`; they load as credentialed.
+    #[serde(alias = "anonymousFree")]
     Credentialed,
 }
 
 impl From<AccessMode> for vellum_proxy_runtime::RuntimeAccessMode {
     fn from(value: AccessMode) -> Self {
         match value {
-            AccessMode::AnonymousFree => vellum_proxy_runtime::RuntimeAccessMode::AnonymousFree,
             AccessMode::Credentialed => vellum_proxy_runtime::RuntimeAccessMode::Credentialed,
         }
     }
@@ -65,14 +66,6 @@ pub enum BudgetSource {
     ModelCache,
     Catalog,
     Fallback,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum CatalogScope {
-    #[default]
-    All,
-    FreeOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,8 +103,6 @@ pub struct Route {
     /// so they load as `Deny`. Official routes ignore this field.
     #[serde(default)]
     pub insecure_http_policy: InsecureHttpPolicy,
-    #[serde(default)]
-    pub catalog_scope: CatalogScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,8 +122,6 @@ pub struct CreateRouteInput {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub model_capabilities: Vec<ModelCapability>,
-    #[serde(default)]
-    pub catalog_scope: Option<CatalogScope>,
 }
 
 fn default_true() -> bool {
@@ -281,21 +270,11 @@ pub struct ModelCapability {
     /// `provider_ignores_unknown_effort`). `None` for every other status.
     #[serde(default)]
     pub effort_probe_issue: Option<String>,
-    /// Whether this model is free to use, per the provider's own catalog
-    /// metadata (currently populated for OpenCode Zen/Go only). `None` means
-    /// the provider has no free/paid distinction Vellum knows about, not
-    /// "known to be paid" — the UI should not render a badge either way.
-    #[serde(default)]
-    pub free: Option<bool>,
-    /// The provider has retired this model. Sourced from the same bundled
-    /// registry as `free`, and orthogonal to it: `deepseek-v4-flash-free`
-    /// still costs nothing and is still deprecated. A free-tier catalog has
-    /// to read both, or it keeps offering models the provider has withdrawn.
-    /// `None` means unknown, never "current".
+    /// The provider has retired this model, per the bundled OpenCode model
+    /// registry. `None` means unknown, never "current".
     #[serde(default)]
     pub deprecated: Option<bool>,
-    /// OpenCode authentication mode persisted per model. Official catalog
-    /// free Zen models are `anonymousFree`; paid, Go, and unknown models are
+    /// OpenCode authentication mode persisted per model; always
     /// `credentialed`. Omitted in older settings files.
     #[serde(default)]
     pub access_mode: Option<AccessMode>,

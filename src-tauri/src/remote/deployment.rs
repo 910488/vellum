@@ -246,6 +246,8 @@ struct StoredDeploymentPlan {
     /// caller to resupply the original selection.
     #[serde(default)]
     policy_overrides: RemotePolicyOverrides,
+    #[serde(default)]
+    deferred_catalog_ids: Vec<String>,
 }
 
 fn bundled_proxy_image() -> AppResult<String> {
@@ -256,18 +258,42 @@ fn bundled_proxy_image() -> AppResult<String> {
         // the bundled manifest. Otherwise plan() stores `:local` and apply()
         // rejects its own plan as a manifest change before deployment.
         if std::env::var_os("VELLUM_LIVE_SSH_ALIAS").is_some() {
-            return Ok(crate::remote::pinned_install::load_verified_manifest()?
-                .proxy
-                .image);
+            return proxy_release_identity(
+                &crate::remote::pinned_install::load_verified_manifest()?
+            );
         }
         Ok("vellum-proxy:local".into())
     }
     #[cfg(not(test))]
     {
-        Ok(crate::remote::pinned_install::load_verified_manifest()?
-            .proxy
-            .image)
+        proxy_release_identity(&crate::remote::pinned_install::load_verified_manifest()?)
     }
+}
+
+// StoredPlan.image also carries a native release identity on schema 5. This
+// value is never sent to Docker or stored as a native InstallRecord.image.
+fn proxy_release_identity(
+    manifest: &crate::remote::pinned_install::ReleaseManifest,
+) -> AppResult<String> {
+    if manifest.schema_version >= 5 {
+        let artifacts = serde_json::to_string(&manifest.proxy.artifacts)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        Ok(format!("native-sha256:{}", hash(&artifacts)))
+    } else {
+        Ok(manifest.proxy.image.clone())
+    }
+}
+
+fn native_proxy_install_needed(status: &Value, digest: &str) -> bool {
+    status
+        .pointer("/install/proxyBackend")
+        .and_then(Value::as_str)
+        != Some("native")
+        || status
+            .pointer("/install/nativeExecutableDigest")
+            .and_then(Value::as_str)
+            != Some(digest)
+        || status.pointer("/proxy/present").and_then(Value::as_bool) != Some(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,30 +406,242 @@ pub fn plan(
     host_id: &str,
     selection: RemoteModelSelection,
 ) -> AppResult<RemoteDeploymentPlan> {
-    RemoteHostManager::resolve_target(state, host_id)?;
-    let proxy_image = bundled_proxy_image()?;
+    plan_scoped(state, host_id, selection, None, &[])
+}
+
+/// One-click converge opts in to credential-aware selection. Explicit manual
+/// plans keep their existing strict validation and mandatory Official models.
+pub(crate) fn plan_for_converge(
+    state: &AppState,
+    host_id: &str,
+    desired: &super::desired_state::RemoteHostDesiredState,
+) -> AppResult<(RemoteDeploymentPlan, super::converge_models::Selection)> {
+    let selected = select_for_converge(state, host_id, desired)?;
+    let scope = selected
+        .catalog_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let plan = plan_scoped(
+        state,
+        host_id,
+        RemoteModelSelection {
+            catalog_ids: selected.catalog_ids.clone(),
+            policy: desired.policy_overrides.clone(),
+        },
+        Some(&scope),
+        &selected.omitted_catalog_ids,
+    )?;
+    Ok((plan, selected))
+}
+
+pub(crate) fn select_for_converge(
+    state: &AppState,
+    host_id: &str,
+    desired: &super::desired_state::RemoteHostDesiredState,
+) -> AppResult<super::converge_models::Selection> {
     let routes = state.routes();
-    let all_models = state.model_routes();
     let codex_paths = crate::codex::CodexPaths::discover(&state.data_root());
     let official_catalog = crate::catalog::read_official_catalog(&codex_paths.models_cache);
-    let hidden_official_models = hidden_official_model_ids(official_catalog.as_ref());
+    let hidden = hidden_official_model_ids(official_catalog.as_ref());
+    let available = qualified_remote_models(state, &routes, &hidden);
+    let account_id = super::desktop_control_account_id(state);
+    let requested = desired.converge_catalog_ids();
+    let wanted = |model: &crate::model::ModelRoute| {
+        requested.is_empty() || requested.contains(&model.catalog_id)
+    };
+    let official_wanted = available.iter().any(|model| {
+        wanted(model)
+            && routes.iter().any(|route| {
+                route.id == model.route_id && route.provider_kind == ProviderKind::Official
+            })
+    });
+    let account = super::converge_models::observe_official_account(
+        official_wanted,
+        account_id.as_deref(),
+        || RemoteHostManager::resolve_target(state, host_id),
+        |target, id| RemoteAgentClient::new(target).codex_account_status(Some(id)),
+    )?;
+    let official_ready =
+        super::converge_models::official_account_ready(account_id.as_deref(), account.as_ref());
+    let official_blocker = if account_id.is_none() {
+        "desktopOfficialAccountMissing"
+    } else if account.is_none() {
+        "officialAccountStatusUnavailable"
+    } else {
+        match account
+            .as_ref()
+            .and_then(|status| status.get("state"))
+            .and_then(Value::as_str)
+        {
+            Some("activationRequired") => "officialAccountActivationRequired",
+            Some("reauthenticationRequired") => "officialAccountReauthenticationRequired",
+            Some("pairingRequired" | "pairingPending" | "accountUnavailable") => {
+                "officialAccountPairingRequired"
+            }
+            _ => "officialAccountStatusUnavailable",
+        }
+    };
+    let mut ready_routes = BTreeSet::new();
+    for route in routes.iter().filter(|route| {
+        available
+            .iter()
+            .any(|model| wanted(model) && model.route_id == route.id)
+    }) {
+        let ready = if route.provider_kind == ProviderKind::Official {
+            official_ready
+        } else {
+            match route.auth_kind {
+                AuthKind::Bearer => crate::credentials::load(&state.data_root(), &route.id)?
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+                AuthKind::GrokSession => state
+                    .grok_accounts()
+                    .default_account_home()
+                    .ok()
+                    .and_then(|(_, home)| crate::grok_auth::read_credential(&home).ok().flatten())
+                    .is_some(),
+                AuthKind::None => true,
+                AuthKind::ChatGpt => false,
+            }
+        };
+        if ready {
+            ready_routes.insert(route.id.clone());
+        }
+    }
+    let candidates = available
+        .iter()
+        .map(|model| super::converge_models::Candidate {
+            catalog_id: model.catalog_id.clone(),
+            official: routes.iter().any(|route| {
+                route.id == model.route_id && route.provider_kind == ProviderKind::Official
+            }),
+            credential_available: ready_routes.contains(&model.route_id),
+        })
+        .collect::<Vec<_>>();
+    super::converge_models::select(&requested, &candidates, official_blocker)
+}
+
+pub(crate) fn model_options(state: &AppState, host_id: &str) -> AppResult<Vec<RemoteModelOption>> {
+    RemoteHostManager::resolve_target(state, host_id)?;
+    let desired = super::desired_state::load(&state.data_root(), host_id)?;
+    let requested = desired.converge_catalog_ids();
+    let routes = state.routes();
+    let paths = crate::codex::CodexPaths::discover(&state.data_root());
+    let catalog = crate::catalog::read_official_catalog(&paths.models_cache);
+    Ok(
+        qualified_remote_models(state, &routes, &hidden_official_model_ids(catalog.as_ref()))
+            .into_iter()
+            .map(|model| {
+                let mandatory = routes.iter().any(|route| {
+                    route.id == model.route_id && route.provider_kind == ProviderKind::Official
+                });
+                RemoteModelOption {
+                    selected: mandatory
+                        || requested.is_empty()
+                        || requested.contains(&model.catalog_id),
+                    mandatory,
+                    catalog_id: model.catalog_id,
+                    display_name: model.display_name,
+                    route_id: model.route_id,
+                    upstream_model: model.upstream_model,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn qualified_remote_models(
+    state: &AppState,
+    routes: &[crate::model::Route],
+    hidden_official: &BTreeSet<String>,
+) -> Vec<crate::model::ModelRoute> {
     let allowed = routes
         .iter()
         .filter(|route| route.enabled && !RETIRED_REMOTE_ROUTE_IDS.contains(&route.id.as_str()))
         .map(|route| route.id.as_str())
         .collect::<BTreeSet<_>>();
-    let available = all_models
-        .iter()
+    state
+        .model_routes()
+        .into_iter()
         .filter(|model| allowed.contains(model.route_id.as_str()))
         .filter(|model| {
             !routes.iter().any(|route| {
                 route.id == model.route_id
                     && route.provider_kind == ProviderKind::Official
-                    && hidden_official_models.contains(&model.catalog_id)
+                    && hidden_official.contains(&model.catalog_id)
             })
         })
         .filter(|model| remote_model_is_qualified(state, model))
-        .cloned()
+        .collect()
+}
+
+/// Local eligibility only: remote grants are observed after Agent availability
+/// is established. A current Desktop identity may pair later if Official is
+/// the only usable provider. Credential read failures remain errors.
+pub(crate) fn preflight_models(state: &AppState, host_id: &str) -> AppResult<()> {
+    let desired = super::desired_state::load(&state.data_root(), host_id)?;
+    let requested = desired.converge_catalog_ids();
+    let routes = state.routes();
+    let paths = crate::codex::CodexPaths::discover(&state.data_root());
+    let catalog = crate::catalog::read_official_catalog(&paths.models_cache);
+    let models =
+        qualified_remote_models(state, &routes, &hidden_official_model_ids(catalog.as_ref()));
+    let mut ready = false;
+    let mut official = false;
+    for route in routes.iter().filter(|route| {
+        models.iter().any(|model| {
+            model.route_id == route.id
+                && (requested.is_empty() || requested.contains(&model.catalog_id))
+        })
+    }) {
+        if route.provider_kind == ProviderKind::Official {
+            official = true;
+            ready |= super::desktop_control_account_id(state).is_some();
+        } else {
+            ready |= match route.auth_kind {
+                AuthKind::Bearer => crate::credentials::load(&state.data_root(), &route.id)?
+                    .is_some_and(|secret| !secret.trim().is_empty()),
+                AuthKind::GrokSession => state
+                    .grok_accounts()
+                    .default_account_home()
+                    .ok()
+                    .and_then(|(_, home)| crate::grok_auth::read_credential(&home).ok().flatten())
+                    .is_some(),
+                AuthKind::None => true,
+                AuthKind::ChatGpt => false,
+            };
+        }
+    }
+    if ready {
+        Ok(())
+    } else {
+        Err(AppError::Message(
+            if official {
+                "desktopOfficialAccountMissing"
+            } else {
+                "noDeployableModels"
+            }
+            .into(),
+        ))
+    }
+}
+
+fn plan_scoped(
+    state: &AppState,
+    host_id: &str,
+    selection: RemoteModelSelection,
+    scope: Option<&BTreeSet<String>>,
+    deferred_catalog_ids: &[String],
+) -> AppResult<RemoteDeploymentPlan> {
+    RemoteHostManager::resolve_target(state, host_id)?;
+    let proxy_image = bundled_proxy_image()?;
+    let routes = state.routes();
+    let codex_paths = crate::codex::CodexPaths::discover(&state.data_root());
+    let official_catalog = crate::catalog::read_official_catalog(&codex_paths.models_cache);
+    let hidden_official_models = hidden_official_model_ids(official_catalog.as_ref());
+    let available = qualified_remote_models(state, &routes, &hidden_official_models)
+        .into_iter()
+        .filter(|model| scope.is_none_or(|ids| ids.contains(&model.catalog_id)))
         .collect::<Vec<_>>();
     let requested = selection
         .catalog_ids
@@ -565,8 +803,28 @@ pub fn plan(
     // disagree.
     let review_policy_fingerprint =
         review_policy_fingerprint_for(&review, selection.policy.auto_review_enabled);
+    let target = RemoteHostManager::resolve_target(state, host_id)?;
+    let client = RemoteAgentClient::new(target);
+    let agent_status = client.host_status();
+    let previous_desired_state = super::desired_state::load(&state.data_root(), host_id)?;
+    let mut identity = deployment_identity_from_status(agent_status.as_ref().ok(), &proxy_image);
+    if let Err(error) = resolve_plan_proxy_port(
+        identity.as_mut(),
+        previous_desired_state.proxy_port,
+        |preferred| client.proxy_select_port(preferred),
+    ) {
+        blocked.push(if error.to_string().contains("proxyPortConflict:") {
+            "proxyPortConflict".into()
+        } else {
+            format!("proxyPortSelectionFailed:{error}")
+        });
+    }
+    let planned_port = identity
+        .as_ref()
+        .map(|identity| identity.host_port)
+        .unwrap_or(crate::remote::platform::LINUX_PROXY_PORT);
     let mut config = ProxyRuntimeConfig {
-        listen: "0.0.0.0:15721".parse().expect("static address"),
+        listen: std::net::SocketAddr::from(([127, 0, 0, 1], planned_port)),
         data_dir: PathBuf::from("/var/lib/vellum/data"),
         history_dir: PathBuf::from("/var/lib/vellum/history"),
         log_dir: PathBuf::from("/var/log/vellum"),
@@ -593,8 +851,6 @@ pub fn plan(
     let config_toml = toml_edit::ser::to_string_pretty(&config)
         .map_err(|error| AppError::Message(format!("encode remote config failed: {error}")))?;
 
-    let target = RemoteHostManager::resolve_target(state, host_id)?;
-    let agent_status = RemoteAgentClient::new(target).host_status();
     let (remote_config_hash, remote_catalog_hash, lease_state, native) = match &agent_status {
         Ok(status) => (
             status
@@ -756,7 +1012,6 @@ pub fn plan(
     let plan_id = ulid::Ulid::new().to_string();
     let expires_at = Utc::now() + Duration::minutes(PLAN_TTL_MINUTES);
     let desired_revision = super::desired_state::next_revision(&state.data_root(), host_id)?;
-    let previous_desired_state = super::desired_state::load(&state.data_root(), host_id)?;
     let observed_revision = previous_desired_state.observed_revision;
     // Gated on `observed_revision > 0`: a host that has never been applied
     // has nothing to "reapply" yet (the general blocked/needs-configure
@@ -811,7 +1066,6 @@ pub fn plan(
             }
         })
         .collect::<Vec<_>>();
-    let identity = deployment_identity_from_status(agent_status.as_ref().ok(), &proxy_image);
     let plan_hash = plan_fingerprint_with_identity(
         &selected_ids,
         &desired_remote_config_hash,
@@ -885,7 +1139,9 @@ pub fn plan(
         platform: identity.as_ref().map(|item| item.platform.clone()),
         proxy_backend: identity.as_ref().map(|item| item.proxy_backend.clone()),
         host_port: identity.as_ref().map(|item| item.host_port),
-        managed_codex_home: identity.as_ref().map(|item| item.managed_codex_home.clone()),
+        managed_codex_home: identity
+            .as_ref()
+            .map(|item| item.managed_codex_home.clone()),
         artifact_id: identity.as_ref().map(|item| item.artifact_id.clone()),
     };
     super::desired_state::save(
@@ -896,8 +1152,10 @@ pub fn plan(
             observed_revision,
             last_plan_id: Some(plan_id.clone()),
             selected_catalog_ids: selected_ids.iter().cloned().collect(),
+            deferred_catalog_ids: deferred_catalog_ids.to_vec(),
             config_hash: Some(public.drift.desired_config_hash.clone()),
             catalog_hash: Some(public.drift.desired_catalog_hash.clone()),
+            proxy_port: public.host_port,
             policy_overrides: selection.policy.clone(),
             review_policy_fingerprint: Some(review_policy_fingerprint),
             applied_review_policy_fingerprint: previous_desired_state
@@ -911,6 +1169,7 @@ pub fn plan(
         image: proxy_image,
         route_ids: selected_route_ids.into_iter().collect(),
         policy_overrides: selection.policy,
+        deferred_catalog_ids: deferred_catalog_ids.to_vec(),
     };
     store_plan(&state.data_root(), &stored)?;
     Ok(public)
@@ -941,6 +1200,25 @@ pub struct DeploymentIdentity {
     pub host_port: u16,
     pub managed_codex_home: String,
     pub artifact_id: String,
+}
+
+/// Recheck persisted intent against the live listener on every converge. A
+/// saved port is a preference, never evidence that the port is still free.
+fn resolve_plan_proxy_port(
+    identity: Option<&mut DeploymentIdentity>,
+    saved_port: Option<u16>,
+    select: impl FnOnce(Option<u16>) -> AppResult<u16>,
+) -> AppResult<()> {
+    if let Some(identity) = identity {
+        if identity.proxy_backend == crate::remote::platform::PROXY_BACKEND_NATIVE {
+            let port = select(saved_port.or(Some(identity.host_port)))?;
+            if port == 0 {
+                return Err(AppError::Message("NativeProxyPortSelectionInvalid".into()));
+            }
+            identity.host_port = port;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -983,9 +1261,7 @@ fn deployment_identity_from_status(
     artifact_id: &str,
 ) -> Option<DeploymentIdentity> {
     let status = status?;
-    let os = status
-        .pointer("/capabilities/os")
-        .and_then(Value::as_str)?;
+    let os = status.pointer("/capabilities/os").and_then(Value::as_str)?;
     let arch = status
         .pointer("/capabilities/arch")
         .and_then(Value::as_str)?;
@@ -1149,6 +1425,80 @@ fn remote_model_is_qualified(state: &AppState, model: &crate::model::ModelRoute)
 }
 
 pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<RemoteApplyResult> {
+    let mut recovery_needed = false;
+    let result = apply_inner(state, host_id, plan_id, &mut recovery_needed).await;
+    if !recovery_needed {
+        return result;
+    }
+    let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
+    let attempt = ulid::Ulid::new();
+    complete_migration(
+        result,
+        || client.proxy_migration_commit(&format!("migration-commit-{attempt}")),
+        || client.proxy_migration_rollback(&format!("migration-rollback-{attempt}")),
+    )
+}
+
+fn migration_recovery_available(version: &Value, status: &Value) -> AppResult<bool> {
+    let supported = version
+        .get("proxyMigrationRecovery")
+        .and_then(Value::as_bool)
+        == Some(true);
+    // Status observes the platform's preferred native backend even when the
+    // persisted install is still Docker. The install record is authoritative.
+    let legacy = match status.get("install").filter(|install| !install.is_null()) {
+        Some(install) => install.get("proxyBackend").and_then(Value::as_str) != Some("native"),
+        None => {
+            status
+                .pointer("/proxy/proxyBackend")
+                .and_then(Value::as_str)
+                == Some("docker")
+        }
+    };
+    if !supported && legacy {
+        return Err(AppError::Message(
+            "ProxyMigrationAgentUpgradeRequired".into(),
+        ));
+    }
+    Ok(supported)
+}
+
+fn complete_migration<T>(
+    result: AppResult<T>,
+    commit: impl FnOnce() -> AppResult<serde_json::Value>,
+    rollback: impl FnOnce() -> AppResult<serde_json::Value>,
+) -> AppResult<T> {
+    let error = match result {
+        Ok(value) => match commit() {
+            Ok(_) => return Ok(value),
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    match rollback() {
+        Ok(value)
+            if value
+                .pointer("/detail/migrationRestored")
+                .and_then(|value| value.as_bool())
+                == Some(true) =>
+        {
+            Err(AppError::Message(format!(
+                "ProxyMigrationRolledBack: {error}"
+            )))
+        }
+        Ok(_) => Err(error),
+        Err(recovery) => Err(AppError::Message(format!(
+            "ProxyMigrationRecoveryFailed: {recovery}; cause: {error}"
+        ))),
+    }
+}
+
+async fn apply_inner(
+    state: &AppState,
+    host_id: &str,
+    plan_id: &str,
+    recovery_needed: &mut bool,
+) -> AppResult<RemoteApplyResult> {
     let stored = load_plan(&state.data_root(), plan_id)?;
     if stored.public.host_id != host_id {
         return Err(AppError::Message("DeploymentPlanHostMismatch".into()));
@@ -1163,9 +1513,12 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         )));
     }
     let client = RemoteAgentClient::new(RemoteHostManager::resolve_target(state, host_id)?);
-    let operation_id = format!("native-{plan_id}");
+    // A compensated attempt has restored old config/credentials. Its completed
+    // per-phase RPCs must not replay into a new attempt after that rollback.
+    let operation_id = format!("native-{plan_id}-{}", ulid::Ulid::new());
+    super::bootstrap::preflight_linux_host(state, host_id)?;
     let mut steps = Vec::new();
-    client.agent_version()?;
+    let version = client.agent_version()?;
     client.codex_discover_native()?;
     steps.push("compatibility.verified".into());
 
@@ -1188,17 +1541,49 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         .get("running")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let needs_install = proxy_install_needed(&agent_status, &stored.image);
-    // `proxy.install` lays down the image's bootstrap/mock configuration.
-    // Even when the previously running install already matched the desired
-    // hash, an image replacement must re-apply the desired configuration or
-    // the new container will start with only `vellum-mock` configured.
-    let needs_configure = stored.public.drift.config_changed || needs_install;
+    let manifest = crate::remote::pinned_install::load_verified_manifest()?;
+    if proxy_release_identity(&manifest)? != stored.image {
+        return Err(AppError::Message("DeploymentProxyManifestChanged".into()));
+    }
+    let os = agent_status
+        .pointer("/capabilities/os")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Message("host status missing capabilities.os".into()))?;
+    let arch = agent_status
+        .pointer("/capabilities/arch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Message("host status missing capabilities.arch".into()))?;
+    let platform = crate::remote::platform::RemotePlatform::from_os_arch(os, arch)
+        .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
+    let native_artifact =
+        if platform.proxy_backend() == crate::remote::platform::ProxyBackend::Native {
+            Some(
+                crate::remote::pinned_install::component_artifact_for_os_arch(
+                    &manifest,
+                    "vellum-proxy-daemon",
+                    os,
+                    arch,
+                )?,
+            )
+        } else {
+            None
+        };
+    let needs_install = match &native_artifact {
+        Some(artifact) => native_proxy_install_needed(&agent_status, &artifact.sha256),
+        None => proxy_install_needed(&agent_status, &stored.image),
+    };
+    // Reconfigure after component replacement so the Agent resolves the new
+    // install identity and upgrades legacy configuration in the normal phase.
+    let port_changed = stored.public.host_port.is_some_and(|port| {
+        status.get("hostPort").and_then(Value::as_u64) != Some(u64::from(port))
+    });
+    let needs_configure = stored.public.drift.config_changed || needs_install || port_changed;
     let needs_proxy_mutation = needs_install || needs_configure;
     let needs_native_apply_preview = needs_proxy_mutation
         || stored.public.drift.catalog_changed
         || stored.public.restart_required;
-    if !needs_install && !needs_configure && !needs_native_apply_preview {
+    *recovery_needed = migration_recovery_available(&version, &agent_status)?;
+    if running && !needs_install && !needs_configure && !needs_native_apply_preview {
         steps.push("apply.noop".into());
         return Ok(RemoteApplyResult {
             operation_id,
@@ -1233,24 +1618,27 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         steps.push("proxy.stoppedForConfiguration".into());
     }
     if needs_install {
-        let manifest = crate::remote::pinned_install::load_verified_manifest()?;
-        if manifest.proxy.image != stored.image {
-            return Err(AppError::Message("DeploymentProxyManifestChanged".into()));
-        }
-        let inventory = client.host_inventory_v2()?;
-        let arch = inventory
-            .pointer("/system/arch")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Message("host inventory missing system.arch".into()))?;
-        let os = inventory
-            .pointer("/system/os")
-            .and_then(Value::as_str)
-            .unwrap_or("linux");
-        let native = crate::remote::platform::RemotePlatform::from_os_arch(os, arch)
-            .map(|platform| platform.proxy_backend() == crate::remote::platform::ProxyBackend::Native)
-            .unwrap_or(false);
-        if native {
-            client.proxy_install(&format!("{operation_id}-install"), "", None)?;
+        if let Some(artifact) = native_artifact.as_ref() {
+            let staged = crate::remote::pinned_install::download_artifact(artifact)?;
+            let install_result = (|| -> AppResult<()> {
+                let bytes = fs::read(&staged).map_err(|error| {
+                    AppError::Message(format!("read native proxy artifact: {error}"))
+                })?;
+                let remote_path = format!("/tmp/vellum-proxy-stage-{}.bin", ulid::Ulid::new());
+                let result = (|| -> AppResult<()> {
+                    client.stage_artifact(&remote_path, &bytes)?;
+                    client.proxy_update(
+                        &format!("{operation_id}-install"),
+                        &remote_path,
+                        Some(&artifact.sha256),
+                    )?;
+                    Ok(())
+                })();
+                client.remove_remote_file(&remote_path);
+                result
+            })();
+            let _ = fs::remove_file(&staged);
+            install_result?;
             steps.push("proxy.installedNative".into());
         } else {
             let artifact = crate::remote::pinned_install::proxy_artifact_for_arch(&manifest, arch)?;
@@ -1332,8 +1720,12 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         steps.push("proxy.configured".into());
     }
     let proxy = if !running || needs_proxy_mutation {
-        let listen_port = stored.public.host_port.unwrap_or(15721);
-        let value = client.proxy_start(&format!("{operation_id}-start"), Some(listen_port), None)?;
+        let listen_port = stored
+            .public
+            .host_port
+            .unwrap_or_else(|| platform.default_proxy_port());
+        let value =
+            client.proxy_start(&format!("{operation_id}-start"), Some(listen_port), None)?;
         steps.push("proxy.ready".into());
         value
     } else {
@@ -1341,6 +1733,7 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
         status
     };
     let needs_native_apply = needs_proxy_mutation
+        || !running
         || stored.public.drift.catalog_changed
         || stored.public.restart_required;
     let (native_adopt, native_runtime) = if needs_native_apply {
@@ -1401,8 +1794,19 @@ pub async fn apply(state: &AppState, host_id: &str, plan_id: &str) -> AppResult<
             observed_revision: stored.public.desired_revision,
             last_plan_id: Some(plan_id.into()),
             selected_catalog_ids: stored.public.selected_catalog_ids.clone(),
-            config_hash: Some(stored.public.drift.desired_config_hash.clone()),
+            deferred_catalog_ids: stored.deferred_catalog_ids.clone(),
+            config_hash: Some(
+                proxy
+                    .get("configHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&stored.public.drift.desired_config_hash)
+                    .to_string(),
+            ),
             catalog_hash: Some(stored.public.drift.desired_catalog_hash.clone()),
+            proxy_port: proxy
+                .get("hostPort")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok()),
             policy_overrides: stored.policy_overrides.clone(),
             review_policy_fingerprint: Some(stored.public.drift.review_policy_fingerprint.clone()),
             // This apply just succeeded, so desired and applied agree.
@@ -1494,6 +1898,73 @@ mod desktop_parity;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converge_rechecks_an_occupied_port_from_desired_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let desired = super::super::desired_state::RemoteHostDesiredState {
+            host_id: "rebooted".into(),
+            proxy_port: Some(15760),
+            ..Default::default()
+        };
+        super::super::desired_state::save(temp.path(), &desired).unwrap();
+        let desired = super::super::desired_state::load(temp.path(), "rebooted").unwrap();
+        let client = vellum_remote_agent::native_proxy::MemoryLaunchd::default();
+        client.busy_ports.lock().unwrap().insert(15760);
+        let mut identity = DeploymentIdentity {
+            platform: "linux-arm64".into(),
+            proxy_backend: "native".into(),
+            host_port: 15760,
+            managed_codex_home: "/home/remote/.vellum-remote/codex".into(),
+            artifact_id: "native-digest".into(),
+        };
+        resolve_plan_proxy_port(Some(&mut identity), desired.proxy_port, |preferred| {
+            assert_eq!(preferred, Some(15760));
+            vellum_remote_agent::native_proxy::select_native_port(&client, preferred.unwrap(), None)
+                .map_err(AppError::Message)
+        })
+        .unwrap();
+        assert_ne!(identity.host_port, 15760);
+        assert!(!client
+            .busy_ports
+            .lock()
+            .unwrap()
+            .contains(&identity.host_port));
+        *client.port_busy.lock().unwrap() = true;
+        let before = identity.clone();
+        assert!(
+            resolve_plan_proxy_port(Some(&mut identity), desired.proxy_port, |preferred| {
+                vellum_remote_agent::native_proxy::select_native_port(
+                    &client,
+                    preferred.unwrap(),
+                    None,
+                )
+                .map_err(AppError::Message)
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("proxyPortConflict:")
+        );
+        assert_eq!(
+            identity, before,
+            "failed probing must not replace the plan's port with a fabricated value"
+        );
+    }
+
+    #[test]
+    fn native_proxy_install_identity_uses_binary_digest_and_requires_migration() {
+        let mut status = serde_json::json!({
+            "proxy": {"present": true},
+            "install": {"image": "", "proxyBackend": "native", "nativeExecutableDigest": "current"}
+        });
+        assert!(!native_proxy_install_needed(&status, "current"));
+        assert!(native_proxy_install_needed(&status, "new"));
+        status["install"]["proxyBackend"] = "docker".into();
+        assert!(native_proxy_install_needed(&status, "current"));
+        status["install"]["proxyBackend"] = "native".into();
+        status["proxy"]["present"] = false.into();
+        assert!(native_proxy_install_needed(&status, "current"));
+    }
 
     #[test]
     fn desktop_bearer_secret_qualifies_the_detached_deployment() {
@@ -1697,33 +2168,18 @@ mod tests {
             managed_codex_home: "/Users/joshhuang/.vellum-remote/codex".into(),
             artifact_id: "sha256:abc".into(),
         };
-        let with_id = plan_fingerprint_with_identity(
-            &selected,
-            "cfg-a",
-            "cat-b",
-            "",
-            Some(&identity),
-        );
-        let again = plan_fingerprint_with_identity(
-            &selected,
-            "cfg-a",
-            "cat-b",
-            "",
-            Some(&identity),
-        );
+        let with_id =
+            plan_fingerprint_with_identity(&selected, "cfg-a", "cat-b", "", Some(&identity));
+        let again =
+            plan_fingerprint_with_identity(&selected, "cfg-a", "cat-b", "", Some(&identity));
         assert_eq!(with_id, again);
         assert!(apply_is_noop(&with_id, &again));
         let other_port = DeploymentIdentity {
             host_port: 15723,
             ..identity.clone()
         };
-        let changed = plan_fingerprint_with_identity(
-            &selected,
-            "cfg-a",
-            "cat-b",
-            "",
-            Some(&other_port),
-        );
+        let changed =
+            plan_fingerprint_with_identity(&selected, "cfg-a", "cat-b", "", Some(&other_port));
         assert!(!apply_is_noop(&with_id, &changed));
     }
 
@@ -1778,7 +2234,6 @@ mod tests {
                 selected_models: Some(vec!["qwen3.6".into()]),
                 context_window: Some(131_072),
                 model_capabilities: vec![qualified()],
-                catalog_scope: None,
             },
             crate::model::ProviderKind::OpenAiCompatible,
             crate::model::AuthKind::Bearer,
@@ -1798,7 +2253,6 @@ mod tests {
                 selected_models: Some(vec!["wu-model".into()]),
                 context_window: Some(131_072),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             crate::model::ProviderKind::OpenAiCompatible,
             crate::model::AuthKind::Bearer,
@@ -1911,7 +2365,6 @@ mod tests {
                 selected_models: Some(vec!["parity-model".into()]),
                 context_window: Some(131_072),
                 model_capabilities: vec![qualified],
-                catalog_scope: None,
             },
             crate::model::ProviderKind::OpenAiCompatible,
             crate::model::AuthKind::None,
@@ -2037,7 +2490,6 @@ mod tests {
                 selected_models: Some(vec!["parity-model".into()]),
                 context_window: Some(131_072),
                 model_capabilities: vec![qualified],
-                catalog_scope: None,
             },
             crate::model::ProviderKind::OpenAiCompatible,
             crate::model::AuthKind::None,
@@ -2294,7 +2746,6 @@ mod tests {
                 selected_models: Some(vec!["changed-model".into()]),
                 context_window: Some(128_000),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             crate::model::ProviderKind::OpenAiCompatible,
             crate::model::AuthKind::None,
@@ -2369,7 +2820,6 @@ mod tests {
                 selected_models: Some(vec!["some-other-model".into()]),
                 context_window: Some(128_000),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             crate::model::ProviderKind::OpenAiCompatible,
             crate::model::AuthKind::None,
@@ -2419,7 +2869,6 @@ mod tests {
                         selected_models: Some(vec![model.into()]),
                         context_window: Some(131_072),
                         model_capabilities: capability.into_iter().collect(),
-                        catalog_scope: None,
                     },
                     crate::model::ProviderKind::OpenAiCompatible,
                     crate::model::AuthKind::None,
@@ -2473,7 +2922,6 @@ mod tests {
                 selected_models: Some(vec!["grok-4.5".into()]),
                 context_window: Some(200_000),
                 model_capabilities: Vec::new(),
-                catalog_scope: None,
             },
             crate::model::ProviderKind::GrokCli,
             crate::model::AuthKind::GrokSession,
@@ -2752,5 +3200,91 @@ mod tests {
                 "boundary-key consumer confirmation must run after {label}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn older_native_agents_do_not_receive_new_rpcs_but_legacy_migration_requires_upgrade() {
+        let old = serde_json::json!({"agentProtocol": 5});
+        assert!(migration_recovery_available(
+            &old,
+            &serde_json::json!({
+                "proxy": {"proxyBackend": "native"}, "install": {"image": "legacy-proxy"}
+            })
+        )
+        .is_err());
+        assert!(!migration_recovery_available(
+            &old,
+            &serde_json::json!({"proxy": {"proxyBackend": "native"}})
+        )
+        .unwrap());
+        assert!(migration_recovery_available(
+            &old,
+            &serde_json::json!({"proxy": {"proxyBackend": "docker"}})
+        )
+        .is_err());
+        assert!(migration_recovery_available(
+            &serde_json::json!({"proxyMigrationRecovery": true}),
+            &serde_json::json!({})
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn success_commits_without_restarting_docker() {
+        let result = complete_migration(
+            Ok(42),
+            || Ok(serde_json::json!({})),
+            || panic!("unexpected rollback"),
+        );
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn later_phase_failure_rolls_back_without_committing() {
+        let result: AppResult<()> = complete_migration(
+            Err(AppError::Message("credential sync failed".into())),
+            || panic!("unexpected commit"),
+            || Ok(serde_json::json!({"detail": {"migrationRestored": true}})),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("ProxyMigrationRolledBack"));
+        assert!(error.contains("credential sync failed"));
+    }
+
+    #[test]
+    fn failed_final_verification_restores_old_proxy() {
+        let result = complete_migration(
+            Ok(()),
+            || Err(AppError::Message("native verification failed".into())),
+            || Ok(serde_json::json!({"detail": {"migrationRestored": true}})),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ProxyMigrationRolledBack"));
+    }
+
+    #[test]
+    fn failed_recovery_reports_both_causes_and_no_snapshot_preserves_error() {
+        let result: AppResult<()> = complete_migration(
+            Err(AppError::Message("configure failed".into())),
+            || panic!("unexpected commit"),
+            || Err(AppError::Message("container ownership changed".into())),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("ProxyMigrationRecoveryFailed"));
+        assert!(error.contains("configure failed"));
+        assert!(error.contains("container ownership changed"));
+        let result: AppResult<()> = complete_migration(
+            Err(AppError::Message("original".into())),
+            || panic!("unexpected commit"),
+            || Ok(serde_json::json!({"detail": {"migrationRestored": false}})),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "original");
     }
 }

@@ -146,7 +146,6 @@ async fn a_spawned_child_runs_upstream_and_the_parent_continues_with_its_result(
             models: Some(vec!["grok-parent".into(), "grok-child".into()]),
             selected_models: None,
             context_window: Some(128_000),
-            catalog_scope: None,
             model_capabilities: Vec::new(),
         },
         ProviderKind::GrokCli,

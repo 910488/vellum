@@ -2,16 +2,15 @@
 //!
 //! The Desktop-bundled core is the authority. A remote binary is never chosen
 //! by `latest`: Vellum resolves the exact OpenAI release tag, requires the
-//! publisher-provided GitHub asset digest, stages the binary, and lets the
+//! publisher-provided GitHub asset digest, stages the full runtime package, and lets the
 //! Remote Agent run its protocol probe before an atomic swap.
 
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -74,7 +73,6 @@ struct GitHubAsset {
 struct OfficialCodexArchive {
     version: String,
     asset_name: String,
-    binary_name: String,
     url: String,
     sha256: String,
 }
@@ -141,6 +139,9 @@ pub async fn compatibility_status(
         record.desktop_version == identity.version
             && record.desktop_schema_sha256 == identity.schema_sha256
             && live_binary_sha256 == Some(record.remote_binary_sha256.as_str())
+            && installation
+                .as_ref()
+                .is_some_and(|value| super::preflight::require_handoff_runtime(value).is_ok())
             && remote_version.as_deref().and_then(version_token)
                 == Some(record.remote_version.as_str())
     });
@@ -241,10 +242,9 @@ pub async fn update_remote_for_desktop(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| AppError::Message("remote inventory missing system.arch".into()))?;
     let archive = resolve_official_archive(&identity.version, arch).await?;
-    let extracted = download_and_extract(&archive).await?;
-    let binary_sha256 = sha256_file(extracted.path())?;
-    let bytes = fs::read(extracted.path())
-        .map_err(|error| AppError::Message(format!("read extracted Codex binary: {error}")))?;
+    let package = download_package(&archive).await?;
+    let bytes = fs::read(package.path())
+        .map_err(|error| AppError::Message(format!("read Codex runtime package: {error}")))?;
     let remote_path = format!("/tmp/vellum-codex-desktop-sync-{}.bin", ulid::Ulid::new());
     crate::remote::provision_remote_boundary_key_without_native_restart(
         &client,
@@ -257,12 +257,20 @@ pub async fn update_remote_for_desktop(
         client.codex_install_pinned(
             operation_id,
             &remote_path,
-            &binary_sha256,
+            &archive.sha256,
             &identity.version,
         )
     })();
     client.remove_remote_file(&remote_path);
     let install = install?;
+    let installed = client.codex_verify_installation(Some(&identity.version))?;
+    super::preflight::require_handoff_runtime(&installed)?;
+    let binary_sha256 = installed
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|digest| valid_sha256(digest))
+        .ok_or_else(|| AppError::Message("DesktopCodexInstalledDigestMissing".into()))?
+        .to_owned();
     let boundary_key = crate::proxy::ensure_remote_boundary_key(&state.data_root(), host_id)?;
     let restart =
         client.codex_restart_native(&crate::remote::boundary_key::restart_operation_id(
@@ -344,7 +352,20 @@ pub fn desktop_identity() -> AppResult<DesktopCodexIdentity> {
         }
     }
 
-    let output = background_command(&binary)
+    let version = core_version(&binary)?;
+    let schema_sha256 = desktop_schema_hash(&binary)?;
+    let identity = DesktopCodexIdentity {
+        version,
+        schema_sha256,
+        binary: binary.to_string_lossy().to_string(),
+    };
+    *cache.lock().expect("state poisoned") = Some((key, identity.clone()));
+    Ok(identity)
+}
+
+/// The version a Codex core reports for itself, as `desktop_identity` reads it.
+pub fn core_version(binary: &Path) -> AppResult<String> {
+    let output = background_command(binary)
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -361,18 +382,10 @@ pub fn desktop_identity() -> AppResult<DesktopCodexIdentity> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let version = version_token(&text)
+    Ok(version_token(&text)
         .filter(|version| valid_version(version))
         .ok_or_else(|| AppError::Message("Desktop Codex reported an invalid version".into()))?
-        .to_string();
-    let schema_sha256 = desktop_schema_hash(&binary)?;
-    let identity = DesktopCodexIdentity {
-        version,
-        schema_sha256,
-        binary: binary.to_string_lossy().to_string(),
-    };
-    *cache.lock().expect("state poisoned") = Some((key, identity.clone()));
-    Ok(identity)
+        .to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -475,7 +488,7 @@ async fn resolve_official_archive(version: &str, arch: &str) -> AppResult<Offici
             )))
         }
     };
-    let asset_name = format!("codex-{target}.tar.gz");
+    let asset_name = format!("codex-package-{target}.tar.gz");
     let api_url =
         format!("https://api.github.com/repos/openai/codex/releases/tags/rust-v{version}");
     let response = http_client()?.get(api_url).send().await.map_err(|error| {
@@ -527,16 +540,13 @@ fn select_official_archive(
     }
     Ok(OfficialCodexArchive {
         version: version.into(),
-        binary_name: asset_name.trim_end_matches(".tar.gz").into(),
         asset_name: asset_name.into(),
         url: asset.browser_download_url,
         sha256: digest.into(),
     })
 }
 
-async fn download_and_extract(
-    archive: &OfficialCodexArchive,
-) -> AppResult<tempfile::NamedTempFile> {
+async fn download_package(archive: &OfficialCodexArchive) -> AppResult<tempfile::NamedTempFile> {
     let response = http_client()?
         .get(&archive.url)
         .send()
@@ -564,42 +574,19 @@ async fn download_and_extract(
             archive.sha256
         )));
     }
-    let decoder = GzDecoder::new(Cursor::new(bytes));
-    let mut tar = tar::Archive::new(decoder);
     let mut output = tempfile::NamedTempFile::new()
         .map_err(|error| AppError::Message(format!("create Codex staging file: {error}")))?;
-    let mut found = false;
-    for entry in tar
-        .entries()
-        .map_err(|error| AppError::Message(format!("read Codex archive: {error}")))?
-    {
-        let mut entry = entry
-            .map_err(|error| AppError::Message(format!("read Codex archive entry: {error}")))?;
-        let path = entry
-            .path()
-            .map_err(|error| AppError::Message(format!("read Codex archive path: {error}")))?;
-        if path == Path::new(&archive.binary_name) {
-            if found || !entry.header().entry_type().is_file() {
-                return Err(AppError::Message("DesktopCodexArchiveInvalid".into()));
-            }
-            std::io::copy(&mut entry, &mut output)
-                .map_err(|error| AppError::Message(format!("extract Codex binary: {error}")))?;
-            found = true;
-        }
-    }
-    if !found {
-        return Err(AppError::Message(format!(
-            "DesktopCodexArchiveMissingBinary: {}",
-            archive.binary_name
-        )));
-    }
+    output
+        .write_all(&bytes)
+        .map_err(|error| AppError::Message(format!("stage Codex package: {error}")))?;
     output
         .flush()
         .map_err(|error| AppError::Message(format!("flush Codex binary: {error}")))?;
+    vellum_codex_package::verify_archive(output.path()).map_err(AppError::Message)?;
     Ok(output)
 }
 
-fn http_client() -> AppResult<reqwest::Client> {
+pub(crate) fn http_client() -> AppResult<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("vellum-desktop-codex-compatibility")
         .connect_timeout(Duration::from_secs(15))
@@ -607,6 +594,51 @@ fn http_client() -> AppResult<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|error| AppError::Message(format!("build update client: {error}")))
+}
+
+/// The remote Codex version this host last passed Desktop protocol
+/// qualification with. A deploy accepts it beside the bundled pinned version,
+/// so redeploying never reinstalls an older pinned runtime over a sync.
+pub(crate) fn qualified_remote_version(root: &Path, host_id: &str) -> Option<String> {
+    load_record(root, host_id)
+        .ok()
+        .flatten()
+        .map(|record| record.remote_version)
+}
+
+/// The qualified version, but only while it is at least the bundled pinned
+/// one. Once a Vellum update pins a newer runtime, an older sync stops counting
+/// as current, so the deploy upgrades the host instead of leaving it behind.
+pub(crate) fn qualified_remote_version_at_least(
+    root: &Path,
+    host_id: &str,
+    pinned: &str,
+) -> Option<String> {
+    let qualified = qualified_remote_version(root, host_id)?;
+    match (parse_codex_version(&qualified), parse_codex_version(pinned)) {
+        (Some(synced), Some(floor)) if synced >= floor => Some(qualified),
+        _ => None,
+    }
+}
+
+fn parse_codex_version(value: &str) -> Option<semver::Version> {
+    version_token(value).and_then(|token| semver::Version::parse(token.split('+').next()?).ok())
+}
+
+/// A deploy brings the remote runtime to the Desktop version on its own only
+/// when that is a strict upgrade. Downgrades stay a deliberate manual sync.
+pub(crate) fn deploy_should_sync(status: &DesktopCodexCompatibilityStatus) -> bool {
+    if status.state != "updateAvailable" || !status.can_update {
+        return false;
+    }
+    let parse = |value: &Option<String>| value.as_deref().and_then(parse_codex_version);
+    match (
+        parse(&status.desktop_version),
+        parse(&status.remote_version),
+    ) {
+        (Some(desktop), Some(remote)) => desktop > remote,
+        _ => false,
+    }
 }
 
 fn record_path(root: &Path, host_id: &str) -> PathBuf {
@@ -644,23 +676,6 @@ fn save_record(root: &Path, record: &QualificationRecord) -> AppResult<()> {
     .map_err(|error| AppError::Message(format!("write qualification record: {error}")))
 }
 
-fn sha256_file(path: &Path) -> AppResult<String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| AppError::Message(format!("open Codex binary: {error}")))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| AppError::Message(format!("hash Codex binary: {error}")))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 fn version_token(value: &str) -> Option<&str> {
     value.split_whitespace().find(|part| {
         part.chars()
@@ -688,7 +703,7 @@ mod tests {
     #[test]
     fn release_selection_requires_exact_tag_asset_url_and_publisher_digest() {
         let version = "0.147.0-alpha.6.5";
-        let name = "codex-aarch64-unknown-linux-musl.tar.gz";
+        let name = "codex-package-aarch64-unknown-linux-musl.tar.gz";
         let url =
             format!("https://github.com/openai/codex/releases/download/rust-v{version}/{name}");
         let release = GitHubRelease {
@@ -702,7 +717,7 @@ mod tests {
         let selected = select_official_archive(version, name, release).unwrap();
         assert_eq!(selected.url, url);
         assert_eq!(selected.sha256, "a".repeat(64));
-        assert_eq!(selected.binary_name, "codex-aarch64-unknown-linux-musl");
+        assert_eq!(selected.asset_name, name);
     }
 
     #[test]
@@ -731,6 +746,96 @@ mod tests {
         );
         assert!(valid_version("0.147.0-alpha.6.5"));
         assert!(!valid_version("../../0.147.0"));
+    }
+
+    fn status(state: &str, desktop: &str, remote: Option<&str>) -> DesktopCodexCompatibilityStatus {
+        DesktopCodexCompatibilityStatus {
+            state: state.into(),
+            desktop_version: Some(desktop.into()),
+            desktop_schema_sha256: None,
+            remote_version: remote.map(str::to_owned),
+            required_remote_version: Some(desktop.into()),
+            remote_arch: Some("aarch64".into()),
+            agent_protocol: Some(3),
+            can_update: state == "updateAvailable",
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn deploy_syncs_only_forward_to_a_newer_desktop_runtime() {
+        assert!(deploy_should_sync(&status(
+            "updateAvailable",
+            "0.150.0",
+            Some("codex-cli 0.147.0-alpha.6.6")
+        )));
+        assert!(deploy_should_sync(&status(
+            "updateAvailable",
+            "0.147.0-alpha.6.7",
+            Some("0.147.0-alpha.6.6")
+        )));
+        // Never an automatic downgrade, re-install or guess.
+        assert!(!deploy_should_sync(&status(
+            "updateAvailable",
+            "0.147.0-alpha.6.5",
+            Some("0.147.0-alpha.6.6")
+        )));
+        assert!(!deploy_should_sync(&status(
+            "qualificationRequired",
+            "0.150.0",
+            Some("0.150.0")
+        )));
+        assert!(!deploy_should_sync(&status(
+            "current",
+            "0.150.0",
+            Some("0.147.0")
+        )));
+        assert!(!deploy_should_sync(&status(
+            "updateAvailable",
+            "0.150.0",
+            None
+        )));
+        assert!(!deploy_should_sync(&status(
+            "updateAvailable",
+            "0.150.0",
+            Some("unknown")
+        )));
+    }
+
+    #[test]
+    fn qualified_remote_version_reads_the_last_sync() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(qualified_remote_version(root.path(), "jetson"), None);
+        save_record(
+            root.path(),
+            &QualificationRecord {
+                schema_version: 1,
+                host_id: "jetson".into(),
+                desktop_version: "0.150.0".into(),
+                desktop_schema_sha256: "a".repeat(64),
+                remote_version: "0.150.0".into(),
+                remote_binary_sha256: "b".repeat(64),
+                qualified_at: "2026-10-17T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            qualified_remote_version(root.path(), "jetson").as_deref(),
+            Some("0.150.0")
+        );
+        // Counts as current only while it is not behind the bundled pin.
+        for (pinned, expected) in [
+            ("0.147.0-alpha.6.6", Some("0.150.0")),
+            ("0.150.0", Some("0.150.0")),
+            ("0.151.0", None),
+            ("not-a-version", None),
+        ] {
+            assert_eq!(
+                qualified_remote_version_at_least(root.path(), "jetson", pinned).as_deref(),
+                expected,
+                "pinned {pinned}"
+            );
+        }
     }
 
     #[test]

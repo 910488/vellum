@@ -2511,6 +2511,12 @@ html[data-performance="low"] .card {
 }
 /* 不釘 nowrap：視窗長度加重置時刻，換成英文或日文就是一整句，
    釘住不折行的結果是它長到欄位外面去。 */
+/* Fable 的內含額度只讀不設閘門：沒有拖得動的刻度，所以多一行字講清楚
+   用完之後是停下來還是開始扣 credit —— 那才是看這條量條的理由。 */
+.acct__quota small.acct__credits--on,
+.acct__quota small.acct__cadence-error {
+  color: var(--warn-ink);
+}
 .acct__quota small {
   grid-column: 2;
   text-align: left;
@@ -5491,6 +5497,7 @@ html[data-performance="low"] .card {
 }
 .official-account-list .resets { grid-column: 1 / -1; }
 .quota-pool__head > label { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.quota-pool__head > label > .input { width: auto; }
 .empty-inline { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--ink-soft); }
 .acct-menu { position: relative; justify-self: end; }
 .acct-menu > summary { list-style: none; cursor: pointer; padding: 4px 10px; border-radius: var(--r-pill); background: var(--surface-sunk); font-size: 20px; line-height: 1; }
@@ -5614,3 +5621,31 @@ html[data-performance="low"] .settings-index {
     transition: none;
   }
 }
+
+/* Claude Desktop Code：帳號在上、接入在下。接入是一次性的設定，平常只需要
+   看「現在走哪個帳號」—— 所以狀態放進標題列，步驟只在未接入時出現，
+   接入後收成兩列讀數。 */
+.claude-code__head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.claude-code__login { margin-top: 14px; align-items: center; flex-wrap: wrap; }
+.claude-code__login .field__hint { flex: 1 1 18em; min-width: 0; }
+.claude-code__connect { display: grid; gap: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid color-mix(in srgb, var(--ink) 10%, transparent); }
+.claude-code__steps { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; counter-reset: cc-step; }
+.claude-code__step { position: relative; display: grid; gap: 8px; padding-left: 1.8em; counter-increment: cc-step; }
+.claude-code__step::before { content: counter(cc-step); position: absolute; left: 0; top: 0; font-family: var(--font-display); font-size: 13px; font-weight: 700; color: var(--ink-ghost); line-height: 1.6; }
+.claude-code__step > * { min-width: 0; }
+.claude-code__step > .rowline { justify-self: start; }
+.claude-code__step-title { font-size: 13px; font-weight: 600; color: var(--ink-soft); line-height: 1.6; }
+.claude-code__path { font-size: 12px; overflow-wrap: anywhere; }
+.claude-code__projects { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.claude-code__project { display: grid; grid-template-columns: auto auto 1fr; column-gap: 8px; align-items: baseline; padding: 4px 0; cursor: pointer; }
+.claude-code__project > .claude-code__path { grid-column: 2 / -1; color: var(--ink-faint); background: none; padding: 0; }
+.claude-code__project-name { font-size: 13px; font-weight: 600; }
+.claude-code__project:has(input:disabled) { cursor: default; }
+.claude-code__add { flex-wrap: nowrap; }
+.claude-code__add .input { min-width: 0; flex: 1 1 22em; }
+.claude-code__step > .claude-code__add { justify-self: stretch; }
+.claude-code__leased { display: grid; gap: 2px; justify-items: end; }
+.claude-code__consent { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.claude-code__more { margin-top: 18px; }
+.claude-code__more > summary { cursor: pointer; font-size: 12.5px; color: var(--ink-faint); }
+.claude-code__more[open] { display: grid; gap: 10px; }

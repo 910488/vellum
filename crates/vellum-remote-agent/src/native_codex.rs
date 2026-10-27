@@ -35,6 +35,8 @@ pub struct NativeCodexRuntimeStatus {
     pub restart_safe: bool,
     pub durable: bool,
     pub standalone_installed: bool,
+    #[serde(default)]
+    pub runtime_package: crate::codex_package::RuntimePackageStatus,
     /// Whether the stable user-level launcher used by Codex App's SSH login
     /// shell resolves to the Vellum-managed standalone binary.
     pub cli_launcher: CodexCliLauncherStatus,
@@ -72,6 +74,8 @@ pub struct CodexInstallationStatus {
     pub sha256: Option<String>,
     pub compatible: bool,
     pub compatibility_reason: Option<String>,
+    #[serde(default)]
+    pub runtime_package: crate::codex_package::RuntimePackageStatus,
 }
 
 /// M31: durable user-service reconcile result.
@@ -157,6 +161,9 @@ pub fn discover_native() -> Result<NativeCodexRuntimeStatus, String> {
         restart_safe: managed,
         durable: managed,
         standalone_installed,
+        runtime_package: crate::codex_package::inspect_installed(
+            &codex_home.join("packages/standalone/current"),
+        ),
         cli_launcher,
         // Codex currently exposes enable/disable commands but no documented,
         // stable status schema. Unknown is intentional rather than guessed.
@@ -292,7 +299,15 @@ pub fn restart_native(
 /// confirmation. This is intentionally narrower than `restart_native`: it
 /// never stops a daemon-managed process and never interrupts an active turn.
 pub fn stop_app_owned_native() -> Result<NativeCodexRuntimeStatus, String> {
+    stop_app_owned_native_expected(None, None)
+}
+
+pub fn stop_app_owned_native_expected(
+    expected_pid: Option<u32>,
+    expected_identity: Option<&str>,
+) -> Result<NativeCodexRuntimeStatus, String> {
     let before = discover_native()?;
+    validate_expected_stop_identity(&before, expected_pid, expected_identity)?;
     if !before.daemon_running {
         return Ok(before);
     }
@@ -323,6 +338,7 @@ pub fn stop_app_owned_native() -> Result<NativeCodexRuntimeStatus, String> {
         return Err("NativeAppOwnedStopIdentityChanged: PID or CODEX_HOME changed".into());
     }
     let current = discover_native()?;
+    validate_expected_stop_identity(&current, expected_pid, expected_identity)?;
     validate_app_owned_stop(&current)?;
     if current.daemon_pid != before.daemon_pid {
         return Err("NativeAppOwnedStopIdentityChanged: PID changed".into());
@@ -335,6 +351,24 @@ pub fn stop_app_owned_native() -> Result<NativeCodexRuntimeStatus, String> {
         return Err("NativeAppOwnedStopFailed: app-server is still running".into());
     }
     Ok(after)
+}
+
+fn validate_expected_stop_identity(
+    native: &NativeCodexRuntimeStatus,
+    expected_pid: Option<u32>,
+    expected_identity: Option<&str>,
+) -> Result<(), String> {
+    match (expected_pid, expected_identity) {
+        (None, None) => Ok(()),
+        (Some(pid), Some(identity))
+            if native.daemon_pid == Some(pid)
+                && !identity.is_empty()
+                && native.daemon_identity.as_deref() == Some(identity) =>
+        {
+            Ok(())
+        }
+        _ => Err("NativeAppOwnedStopIdentityChanged: confirmed process changed".into()),
+    }
 }
 
 fn validate_app_owned_stop(native: &NativeCodexRuntimeStatus) -> Result<(), String> {
@@ -760,7 +794,7 @@ fn download_pinned_artifact(url: &str, expected_sha256: &str) -> Result<PathBuf,
     Ok(staged)
 }
 
-/// M31: install a digest-pinned Codex standalone binary into
+/// Install a digest-pinned complete Codex runtime package into
 /// `codex_home/packages/standalone/current` with atomic swap and rollback.
 pub fn install_pinned_codex(
     codex_home: &Path,
@@ -839,20 +873,27 @@ fn install_pinned_codex_with_hooks(
     let staged_bin = staging_dir.join("codex");
     fs::create_dir_all(&staging_dir)
         .map_err(|error| format!("CodexInstallStagingFailed: {error}"))?;
-    crate::update::copy_private_executable(staged, &staged_bin)?;
-
-    // Probe the *staged* binary against the pinned version before swapping.
-    let version = probe(&staged_bin).ok_or_else(|| "CodexInstallProbeFailed".to_string())?;
-    if !release_manifest::version_in_range(&version, expected_version) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(format!(
-            "CodexInstallerVersionMismatch: expected {expected_version}, found {version}"
-        ));
-    }
-    if let Err(error) = protocol_probe(&staged_bin) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(format!("CodexDesktopProtocolMismatch: {error}"));
-    }
+    let prepare = || -> Result<String, String> {
+        crate::codex_package::unpack(staged, &staging_dir)?;
+        crate::codex_package::link_daemon_entrypoint(&staging_dir)?;
+        // Probe the staged runtime, including its real helper/resource layout.
+        let version = probe(&staged_bin).ok_or_else(|| "CodexInstallProbeFailed".to_string())?;
+        if !release_manifest::version_in_range(&version, expected_version) {
+            return Err(format!(
+                "CodexInstallerVersionMismatch: expected {expected_version}, found {version}"
+            ));
+        }
+        protocol_probe(&staged_bin)
+            .map_err(|error| format!("CodexDesktopProtocolMismatch: {error}"))?;
+        Ok(version)
+    };
+    let version = match prepare() {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(error);
+        }
+    };
 
     let current_dir = parent.join("current");
     let rollback_dir = parent.join(format!(".vellum-codex-rollback-{}", ulid::Ulid::new()));
@@ -895,6 +936,11 @@ fn install_pinned_codex_with_hooks(
     if let Err(error) = reconcile_launcher(codex_home) {
         restore_previous();
         return Err(format!("CodexCliLauncherReconcileFailed: {error}"));
+    }
+    let runtime = crate::codex_package::inspect_installed(&current_dir);
+    if !runtime.complete {
+        restore_previous();
+        return Err(format!("CodexRuntimeIncomplete: installed package failed verification after reconciliation: {}", runtime.missing.join(", ")));
     }
     if rollback_dir.exists() {
         let _ = fs::remove_dir_all(&rollback_dir);
@@ -1077,6 +1123,9 @@ pub fn verify_installation(
         sha256,
         compatible,
         compatibility_reason,
+        runtime_package: crate::codex_package::inspect_installed(
+            &codex_home.join("packages/standalone/current"),
+        ),
     })
 }
 
@@ -1794,6 +1843,7 @@ mod tests {
             restart_safe: false,
             durable: false,
             standalone_installed: false,
+            runtime_package: Default::default(),
             cli_launcher: CodexCliLauncherStatus::default(),
             remote_control_enabled: Some(true),
             active_turn: None,
@@ -1801,6 +1851,18 @@ mod tests {
             broker_enabled: false,
         };
         assert!(validate_app_owned_stop(&status).is_ok());
+        assert!(validate_expected_stop_identity(&status, Some(42), Some("pid-42")).is_ok());
+        assert!(validate_expected_stop_identity(&status, None, None).is_ok());
+        for (pid, identity) in [
+            (Some(43), Some("pid-42")),
+            (Some(42), Some("another-start")),
+            (Some(42), None),
+            (None, Some("pid-42")),
+        ] {
+            assert!(validate_expected_stop_identity(&status, pid, identity)
+                .unwrap_err()
+                .contains("NativeAppOwnedStopIdentityChanged"));
+        }
         status.daemon_owner = "codexCliDaemon".into();
         status.restart_safe = true;
         assert!(validate_app_owned_stop(&status)
@@ -1966,7 +2028,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let codex_home = temp.path().join("codex-home");
         let staged = temp.path().join("staged-codex");
-        fs::write(&staged, "fake codex payload").unwrap();
+        crate::codex_package::test_archive(&staged, "fake codex payload", None);
         let digest = crate::update::sha256_file(&staged).unwrap();
         let noop_reconcile = |_codex_home: &Path| Ok(ServiceReconcileResult::default());
 
@@ -1981,6 +2043,12 @@ mod tests {
         );
         assert!(bad.unwrap_err().contains("CodexArtifactDigestMismatch"));
         assert!(!codex_home.join("packages/standalone/current").exists());
+
+        // Upgrade a previously deployed single binary even at the same version.
+        let legacy = codex_home.join("packages/standalone/current/codex");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "previous single binary").unwrap();
+        assert!(!crate::codex_package::inspect_installed(legacy.parent().unwrap()).complete);
 
         // Success: binary lands at Codex's official standalone daemon path.
         let result = install_pinned_codex_with(
@@ -2003,6 +2071,12 @@ mod tests {
         assert_eq!(result.version.as_deref(), Some("codex-cli 0.147.0"));
         assert_eq!(result.sha256, digest);
         let installed = codex_home.join("packages/standalone/current/codex");
+        assert!(crate::codex_package::inspect_installed(installed.parent().unwrap()).complete);
+        assert!(installed
+            .parent()
+            .unwrap()
+            .join("bin/codex-code-mode-host")
+            .is_file());
         assert_eq!(
             fs::read_to_string(&installed).unwrap(),
             "fake codex payload"
@@ -2027,7 +2101,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let codex_home = temp.path().join("codex-home");
         let staged = temp.path().join("staged-codex");
-        fs::write(&staged, "new payload").unwrap();
+        crate::codex_package::test_archive(&staged, "new payload", None);
         let digest = crate::update::sha256_file(&staged).unwrap();
         let noop_reconcile = |_codex_home: &Path| Ok(ServiceReconcileResult::default());
 
@@ -2062,6 +2136,100 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_package_is_rejected_before_probes_or_replacing_the_old_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let current = home.join("packages/standalone/current/codex");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, "previous binary").unwrap();
+        let staged = temp.path().join("package.tgz");
+        crate::codex_package::test_archive(&staged, "new binary", Some("bin/codex-code-mode-host"));
+        let digest = crate::update::sha256_file(&staged).unwrap();
+        let result = install_pinned_codex_with(
+            &home,
+            &staged,
+            &digest,
+            "0.147.x",
+            |_| panic!("incomplete runtime must not be executed"),
+            |_| panic!("incomplete runtime must not reach service reconciliation"),
+        );
+        assert!(result.unwrap_err().contains("bin/codex-code-mode-host"));
+        assert_eq!(fs::read_to_string(current).unwrap(), "previous binary");
+        assert_eq!(
+            fs::read_dir(home.join("packages/standalone"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_service_reconcile_restores_the_entire_previous_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let staged = temp.path().join("package.tgz");
+        crate::codex_package::test_archive(&staged, "previous payload", None);
+        let digest = crate::update::sha256_file(&staged).unwrap();
+        install_pinned_codex_with(
+            &home,
+            &staged,
+            &digest,
+            "0.147.x",
+            |_| Some("0.147.0".into()),
+            |_| Ok(ServiceReconcileResult::default()),
+        )
+        .unwrap();
+        let current = home.join("packages/standalone/current");
+        fs::write(
+            current.join("codex-resources/old-marker"),
+            "keep on rollback",
+        )
+        .unwrap();
+        crate::codex_package::test_archive(&staged, "new payload", None);
+        let digest = crate::update::sha256_file(&staged).unwrap();
+        let error = install_pinned_codex_with(
+            &home,
+            &staged,
+            &digest,
+            "0.147.x",
+            |_| Some("0.147.0".into()),
+            |_| Err("injected service failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected service failure"));
+        assert!(crate::codex_package::inspect_installed(&current).complete);
+        assert_eq!(
+            fs::read_to_string(current.join("codex")).unwrap(),
+            "previous payload"
+        );
+        assert_eq!(
+            fs::read_to_string(current.join("codex-resources/old-marker")).unwrap(),
+            "keep on rollback"
+        );
+        assert_eq!(
+            fs::read_dir(home.join("packages/standalone"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn verify_installation_reports_legacy_binary_as_present_but_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("packages/standalone/current/codex");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, "legacy single binary").unwrap();
+        let status = verify_installation(temp.path(), Some("0.147.x")).unwrap();
+        assert!(status.present);
+        assert!(!status.runtime_package.complete);
+        assert!(status
+            .runtime_package
+            .missing
+            .contains(&"bin/codex-code-mode-host".into()));
+    }
+
+    #[test]
     fn pinned_install_restores_previous_install_when_launcher_reconcile_fails() {
         let temp = tempfile::tempdir().unwrap();
         let codex_home = temp.path().join("codex-home");
@@ -2069,7 +2237,7 @@ mod tests {
         let current = codex_home.join("packages/standalone/current/codex");
         fs::create_dir_all(current.parent().unwrap()).unwrap();
         fs::write(&current, "previous payload").unwrap();
-        fs::write(&staged, "new payload").unwrap();
+        crate::codex_package::test_archive(&staged, "new payload", None);
         let digest = crate::update::sha256_file(&staged).unwrap();
 
         let result = install_pinned_codex_with_hooks(
@@ -2096,7 +2264,7 @@ mod tests {
         let current = codex_home.join("packages/standalone/current/codex");
         fs::create_dir_all(current.parent().unwrap()).unwrap();
         fs::write(&current, "previous payload").unwrap();
-        fs::write(&staged, "new payload").unwrap();
+        crate::codex_package::test_archive(&staged, "new payload", None);
         let digest = crate::update::sha256_file(&staged).unwrap();
 
         let result = install_pinned_codex_with_hooks(

@@ -169,19 +169,20 @@ impl RuntimeProviderProfile {
     }
 }
 
-/// How an OpenCode model authenticates. Persisted per model; unknown models
-/// stay credentialed and are never guessed free from a name suffix.
+/// How an OpenCode model authenticates. Persisted per model. Only
+/// `credentialed` remains: configs written while Vellum still offered the
+/// free tier say `anonymousFree`, and now load as credentialed so a stale
+/// route fails with "requires an API key" instead of failing to parse.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeAccessMode {
-    AnonymousFree,
+    #[serde(alias = "anonymousFree")]
     Credentialed,
 }
 
 impl RuntimeAccessMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::AnonymousFree => "anonymousFree",
             Self::Credentialed => "credentialed",
         }
     }
@@ -381,7 +382,7 @@ impl RuntimeModelRoute {
             return Some(mode);
         }
         self.effective_provider_profile()
-            .map(|profile| crate::opencode::default_access_mode(profile, &self.upstream_model))
+            .map(crate::opencode::default_access_mode)
     }
 }
 

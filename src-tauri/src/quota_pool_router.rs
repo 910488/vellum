@@ -459,10 +459,14 @@ impl SmartRouter {
         };
         let admission = (0..candidates.len()).map(fits).collect::<Vec<_>>();
         let any_fits = admission.iter().any(|fits| *fits);
+        let active_socket_turn = context
+            .socket_affinity
+            .as_ref()
+            .is_some_and(|a| a.turn_in_progress);
         self.last_admission = admission.clone();
-        self.budget_enforced = any_fits && socket_incumbent.is_none();
-        let incumbent = available_incumbent
-            .filter(|i| socket_incumbent == Some(*i) || !any_fits || admission[*i]);
+        self.budget_enforced = any_fits && !active_socket_turn;
+        let incumbent =
+            available_incumbent.filter(|i| active_socket_turn || !any_fits || admission[*i]);
         let mut best =
             incumbent.unwrap_or_else(|| (0..candidates.len()).find(|i| admission[*i]).unwrap_or(0));
         let projected =
@@ -477,7 +481,40 @@ impl SmartRouter {
         }
         let mut benefit = 0.0;
         let (selected, reason) = match incumbent {
-            Some(i) if socket_incumbent == Some(i) => (i, "socket_account_affinity"),
+            Some(i) if socket_incumbent == Some(i) => {
+                let weekly_left = candidates[i]
+                    .weekly_headroom
+                    .unwrap_or(candidates[i].headroom)
+                    * fair[i].1;
+                let five_left = candidates[i].five_hour_used.map(|used| {
+                    let size = self
+                        .five_calibration
+                        .get(&candidates[i].account_id)
+                        .and_then(|c| c.tokens_per_point)
+                        .unwrap_or(fair[i].1 * FIVE_HOUR_CAPACITY_RATIO);
+                    (95.0 - used).max(0.0) * size
+                });
+                let near = candidates[i]
+                    .five_hour_used
+                    .is_some_and(|used| used >= 90.0)
+                    || weekly_left.min(five_left.unwrap_or(f64::INFINITY))
+                        <= context.estimated_input_tokens as f64;
+                if !active_socket_turn
+                    && near
+                    && admission
+                        .iter()
+                        .enumerate()
+                        .any(|(j, fits)| j != i && *fits)
+                {
+                    let next = (0..candidates.len())
+                        .filter(|j| *j != i && admission[*j])
+                        .min_by(|a, b| projected(*a).total_cmp(&projected(*b)))
+                        .unwrap();
+                    (next, "migrate_near_limit")
+                } else {
+                    (i, "socket_account_affinity")
+                }
+            }
             None => (
                 best,
                 if available_incumbent.is_some() && incumbent.is_none() && any_fits {
@@ -513,10 +550,9 @@ impl SmartRouter {
                         .map(|size| (95.0 - used).max(0.0) * size)
                 });
                 let near = weekly_left.min(five_left.unwrap_or(f64::INFINITY)) <= tokens as f64
-                    || (five_left.is_none()
-                        && candidates[i]
-                            .five_hour_used
-                            .is_some_and(|used| used >= 90.0));
+                    || (candidates[i]
+                        .five_hour_used
+                        .is_some_and(|used| used >= 90.0));
                 let hysteresis = previous.is_none_or(|s| {
                     s.migrated
                         .is_none_or(|t| now.saturating_sub(t) >= MIGRATION_INTERVAL_MS)
@@ -641,8 +677,11 @@ impl SmartRouter {
         );
         let candidates = candidates.iter().enumerate().map(|(i,c)| {
             let id=format!("{:x}",Sha256::digest(c.account_id.as_bytes()));
-            format!("account={} headroom={:.3} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} external_week_est={:.3} external_five_est={:.3} L={:.3} f={:.3} u={:.3}",
-                &id[..12],c.weekly_headroom.unwrap_or(c.headroom),c.weekly_used,fair[i].1,
+            let headroom = if reason == "socket_account_affinity" && c.weekly_used.is_none() {
+                "unknown(affinity_only)".into()
+            } else { format!("{:.3}", c.weekly_headroom.unwrap_or(c.headroom)) };
+            format!("account={} headroom={} weekly_used={:?} capacity={:.3} source={} five_used={:?} five_capacity={:.3} five_source={} external_week_est={:.3} external_five_est={:.3} L={:.3} f={:.3} u={:.3}",
+                &id[..12],headroom,c.weekly_used,fair[i].1,
                 if fair[i].2 {"measured"} else {"prior"},c.five_hour_used,
                 self.five_calibration.get(&c.account_id).and_then(|c|c.tokens_per_point).unwrap_or(fair[i].1*FIVE_HOUR_CAPACITY_RATIO),
                 if self.five_calibration.get(&c.account_id).is_some_and(|c|c.tokens_per_point.is_some()) {"measured"} else {"prior"},self.calibration.get(&c.account_id).map_or(0.0, |c| c.external_points),self.five_calibration.get(&c.account_id).map_or(0.0, |c| c.external_points),loads[i],fair[i].0,loads[i]/fair[i].0)
@@ -723,7 +762,7 @@ mod tests {
     #[test]
     fn enabling_pool_adopts_socket_account_and_full_context_instead_of_new_placement() {
         let mut router = SmartRouter::default();
-        let candidates = [candidate("busy", 10.0), candidate("idle", 90.0)];
+        let candidates = [candidate("busy", 50.0), candidate("idle", 90.0)];
         let mut request = context("existing-thread", 1, 300_000);
         request.socket_affinity = Some(vellum_proxy_runtime::request::OfficialSocketAffinity {
             account_hash: vellum_proxy_runtime::request::OfficialSocketAffinity::hash_account(
@@ -753,6 +792,61 @@ mod tests {
         );
         assert_eq!(router.sessions["existing-thread"].account_id, "idle");
     }
+    #[test]
+    fn socket_affinity_yields_to_near_limit_but_retains_healthy_account() {
+        for (used, expected) in [
+            (93.0, "migrate_near_limit"),
+            (30.0, "socket_account_affinity"),
+        ] {
+            let mut router = SmartRouter::default();
+            let candidates =
+                [("incumbent", used), ("other-a", 11.0), ("other-b", 26.0)].map(|(id, five)| {
+                    Candidate {
+                        five_hour_used: Some(five),
+                        five_hour_reset_at: Some(18_000_000),
+                        weekly_headroom: Some(80.0),
+                        ..candidate(id, 95.0 - five)
+                    }
+                });
+            let mut request = context("socket", 1, 1000);
+            request.socket_affinity = Some(vellum_proxy_runtime::request::OfficialSocketAffinity {
+                account_hash: vellum_proxy_runtime::request::OfficialSocketAffinity::hash_account(
+                    "incumbent",
+                ),
+                input_tokens: 1000,
+                turn_in_progress: false,
+                quota_exhausted: false,
+            });
+            let (selected, reason) = router.choose(&candidates, &request, 1);
+            assert_eq!(reason, expected);
+            assert_eq!(selected == 0, used < 90.0);
+        }
+    }
+
+    #[test]
+    fn socket_request_budget_gate_requires_a_fitting_alternative() {
+        let mut router = SmartRouter::default();
+        let mut request = context("socket", 1, 20_000);
+        request.socket_affinity = Some(vellum_proxy_runtime::request::OfficialSocketAffinity {
+            account_hash: vellum_proxy_runtime::request::OfficialSocketAffinity::hash_account(
+                "small",
+            ),
+            input_tokens: 20_000,
+            turn_in_progress: false,
+            quota_exhausted: false,
+        });
+        let candidates = [candidate("small", 1.0), candidate("large", 80.0)];
+        assert_eq!(
+            router.choose(&candidates, &request, 1),
+            (1, "gate_request_budget")
+        );
+        let candidates = [candidate("small", 1.0), candidate("large", 0.5)];
+        assert_eq!(
+            router.choose(&candidates, &request, 2),
+            (0, "socket_account_affinity")
+        );
+    }
+
     #[test]
     fn accumulated_weekly_skew_changes_placement_before_new_usage_arrives() {
         let mut router = SmartRouter::default();

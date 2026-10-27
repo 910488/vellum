@@ -15,6 +15,113 @@
 /** 主要動作。工作面上永遠只有一顆，這個型別就是「那一顆是什麼」。 */
 export type RemotePrimaryAction = "bootstrap" | "reconverge" | null;
 
+export function convergeCredentialFailure(message: string | null | undefined): { messageKey: string; remedy: RemoteRemedy | null } | null {
+  const code = ["noDeployableModels", "desktopOfficialAccountMissing", "officialAccountPairingRequired", "officialAccountActivationRequired", "officialAccountReauthenticationRequired", "officialAccountStatusUnavailable"]
+    .find((code) => message?.includes(code));
+  return code ? { messageKey: `remote.blocker.${code}`, remedy: BLOCKERS[code]?.remedy ?? null } : null;
+}
+
+export function convergePairingSuggested(result: unknown): boolean {
+  return typeof result === "object" && result !== null
+    && "chatgptPairingSuggested" in result && result.chatgptPairingSuggested === true;
+}
+
+export function deploymentWaitControls(operation: { hostId: string; kind: string; state: string; phase: string; result: unknown } | null | undefined, hostId: string | null): { cancel: boolean; token: string | null } {
+  if (!operation || operation.hostId !== hostId || operation.kind !== "oneClickBootstrap" || operation.state !== "running"
+    || !["observing", "waitingForIdle", "awaitingTakeover"].includes(operation.phase)) return { cancel: false, token: null };
+  const result = operation.result;
+  const token = operation.phase === "awaitingTakeover" && typeof result === "object" && result !== null && "takeoverToken" in result
+    && typeof result.takeoverToken === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(result.takeoverToken) ? result.takeoverToken : null;
+  return { cancel: true, token };
+}
+
+/**
+ * 配對完成後要不要自動再部署一次。部署失敗在帳號上，或是部署成功但先把
+ * 需要帳號的模型擱著（chatgptPairingSuggested），兩種都是「帳號好了就該補上」，
+ * 不該要使用者記得回來再按一次。
+ */
+export function resumeConvergeAfterAccount(operation: { hostId: string; kind: string; state: string; message: string | null; result?: unknown } | null | undefined, hostId: string): boolean {
+  if (!operation || operation.hostId !== hostId || operation.kind !== "oneClickBootstrap") return false;
+  if (operation.state === "completed") return convergePairingSuggested(operation.result);
+  return operation.state === "failed" && Boolean(operation.message?.includes("officialAccount"));
+}
+
+function versionParts(value: string | null | undefined): { core: number[]; pre: string[] } | null {
+  const token = value?.split(/\s+/).find((part) => /^\d/.test(part))?.split("+")[0];
+  const match = token?.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+  return match ? { core: [Number(match[1]), Number(match[2]), Number(match[3])], pre: match[4]?.split(/\./) ?? [] } : null;
+}
+
+/** semver 先後；任一邊認不得就回 null，不猜。 */
+export function compareVersions(a: string | null | undefined, b: string | null | undefined): number | null {
+  const left = versionParts(a); const right = versionParts(b);
+  if (!left || !right) return null;
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (left.core[index] ?? 0) - (right.core[index] ?? 0);
+    if (difference) return difference;
+  }
+  if (!left.pre.length || !right.pre.length) return right.pre.length - left.pre.length;
+  for (let index = 0; index < Math.max(left.pre.length, right.pre.length); index += 1) {
+    const x = left.pre[index]; const y = right.pre[index];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const numeric = /^\d+$/.test(x) && /^\d+$/.test(y);
+    if (numeric) return Number(x) - Number(y);
+    if (/^\d+$/.test(x)) return -1;
+    if (/^\d+$/.test(y)) return 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Desktop 的 Codex 比這台新，而且有對應的官方 Linux 版本。重新部署會一併
+ * 跟上（後端 `deploy_should_sync`，同一條規則），所以不需要另一顆同步按鈕。
+ * 只往前；Desktop 比較舊時不提示，也不自動降版。
+ */
+export function desktopRuntimeAhead(status: { state: string; canUpdate: boolean; desktopVersion: string | null; remoteVersion: string | null } | null | undefined): boolean {
+  if (!status || status.state !== "updateAvailable" || !status.canUpdate) return false;
+  return (compareVersions(status.desktopVersion, status.remoteVersion) ?? 0) > 0;
+}
+
+export function deploymentVerificationFailure(message: string | null | undefined): string | null {
+  return message?.includes("OneClickBootstrapVerificationFailed")
+    ? "remote.blocker.deploymentVerificationFailed" : null;
+}
+
+export function deploymentPreflightFailure(message: string | null | undefined): string | null {
+  const code = ["DeploymentAgentUpgradeRequired", "DeploymentAlreadyRunning", "DeploymentControlUnavailable", "DeploymentConfirmationExpired", "bundledReleaseUnavailable", "activeWorkInProgress", "incompleteObservation", "proxyConfigurationSchemaTooNew", "proxyConfigurationUnreadable", "insufficientDiskSpace", "proxyPortConflict", "intelMacUnsupported", "unsupportedRemotePlatform", "guiSessionUnavailable"]
+    .find((code) => message?.includes(code));
+  return code ? `remote.blocker.${code}` : null;
+}
+
+export function proxyMigrationFailure(message: string | null | undefined): string | null {
+  if (message?.includes("ProxyMigrationRecoveryFailed")) return "remote.blocker.proxyMigrationRecoveryFailed";
+  if (message?.includes("ProxyMigrationRolledBack")) return "remote.blocker.proxyMigrationRolledBack";
+  if (message?.includes("ProxyMigrationAgentUpgradeRequired")) return "remote.blocker.proxyMigrationAgentUpgradeRequired";
+  return null;
+}
+
+/** A preflight refusal carries a fixed, distro-specific repair hint from the backend. */
+export function psStartTimeFailure(message: string | null | undefined): { repair: string | null } | null {
+  if (!message?.includes("psStartTimeUnavailable")) return null;
+  const structured = message.split("; repairs:")[1]?.split(/[\r\n]/, 1)[0]?.trim();
+  if (structured) {
+    try {
+      const repairs: unknown = JSON.parse(structured);
+      const repair = typeof repairs === "object" && repairs !== null && "psStartTimeUnavailable" in repairs
+        && typeof repairs.psStartTimeUnavailable === "string" ? repairs.psStartTimeUnavailable : null;
+      return { repair };
+    } catch { return { repair: null }; }
+  }
+  // Old single-blocker replies remain readable. Never show another blocker's
+  // repair as a shell command when an older server joins multiple repairs.
+  if (message.split("; repair:")[0]?.includes(",")) return { repair: null };
+  const repair = message.split("; repair:")[1]?.split(/[\r\n]/, 1)[0]?.split(" | ")[0]?.trim();
+  return { repair: repair || null };
+}
+
 export interface RemoteVerdict {
   tone: "ok" | "warn" | "quiet";
   /** 短語，給 <State> 那一道筆畫。 */
@@ -103,6 +210,17 @@ interface BlockerEntry {
 }
 
 const BLOCKERS: Record<string, BlockerEntry> = {
+  windowsOpenSshUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  codexRuntimeIncomplete: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  DeploymentAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
+  DeploymentAlreadyRunning: { remedy: null, expectedBeforeBootstrap: false },
+  DeploymentControlUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  DeploymentConfirmationExpired: { remedy: null, expectedBeforeBootstrap: false },
+  bundledReleaseUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  CodexPackageDownloadFailed: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  CodexPackageVerificationFailed: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  activeWorkInProgress: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  unsupportedRemotePlatform: { remedy: null, expectedBeforeBootstrap: false },
   agentUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: true },
   codexRestartRequired: { remedy: "repair", expectedBeforeBootstrap: false },
   credentialsMissing: { remedy: "bootstrap", expectedBeforeBootstrap: true },
@@ -110,7 +228,13 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   dockerUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   intelMacUnsupported: { remedy: null, expectedBeforeBootstrap: false },
   guiSessionUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  // Only emitted after the Agent exhausts the automatic fallback range.
   proxyPortConflict: { remedy: null, expectedBeforeBootstrap: false },
+  proxyPortOccupied: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  proxyMigrationRolledBack: { remedy: "bootstrap", expectedBeforeBootstrap: false },
+  proxyMigrationRecoveryFailed: { remedy: null, expectedBeforeBootstrap: false },
+  proxyMigrationAgentUpgradeRequired: { remedy: "updateAgent", expectedBeforeBootstrap: false },
+  deploymentVerificationFailed: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   insufficientDiskSpace: { remedy: null, expectedBeforeBootstrap: false },
   incompleteObservation: { remedy: null, expectedBeforeBootstrap: false },
   hostNotConfigured: { remedy: "bootstrap", expectedBeforeBootstrap: true },
@@ -120,8 +244,12 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   nativeCodexVersionMismatch: { remedy: "installCodex", expectedBeforeBootstrap: false },
   nativeDaemonAppOwned: { remedy: "stopAppOwned", expectedBeforeBootstrap: false },
   noModelsSelected: { remedy: "plan", expectedBeforeBootstrap: false },
+  noDeployableModels: { remedy: null, expectedBeforeBootstrap: false },
+  psStartTimeUnavailable: { remedy: null, expectedBeforeBootstrap: false },
   officialAccountActivationRequired: { remedy: "activateChatGpt", expectedBeforeBootstrap: false },
   officialAccountPairingRequired: { remedy: "pairChatGpt", expectedBeforeBootstrap: false },
+  officialAccountReauthenticationRequired: { remedy: "pairChatGpt", expectedBeforeBootstrap: false },
+  officialAccountStatusUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: false },
   proxyConfigurationMissing: { remedy: "bootstrap", expectedBeforeBootstrap: true },
   // A newer schema than this build understands, or a config file that
   // couldn't be read at all -- both must block deployment outright rather
@@ -130,7 +258,7 @@ const BLOCKERS: Record<string, BlockerEntry> = {
   // never filtered out by `visibleBlockers`'s `fresh` pass.
   proxyConfigurationSchemaTooNew: { remedy: null, expectedBeforeBootstrap: false },
   proxyConfigurationUnreadable: { remedy: null, expectedBeforeBootstrap: false },
-  systemdUserUnavailable: { remedy: null, expectedBeforeBootstrap: false },
+  systemdUserUnavailable: { remedy: "bootstrap", expectedBeforeBootstrap: true },
   versionMismatch: { remedy: "updateAgent", expectedBeforeBootstrap: false },
 };
 
@@ -176,6 +304,7 @@ function blockerCode(reason: string): string {
 }
 
 export function describeBlocker(reason: string): RemoteBlocker {
+  if (blockerCode(reason) === "windowsOpenSshUnavailable") return { code: "windowsOpenSshUnavailable", messageKey: "remoteSsh.nativeMissing", remedy: null };
   const code = blockerCode(reason);
   const entry = BLOCKERS[code];
   return {
@@ -222,6 +351,11 @@ const PHASES = new Set([
   "queued",
   "cleanHostPreflight",
   "hostPreflight",
+  "autoFix",
+  "waitingForIdle",
+  "observing",
+  "awaitingTakeover",
+  "cancelled",
   "resolvingDesktopCodex",
   "installCodex",
   "nativeDaemon",
@@ -229,6 +363,7 @@ const PHASES = new Set([
   "deploymentApply",
   "applying",
   "verification",
+  "verificationRetry",
   "verified",
   "restorePreflight",
   "restoreLease",

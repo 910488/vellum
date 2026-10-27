@@ -32,7 +32,7 @@ use crate::enhanced_runtime::{
 };
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    AuthKind, CatalogScope, ModelRoute, ProviderKind, ReasoningEffortTransport, Route, WireFormat,
+    AuthKind, ModelRoute, ProviderKind, ReasoningEffortTransport, Route, WireFormat,
 };
 
 use super::child::{gate_child_executable, workspace_side_effect_log};
@@ -685,6 +685,8 @@ fn build_manifest(
         attestation_path: run_root.join("bridge-attestation.json"),
         qualification_journal_path: run_root.join("qualification-journal.jsonl"),
         relay: None,
+        official_successors: Vec::new(),
+        official_helpers: crate::enhanced_runtime::launch_manifest::official_helpers(official),
     })
 }
 
@@ -725,7 +727,6 @@ fn stage_real_codex_homes(manifest: &LaunchManifestV1, provider_url: &str) -> Ap
         context_window: Some(128_000),
         model_capabilities: Vec::new(),
         insecure_http_policy: Default::default(),
-        catalog_scope: CatalogScope::All,
     };
     let models = default_catalog()
         .models
