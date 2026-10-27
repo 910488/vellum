@@ -1,7 +1,7 @@
 {
   "name": "vellum",
   "private": true,
-  "version": "0.2.10",
+  "version": "0.2.11",
   "license": "Apache-2.0",
   "type": "module",
   "description": "Vellum — 本機代理管理器",
