@@ -375,8 +375,9 @@ fn is_startup_config_read(args: &[String]) -> bool {
 
 /// Only a core as new as the Desktop asking knows the startup flags; the
 /// launch pin and the Enhanced core may predate them. The read goes to the
-/// core Desktop ships, as it would without Vellum, and to the resolved
-/// Official core only where Desktop's own cannot be found.
+/// core Desktop ships, as it would without Vellum, run from a copy where this
+/// machine does not let the bridge execute it in place, and to the resolved
+/// Official core only where neither is possible.
 fn delegate_startup_config_read(
     manifest_path: &Path,
     parent: Option<&Path>,
@@ -385,7 +386,8 @@ fn delegate_startup_config_read(
     let manifest = LaunchManifestV1::read(manifest_path)?;
     let shipped = parent
         .filter(|parent| super::desktop_manager::is_known_codex_desktop_executable(parent))
-        .and_then(super::official_drift::desktop_shipped_core);
+        .and_then(super::official_drift::desktop_shipped_core)
+        .and_then(|shipped| super::official_drift::runnable_shipped_core(&manifest, &shipped, &[]));
     let executable = match shipped {
         Some(shipped) => shipped,
         None => super::official_drift::resolve_official(&manifest)
