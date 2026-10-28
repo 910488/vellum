@@ -143,12 +143,14 @@ fn choose_shipped(
     if sha256 == manifest.official.artifact_sha256 {
         return None;
     }
-    if !missing_official_helpers(shipped, &expected_helpers(manifest, &sha256)).is_empty() {
+    let helpers = expected_helpers(manifest, &sha256);
+    if !missing_official_helpers(shipped, &helpers).is_empty() {
         return None;
     }
+    let executable = runnable_shipped_core(manifest, shipped, &helpers)?;
     if manifest.accepts_official_successor(&sha256) {
         return Some((
-            official_identity(manifest, shipped.to_path_buf(), sha256),
+            official_identity(manifest, executable, sha256),
             OfficialSource::Successor,
         ));
     }
@@ -159,9 +161,100 @@ fn choose_shipped(
         "Codex Desktop ships an Official core this launch never checked".into(),
     );
     Some((
-        official_identity(manifest, shipped.to_path_buf(), sha256),
+        official_identity(manifest, executable, sha256),
         OfficialSource::Drifted,
     ))
+}
+
+/// Desktop's shipped core where this process may run it, else a copy of it
+/// that this process may run.
+///
+/// Whether a process outside the Store package may execute the package's files
+/// differs between machines. One grants `BUILTIN\Users` plain RX on them;
+/// another grants it only to processes running as the package, and there
+/// `CreateProcess` fails with "Access is denied" although the file reads fine.
+/// On 2026-10-28 such a machine on 0.2.11, whose bridge ran the shipped core in
+/// place, was still stuck at "Organization settings could not be loaded".
+/// Desktop runs its own copies in `bin\<hash>\` for this reason, but makes them
+/// only after its own startup succeeded. So Vellum keeps one copy per package
+/// beside the launch state, holding the core and the helpers it needs.
+pub fn runnable_shipped_core(
+    manifest: &LaunchManifestV1,
+    shipped: &Path,
+    helpers: &[String],
+) -> Option<PathBuf> {
+    if may_execute(shipped) {
+        return Some(shipped.to_path_buf());
+    }
+    // `<package>\app\resources\codex.exe`; a Store package never changes in
+    // place, so its name identifies the bytes.
+    let resources = shipped.parent()?;
+    let package = resources.parent()?.parent()?.file_name()?;
+    let root = manifest
+        .attestation_path
+        .parent()?
+        .join(DESKTOP_CORE_COPIES);
+    let target = root.join(package);
+    std::fs::create_dir_all(&target).ok()?;
+    let core = shipped.file_name()?;
+    for name in std::iter::once(core.to_string_lossy().into_owned()).chain(helpers.iter().cloned())
+    {
+        copy_once(&resources.join(&name), &target.join(&name)).ok()?;
+    }
+    remove_other_copies(&root, package);
+    Some(target.join(core))
+}
+
+const DESKTOP_CORE_COPIES: &str = "desktop-cores";
+
+/// Opening for execute asks Windows the same access question `CreateProcess`
+/// does, without starting anything.
+#[cfg(windows)]
+fn may_execute(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_EXECUTE: u32 = 0x0020;
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_EXECUTE)
+        .open(path)
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+fn may_execute(_path: &Path) -> bool {
+    true
+}
+
+/// A file only ever appears under its final name complete, so one that is
+/// there with the source's length was copied before.
+fn copy_once(source: &Path, target: &Path) -> std::io::Result<()> {
+    let length = std::fs::metadata(source)?.len();
+    if std::fs::metadata(target).is_ok_and(|existing| existing.len() == length) {
+        return Ok(());
+    }
+    let partial = target.with_extension(format!("partial-{}", std::process::id()));
+    std::fs::copy(source, &partial)?;
+    std::fs::rename(&partial, target).inspect_err(|_| {
+        let _ = std::fs::remove_file(&partial);
+    })
+}
+
+/// Copies of older packages go once nothing runs them. A running core holds
+/// its executable open, so a copy whose core cannot be deleted is left whole
+/// for a later pass rather than losing helpers it may still start.
+fn remove_other_copies(root: &Path, keep: &std::ffi::OsStr) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name() == keep || !path.is_dir() {
+            continue;
+        }
+        let core = path.join("codex.exe");
+        if std::fs::remove_file(&core).is_ok() || !core.exists() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 pub(crate) fn observe_official(
@@ -785,6 +878,141 @@ mod tests {
             desktop_shipped_core(&temp.path().join("elsewhere/app/ChatGPT.exe")),
             None
         );
+    }
+
+    /// What a Store package's files look like on a machine that grants execute
+    /// only to processes running as the package.
+    #[cfg(windows)]
+    fn deny_execute(path: &Path) {
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/deny", "*S-1-1-0:(X)"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!may_execute(path));
+    }
+
+    #[cfg(windows)]
+    fn store_layout(root: &Path, package: &str, core: &str) -> (PathBuf, PathBuf) {
+        let desktop = root.join(package).join("app/ChatGPT.exe");
+        let shipped = desktop.parent().unwrap().join("resources/codex.exe");
+        write_all(&[
+            (&desktop, "desktop"),
+            (&shipped, core),
+            (
+                &shipped.parent().unwrap().join("codex-code-mode-host.exe"),
+                "host",
+            ),
+        ]);
+        (desktop, shipped)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_shipped_core_this_process_may_run_is_run_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let (_, shipped) = store_layout(temp.path(), "OpenAI.Codex_26.1023.0.0_x64", "v3");
+
+        assert_eq!(
+            runnable_shipped_core(&manifest, &shipped, &[]),
+            Some(shipped)
+        );
+        assert!(!temp.path().join(DESKTOP_CORE_COPIES).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_shipped_core_this_process_may_not_run_is_run_from_one_copy_per_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let (_, shipped) = store_layout(temp.path(), "OpenAI.Codex_26.1023.0.0_x64", "v3");
+        let older = temp
+            .path()
+            .join(DESKTOP_CORE_COPIES)
+            .join("OpenAI.Codex_26.1021.0.0_x64");
+        write_all(&[(&older.join("codex.exe"), "v2")]);
+        deny_execute(&shipped);
+
+        let helpers = vec!["codex-code-mode-host.exe".to_string()];
+        let copy = runnable_shipped_core(&manifest, &shipped, &helpers).unwrap();
+        assert_eq!(
+            copy,
+            temp.path()
+                .join(DESKTOP_CORE_COPIES)
+                .join("OpenAI.Codex_26.1023.0.0_x64")
+                .join("codex.exe")
+        );
+        assert_eq!(fs::read(&copy).unwrap(), b"v3");
+        assert!(may_execute(&copy));
+        let host = copy.parent().unwrap().join("codex-code-mode-host.exe");
+        assert_eq!(fs::read(&host).unwrap(), b"host");
+        assert!(!older.exists());
+
+        // The next read reuses the copy instead of copying the package again.
+        let copied_at = fs::metadata(&copy).unwrap().modified().unwrap();
+        assert_eq!(
+            runnable_shipped_core(&manifest, &shipped, &helpers),
+            Some(copy.clone())
+        );
+        assert_eq!(fs::metadata(&copy).unwrap().modified().unwrap(), copied_at);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_still_running_is_kept_when_a_newer_package_arrives() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let (_, shipped) = store_layout(temp.path(), "OpenAI.Codex_26.1023.0.0_x64", "v3");
+        let older = temp
+            .path()
+            .join(DESKTOP_CORE_COPIES)
+            .join("OpenAI.Codex_26.1021.0.0_x64");
+        let older_host = older.join("codex-code-mode-host.exe");
+        write_all(&[(&older.join("codex.exe"), "v2"), (&older_host, "host")]);
+        deny_execute(&shipped);
+        // Windows refuses to delete an executable image that is running; an
+        // open handle without delete sharing is refused the same way.
+        let running = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1)
+                .open(older.join("codex.exe"))
+                .unwrap()
+        };
+
+        runnable_shipped_core(&manifest, &shipped, &[]).unwrap();
+        assert!(older_host.exists());
+        drop(running);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_runs_its_own_core_from_a_copy_where_it_may_not_run_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = helper_fixture(temp.path());
+        let (desktop, shipped) = store_layout(temp.path(), "OpenAI.Codex_26.1023.0.0_x64", "v3");
+        deny_execute(&shipped);
+
+        let (official, source) =
+            resolve_official_for_desktop(&manifest, Some(desktop.as_path())).unwrap();
+        assert_eq!(source, OfficialSource::Drifted);
+        assert_eq!(official.artifact_sha256, sha256_file(&shipped).unwrap());
+        assert_eq!(
+            official.executable,
+            temp.path()
+                .join(DESKTOP_CORE_COPIES)
+                .join("OpenAI.Codex_26.1023.0.0_x64")
+                .join("codex.exe")
+        );
+        assert!(missing_official_helpers(
+            &official.executable,
+            &expected_helpers(&manifest, &official.artifact_sha256)
+        )
+        .is_empty());
     }
 
     #[test]
