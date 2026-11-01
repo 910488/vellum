@@ -12,7 +12,8 @@
 //! Desktop's own identity, so the phone and Desktop stay on the same account.
 //!
 //! Desktop keeps the request's path and swaps only the origin, so the relay
-//! serves the same `/backend-api/...` paths chatgpt.com does. Pointing
+//! serves every path chatgpt.com does: `/backend-api/...`, and also the
+//! `/api/...` paths attachment uploads go to. Pointing
 //! `CODEX_API_BASE_URL` at a relay path instead does not work: workspace
 //! routing puts Desktop's chatgpt.com origin back in front of that path.
 //!
@@ -30,10 +31,9 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Path, Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -47,8 +47,8 @@ pub const DESKTOP_RELAY_PORTS: [u16; 2] = [443, 8000];
 /// forwards to it and stands in only for it; a workspace on another backend
 /// (a data-residency one, say) is left alone.
 pub const PRODUCTION_BACKEND_ORIGIN: &str = "https://chatgpt.com";
-const PRODUCTION_BACKEND: &str = "https://chatgpt.com/backend-api";
-/// Desktop's backend request bodies are small JSON; this only bounds memory.
+/// Most of Desktop's backend request bodies are small JSON; attachment
+/// uploads carry the file. This only bounds memory.
 const MAX_RELAY_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The `backendOrigin` that sends Desktop to the relay on `port`, in the
@@ -237,7 +237,7 @@ pub struct DesktopBackendRelay {
 
 impl DesktopBackendRelay {
     pub fn production() -> Self {
-        Self::with_backend(PRODUCTION_BACKEND)
+        Self::with_backend(PRODUCTION_BACKEND_ORIGIN)
     }
 
     pub fn with_backend(backend: impl Into<String>) -> Self {
@@ -254,10 +254,12 @@ impl DesktopBackendRelay {
     }
 }
 
+/// Every path goes through. Desktop's workspace routing puts the relay's
+/// origin in front of any authenticated chatgpt.com request, not only
+/// `/backend-api/...`: a 26.1027 attachment uploads to `/api/estuary/...`,
+/// and a 404 there leaves the attachment uploading forever.
 pub fn router(relay: Arc<DesktopBackendRelay>) -> Router {
-    Router::new()
-        .route("/backend-api/{*rest}", any(relay_backend))
-        .with_state(relay)
+    Router::new().fallback(relay_backend).with_state(relay)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,21 +268,21 @@ enum UsageShape {
     EventStream,
 }
 
-fn usage_shape(rest: &str) -> Option<UsageShape> {
-    match rest.trim_end_matches('/') {
-        "wham/usage" => Some(UsageShape::Json),
-        "wham/usage/stream" => Some(UsageShape::EventStream),
+fn usage_shape(path: &str) -> Option<UsageShape> {
+    match path.trim_end_matches('/') {
+        "/backend-api/wham/usage" => Some(UsageShape::Json),
+        "/backend-api/wham/usage/stream" => Some(UsageShape::EventStream),
         _ => None,
     }
 }
 
 async fn relay_backend(
     State(relay): State<Arc<DesktopBackendRelay>>,
-    Path(rest): Path<String>,
     request: Request,
 ) -> Response {
     let (mut parts, body) = request.into_parts();
-    let mut url = format!("{}/{}", relay.backend, rest);
+    let path = parts.uri.path().to_string();
+    let mut url = format!("{}{}", relay.backend, path);
     if let Some(query) = parts.uri.query() {
         url.push('?');
         url.push_str(query);
@@ -304,7 +306,7 @@ async fn relay_backend(
                 .into_response()
         }
     };
-    let usage = usage_shape(&rest);
+    let usage = usage_shape(&path);
     let mut headers = forwardable_headers(&parts.headers);
     if usage.is_some() {
         // The body is rewritten, so it has to arrive uncompressed.
@@ -633,7 +635,7 @@ pub fn mark_unlimited(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::get;
+    use axum::routing::{any, get};
     use serde_json::json;
 
     fn exhausted() -> Value {
@@ -742,7 +744,7 @@ mod tests {
         ))
         .await;
         let relay = serve(router(Arc::new(DesktopBackendRelay::with_backend(
-            format!("http://{upstream}/backend-api"),
+            format!("http://{upstream}"),
         ))))
         .await;
 
@@ -766,10 +768,11 @@ mod tests {
 
     #[test]
     fn only_usage_paths_are_rewritten() {
-        assert!(usage_shape("wham/usage") == Some(UsageShape::Json));
-        assert!(usage_shape("wham/usage/stream") == Some(UsageShape::EventStream));
-        assert!(usage_shape("wham/usage/thread_usage/query").is_none());
-        assert!(usage_shape("wham/tasks/list").is_none());
+        assert!(usage_shape("/backend-api/wham/usage") == Some(UsageShape::Json));
+        assert!(usage_shape("/backend-api/wham/usage/stream") == Some(UsageShape::EventStream));
+        assert!(usage_shape("/backend-api/wham/usage/thread_usage/query").is_none());
+        assert!(usage_shape("/backend-api/wham/tasks/list").is_none());
+        assert!(usage_shape("/api/wham/usage").is_none());
     }
 
     /// Desktop's two rules for the origin: `https:` and already in origin
@@ -803,9 +806,7 @@ mod tests {
     #[tokio::test]
     async fn browser_pages_and_foreign_hosts_are_refused() {
         use tower::ServiceExt;
-        let relay = Arc::new(DesktopBackendRelay::with_backend(
-            "http://127.0.0.1:9/backend-api",
-        ));
+        let relay = Arc::new(DesktopBackendRelay::with_backend("http://127.0.0.1:9"));
         let send = |port: u16, host: &str, origin: Option<&str>| {
             let mut builder = axum::http::Request::builder()
                 .uri("/backend-api/wham/usage")
@@ -878,7 +879,7 @@ mod tests {
             let _ = axum::serve(listener, upstream).await;
         });
         let relay = router(Arc::new(DesktopBackendRelay::with_backend(format!(
-            "http://{address}/backend-api"
+            "http://{address}"
         ))));
         for (path, unlimited) in [
             ("/backend-api/wham/usage", true),
@@ -910,6 +911,61 @@ mod tests {
             .all(|(_, auth)| auth.as_deref() == Some("Bearer desktop-login")));
     }
 
+    /// Desktop 26.1027 uploads a pptx attachment to `/api/estuary/...`, not
+    /// `/backend-api/...`. Before the relay took every path it answered 404
+    /// and the attachment never finished uploading.
+    #[tokio::test]
+    async fn attachment_uploads_outside_backend_api_reach_chatgpt() {
+        use tower::ServiceExt;
+        let seen = Arc::new(std::sync::Mutex::new(
+            None::<(String, String, Bytes, Option<String>)>,
+        ));
+        let upstream = Router::new().fallback({
+            let seen = seen.clone();
+            move |request: Request| {
+                let seen = seen.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let auth = parts
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                    *seen.lock().unwrap() =
+                        Some((parts.method.to_string(), parts.uri.to_string(), body, auth));
+                    axum::Json(json!({"status": "success"}))
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let relay = router(Arc::new(DesktopBackendRelay::with_backend(format!(
+            "http://{address}"
+        ))));
+        let file = Bytes::from(vec![7_u8; 2 * 1024 * 1024]);
+        let response = relay
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/estuary/upload_content_bytes?upload_url=signed")
+                    .header("authorization", "Bearer desktop-login")
+                    .body(Body::from(file.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (method, uri, body, auth) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(uri, "/api/estuary/upload_content_bytes?upload_url=signed");
+        assert_eq!(body, file);
+        assert_eq!(auth.as_deref(), Some("Bearer desktop-login"));
+    }
+
     /// What Desktop does once the bridge has pointed it here: an `https:`
     /// request to `localhost`, trusting the relay's certificate, with usage
     /// coming back unlimited and everything else untouched.
@@ -933,7 +989,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let relay = Arc::new(DesktopBackendRelay::with_backend(format!(
-            "http://{upstream_address}/backend-api"
+            "http://{upstream_address}"
         )));
         tokio::spawn(serve_tls(
             listener,
