@@ -5,7 +5,7 @@ import "@/i18n";
 import { ClaudeCodeCard } from "@/components/ClaudeCodeCard";
 import { claudeCodeApi, type ClaudeCodeStatus } from "@/lib/claudeCode";
 
-vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), setFiveHour: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
+vi.mock("@/lib/claudeCode", () => ({ claudeCodeApi: { status: vi.fn(), recentProjects: vi.fn(), start: vi.fn(), startUser: vi.fn(), stop: vi.fn(), select: vi.fn(), login: vi.fn(), cancelLogin: vi.fn(), remove: vi.fn(), usage: vi.fn(), setGate: vi.fn(), setFiveHour: vi.fn(), setFableForOpus: vi.fn(), prepareCertificate: vi.fn(), trustCertificate: vi.fn(), restoreTrust: vi.fn() } }));
 
 function status(): ClaudeCodeStatus {
   return { running: false, projects: [], scope: null, port: null, settingsMatch: false, recoveryRequired: false, notice: null,
@@ -54,6 +54,17 @@ describe("Claude Desktop Code", () => {
     fireEvent.click(screen.getByText(i18n.t("models.ui.account.useThis")));
     await waitFor(() => expect(claudeCodeApi.select).toHaveBeenCalledWith("B"));
     expect(claudeCodeApi.start).not.toHaveBeenCalled();
+  });
+  it("turns sending Opus as Fable on and off for every account", async () => {
+    const value = status();
+    vi.mocked(claudeCodeApi.setFableForOpus).mockImplementation(async (enabled) => { value.accounts.fableForOpus = enabled; return value; });
+    vi.mocked(claudeCodeApi.status).mockImplementation(async () => value);
+    render(<ClaudeCodeCard active />);
+    fireEvent.click(await screen.findByText(i18n.t("claudeCode.fableForOpusOff")));
+    await waitFor(() => expect(claudeCodeApi.setFableForOpus).toHaveBeenCalledWith(true));
+    fireEvent.click(await screen.findByText(i18n.t("claudeCode.fableForOpusOn")));
+    await waitFor(() => expect(claudeCodeApi.setFableForOpus).toHaveBeenLastCalledWith(false));
+    expect(screen.getByText(i18n.t("claudeCode.fableForOpusHint"))).toBeTruthy();
   });
   it("shows Fable's weekly share without a gate and says what credits will do past it", async () => {
     const value = status(); value.accounts.selected = null;

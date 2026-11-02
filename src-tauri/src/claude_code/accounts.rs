@@ -19,11 +19,17 @@ const STORAGE_ID: &str = "claudecodeaccounts";
 const USAGE_FRESH_SECS: i64 = 120;
 /// A gate check never stalls an inference request for longer than this.
 const GATE_USAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// What an Opus request is sent as when `fable_for_opus` is on.
+const FABLE_MODEL: &str = "claude-fable-5-1";
 
 #[derive(Default, Serialize, Deserialize)]
 struct StoredAccounts {
     accounts: Vec<StoredAccount>,
     selected: Option<String>,
+    /// Send Desktop's Opus requests as Fable on the execution account. Desktop
+    /// gates Fable by its own sign-in, which may not include it.
+    #[serde(default)]
+    fable_for_opus: bool,
     /// The account a gate moved the selection away from, until a manual pick.
     #[serde(skip)]
     switched_from: Option<String>,
@@ -121,6 +127,7 @@ pub struct AccountsView {
     pub accounts: Vec<AccountView>,
     pub selected: Option<String>,
     pub switched_from: Option<String>,
+    pub fable_for_opus: bool,
     pub login_pending: bool,
     pub login_error: Option<String>,
 }
@@ -220,6 +227,7 @@ impl CodeAccounts {
                 .collect(),
             selected: data.selected.clone(),
             switched_from: data.switched_from.clone(),
+            fable_for_opus: data.fable_for_opus,
             login_pending: login.pending.is_some(),
             login_error: login.error.clone(),
         })
@@ -268,6 +276,18 @@ impl CodeAccounts {
             }
             return Err(error);
         }
+        Ok(())
+    }
+    pub async fn set_fable_for_opus(&self, enabled: bool) -> Result<(), String> {
+        let mut stored = self.stored.lock().await;
+        self.load(&mut stored)?;
+        let data = stored.as_mut().unwrap();
+        let previous = std::mem::replace(&mut data.fable_for_opus, enabled);
+        if let Err(error) = self.save(data) {
+            data.fable_for_opus = previous;
+            return Err(error);
+        }
+        log::info!("[ClaudeCode] fable for opus enabled={enabled}");
         Ok(())
     }
     pub async fn set_maintain_five_hour(&self, id: &str, enabled: bool) -> Result<(), String> {
@@ -711,6 +731,27 @@ impl ClaudeAccounts for CodeAccounts {
         }
         self.token_for(data, &selected).await.map(Some)
     }
+
+    async fn substitute_model(&self, account_id: Option<&str>, requested: &str) -> Option<String> {
+        // Desktop's own sign-in is what lacks Fable; it passes untouched.
+        let id = account_id?;
+        if !requested.starts_with("claude-opus-") {
+            return None;
+        }
+        let stored = self.stored.lock().await;
+        let data = stored.as_ref().filter(|d| d.fable_for_opus)?;
+        let account = data.accounts.iter().find(|a| a.id == id)?;
+        // Past the included share Fable bills usage credits or stops, so the
+        // request goes as Opus. An account with no known share is tried; a
+        // refusal sends Opus and keeps Fable off for a while.
+        let now = chrono::Utc::now().timestamp();
+        let used_up = account
+            .usage
+            .as_ref()
+            .and_then(|u| remaining(u.fable.as_ref(), now))
+            .is_some_and(|left| left <= 0.0);
+        (!used_up).then(|| FABLE_MODEL.into())
+    }
 }
 impl CodeAccounts {
     /// Re-reads usage for a gated account when it is stale, best effort.
@@ -1116,6 +1157,7 @@ mod tests {
                     usage_checked_at: 0,
                     five_hour_error: None,
                 }],
+                fable_for_opus: false,
                 switched_from: None,
                 all_gated_logged: false,
             })
@@ -1267,6 +1309,7 @@ mod tests {
         let data = StoredAccounts {
             selected: Some(accounts[0].id.clone()),
             accounts,
+            fable_for_opus: false,
             switched_from: None,
             all_gated_logged: false,
         };
@@ -1668,6 +1711,55 @@ mod tests {
         );
         // One gated window plus Fable is still a partial observation.
         assert_eq!(account.usage_checked_at, checked_before);
+    }
+    #[tokio::test]
+    async fn fable_for_opus_covers_only_opus_on_an_execution_account_with_fable_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        let mut used_up = account("B", AccountGate::default(), 10.0, None);
+        used_up.usage.as_mut().unwrap().fable = Some(UsageWindow::for_test(100.0, None));
+        install(
+            &manager,
+            vec![account("A", AccountGate::default(), 10.0, None), used_up],
+        )
+        .await;
+        assert_eq!(
+            manager.substitute_model(Some("A"), "claude-opus-5-5").await,
+            None
+        );
+        manager.set_fable_for_opus(true).await.unwrap();
+        assert!(manager.view().await.unwrap().fable_for_opus);
+        assert_eq!(
+            manager
+                .substitute_model(Some("A"), "claude-opus-5-5")
+                .await
+                .as_deref(),
+            Some(FABLE_MODEL)
+        );
+        for (account, model) in [
+            (Some("A"), "claude-haiku-5-5"),
+            // Desktop's own sign-in, and an account whose share is used up.
+            (None, "claude-opus-5-5"),
+            (Some("B"), "claude-opus-5-5"),
+            (Some("missing"), "claude-opus-5-5"),
+        ] {
+            assert_eq!(manager.substitute_model(account, model).await, None);
+        }
+        // A share past its reset is whole again.
+        manager.stored.lock().await.as_mut().unwrap().accounts[1]
+            .usage
+            .as_mut()
+            .unwrap()
+            .fable = Some(UsageWindow::for_test(
+            100.0,
+            Some("2020-01-01T00:00:00Z".into()),
+        ));
+        assert!(manager
+            .substitute_model(Some("B"), "claude-opus-5-5")
+            .await
+            .is_some());
+        let reloaded = CodeAccounts::with_tokens(temp.path().into(), tokens(false));
+        assert!(reloaded.view().await.unwrap().fable_for_opus);
     }
     #[tokio::test]
     async fn five_hour_choice_persists_and_only_opted_in_accounts_are_scheduled() {

@@ -26,6 +26,8 @@ export interface ClaudeCodeStatus {
       maintainFiveHour?: boolean; fiveHourError?: string | null }[];
     selected: string | null;
     switchedFrom?: string | null;
+    /** Desktop's Opus requests go out as Fable while the execution account has Fable left. */
+    fableForOpus?: boolean;
     loginPending: boolean;
     loginError: string | null;
   };
@@ -65,4 +67,5 @@ export const claudeCodeApi = {
   setGate: (accountId: string, gate: ClaudeCodeGate) => invoke<ClaudeCodeStatus>("claude_code_set_gate", { accountId, gate }),
   usage: (accountId: string) => invoke<ClaudeCodeStatus>("claude_code_refresh_usage", { accountId }),
   setFiveHour: (accountId: string, enabled: boolean) => invoke<ClaudeCodeStatus>("claude_code_set_five_hour", { accountId, enabled }),
+  setFableForOpus: (enabled: boolean) => invoke<ClaudeCodeStatus>("claude_code_set_fable_for_opus", { enabled }),
 };

@@ -140,6 +140,7 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
   const label = (id: string | null) => id === null ? t("claudeCode.original")
     : status?.accounts.accounts.find((account) => account.id === id)?.label ?? id;
   const selected = status?.accounts.selected ?? null;
+  const fableForOpus = status?.accounts.fableForOpus ?? false;
   const inference = status ? lastInference(status) : undefined;
   const trust = status?.trust;
   const needsTrust = Boolean(trust?.supported && !trust.trusted);
@@ -252,6 +253,13 @@ export function ClaudeCodeCard({ active, refreshVersion = 0, onRefreshed }: {
     {status?.accounts.switchedFrom && selected && <p className="field__hint" role="status">
       {t("claudeCode.switchedFrom", { from: label(status.accounts.switchedFrom), to: label(selected) })}
     </p>}
+    <div className="rowline claude-code__fable">
+      <Btn mini soft disabled={busy || !status}
+        onClick={() => void act(() => claudeCodeApi.setFableForOpus(!fableForOpus))}>
+        {t(fableForOpus ? "claudeCode.fableForOpusOn" : "claudeCode.fableForOpusOff")}
+      </Btn>
+      <span className="field__hint">{t("claudeCode.fableForOpusHint")}</span>
+    </div>
     <div className="rowline claude-code__login">
       <Btn soft disabled={busy || !status || status.accounts.loginPending} onClick={() => void act(() => claudeCodeApi.login())}>
         {t(status?.accounts.loginPending ? "models.ui.oauth.waitingBrowser" : "claudeCode.login")}

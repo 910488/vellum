@@ -127,6 +127,21 @@ pub async fn claude_code_set_gate(
     state.claude_code().status().await
 }
 
+/// Sends Desktop's Opus requests as Fable while the execution account has
+/// Fable left. Applies to the next inference request.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn claude_code_set_fable_for_opus(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<CodeStatus, String> {
+    state
+        .claude_code()
+        .accounts
+        .set_fable_for_opus(enabled)
+        .await?;
+    state.claude_code().status().await
+}
+
 /// Starts the next 5-hour window right after each reset (one Haiku turn).
 #[tauri::command(rename_all = "camelCase")]
 pub async fn claude_code_set_five_hour(
