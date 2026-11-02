@@ -288,6 +288,7 @@ pub fn run() {
             commands::claude_code_refresh_usage,
             commands::claude_code_set_gate,
             commands::claude_code_set_five_hour,
+            commands::claude_code_set_fable_for_opus,
             commands::get_overview,
             commands::get_provider_overviews,
             commands::get_request_log,

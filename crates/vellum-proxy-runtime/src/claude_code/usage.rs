@@ -228,7 +228,7 @@ impl ResponseInspector {
         }
     }
 }
-fn error_type(value: &serde_json::Value) -> Option<String> {
+pub(super) fn error_type(value: &serde_json::Value) -> Option<String> {
     value
         .pointer("/error/type")
         .and_then(|t| t.as_str())

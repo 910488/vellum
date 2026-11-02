@@ -10,9 +10,18 @@ struct Accounts(
     tokio::sync::Mutex<()>,
     tokio::sync::Notify,
     Mutex<Vec<CodeUsageRecord>>,
+    /// Model substituted for Opus requests, when set.
+    Mutex<Option<String>>,
 );
 #[async_trait]
 impl ClaudeAccounts for Accounts {
+    async fn substitute_model(&self, _account_id: Option<&str>, requested: &str) -> Option<String> {
+        self.5
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|_| requested.starts_with("claude-opus-"))
+    }
     async fn observe_usage(&self, id: &str, usage: UsageObservation) {
         self.3.notify_one();
         let _lock = self.2.lock().await;
@@ -83,6 +92,9 @@ impl Fixture {
             let (parts,body)=request.into_parts();
             let bytes=to_bytes(body,MAX_BODY).await.unwrap();
             let is_reject=parts.headers.contains_key("x-test-reject");
+            // Stands in for an account whose Fable share is used up.
+            let reject_fable=parts.headers.contains_key("x-test-reject-fable")
+                && serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|v|v["model"]=="claude-fable-5-1");
             let streaming=parts.headers.contains_key("x-test-stream");
             let native_stream=serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|v|v["stream"]==true);
             let gzip=parts.headers.get(header::ACCEPT_ENCODING).and_then(|v|v.to_str().ok()).is_some_and(|v|v.contains("gzip"));
@@ -90,6 +102,15 @@ impl Fixture {
             let method=parts.method.clone();
             send.send(Captured {path:parts.uri.to_string(),headers:parts.headers,body:bytes}).await.unwrap();
             if is_reject {return failure(StatusCode::TOO_MANY_REQUESTS,"rate_limit_error");}
+            if reject_fable {
+                let mut response=failure(StatusCode::TOO_MANY_REQUESTS,"rate_limit_error");
+                for (name, value) in [
+                    ("retry-after", "120"),
+                    ("anthropic-ratelimit-unified-7d_oi-utilization", "1.0"),
+                    ("anthropic-ratelimit-unified-7d_oi-reset", "1900600000"),
+                ] { response.headers_mut().insert(name, value.parse().unwrap()); }
+                return response;
+            }
             if native_stream {return native_completion(gzip);}
             if method==Method::GET {return Response::new(Body::from("{}"));}
             if path=="/v1/messages/count_tokens" {return Response::new(Body::from("{\"input_tokens\":10}"));}
@@ -121,6 +142,7 @@ impl Fixture {
             tokio::sync::Mutex::new(()),
             tokio::sync::Notify::new(),
             Mutex::new(Vec::new()),
+            Mutex::new(None),
         ));
         let proxy = ClaudeCodeProxy::build_scoped(
             "test-secret",
@@ -655,6 +677,121 @@ async fn quota_rejection_is_preserved_without_replaying_or_falling_back() {
     let _ = f.captured.recv().await.unwrap();
     assert!(f.captured.try_recv().is_err());
     assert_eq!(f.proxy.status().records[0].state, "upstream_rejected");
+    f.stop().await;
+}
+
+fn opus_body() -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(&body()).unwrap();
+    value["model"] = json!("claude-opus-5-5");
+    serde_json::to_vec(&value).unwrap()
+}
+
+#[tokio::test]
+async fn a_substituted_model_replaces_only_the_model_and_is_recorded_as_sent() {
+    use std::io::Write;
+    let mut f = Fixture::new().await;
+    *f.accounts.5.lock().unwrap() = Some("claude-fable-5-1".into());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&opus_body()).unwrap();
+    for (bytes, encoding) in [
+        (opus_body(), None),
+        (encoder.finish().unwrap(), Some("gzip")),
+    ] {
+        let mut request = f.request("/v1/messages", bytes);
+        if let Some(encoding) = encoding {
+            request = request.header(header::CONTENT_ENCODING, encoding);
+        }
+        assert_eq!(
+            request.send().await.unwrap().text().await.unwrap(),
+            "upstream-response"
+        );
+        let sent = f.captured.recv().await.unwrap();
+        assert!(!sent.headers.contains_key(header::CONTENT_ENCODING));
+        assert_eq!(sent.headers[header::AUTHORIZATION], "Bearer token-B");
+        let mut expected: serde_json::Value = serde_json::from_slice(&opus_body()).unwrap();
+        expected["model"] = json!("claude-fable-5-1");
+        // Same keys in the same order, thinking signatures untouched.
+        assert_eq!(sent.body, serde_json::to_vec(&expected).unwrap());
+    }
+    // Models the accounts do not substitute go out byte for byte.
+    let bytes = body();
+    f.request("/v1/messages", bytes.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(f.captured.recv().await.unwrap().body, bytes);
+    let records = f.accounts.wait_records(3).await;
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r.model.as_deref())
+            .collect::<Vec<_>>(),
+        [
+            Some("claude-fable-5-1"),
+            Some("claude-fable-5-1"),
+            Some("claude-sonnet-4-6")
+        ]
+    );
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn a_refused_substitution_goes_out_once_as_built_and_stays_off_for_the_account() {
+    let mut f = Fixture::new().await;
+    *f.accounts.5.lock().unwrap() = Some("claude-fable-5-1".into());
+    let bytes = opus_body();
+    let response = f
+        .request("/v1/messages", bytes.clone())
+        .header("x-test-reject-fable", "1")
+        .send()
+        .await
+        .unwrap();
+    // Claude Code only ever sees the answer to the request it built.
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "upstream-response");
+    let refused = f.captured.recv().await.unwrap();
+    assert!(String::from_utf8_lossy(&refused.body).contains("claude-fable-5-1"));
+    let retried = f.captured.recv().await.unwrap();
+    assert_eq!(retried.body, bytes);
+    assert_eq!(retried.headers[header::AUTHORIZATION], "Bearer token-B");
+    let records = f.accounts.wait_records(1).await;
+    assert_eq!(records[0].model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(records[0].upstream_status, Some(200));
+    // The refusal's Fable window still reaches the account.
+    f.accounts.wait_observations(2).await;
+    assert!(f
+        .accounts
+        .1
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(id, u)| id == "B" && u.fable.is_some_and(|w| w.utilization == 100.0)));
+    // Retry-After keeps the account on the requested model, without a probe.
+    f.request("/v1/messages", bytes.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(f.captured.recv().await.unwrap().body, bytes);
+    assert!(f.captured.try_recv().is_err());
+    // Another account is still offered the substitution.
+    *f.accounts.0.write().await = Some("C".into());
+    f.request("/v1/messages", bytes)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&f.captured.recv().await.unwrap().body)
+            .contains("claude-fable-5-1")
+    );
     f.stop().await;
 }
 

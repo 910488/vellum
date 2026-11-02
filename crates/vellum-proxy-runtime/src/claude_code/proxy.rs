@@ -38,7 +38,21 @@ pub trait ClaudeAccounts: Send + Sync {
     /// One finished Desktop inference request. Called from a drop path, so it
     /// must not wait on async work.
     fn record_request(&self, _record: &CodeUsageRecord) {}
+    /// A model to send in place of the one Claude Code asked for, or None to
+    /// forward the request as built. Asked once per Desktop inference request,
+    /// after `selected_token`, with the account that request captured.
+    async fn substitute_model(
+        &self,
+        _account_id: Option<&str>,
+        _requested: &str,
+    ) -> Option<String> {
+        None
+    }
 }
+
+/// How long a refused substitution stays off when upstream gives no
+/// Retry-After. The request itself is sent again as Claude Code built it.
+const SUBSTITUTION_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// What one Desktop inference request did, for usage rows and logs. Carries no
 /// credential or content: only the account id and already hashed identities.
@@ -104,6 +118,15 @@ pub struct ClaudeCodeProxy {
     accepting: AtomicBool,
     tunnels: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tunnel_slots: Arc<tokio::sync::Semaphore>,
+    /// Substitutions upstream refused, by account or by account and session,
+    /// until the instant they may be tried again.
+    refused: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+/// The body to send instead of Claude Code's, carrying a substituted model.
+struct Substitution {
+    model: String,
+    body: Bytes,
 }
 
 impl ClaudeCodeProxy {
@@ -143,6 +166,7 @@ impl ClaudeCodeProxy {
             accepting: AtomicBool::new(true),
             tunnels: Mutex::new(Vec::new()),
             tunnel_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            refused: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -393,6 +417,8 @@ impl ClaudeCodeProxy {
         let mut headers = end_to_end_headers(&parts.headers);
         let mut guard = None;
         let mut response_account = None;
+        let mut substitution = None;
+        let mut requested_model = None;
         if inference && desktop {
             self.status.lock().unwrap().last_error = None;
             let (session, model) = match session_key(&parts.headers, &bytes) {
@@ -433,12 +459,28 @@ impl ClaudeCodeProxy {
             } else {
                 "count_tokens"
             };
+            if let Some(requested) = model.as_deref() {
+                substitution = self
+                    .substitution(
+                        account_id.as_deref(),
+                        &session,
+                        requested,
+                        &parts.headers,
+                        &bytes,
+                    )
+                    .await;
+            }
+            let sent_model = substitution
+                .as_ref()
+                .map(|s| s.model.clone())
+                .or(model.clone());
+            requested_model = model;
             guard = Some(RequestGuard::new(
                 self.clone(),
                 session,
                 account_id,
                 operation,
-                model,
+                sent_model,
             ));
         }
         let path = parts
@@ -446,13 +488,75 @@ impl ClaudeCodeProxy {
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/");
+        let url = format!("{}{path}", self.upstream);
+        // Claude Code's own request is kept only while a substitution may
+        // still need it.
+        let (sent_headers, sent_body, as_built) = match &substitution {
+            Some(substitution) => {
+                // The rewritten body is plain JSON of a new length.
+                let mut sent = headers.clone();
+                sent.remove(header::CONTENT_ENCODING);
+                sent.remove(header::CONTENT_LENGTH);
+                (sent, substitution.body.clone(), Some((headers, bytes)))
+            }
+            None => (headers, bytes, None),
+        };
         let result = self
             .client
-            .request(parts.method, format!("{}{path}", self.upstream))
-            .headers(headers)
-            .body(bytes)
+            .request(parts.method.clone(), &url)
+            .headers(sent_headers)
+            .body(sent_body)
             .send()
             .await;
+        // Only a substitution Vellum made is ever sent twice: Claude Code
+        // never saw the refused answer, and its own request still stands.
+        // Upstream rejections of the request as built are passed through.
+        let result = match (substitution.zip(as_built), result) {
+            (Some((substitution, (headers, bytes))), Ok(refused))
+                if refuses_substitution(refused.status()) =>
+            {
+                self.observe(response_account.as_deref(), refused.headers());
+                let status = refused.status();
+                let retry_after = refused
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                let error =
+                    match tokio::time::timeout(Duration::from_secs(5), refused.bytes()).await {
+                        Ok(Ok(body)) => serde_json::from_slice::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| super::usage::error_type(&v)),
+                        _ => None,
+                    };
+                // Only a Desktop inference request, which has a guard, substitutes.
+                if let Some(guard) = guard.as_mut() {
+                    let cooldown = self.refuse(
+                        guard.record.account_id.as_deref(),
+                        &guard.record.session_hash,
+                        status,
+                        retry_after,
+                    );
+                    guard.record.model = requested_model;
+                    log::warn!(
+                        "[ClaudeCode] substitution refused request={} model={} status={} error={} cooldown_s={}; sending {}",
+                        guard.record.request_id,
+                        substitution.model,
+                        status.as_u16(),
+                        error.as_deref().unwrap_or("-"),
+                        cooldown.as_secs(),
+                        guard.record.model.as_deref().unwrap_or("-"),
+                    );
+                }
+                self.client
+                    .request(parts.method, &url)
+                    .headers(headers)
+                    .body(bytes)
+                    .send()
+                    .await
+            }
+            (_, result) => result,
+        };
         let upstream = match result {
             Ok(response) => response,
             Err(error) => {
@@ -467,17 +571,7 @@ impl ClaudeCodeProxy {
                 return failure(StatusCode::BAD_GATEWAY, "claude_upstream_transport_failed");
             }
         };
-        if let Some(account_id) = response_account {
-            let usage = UsageObservation::from_headers(upstream.headers());
-            if !usage.is_empty() {
-                let accounts = self.accounts.clone();
-                // Account refresh/usage API reads may hold their lock for
-                // seconds. Never delay response headers or streaming for it.
-                tokio::spawn(async move {
-                    accounts.observe_usage(&account_id, usage).await;
-                });
-            }
-        }
+        self.observe(response_account.as_deref(), upstream.headers());
         let status = upstream.status();
         if let Some(guard) = guard.as_mut() {
             guard.update("streaming", Some(status.as_u16()));
@@ -519,6 +613,101 @@ impl ClaudeCodeProxy {
         *response.headers_mut() = headers;
         response
     }
+
+    /// Hands usage headers to the account that request captured.
+    fn observe(&self, account_id: Option<&str>, headers: &HeaderMap) {
+        let Some(account_id) = account_id.map(str::to_owned) else {
+            return;
+        };
+        let usage = UsageObservation::from_headers(headers);
+        if usage.is_empty() {
+            return;
+        }
+        let accounts = self.accounts.clone();
+        // Account refresh/usage API reads may hold their lock for
+        // seconds. Never delay response headers or streaming for it.
+        tokio::spawn(async move {
+            accounts.observe_usage(&account_id, usage).await;
+        });
+    }
+
+    /// The rewritten request, unless the accounts decline or upstream
+    /// refused this substitution for the account or session recently.
+    async fn substitution(
+        &self,
+        account_id: Option<&str>,
+        session: &str,
+        requested: &str,
+        headers: &HeaderMap,
+        bytes: &[u8],
+    ) -> Option<Substitution> {
+        let model = self
+            .accounts
+            .substitute_model(account_id, requested)
+            .await?;
+        if model == requested {
+            return None;
+        }
+        {
+            let now = std::time::Instant::now();
+            let mut refused = self.refused.lock().unwrap();
+            refused.retain(|_, until| *until > now);
+            let account = account_id.unwrap_or("passthrough");
+            if refused.contains_key(&format!("account:{account}"))
+                || refused.contains_key(&format!("session:{account}:{session}"))
+            {
+                return None;
+            }
+        }
+        let body = with_model(headers, bytes, &model)?;
+        Some(Substitution { model, body })
+    }
+
+    /// Keeps a refused substitution off for a while and returns how long. A
+    /// limit or a missing entitlement belongs to the account; anything else,
+    /// such as a context the model cannot take, only to that session.
+    fn refuse(
+        &self,
+        account_id: Option<&str>,
+        session: &str,
+        status: StatusCode,
+        retry_after: Option<u64>,
+    ) -> Duration {
+        let account = account_id.unwrap_or("passthrough");
+        let (key, cooldown) = match status.as_u16() {
+            429 => (
+                format!("account:{account}"),
+                retry_after
+                    .map(|s| Duration::from_secs(s.clamp(60, 7 * 24 * 3600)))
+                    .unwrap_or(SUBSTITUTION_COOLDOWN),
+            ),
+            403 | 404 => (format!("account:{account}"), SUBSTITUTION_COOLDOWN),
+            _ => (
+                format!("session:{account}:{session}"),
+                SUBSTITUTION_COOLDOWN,
+            ),
+        };
+        self.refused
+            .lock()
+            .unwrap()
+            .insert(key, std::time::Instant::now() + cooldown);
+        cooldown
+    }
+}
+
+/// A client error that the request as Claude Code built it may not get.
+/// Authentication and timeouts would fail the same way, so they pass.
+fn refuses_substitution(status: StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 401 | 407 | 408)
+}
+
+/// The body as plain JSON with only its top-level model replaced. Key order
+/// is kept, so nothing else Claude Code sent changes meaning.
+fn with_model(headers: &HeaderMap, bytes: &[u8], model: &str) -> Option<Bytes> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&decoded_body(headers, bytes).ok()?).ok()?;
+    *value.as_object_mut()?.get_mut("model")? = serde_json::Value::String(model.to_owned());
+    serde_json::to_vec(&value).ok().map(Bytes::from)
 }
 
 struct RequestGuard {
@@ -691,19 +880,19 @@ fn is_desktop_code(headers: &HeaderMap) -> bool {
             .any(|part| part == "claude-desktop")
 }
 
-/// Hashed session identity and the requested model.
-fn session_key(
+/// The request body without its content encoding.
+fn decoded_body<'a>(
     headers: &HeaderMap,
-    bytes: &[u8],
-) -> Result<(String, Option<String>), &'static str> {
-    let mut decoded = Vec::new();
-    let bytes = match headers
+    bytes: &'a [u8],
+) -> Result<std::borrow::Cow<'a, [u8]>, &'static str> {
+    match headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
     {
-        None | Some("identity") => bytes,
+        None | Some("identity") => Ok(bytes.into()),
         Some("gzip") => {
             use std::io::Read;
+            let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(bytes)
                 .take(MAX_BODY as u64 + 1)
                 .read_to_end(&mut decoded)
@@ -711,12 +900,20 @@ fn session_key(
             if decoded.len() > MAX_BODY {
                 return Err("decoded_request_too_large");
             }
-            &decoded
+            Ok(decoded.into())
         }
-        _ => return Err("unsupported_request_encoding"),
-    };
+        _ => Err("unsupported_request_encoding"),
+    }
+}
+
+/// Hashed session identity and the requested model.
+fn session_key(
+    headers: &HeaderMap,
+    bytes: &[u8],
+) -> Result<(String, Option<String>), &'static str> {
+    let bytes = decoded_body(headers, bytes)?;
     let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| "invalid_messages_json")?;
+        serde_json::from_slice(&bytes).map_err(|_| "invalid_messages_json")?;
     let raw = value
         .pointer("/metadata/user_id")
         .and_then(|v| v.as_str())
