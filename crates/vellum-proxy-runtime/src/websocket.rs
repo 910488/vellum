@@ -472,11 +472,19 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                         }
                         Err(error) => {
                             // Missing local history keeps the portable path,
-                            // which asks Codex for a full-input retry.
-                            log::warn!(
-                                "[OfficialSocket] account handoff falls back to portable replay connection={connection_id} kind={}",
-                                error.category()
-                            );
+                            // which asks Codex for a full-input retry. That
+                            // is the designed recovery for a response only the
+                            // old account can resume, not a failure.
+                            if matches!(error, RuntimeError::PreviousResponseNotFound(_)) {
+                                log::info!(
+                                    "[OfficialSocket] account handoff has no local history; asking Codex for full input connection={connection_id}"
+                                );
+                            } else {
+                                log::warn!(
+                                    "[OfficialSocket] account handoff falls back to portable replay connection={connection_id} kind={}",
+                                    error.category()
+                                );
+                            }
                             runtime_request.metadata.force_portable_official_handoff = true;
                             turn_dispatch = WebSocketTurnDispatch::PortableReplay {
                                 force_official_handoff: true,
