@@ -7,7 +7,44 @@ use crate::model::{
 use crate::review::AUTO_REVIEW_MODEL;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Request rows kept for the log screen. Older rows leave their counts behind
+/// in `request_usage_daily`, so totals and the activity heatmap do not reset.
+const REQUEST_LOG_RETAINED_ROWS: i64 = 500;
+/// Rows per route that `summary` reads for its latest figures and sparkline. A
+/// route the log has rolled past still shows them on the Today screen.
+const ROUTE_TAIL_ROWS: i64 = 12;
+/// Rows one roll-over moves while holding the database lock. Normally that is a
+/// single row; a database from before the limit works through its backlog in
+/// steps this size, so a request waiting to write never waits long.
+const ROLL_STEP_ROWS: i64 = 1_000;
+
+/// Every request ever counted: rows still in the log, plus what rolled out of it.
+/// A row is in exactly one of the two, so summing across them cannot double count.
+const USAGE_TOTALS_CTE: &str = "WITH usage_totals AS (
+    SELECT date(created_at, 'unixepoch', 'localtime') AS day, route_id, provider,
+           1 AS requests, (status >= 400) AS failed_requests,
+           input_tokens, output_tokens, duration_ms AS longest_ms
+    FROM request_usage
+    UNION ALL
+    SELECT day, route_id, provider, requests, failed_requests,
+           input_tokens, output_tokens, longest_ms
+    FROM request_usage_daily
+)";
+
+/// Review traffic still in the log plus what rolled out of it. Binds ?1 to the
+/// auto-review model name.
+const REVIEW_ROWS_CTE: &str = "WITH review_rows AS (
+    SELECT id, route_id, provider, model, status, review_run_id, review_role,
+           review_reason, created_at
+    FROM request_usage
+    WHERE review_run_id IS NOT NULL OR lower(model) = lower(?1)
+    UNION ALL
+    SELECT id, route_id, provider, model, status, review_run_id, review_role,
+           review_reason, created_at
+    FROM review_usage_archive
+)";
 
 /// One page of the request log. Event lists stay independently capped so
 /// Start/Stop timing is not coupled to how many request rows the UI shows.
@@ -542,9 +579,190 @@ impl UsageStore {
             .map_err(|error| {
                 AppError::Message(format!("create connection usage index: {error}"))
             })?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS request_usage_daily (
+                    day             TEXT NOT NULL,
+                    route_id        TEXT NOT NULL,
+                    provider        TEXT NOT NULL,
+                    requests        INTEGER NOT NULL,
+                    failed_requests INTEGER NOT NULL,
+                    input_tokens    INTEGER NOT NULL,
+                    output_tokens   INTEGER NOT NULL,
+                    longest_ms      INTEGER NOT NULL,
+                    PRIMARY KEY (day, route_id, provider)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS request_usage_route_tail (
+                    id            INTEGER PRIMARY KEY,
+                    route_id      TEXT NOT NULL,
+                    input_tokens  INTEGER NOT NULL,
+                    first_byte_ms INTEGER,
+                    created_at    INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS ix_usage_route_tail
+                   ON request_usage_route_tail(route_id, id);
+                 CREATE TABLE IF NOT EXISTS review_usage_archive (
+                    id            INTEGER PRIMARY KEY,
+                    route_id      TEXT NOT NULL,
+                    provider      TEXT NOT NULL,
+                    model         TEXT NOT NULL,
+                    status        INTEGER NOT NULL,
+                    review_run_id TEXT,
+                    review_role   TEXT,
+                    review_reason TEXT,
+                    created_at    INTEGER NOT NULL
+                 );",
+            )
+            .map_err(|error| AppError::Message(format!("create usage rollups: {error}")))?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    /// Work through a database from before the limit without holding up startup.
+    /// Normal operation never needs this: each write rolls the row it displaced.
+    pub fn roll_backlog_in_background(self: &Arc<Self>) {
+        let has_backlog =
+            Self::oldest_rolled_out_row(&self.connection.lock().expect("usage db poisoned"))
+                .is_ok_and(|cut| cut.is_some());
+        if has_backlog {
+            let store = Arc::clone(self);
+            std::thread::spawn(move || {
+                let rolled = store.work_off_backlog();
+                log::info!("[Usage] request log backlog rolled over rows={rolled}");
+            });
+        }
+    }
+
+    fn work_off_backlog(&self) -> usize {
+        let mut total = 0;
+        loop {
+            let step =
+                Self::roll_request_log_inner(&self.connection.lock().expect("usage db poisoned"));
+            match step {
+                Ok(0) => return total,
+                Ok(rolled) => total += rolled,
+                Err(error) => {
+                    log::warn!("[Usage] request log roll-over failed: {error}");
+                    return total;
+                }
+            }
+            // Between steps the lock is free for whatever is waiting to write.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The newest row past the limit: this one and everything older has to go.
+    fn oldest_rolled_out_row(connection: &Connection) -> rusqlite::Result<Option<i64>> {
+        connection
+            .query_row(
+                "SELECT id FROM request_usage ORDER BY id DESC LIMIT 1 OFFSET ?1",
+                [REQUEST_LOG_RETAINED_ROWS],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+    }
+
+    /// Keep the newest rows for the log screen and fold older ones into the
+    /// tables that outlive them, at most [`ROLL_STEP_ROWS`] at a time. One
+    /// transaction, so a request is always counted by its own row or by the
+    /// rollup, never by both and never by neither.
+    fn roll_request_log_inner(connection: &Connection) -> AppResult<usize> {
+        let fail = |error: rusqlite::Error| AppError::Message(format!("roll request log: {error}"));
+        let Some(cut) = Self::oldest_rolled_out_row(connection).map_err(fail)? else {
+            return Ok(0);
+        };
+        let oldest: i64 = connection
+            .query_row("SELECT MIN(id) FROM request_usage", [], |row| row.get(0))
+            .map_err(fail)?;
+        let cut = cut.min(oldest + ROLL_STEP_ROWS - 1);
+        let transaction = connection.unchecked_transaction().map_err(fail)?;
+        transaction
+            .execute(
+                "INSERT INTO request_usage_daily
+                   (day, route_id, provider, requests, failed_requests,
+                    input_tokens, output_tokens, longest_ms)
+                 SELECT date(created_at, 'unixepoch', 'localtime'), route_id, provider,
+                        COUNT(*), SUM(status >= 400),
+                        SUM(input_tokens), SUM(output_tokens), MAX(duration_ms)
+                 FROM request_usage
+                 WHERE id <= ?1
+                 GROUP BY 1, 2, 3
+                 ON CONFLICT (day, route_id, provider) DO UPDATE SET
+                    requests = requests + excluded.requests,
+                    failed_requests = failed_requests + excluded.failed_requests,
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    longest_ms = MAX(longest_ms, excluded.longest_ms)",
+                [cut],
+            )
+            .map_err(fail)?;
+        transaction
+            .execute(
+                "INSERT INTO request_usage_route_tail
+                   (id, route_id, input_tokens, first_byte_ms, created_at)
+                 SELECT id, route_id, input_tokens, first_byte_ms, created_at
+                 FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY route_id ORDER BY id DESC
+                    ) AS position
+                    FROM request_usage
+                    WHERE id <= ?1
+                 )
+                 WHERE position <= ?2",
+                [cut, ROUTE_TAIL_ROWS],
+            )
+            .map_err(fail)?;
+        transaction
+            .execute(
+                "DELETE FROM request_usage_route_tail
+                 WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY route_id ORDER BY id DESC
+                        ) AS position
+                        FROM request_usage_route_tail
+                    )
+                    WHERE position > ?1
+                 )",
+                [ROUTE_TAIL_ROWS],
+            )
+            .map_err(fail)?;
+        transaction
+            .execute(
+                "INSERT INTO review_usage_archive
+                   (id, route_id, provider, model, status, review_run_id,
+                    review_role, review_reason, created_at)
+                 SELECT id, route_id, provider, model, status, review_run_id,
+                        review_role, review_reason, created_at
+                 FROM request_usage
+                 WHERE id <= ?1
+                   AND (review_run_id IS NOT NULL OR lower(model) = lower(?2))",
+                params![cut, AUTO_REVIEW_MODEL],
+            )
+            .map_err(fail)?;
+        let rolled = transaction
+            .execute("DELETE FROM request_usage WHERE id <= ?1", [cut])
+            .map_err(fail)?;
+        transaction.commit().map_err(fail)?;
+        Ok(rolled)
+    }
+
+    /// Where the log's coverage starts once it has rolled over, else 0.
+    ///
+    /// A subagent event older than this can no longer find its child's request
+    /// row, and a run without one reads as failed. Those runs stay out of the
+    /// list rather than report an outcome nobody can check any more.
+    fn request_log_window_start(connection: &Connection) -> AppResult<i64> {
+        connection
+            .query_row(
+                "SELECT created_at FROM request_usage ORDER BY id DESC LIMIT 1 OFFSET ?1",
+                [REQUEST_LOG_RETAINED_ROWS - 1],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(|error| AppError::Message(format!("read log window: {error}")))
     }
 
     pub fn record(&self, value: &UsageRecord) -> AppResult<()> {
@@ -559,9 +777,8 @@ impl UsageStore {
         value: &UsageRecord,
         agent_attribution_json: Option<&str>,
     ) -> AppResult<()> {
-        self.connection
-            .lock()
-            .expect("usage db poisoned")
+        let connection = self.connection.lock().expect("usage db poisoned");
+        connection
             .execute(
                 "INSERT INTO request_usage
                    (route_id, provider, model, input_tokens, output_tokens,
@@ -623,6 +840,10 @@ impl UsageStore {
                 ],
             )
             .map_err(|error| AppError::Message(format!("寫入使用統計失敗：{error}")))?;
+        // The row is safely written; a failed roll-over is retried on the next.
+        if let Err(error) = Self::roll_request_log_inner(&connection) {
+            log::warn!("[Usage] request log roll-over failed: {error}");
+        }
         Ok(())
     }
 
@@ -778,6 +999,25 @@ impl UsageStore {
                 [cutoff],
             )
             .map_err(|error| AppError::Message(format!("evict request usage: {error}")))?;
+        connection
+            .execute(
+                "DELETE FROM request_usage_daily
+                 WHERE day < date(unixepoch() - ?1, 'unixepoch', 'localtime')",
+                [cutoff],
+            )
+            .map_err(|error| AppError::Message(format!("evict usage rollup: {error}")))?;
+        connection
+            .execute(
+                "DELETE FROM request_usage_route_tail WHERE created_at < unixepoch() - ?1",
+                [cutoff],
+            )
+            .map_err(|error| AppError::Message(format!("evict route tail: {error}")))?;
+        connection
+            .execute(
+                "DELETE FROM review_usage_archive WHERE created_at < unixepoch() - ?1",
+                [cutoff],
+            )
+            .map_err(|error| AppError::Message(format!("evict review archive: {error}")))?;
         // Bounded payload guard: keep the newest 100_000 diagnostic rows. The
         // T1 summary is ~1-3 KB, so this is comfortably below the 64 MB target
         // while still preserving a large diagnostic window.
@@ -952,8 +1192,15 @@ impl UsageStore {
         let mut statement = connection
             .prepare(
                 "SELECT input_tokens, first_byte_ms
-                 FROM request_usage
-                 WHERE route_id = ?1
+                 FROM (
+                    SELECT id, input_tokens, first_byte_ms
+                    FROM request_usage
+                    WHERE route_id = ?1
+                    UNION ALL
+                    SELECT id, input_tokens, first_byte_ms
+                    FROM request_usage_route_tail
+                    WHERE route_id = ?1
+                 )
                  ORDER BY id DESC
                  LIMIT 12",
             )
@@ -978,10 +1225,13 @@ impl UsageStore {
         trend.reverse();
         let (turns, total_tokens) = connection
             .query_row(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(input_tokens + output_tokens), 0)
-                 FROM request_usage
-                 WHERE route_id = ?1",
+                &format!(
+                    "{USAGE_TOTALS_CTE}
+                     SELECT COALESCE(SUM(requests), 0),
+                            COALESCE(SUM(input_tokens + output_tokens), 0)
+                     FROM usage_totals
+                     WHERE route_id = ?1"
+                ),
                 [route_id],
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?)),
             )
@@ -1032,32 +1282,34 @@ impl UsageStore {
         let connection = self.connection.lock().expect("usage db poisoned");
         let (total_runs, fallback_runs) = connection
             .query_row(
-                "SELECT COUNT(DISTINCT CASE
-                          WHEN review_run_id IS NOT NULL THEN review_run_id
-                          ELSE 'legacy-review-' || id END),
-                        COUNT(DISTINCT CASE
-                          WHEN review_role = 'fallback' AND status < 400
-                          THEN COALESCE(review_run_id, 'legacy-review-' || id) END)
-                 FROM request_usage
-                 WHERE review_run_id IS NOT NULL OR lower(model) = lower(?1)",
+                &format!(
+                    "{REVIEW_ROWS_CTE}
+                     SELECT COUNT(DISTINCT CASE
+                              WHEN review_run_id IS NOT NULL THEN review_run_id
+                              ELSE 'legacy-review-' || id END),
+                            COUNT(DISTINCT CASE
+                              WHEN review_role = 'fallback' AND status < 400
+                              THEN COALESCE(review_run_id, 'legacy-review-' || id) END)
+                     FROM review_rows"
+                ),
                 [AUTO_REVIEW_MODEL],
                 |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
             )
             .map_err(|error| AppError::Message(format!("read review totals: {error}")))?;
 
         let mut statement = connection
-            .prepare(
-                "SELECT route_id, MIN(provider), model,
+            .prepare(&format!(
+                "{REVIEW_ROWS_CTE}
+                 SELECT route_id, MIN(provider), model,
                         SUM(CASE WHEN COALESCE(review_role, 'primary') = 'primary'
                                       AND status < 400 THEN 1 ELSE 0 END),
                         SUM(CASE WHEN review_role = 'fallback' AND status < 400 THEN 1 ELSE 0 END),
                         SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END),
                         MAX(created_at)
-                 FROM request_usage
-                 WHERE review_run_id IS NOT NULL OR lower(model) = lower(?1)
+                 FROM review_rows
                  GROUP BY route_id, model
-                 ORDER BY MAX(created_at) DESC",
-            )
+                 ORDER BY MAX(created_at) DESC"
+            ))
             .map_err(|error| AppError::Message(format!("prepare review stats: {error}")))?;
         let providers = statement
             .query_map([AUTO_REVIEW_MODEL], |row| {
@@ -1077,11 +1329,13 @@ impl UsageStore {
         drop(statement);
 
         let active = connection.query_row(
-            "SELECT route_id, model, review_role, review_reason
-             FROM request_usage
-             WHERE review_run_id IS NOT NULL OR lower(model) = lower(?1)
-             ORDER BY id DESC
-             LIMIT 1",
+            &format!(
+                "{REVIEW_ROWS_CTE}
+                 SELECT route_id, model, review_role, review_reason
+                 FROM review_rows
+                 ORDER BY id DESC
+                 LIMIT 1"
+            ),
             [AUTO_REVIEW_MODEL],
             |row| {
                 Ok((
@@ -1237,14 +1491,15 @@ impl UsageStore {
             .map_err(|error| AppError::Message(format!("decode request log routes: {error}")))?;
 
         let mut statement = connection
-            .prepare(
-                "SELECT provider, COUNT(*), COALESCE(SUM(input_tokens), 0),
+            .prepare(&format!(
+                "{USAGE_TOTALS_CTE}
+                 SELECT provider, SUM(requests), COALESCE(SUM(input_tokens), 0),
                         COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0)
-                 FROM request_usage
+                        COALESCE(SUM(failed_requests), 0)
+                 FROM usage_totals
                  GROUP BY provider
-                 ORDER BY COUNT(*) DESC, provider ASC",
-            )
+                 ORDER BY SUM(requests) DESC, provider ASC"
+            ))
             .map_err(|error| AppError::Message(format!("查詢供應商統計失敗：{error}")))?;
         let providers = statement
             .query_map([], |row| {
@@ -1754,12 +2009,14 @@ impl UsageStore {
                 "SELECT id, created_at, kind, call_id, parent_request_id,
                         child_request_id, child_model, link_method, link_confidence
                  FROM subagent_events
+                 WHERE created_at >= ?2
                  ORDER BY id DESC
                  LIMIT ?1",
             )
             .map_err(|error| AppError::Message(format!("prepare subagent log: {error}")))?;
+        let window_start = Self::request_log_window_start(connection)?;
         let rows = statement
-            .query_map([limit.clamp(1, 500)], |row| {
+            .query_map(params![limit.clamp(1, 500), window_start], |row| {
                 Ok(SubagentLogEntry {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
@@ -1800,12 +2057,14 @@ impl UsageStore {
                         child_request_id, child_model, child_effort,
                         link_method, link_confidence, payload
                  FROM subagent_events
+                 WHERE created_at >= ?2
                  ORDER BY id DESC
                  LIMIT ?1",
             )
             .map_err(|error| AppError::Message(format!("prepare subagent runs: {error}")))?;
+        let window_start = Self::request_log_window_start(connection)?;
         let mut rows = statement
-            .query_map([raw_limit], |row| {
+            .query_map(params![raw_limit, window_start], |row| {
                 Ok(RawSubagentRow {
                     created_at: row.get(1)?,
                     kind: row.get(2)?,
@@ -1977,7 +2236,10 @@ impl UsageStore {
         // Its exact parent/child authority is `subagent_graph_linked`; omitting
         // that source made the UI report only old translated-harness runs.
         runs.extend(Self::native_subagent_runs_inner(
-            connection, raw_limit, now,
+            connection,
+            raw_limit,
+            window_start,
+            now,
         )?);
 
         runs.sort_by_key(|run| std::cmp::Reverse(run.requested_at));
@@ -1988,6 +2250,7 @@ impl UsageStore {
     fn native_subagent_runs_inner(
         connection: &Connection,
         raw_limit: i64,
+        window_start: i64,
         now: i64,
     ) -> AppResult<Vec<SubagentRun>> {
         let mut statement = connection
@@ -1995,6 +2258,7 @@ impl UsageStore {
                 "SELECT created_at, payload
                  FROM diagnostic_events
                  WHERE kind = 'subagent_graph_linked'
+                   AND created_at >= ?2
                  ORDER BY id DESC
                  LIMIT ?1",
             )
@@ -2002,7 +2266,7 @@ impl UsageStore {
                 AppError::Message(format!("prepare native subagent graph: {error}"))
             })?;
         let rows = statement
-            .query_map([raw_limit], |row| {
+            .query_map(params![raw_limit, window_start], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| AppError::Message(format!("read native subagent graph: {error}")))?
@@ -2229,13 +2493,14 @@ impl UsageStore {
             .collect::<std::collections::HashSet<_>>();
 
         let mut statement = connection
-            .prepare(
-                "SELECT date(created_at, 'unixepoch', 'localtime'), route_id, MIN(provider),
-                        COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
-                 FROM request_usage
-                 GROUP BY date(created_at, 'unixepoch', 'localtime'), route_id
-                 ORDER BY 1 ASC",
-            )
+            .prepare(&format!(
+                "{USAGE_TOTALS_CTE}
+                 SELECT day, route_id, MIN(provider),
+                        COALESCE(SUM(input_tokens + output_tokens), 0), SUM(requests)
+                 FROM usage_totals
+                 GROUP BY day, route_id
+                 ORDER BY 1 ASC"
+            ))
             .map_err(|error| AppError::Message(format!("prepare usage activity: {error}")))?;
         let days = statement
             .query_map([], |row| {
@@ -2256,13 +2521,14 @@ impl UsageStore {
         drop(statement);
 
         let mut statement = connection
-            .prepare(
-                "SELECT route_id, MIN(provider),
+            .prepare(&format!(
+                "{USAGE_TOTALS_CTE}
+                 SELECT route_id, MIN(provider),
                         COALESCE(SUM(input_tokens + output_tokens), 0)
-                 FROM request_usage
+                 FROM usage_totals
                  GROUP BY route_id
-                 ORDER BY 3 DESC, 2 ASC",
-            )
+                 ORDER BY 3 DESC, 2 ASC"
+            ))
             .map_err(|error| AppError::Message(format!("prepare provider activity: {error}")))?;
         let providers = statement
             .query_map([], |row| {
@@ -2280,7 +2546,10 @@ impl UsageStore {
             .collect();
         drop(statement);
         let mut statement = connection
-            .prepare("SELECT route_id, duration_ms FROM request_usage")
+            .prepare(&format!(
+                "{USAGE_TOTALS_CTE}
+                 SELECT route_id, MAX(longest_ms) FROM usage_totals GROUP BY route_id"
+            ))
             .map_err(|error| AppError::Message(format!("prepare request durations: {error}")))?;
         let longest_request_ms = statement
             .query_map([], |row| {
@@ -2502,6 +2771,272 @@ mod tests {
         assert_eq!(summary.turns, 1);
         assert_eq!(summary.latest_input_tokens, 10);
         assert_eq!(summary.total_tokens, 12);
+    }
+
+    fn usage_row(route: &str, status: u16, input_tokens: u64, duration_ms: u64) -> UsageRecord {
+        UsageRecord {
+            route_id: route.into(),
+            provider: format!("{route}-provider"),
+            model: "glm".into(),
+            input_tokens,
+            output_tokens: 2,
+            status,
+            duration_ms,
+            first_byte_ms: Some(input_tokens),
+            ..Default::default()
+        }
+    }
+
+    fn insert_rows(store: &UsageStore, rows: i64, route: &str, model: &str, created_at: &str) {
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                &format!(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                     INSERT INTO request_usage
+                       (route_id, provider, model, input_tokens, output_tokens, status,
+                        duration_ms, created_at)
+                     SELECT ?2, ?2 || '-provider', ?3, 10, 2, 200, 20, {created_at} FROM n"
+                ),
+                params![rows, route, model],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn logged_rows(store: &UsageStore) -> u32 {
+        store
+            .request_log_page(&RequestLogPage::default())
+            .unwrap()
+            .entry_total
+    }
+
+    #[test]
+    fn the_request_log_rolls_at_its_limit_without_losing_any_total() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        // The oldest row, so the first to leave: its failure and its duration can
+        // only reach the totals below through the rollup.
+        store.record(&usage_row("busy", 500, 7, 90_000)).unwrap();
+        insert_rows(
+            &store,
+            REQUEST_LOG_RETAINED_ROWS,
+            "busy",
+            "glm",
+            "unixepoch()",
+        );
+        store.record(&usage_row("busy", 200, 8, 30)).unwrap();
+        store.record(&usage_row("other", 200, 9, 40)).unwrap();
+
+        let log = store
+            .request_log_page(&RequestLogPage {
+                limit: 100,
+                ..RequestLogPage::default()
+            })
+            .unwrap();
+        assert_eq!(i64::from(log.entry_total), REQUEST_LOG_RETAINED_ROWS);
+        assert_eq!(log.entries[0].route_id, "other");
+        let failed_rows = store
+            .request_log_page(&RequestLogPage {
+                failed_only: true,
+                ..RequestLogPage::default()
+            })
+            .unwrap();
+        assert_eq!(failed_rows.entry_total, 0, "the failed row has rolled out");
+
+        let busy = store.summary("busy").unwrap();
+        assert_eq!(i64::from(busy.turns), REQUEST_LOG_RETAINED_ROWS + 2);
+        let expected_tokens = (REQUEST_LOG_RETAINED_ROWS as u64) * 12 + (7 + 2) + (8 + 2);
+        assert_eq!(busy.total_tokens, expected_tokens);
+
+        let activity = store.activity(&[]).unwrap();
+        let busy_day = activity
+            .days
+            .iter()
+            .find(|day| day.route_id == "busy")
+            .unwrap();
+        assert_eq!(busy_day.tokens, expected_tokens);
+        assert_eq!(busy_day.requests as i64, REQUEST_LOG_RETAINED_ROWS + 2);
+        assert_eq!(activity.longest_request_ms, 90_000);
+        let total: u64 = activity.providers.iter().map(|row| row.tokens).sum();
+        assert_eq!(total, expected_tokens + 9 + 2);
+
+        let provider = log
+            .providers
+            .iter()
+            .find(|row| row.provider == "busy-provider")
+            .unwrap();
+        assert_eq!(provider.requests as i64, REQUEST_LOG_RETAINED_ROWS + 2);
+        assert_eq!(provider.failed_requests, 1);
+    }
+
+    #[test]
+    fn a_route_the_log_rolled_past_keeps_its_latest_figures() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        for tokens in 1..=(ROUTE_TAIL_ROWS as u64 + 3) {
+            store.record(&usage_row("quiet", 200, tokens, 20)).unwrap();
+        }
+        insert_rows(
+            &store,
+            REQUEST_LOG_RETAINED_ROWS,
+            "busy",
+            "glm",
+            "unixepoch()",
+        );
+        store.record(&usage_row("busy", 200, 10, 20)).unwrap();
+        assert!(!store
+            .request_log_page(&RequestLogPage {
+                limit: 100,
+                ..RequestLogPage::default()
+            })
+            .unwrap()
+            .entry_routes
+            .iter()
+            .any(|route| route.route_id == "quiet"));
+
+        let quiet = store.summary("quiet").unwrap();
+        assert_eq!(quiet.latest_input_tokens, ROUTE_TAIL_ROWS as u64 + 3);
+        assert_eq!(quiet.latest_first_byte_ms, Some(ROUTE_TAIL_ROWS as u32 + 3));
+        assert_eq!(quiet.trend.len() as i64, ROUTE_TAIL_ROWS);
+        assert_eq!(i64::from(quiet.turns), ROUTE_TAIL_ROWS + 3);
+
+        let tail: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM request_usage_route_tail WHERE route_id = 'quiet'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tail, ROUTE_TAIL_ROWS);
+    }
+
+    #[test]
+    fn review_totals_survive_the_log_rolling_past_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        insert_rows(&store, 3, "reviewer", AUTO_REVIEW_MODEL, "unixepoch()");
+        store
+            .record(&UsageRecord {
+                review_run_id: Some("run-1".into()),
+                review_role: Some("fallback".into()),
+                ..usage_row("reviewer", 200, 1, 20)
+            })
+            .unwrap();
+        let before = store.review_stats().unwrap();
+        assert_eq!(before.total_runs, 4);
+        assert_eq!(before.fallback_runs, 1);
+
+        insert_rows(
+            &store,
+            REQUEST_LOG_RETAINED_ROWS,
+            "busy",
+            "glm",
+            "unixepoch()",
+        );
+        store.record(&usage_row("busy", 200, 10, 20)).unwrap();
+        assert_eq!(i64::from(logged_rows(&store)), REQUEST_LOG_RETAINED_ROWS);
+
+        let after = store.review_stats().unwrap();
+        assert_eq!(after.total_runs, 4);
+        assert_eq!(after.fallback_runs, 1);
+        assert_eq!(after.providers.len(), before.providers.len());
+        assert_eq!(after.active_route_id.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn subagent_runs_older_than_the_log_are_not_reported_as_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO subagent_events (kind, call_id, payload, created_at)
+                     VALUES ('spawn_requested', 'old-call', '{}', unixepoch() - 86400)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO diagnostic_events (kind, payload, created_at)
+                     VALUES ('subagent_graph_linked',
+                             '{\"parent_thread_id\":\"p\",\"child_thread_id\":\"c\"}',
+                             unixepoch() - 86400)",
+                    [],
+                )
+                .unwrap();
+        }
+        // Below the limit the log still covers everything, so nothing is hidden.
+        let page = RequestLogPage::default();
+        let log = store.request_log_page(&page).unwrap();
+        assert!(!log.subagent_events.is_empty());
+        assert!(!log.subagent_runs.is_empty());
+
+        insert_rows(
+            &store,
+            REQUEST_LOG_RETAINED_ROWS,
+            "busy",
+            "glm",
+            "unixepoch()",
+        );
+        let log = store.request_log_page(&page).unwrap();
+        assert!(log.subagent_events.is_empty());
+        assert!(log.subagent_runs.is_empty(), "{:?}", log.subagent_runs);
+    }
+
+    #[test]
+    fn a_backlog_from_before_the_limit_rolls_over_in_bounded_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        let rows = REQUEST_LOG_RETAINED_ROWS + ROLL_STEP_ROWS * 2 + 7;
+        insert_rows(&store, rows, "busy", "glm", "unixepoch()");
+
+        // A request arriving mid-backlog pays for one step, not for all of it.
+        store.record(&usage_row("busy", 200, 10, 20)).unwrap();
+        assert_eq!(i64::from(logged_rows(&store)), rows + 1 - ROLL_STEP_ROWS);
+        assert_eq!(i64::from(store.summary("busy").unwrap().turns), rows + 1);
+
+        assert_eq!(store.work_off_backlog() as i64, ROLL_STEP_ROWS + 8);
+        assert_eq!(i64::from(logged_rows(&store)), REQUEST_LOG_RETAINED_ROWS);
+        let busy = store.summary("busy").unwrap();
+        assert_eq!(i64::from(busy.turns), rows + 1);
+        assert_eq!(busy.total_tokens as i64, rows * 12 + 12);
+        assert_eq!(store.work_off_backlog(), 0);
+    }
+
+    #[test]
+    fn rollups_age_out_with_the_rows_they_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(temp.path().join("usage.sqlite3")).unwrap();
+        let aged = crate::history::DEFAULT_RETENTION_DAYS as i64 + 2;
+        insert_rows(
+            &store,
+            REQUEST_LOG_RETAINED_ROWS + 1,
+            "aged",
+            AUTO_REVIEW_MODEL,
+            &format!("unixepoch() - {aged} * 86400"),
+        );
+        let connection = store.connection.lock().unwrap();
+        UsageStore::roll_request_log_inner(&connection).unwrap();
+        store.evict_diagnostics_inner(&connection).unwrap();
+        for table in [
+            "request_usage",
+            "request_usage_daily",
+            "request_usage_route_tail",
+            "review_usage_archive",
+        ] {
+            let left: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(left, 0, "{table}");
+        }
     }
 
     #[test]
@@ -2758,9 +3293,15 @@ mod tests {
             })
             .unwrap();
         let log = store.request_log(10).unwrap();
-        assert_eq!(log.entries[0].error_category.as_deref(), Some("provider_quota"));
+        assert_eq!(
+            log.entries[0].error_category.as_deref(),
+            Some("provider_quota")
+        );
         assert_eq!(log.entries[0].retry_after, Some(60));
-        assert_eq!(log.entries[0].error.as_deref(), Some("private raw diagnostic"));
+        assert_eq!(
+            log.entries[0].error.as_deref(),
+            Some("private raw diagnostic")
+        );
     }
 
     fn spawn_requested_fixture(

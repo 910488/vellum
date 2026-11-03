@@ -162,6 +162,7 @@ Codex 會在回合開始或壓縮後重送 `token_count`，但 total 不變，ob
 - `bootCount` 變了：Windows 事件記錄檔的 `Application Error` 過濾 `vellum`，`0xC0000409` 是 Rust panic-abort。
 - 對話身分有三種形狀（`codex:<s>:<t>`、sha256、裸 uuid），不要自己 hash 去比；observer 用 `like '%<tid>%'`。
 - 快取問題：`request_usage` 的 `cached_input_tokens` 依 `connection_id` 分組看，換連線才歸零是已知行為。
+- `request_usage` 只留最新 500 筆，尖峰時不到一天就滾掉，要對照的請求要趁早查。總量與每日統計在 `request_usage_daily`，舊的請求明細查不回來，只剩 `Vellum.log`。
 
 ## 9. 已知問題基線（2026-10-12）
 
