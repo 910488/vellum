@@ -2245,6 +2245,12 @@ fn completed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
     })
 }
 
+fn incomplete_reason(event: &Value) -> Option<&str> {
+    event
+        .pointer("/response/incomplete_details/reason")
+        .and_then(Value::as_str)
+}
+
 fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
     websocket_event(message).and_then(|event| {
         let failed = match event.get("type").and_then(Value::as_str) {
@@ -2255,12 +2261,6 @@ fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
         };
         failed.then_some(event)
     })
-}
-
-fn incomplete_reason(event: &Value) -> Option<&str> {
-    event
-        .pointer("/response/incomplete_details/reason")
-        .and_then(Value::as_str)
 }
 
 /// Lifecycle frames that precede any model output. A handoff replay that
