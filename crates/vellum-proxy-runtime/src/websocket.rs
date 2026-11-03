@@ -843,9 +843,8 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                 }
             }
             _ => {
-                // Codex's WebSocket protocol only sends response.create and
-                // response.cancel; anything else is a forward-compatible
-                // control frame. On an open Official segment it is relayed
+                // Anything else is a control frame, such as Codex's
+                // response.interrupt. On an open Official segment it is relayed
                 // upstream unchanged (native passthrough); with no segment
                 // open there is nowhere to route it, so it is ignored.
                 if let Some(segment) = official.as_mut() {
@@ -1799,10 +1798,13 @@ async fn handle_official_upstream_frame(
                     == Some("usage_limit_reached");
                 segment.stages.terminal_ms = Some(segment.started.elapsed().as_millis() as u64);
                 let category = official_websocket_failure_category(&failed);
+                let incomplete = incomplete_reason(&failed)
+                    .map(|reason| format!("response incomplete: {reason}"));
                 let message = failed
                     .pointer("/response/error/message")
                     .or_else(|| failed.pointer("/error/message"))
                     .and_then(Value::as_str)
+                    .or(incomplete.as_deref())
                     .unwrap_or("upstream Official WebSocket failure");
                 let outcome = if category == "provider_protocol" || category == "invalid_request" {
                     "protocol_failure"
@@ -2231,20 +2233,34 @@ fn response_id_from_sse_block(block: &str) -> Option<String> {
 
 fn completed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
     websocket_event(message).and_then(|event| {
-        (event.get("type").and_then(Value::as_str) == Some("response.completed"))
-            .then(|| event.get("response").cloned())
-            .flatten()
+        let finished = match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => true,
+            // How Official ends a response Codex interrupted to deliver a
+            // mid-turn message or a stop. Codex reads it as a completion: it
+            // has usage, and the next turn may chain from its id.
+            Some("response.incomplete") => incomplete_reason(&event) == Some("interrupted"),
+            _ => false,
+        };
+        finished.then(|| event.get("response").cloned()).flatten()
     })
 }
 
 fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
     websocket_event(message).and_then(|event| {
-        matches!(
-            event.get("type").and_then(Value::as_str),
-            Some("response.failed" | "error")
-        )
-        .then_some(event)
+        let failed = match event.get("type").and_then(Value::as_str) {
+            Some("response.failed" | "error") => true,
+            // Codex reports every other reason as an error for this turn.
+            Some("response.incomplete") => incomplete_reason(&event) != Some("interrupted"),
+            _ => false,
+        };
+        failed.then_some(event)
     })
+}
+
+fn incomplete_reason(event: &Value) -> Option<&str> {
+    event
+        .pointer("/response/incomplete_details/reason")
+        .and_then(Value::as_str)
 }
 
 /// Lifecycle frames that precede any model output. A handoff replay that
@@ -6784,6 +6800,252 @@ mod tests {
                 run_official_error_frame(event, "provider_unavailable", 503).await;
             }
         }
+    }
+
+    /// Serves an Official socket that leaves its first response open until
+    /// `response.interrupt`, ends it as `response.incomplete`, and completes
+    /// every later `response.create` right away. Returns a client connected
+    /// through a real proxy.
+    async fn connect_through_interrupting_upstream(
+        reason: &'static str,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Arc<ProxyRuntime>,
+        [tokio::task::JoinHandle<()>; 2],
+    ) {
+        let upstream = Router::new().route(
+            "/backend-api/codex/responses",
+            get(move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let mut creates = 0;
+                    while let Some(Ok(message)) = socket.recv().await {
+                        let AxumWsMessage::Text(text) = message else {
+                            continue;
+                        };
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        let events = match frame.get("type").and_then(Value::as_str) {
+                            Some("response.create") => {
+                                creates += 1;
+                                if creates == 1 {
+                                    vec![json!({"type": "response.created",
+                                        "response": {"id": "resp_first"}})]
+                                } else {
+                                    vec![json!({"type": "response.completed", "response": {
+                                        "id": format!("resp_{creates}"),
+                                        "object": "response",
+                                        "status": "completed",
+                                        "output": [],
+                                        "usage": {"input_tokens": 22, "output_tokens": 3,
+                                            "total_tokens": 25},
+                                    }})]
+                                }
+                            }
+                            Some("response.interrupt") => vec![
+                                json!({"type": "response.interrupt.accepted",
+                                    "response_id": "resp_first"}),
+                                json!({"type": "response.incomplete", "response": {
+                                    "id": "resp_first",
+                                    "object": "response",
+                                    "status": "incomplete",
+                                    "incomplete_details": {"reason": reason},
+                                    "output": [],
+                                    "usage": {"input_tokens": 11, "output_tokens": 2,
+                                        "total_tokens": 13},
+                                }}),
+                            ],
+                            _ => Vec::new(),
+                        };
+                        for event in events {
+                            let _ = socket
+                                .send(AxumWsMessage::Text(event.to_string().into()))
+                                .await;
+                        }
+                    }
+                })
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream).await;
+        });
+        let mut state = StaticProxyState::from_config(ProxyRuntimeConfig {
+            models: vec![official_route_config(format!(
+                "http://{upstream_address}/backend-api/codex"
+            ))],
+            ..ProxyRuntimeConfig::default()
+        })
+        .unwrap();
+        state.mark_listener_ready();
+        let state = Arc::new(state);
+        let runtime = state.proxy_runtime();
+        let proxy = build_headless_router(state, InboundAccessPolicy::test_only_disabled());
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, proxy).await;
+        });
+        let (client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{proxy_address}/v1/responses"))
+                .await
+                .unwrap();
+        (client, runtime, [upstream_task, proxy_task])
+    }
+
+    /// Sends one `response.create` frame and reads until `kind` comes back.
+    /// Fails if it does not arrive, which is how a held-back frame shows up.
+    async fn create_and_read_until(
+        client: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        extra: Value,
+        kind: &str,
+    ) {
+        let mut frame = json!({
+            "type": "response.create",
+            "model": "vellum-official",
+            "input": [{"role": "user", "content": "go"}],
+            "stream": true,
+        });
+        frame
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        client
+            .send(TungsteniteMessage::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        read_until(client, kind).await;
+    }
+
+    async fn read_until(
+        client: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        kind: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(frame) = client.next().await {
+                if let TungsteniteMessage::Text(text) = frame.unwrap() {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event.get("type").and_then(Value::as_str) == Some(kind) {
+                        return;
+                    }
+                }
+            }
+            panic!("the socket closed before {kind}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{kind} never reached the client"));
+    }
+
+    async fn interrupt_first_response(
+        client: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        create_and_read_until(client, json!({}), "response.created").await;
+        client
+            .send(TungsteniteMessage::Text(
+                json!({"type": "response.interrupt", "response_id": "resp_first",
+                    "mode": "discard_partial_items"})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        read_until(client, "response.incomplete").await;
+    }
+
+    /// Official ends an interrupted response with `response.incomplete`. Missing
+    /// it left the turn queued for good, so every later response was attributed
+    /// to the turn before its own: the request id, plan and history input of the
+    /// wrong turn, and a duration that counted the wait in between.
+    #[tokio::test]
+    async fn an_interrupted_response_keeps_later_turns_attributed_to_themselves() {
+        let (mut client, runtime, tasks) =
+            connect_through_interrupting_upstream("interrupted").await;
+        interrupt_first_response(&mut client).await;
+
+        let idle = std::time::Duration::from_secs(1);
+        tokio::time::sleep(idle).await;
+        create_and_read_until(
+            &mut client,
+            json!({"previous_response_id": "resp_first"}),
+            "response.completed",
+        )
+        .await;
+
+        let rows = runtime.usage_records().unwrap();
+        let row_with = |tokens: u64| {
+            rows.iter()
+                .find(|row| row.input_tokens == tokens)
+                .unwrap_or_else(|| panic!("no row carries {tokens} input tokens: {rows:?}"))
+        };
+        let interrupted = row_with(11);
+        assert_eq!(interrupted.status, 200, "{rows:?}");
+        assert_eq!(interrupted.output_tokens, 2, "{rows:?}");
+        let next = row_with(22);
+        assert_eq!(next.status, 200, "{rows:?}");
+        assert!(
+            next.duration_ms < idle.as_millis() as u64,
+            "the wait before a turn is not part of it: {rows:?}"
+        );
+        assert_ne!(interrupted.request_id, next.request_id, "{rows:?}");
+
+        // Nothing is left queued to fail as a phantom row when the socket ends.
+        let _ = client.close(None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(runtime.usage_records().unwrap().len(), 2);
+        tasks.iter().for_each(|task| task.abort());
+    }
+
+    /// A frame that has to wait for the queue to drain (a prewarm here, an
+    /// account handoff in production) used to wait until the socket ended, while
+    /// Codex sat through its five-minute idle timeout.
+    #[tokio::test]
+    async fn an_interrupted_response_does_not_hold_back_the_next_frame() {
+        let (mut client, _runtime, tasks) =
+            connect_through_interrupting_upstream("interrupted").await;
+        interrupt_first_response(&mut client).await;
+
+        create_and_read_until(
+            &mut client,
+            json!({"generate": false}),
+            "response.completed",
+        )
+        .await;
+
+        let _ = client.close(None).await;
+        tasks.iter().for_each(|task| task.abort());
+    }
+
+    /// Codex reports any other reason as an error, so the row says so too.
+    #[tokio::test]
+    async fn an_incomplete_response_for_another_reason_fails_only_its_own_turn() {
+        let (mut client, runtime, tasks) =
+            connect_through_interrupting_upstream("max_output_tokens").await;
+        interrupt_first_response(&mut client).await;
+        create_and_read_until(&mut client, json!({}), "response.completed").await;
+
+        let rows = runtime.usage_records().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let failed = rows.iter().find(|row| row.status != 200).unwrap();
+        assert_eq!(failed.status, 502, "{rows:?}");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("response incomplete: max_output_tokens")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.status == 200 && row.input_tokens == 22),
+            "{rows:?}"
+        );
+
+        let _ = client.close(None).await;
+        tasks.iter().for_each(|task| task.abort());
     }
 
     #[tokio::test]
