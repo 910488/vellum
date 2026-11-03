@@ -140,8 +140,12 @@ function installFixture(sceneOf: () => Scene) {
     switch (cmd) {
       case "get_request_log":
         return paginatePreviewLog(requestLog(scene), args);
-      case "get_usage_activity":
+      case "get_usage_activity": {
+        /* ?activityDelayMs=：重現上游慢的時候，請求紀錄要先畫出來。 */
+        const delay = Number(new URLSearchParams(window.location.search).get("activityDelayMs") ?? 0);
+        if (delay > 0) await new Promise((resolve) => window.setTimeout(resolve, delay));
         return usageActivity(scene);
+      }
       case "get_boot_telemetry":
         return { pid: 22228, bootCount: 41, previousStartedAt: Math.floor(Date.now() / 1000) - 7_200 };
       default:

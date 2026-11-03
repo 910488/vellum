@@ -316,26 +316,22 @@ export function App() {
     if (manageSpinner) setRefreshing(true);
     const work = (async () => {
       try {
-        const [proxy, runtime, enhancedRuntime, overview, updates] = await Promise.allSettled([
-          api.getProxyStatus(),
-          api.getRuntimeStatus(),
-          api.getEnhancedDesktopRuntimeStatus(),
-          api.getOverview(force),
-          api.getUpdateStatus(),
+        /* 每一項到了就先畫：第一次開啟時 Enhanced 狀態要雜湊數百 MB 的 core，
+           現況頁不該為了這個空白。 */
+        const land = <K extends keyof SystemStatus>(key: K, read: Promise<SystemStatus[K]>) =>
+          read.then((value) => {
+            if (statusGeneration === statusLoadGeneration.current) {
+              setStatus((current) => ({ ...current, [key]: value }));
+            }
+          });
+        const results = await Promise.allSettled([
+          land("proxy", api.getProxyStatus()),
+          land("runtime", api.getRuntimeStatus()),
+          land("enhancedRuntime", api.getEnhancedDesktopRuntimeStatus()),
+          land("overview", api.getOverview(force)),
+          land("updates", api.getUpdateStatus()),
         ]);
-        if (statusGeneration === statusLoadGeneration.current) {
-          setStatus((current) => ({
-            proxy: proxy.status === "fulfilled" ? proxy.value : current.proxy,
-            runtime: runtime.status === "fulfilled" ? runtime.value : current.runtime,
-            enhancedRuntime:
-              enhancedRuntime.status === "fulfilled"
-                ? enhancedRuntime.value
-                : current.enhancedRuntime,
-            overview: overview.status === "fulfilled" ? overview.value : current.overview,
-            updates: updates.status === "fulfilled" ? updates.value : current.updates,
-          }));
-        }
-        const failure = [proxy, runtime, enhancedRuntime, overview, updates].find(
+        const failure = results.find(
           (result): result is PromiseRejectedResult => result.status === "rejected",
         );
         setRefreshError(failure ? t("common.statusUpdateFailed", { detail: String(failure.reason) }) : null);
