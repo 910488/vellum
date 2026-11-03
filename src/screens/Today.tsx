@@ -90,33 +90,40 @@ export function Today({
 
   const load = useCallback(async (forceRefresh: boolean) => {
       const generation = ++loadGeneration.current;
-      const [nextProviders, nextRoutes, nextSessions] = await Promise.allSettled([
-        api.getProviderOverviews(forceRefresh),
-        api.listRoutes(),
-        api.listSessions(),
-      ]);
-      if (generation !== loadGeneration.current) return;
-      if (nextProviders.status === "fulfilled") setProviders(nextProviders.value);
-      setProvidersLoaded(true);
-      if (nextSessions.status === "fulfilled") setSessions(nextSessions.value);
-      if (nextRoutes.status === "fulfilled") {
-        const saved = window.localStorage.getItem("vellum.dashboard.providers");
-        let selected: string[] = [];
-        if (saved) {
-          try {
-            selected = JSON.parse(saved) as string[];
-          } catch {
-            selected = [];
+      const isCurrent = () => generation === loadGeneration.current;
+      /* 三項各自落地：額度卡等的是上游，不該再多等對話掃描。 */
+      const results = await Promise.allSettled([
+        api.getProviderOverviews(forceRefresh)
+          .then((nextProviders) => {
+            if (isCurrent()) setProviders(nextProviders);
+          })
+          .finally(() => {
+            if (isCurrent()) setProvidersLoaded(true);
+          }),
+        api.listRoutes().then((nextRoutes) => {
+          if (!isCurrent()) return;
+          const saved = window.localStorage.getItem("vellum.dashboard.providers");
+          let selected: string[] = [];
+          if (saved) {
+            try {
+              selected = JSON.parse(saved) as string[];
+            } catch {
+              selected = [];
+            }
           }
-        }
-        const available = new Set(nextRoutes.value.map((route) => route.id));
-        selected = selected.filter((id) => available.has(id));
-        if (!selected.length) {
-          selected = nextRoutes.value.filter((route) => route.enabled).map((route) => route.id);
-        }
-        setDashboardRouteIds(selected);
-      }
-      const failures = [nextProviders, nextRoutes, nextSessions].filter(
+          const available = new Set(nextRoutes.map((route) => route.id));
+          selected = selected.filter((id) => available.has(id));
+          if (!selected.length) {
+            selected = nextRoutes.filter((route) => route.enabled).map((route) => route.id);
+          }
+          setDashboardRouteIds(selected);
+        }),
+        api.listSessions().then((nextSessions) => {
+          if (isCurrent()) setSessions(nextSessions);
+        }),
+      ]);
+      if (!isCurrent()) return;
+      const failures = results.filter(
         (result): result is PromiseRejectedResult => result.status === "rejected",
       );
       setError(

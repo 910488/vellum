@@ -297,6 +297,7 @@ impl AppState {
             }
         }
         let usage = Arc::new(UsageStore::open(root.join("usage.sqlite3"))?);
+        usage.roll_backlog_in_background();
         let history = open_history(&root)?;
         if let Err(error) = history.evict_older_than_days(DEFAULT_RETENTION_DAYS) {
             log::warn!("[History] startup retention cleanup failed: {error}");

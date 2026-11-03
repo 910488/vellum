@@ -42,8 +42,8 @@ type Translate = (key: string, options?: Record<string, unknown>) => string;
 /** 一頁幾筆。20 筆大約是一屏，不用捲就能掃完。請求明細與系統事件共用，
  *  因為兩張卡的列高相近，兩種不同的頁長只會讓人以為它們是兩種東西。 */
 const PAGE_SIZE = 20;
-/** Retention hint only — the store still prunes past this; the renderer
- *  never fetches the whole window. */
+/** Mirrors REQUEST_LOG_RETAINED_ROWS in usage.rs; the renderer never fetches
+ *  the whole window. */
 const RETAIN = 500;
 
 /* 段色不帶意義 —— 它只負責把長條上的一段和讀數列上的一列綁在一起，
@@ -356,7 +356,8 @@ export function Log({
     [shares],
   );
 
-  if (!data || !activity) {
+  /* 用量統計要等上游的帳號資料；請求紀錄不必陪它等。 */
+  if (!data) {
     return (
       <>
         <div className="canvas__head">
@@ -392,37 +393,37 @@ export function Log({
       ) : null}
 
       {error ? <p className="note">{error}</p> : null}
-      {activity.warning ? <p className="note">{noticeText(activity.warning, t)}</p> : null}
+      {activity?.warning ? <p className="note">{noticeText(activity.warning, t)}</p> : null}
 
       <Card className="usage-card">
         {/* 統計摘要固定置於 HeatMap 上方，與時間分布形成同一個資訊區塊。 */}
         <div className="stats">
           <div className="stats__cell">
             <div className="stats__num">
-              {tokens(activity.totalTokens)}
+              {activity ? tokens(activity.totalTokens) : "—"}
             </div>
             <div className="stats__label">{t("log.stats.total")}</div>
           </div>
           <div className="stats__cell">
             <div className="stats__num">
-              {activity.peakTokens ? tokens(activity.peakTokens) : "—"}
+              {activity?.peakTokens ? tokens(activity.peakTokens) : "—"}
             </div>
             <div className="stats__label">{t("log.stats.peak")}</div>
           </div>
           <div className="stats__cell">
             <div className="stats__num">
-              {activity.longestTaskDurationMs
+              {activity?.longestTaskDurationMs
                 ? humanDuration(activity.longestTaskDurationMs, t)
                 : "—"}
             </div>
             <div className="stats__label">{t("log.stats.longestRequest")}</div>
           </div>
           <div className="stats__cell">
-            <div className="stats__num">{t("log.days", { count: activity.currentStreakDays })}</div>
+            <div className="stats__num">{activity ? t("log.days", { count: activity.currentStreakDays }) : "—"}</div>
             <div className="stats__label">{t("log.stats.currentStreak")}</div>
           </div>
           <div className="stats__cell">
-            <div className="stats__num">{t("log.days", { count: activity.longestStreakDays })}</div>
+            <div className="stats__num">{activity ? t("log.days", { count: activity.longestStreakDays }) : "—"}</div>
             <div className="stats__label">{t("log.stats.longestStreak")}</div>
           </div>
         </div>

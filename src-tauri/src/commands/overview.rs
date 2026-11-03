@@ -345,10 +345,18 @@ pub async fn get_usage_activity(state: State<'_, AppState>) -> AppResult<UsageAc
 
     let manager = state.codex_oauth();
     let accounts = manager.status().await.accounts;
+    // Asked one account after another, a screen waited for the sum of their
+    // upstream round trips, and a failing account is not cached.
+    let profile_reads = futures_util::future::join_all(
+        accounts
+            .iter()
+            .map(|account| query_managed_profile(&manager, &account.account_id)),
+    )
+    .await;
     let mut profiles = Vec::with_capacity(accounts.len());
     let mut failed_accounts = 0_usize;
-    for account in &accounts {
-        match query_managed_profile(&manager, &account.account_id).await {
+    for read in profile_reads {
+        match read {
             Ok(profile) => profiles.push(profile),
             Err(_) => failed_accounts += 1,
         }
@@ -856,23 +864,7 @@ pub async fn refresh_quota(route_id: String, state: State<'_, AppState>) -> AppR
 async fn build_overview(state: &AppState, force_refresh: bool) -> AppResult<Overview> {
     let route = state.current_route();
 
-    let quota = match &route {
-        Some(route) if route.provider_kind == ProviderKind::Official => {
-            openai_quota_windows(state, &route.id, force_refresh)
-                .await
-                .0
-                .into_iter()
-                .next()
-        }
-        Some(route) if route.provider_kind == ProviderKind::GrokCli => {
-            grok_quota_windows(state, &route.id, force_refresh)
-                .await
-                .0
-                .into_iter()
-                .next()
-        }
-        _ => None,
-    };
+    let quota = overview_quota(state, route.as_ref(), force_refresh).await;
 
     // doc/04：用真實預算解析器算有效視窗。沒有線路時退保底值。
     let window_tokens = match &route {
@@ -944,6 +936,41 @@ async fn build_overview(state: &AppState, force_refresh: bool) -> AppResult<Over
         },
         findings: state.findings(),
     })
+}
+
+/// How long a routine overview read waits for the upstream quota. The Today
+/// screen cannot draw until the overview arrives, and it can draw without this.
+const OVERVIEW_QUOTA_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// The read outlives a timed-out wait and lands in the quota cache, so the next
+/// poll has the answer. Only a refresh the user asked for waits for it in full.
+async fn overview_quota(
+    state: &AppState,
+    route: Option<&Route>,
+    force_refresh: bool,
+) -> Option<QuotaSnapshot> {
+    let route = route?.clone();
+    let state = state.clone();
+    let read = tauri::async_runtime::spawn(async move {
+        let windows = match route.provider_kind {
+            ProviderKind::Official => {
+                openai_quota_windows(&state, &route.id, force_refresh)
+                    .await
+                    .0
+            }
+            ProviderKind::GrokCli => grok_quota_windows(&state, &route.id, force_refresh).await.0,
+            ProviderKind::OpenAiCompatible => Vec::new(),
+        };
+        windows.into_iter().next()
+    });
+    if force_refresh {
+        return read.await.ok().flatten();
+    }
+    tokio::time::timeout(OVERVIEW_QUOTA_WAIT, read)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
 }
 
 async fn openai_quota_windows(
