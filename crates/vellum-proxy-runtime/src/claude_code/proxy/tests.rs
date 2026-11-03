@@ -96,6 +96,8 @@ impl Fixture {
             let reject_fable=parts.headers.contains_key("x-test-reject-fable")
                 && serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|v|v["model"]=="claude-fable-5-1");
             let streaming=parts.headers.contains_key("x-test-stream");
+            // A token estimate that takes a while and reports the account's usage.
+            let estimate=parts.headers.contains_key("x-test-estimate");
             let native_stream=serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|v|v["stream"]==true);
             let gzip=parts.headers.get(header::ACCEPT_ENCODING).and_then(|v|v.to_str().ok()).is_some_and(|v|v.contains("gzip"));
             let path=parts.uri.path().to_string();
@@ -113,7 +115,15 @@ impl Fixture {
             }
             if native_stream {return native_completion(gzip);}
             if method==Method::GET {return Response::new(Body::from("{}"));}
-            if path=="/v1/messages/count_tokens" {return Response::new(Body::from("{\"input_tokens\":10}"));}
+            if path=="/v1/messages/count_tokens" {
+                if estimate {tokio::time::sleep(Duration::from_millis(100)).await;}
+                let mut response=Response::new(Body::from("{\"input_tokens\":10}"));
+                if estimate {
+                    response.headers_mut().insert("anthropic-ratelimit-unified-5h-utilization","0.1".parse().unwrap());
+                    response.headers_mut().insert("anthropic-ratelimit-unified-5h-reset","1900000000".parse().unwrap());
+                }
+                return response;
+            }
             if streaming {
                 let stream=async_stream::stream! {
                     yield Ok::<Bytes,std::io::Error>(Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
@@ -541,6 +551,95 @@ async fn desktop_inference_changes_only_auth_and_encoding_and_keeps_existing_his
         "Bearer token-C"
     );
     assert_eq!(f.proxy.status().records[1].operation, "count_tokens");
+    f.stop().await;
+}
+
+/// What Claude Code builds for a token estimate: no metadata.
+fn estimate_body() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": "claude-opus-5-5",
+        "messages": [{"role": "user", "content": "foo"}],
+        "tools": [],
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_token_estimate_without_metadata_uses_the_execution_account_and_is_not_inference() {
+    let mut f = Fixture::new().await;
+    let response = f
+        .request("/v1/messages/count_tokens", estimate_body())
+        .header("x-test-estimate", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "{\"input_tokens\":10}");
+    let sent = f.captured.recv().await.unwrap();
+    assert_eq!(sent.body, estimate_body());
+    assert_eq!(sent.headers[header::AUTHORIZATION], "Bearer token-B");
+    let status = f.proxy.status();
+    assert_eq!(status.desktop_requests, 0);
+    assert!(status.records.is_empty());
+
+    // Inference still needs its session, so an account is never charged for
+    // a request that cannot be told apart from another session's.
+    let refused = f
+        .request("/v1/messages", estimate_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(refused
+        .text()
+        .await
+        .unwrap()
+        .contains(SESSION_IDENTITY_MISSING));
+
+    // The only quota reading is the one inference brought back.
+    f.request("/v1/messages", body())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    f.accounts.wait_observations(1).await;
+    assert_eq!(f.accounts.1.lock().unwrap().len(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn a_burst_of_token_estimates_waits_instead_of_taking_inference_slots() {
+    let f = Fixture::new().await;
+    let burst: Vec<_> = (0..24)
+        .map(|_| {
+            tokio::spawn(
+                f.request("/v1/messages/count_tokens", estimate_body())
+                    .header("x-test-estimate", "1")
+                    .send(),
+            )
+        })
+        .collect();
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sampler = tokio::spawn({
+        let (proxy, peak) = (f.proxy.clone(), peak.clone());
+        async move {
+            loop {
+                peak.fetch_max(proxy.status().active_requests, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    });
+    let inference = f.request("/v1/messages", body()).send().await.unwrap();
+    assert_eq!(inference.status(), StatusCode::OK);
+    inference.text().await.unwrap();
+    for estimate in burst {
+        assert_eq!(estimate.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+    sampler.abort();
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(peak <= ESTIMATE_SLOTS + 1, "peak {peak}");
     f.stop().await;
 }
 

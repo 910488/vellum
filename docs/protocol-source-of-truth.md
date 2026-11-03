@@ -69,6 +69,11 @@ the Desktop host owns OAuth, encrypted storage and project settings leases in
   User-Agent identifying `claude-desktop`, plus a supported session identity,
   is required to use execution credentials. The User-Agent is a compatibility
   gate, not OS process attestation; proxy authentication is the access boundary.
+- Native Code sends `count_tokens` without `metadata`, so those requests have no
+  session identity. They still use the execution account, without a routing
+  record, usage row or quota observation, and at most 8 run at once so a burst
+  cannot take the slots streaming inference needs. A `messages` request with no
+  identity is refused.
 - Non-inference traffic keeps its inbound authorization. An explicitly selected
   A-to-A probe mode preserves it for inference too. A failed execution account
   never silently falls back to A.

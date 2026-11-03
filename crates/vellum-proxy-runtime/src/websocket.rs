@@ -2247,13 +2247,18 @@ fn failed_websocket_response(message: &TungsteniteMessage) -> Option<Value> {
     })
 }
 
-/// Lifecycle frames that precede any model output. A handoff replay that
-/// fails after only these is retried without Codex having seen output.
+/// Frames that show Codex no model output: lifecycle, metadata, and `codex.*`
+/// notices such as the rate limits a new account's socket sends first. A
+/// handoff replay that fails after only these is retried without Codex having
+/// seen output.
 fn handoff_preamble_event(event: &Value) -> bool {
-    matches!(
-        event.get("type").and_then(Value::as_str),
-        Some("response.created" | "response.in_progress" | "response.queued")
-    )
+    match event.get("type").and_then(Value::as_str) {
+        Some(
+            "response.created" | "response.in_progress" | "response.queued" | "response.metadata",
+        ) => true,
+        Some(kind) => kind.starts_with("codex."),
+        None => false,
+    }
 }
 
 /// A locally rebuilt account-handoff frame that Official rejected as an
@@ -4098,6 +4103,16 @@ mod tests {
                                     .push((account.clone(), request.clone()));
                                 let turn_count = capture.responses.fetch_add(1, Ordering::SeqCst) + 1;
                                 if reject_replay && turn_count == 2 {
+                                    // The new account's notice arrives before
+                                    // the rejection and shows Codex no output.
+                                    socket
+                                        .send(AxumWsMessage::Text(
+                                            json!({"type":"codex.rate_limits","plan_type":"pro"})
+                                                .to_string()
+                                                .into(),
+                                        ))
+                                        .await
+                                        .unwrap();
                                     // What Official answered the locally
                                     // rebuilt handoff on 2026-10-17.
                                     socket
@@ -7628,7 +7643,15 @@ mod tests {
             rejected_handoff_replay(&turn, &failed).is_none(),
             "an ordinary turn surfaces its error"
         );
-        assert!(handoff_preamble_event(&json!({"type":"response.created"})));
+        for kind in [
+            "response.created",
+            "response.metadata",
+            "codex.rate_limits",
+            "codex.response.metadata",
+        ] {
+            assert!(handoff_preamble_event(&json!({"type": kind})), "{kind}");
+        }
+        assert!(!handoff_preamble_event(&json!({"status": 200})));
         assert!(!handoff_preamble_event(
             &json!({"type":"response.output_item.added"})
         ));

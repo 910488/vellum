@@ -54,6 +54,11 @@ pub trait ClaudeAccounts: Send + Sync {
 /// Retry-After. The request itself is sent again as Claude Code built it.
 const SUBSTITUTION_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
+const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
+const SESSION_IDENTITY_MISSING: &str = "claude_session_identity_missing";
+/// Token estimates in flight at once, out of the 32 request slots.
+const ESTIMATE_SLOTS: usize = 8;
+
 /// What one Desktop inference request did, for usage rows and logs. Carries no
 /// credential or content: only the account id and already hashed identities.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -118,6 +123,7 @@ pub struct ClaudeCodeProxy {
     accepting: AtomicBool,
     tunnels: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tunnel_slots: Arc<tokio::sync::Semaphore>,
+    estimates: Arc<tokio::sync::Semaphore>,
     /// Substitutions upstream refused, by account or by account and session,
     /// until the instant they may be tried again.
     refused: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -166,6 +172,7 @@ impl ClaudeCodeProxy {
             accepting: AtomicBool::new(true),
             tunnels: Mutex::new(Vec::new()),
             tunnel_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            estimates: Arc::new(tokio::sync::Semaphore::new(ESTIMATE_SLOTS)),
             refused: Mutex::new(std::collections::HashMap::new()),
         }))
     }
@@ -378,6 +385,17 @@ impl ClaudeCodeProxy {
     }
 
     async fn forward(self: Arc<Self>, request: Request<Body>) -> Response {
+        // One context check sends dozens of token estimates at once. They
+        // wait for each other here, so they cannot fill the slots below and
+        // turn a streaming request away.
+        let estimate = if request.method() == Method::POST
+            && request.uri().path() == COUNT_TOKENS_PATH
+            && is_desktop_code(request.headers())
+        {
+            self.estimates.clone().acquire_owned().await.ok()
+        } else {
+            None
+        };
         let Ok(permit) = self.requests.clone().try_acquire_owned() else {
             return failure(StatusCode::SERVICE_UNAVAILABLE, "claude_proxy_busy");
         };
@@ -409,10 +427,7 @@ impl ClaudeCodeProxy {
                 }
             };
         let inference = parts.method == Method::POST
-            && matches!(
-                parts.uri.path(),
-                "/v1/messages" | "/v1/messages/count_tokens"
-            );
+            && matches!(parts.uri.path(), "/v1/messages" | COUNT_TOKENS_PATH);
         let desktop = is_desktop_code(&parts.headers);
         let mut headers = end_to_end_headers(&parts.headers);
         let mut guard = None;
@@ -421,8 +436,12 @@ impl ClaudeCodeProxy {
         let mut requested_model = None;
         if inference && desktop {
             self.status.lock().unwrap().last_error = None;
-            let (session, model) = match session_key(&parts.headers, &bytes) {
-                Ok(identity) => identity,
+            let identity = match session_key(&parts.headers, &bytes) {
+                Ok(identity) => Some(identity),
+                // Claude Code builds its token estimates without metadata.
+                // They still go to the execution account, but they are not
+                // inference: no record, usage row or quota observation.
+                Err(SESSION_IDENTITY_MISSING) if parts.uri.path() == COUNT_TOKENS_PATH => None,
                 Err(code) => {
                     log::warn!("[ClaudeCode] request refused: {code}");
                     return failure(StatusCode::CONFLICT, code);
@@ -439,7 +458,6 @@ impl ClaudeCodeProxy {
                 }
             };
             let account_id = lease.as_ref().map(|l| l.account_id.clone());
-            response_account = account_id.clone();
             if let Some(lease) = lease {
                 let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", lease.access_token))
                 else {
@@ -448,40 +466,43 @@ impl ClaudeCodeProxy {
                 headers.insert(header::AUTHORIZATION, value);
                 headers.remove("x-api-key");
             }
-            // Usage is read from the response as it streams past. Anthropic's
-            // edge compresses whenever the client allows it, which hides it.
-            headers.insert(
-                header::ACCEPT_ENCODING,
-                HeaderValue::from_static("identity"),
-            );
-            let operation = if parts.uri.path() == "/v1/messages" {
-                "messages"
-            } else {
-                "count_tokens"
-            };
-            if let Some(requested) = model.as_deref() {
-                substitution = self
-                    .substitution(
-                        account_id.as_deref(),
-                        &session,
-                        requested,
-                        &parts.headers,
-                        &bytes,
-                    )
-                    .await;
+            if let Some((session, model)) = identity {
+                response_account = account_id.clone();
+                // Usage is read from the response as it streams past. Anthropic's
+                // edge compresses whenever the client allows it, which hides it.
+                headers.insert(
+                    header::ACCEPT_ENCODING,
+                    HeaderValue::from_static("identity"),
+                );
+                let operation = if parts.uri.path() == "/v1/messages" {
+                    "messages"
+                } else {
+                    "count_tokens"
+                };
+                if let Some(requested) = model.as_deref() {
+                    substitution = self
+                        .substitution(
+                            account_id.as_deref(),
+                            &session,
+                            requested,
+                            &parts.headers,
+                            &bytes,
+                        )
+                        .await;
+                }
+                let sent_model = substitution
+                    .as_ref()
+                    .map(|s| s.model.clone())
+                    .or(model.clone());
+                requested_model = model;
+                guard = Some(RequestGuard::new(
+                    self.clone(),
+                    session,
+                    account_id,
+                    operation,
+                    sent_model,
+                ));
             }
-            let sent_model = substitution
-                .as_ref()
-                .map(|s| s.model.clone())
-                .or(model.clone());
-            requested_model = model;
-            guard = Some(RequestGuard::new(
-                self.clone(),
-                session,
-                account_id,
-                operation,
-                sent_model,
-            ));
         }
         let path = parts
             .uri
@@ -590,6 +611,7 @@ impl ClaudeCodeProxy {
         let headers = end_to_end_headers(upstream.headers());
         let stream = async_stream::stream! {
             let _permit = permit;
+            let _estimate = estimate;
             let mut guard = guard;
             let mut received=0u64;
             let mut bytes = upstream.bytes_stream();
@@ -917,7 +939,7 @@ fn session_key(
     let raw = value
         .pointer("/metadata/user_id")
         .and_then(|v| v.as_str())
-        .ok_or("claude_session_identity_missing")?;
+        .ok_or(SESSION_IDENTITY_MISSING)?;
     let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
     let id = parsed
         .as_ref()
