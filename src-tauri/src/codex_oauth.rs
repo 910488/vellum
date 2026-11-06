@@ -783,29 +783,33 @@ impl CodexOAuthManager {
         allow_retry: bool,
     ) -> Result<Option<AppliedOAuth>, OAuthError> {
         let settings = self.quota_pool.read().await.clone();
-        if !settings.enabled
-            || !settings
-                .members
-                .iter()
-                .any(|m| m.in_pool && pool_account_hash(&m.account_id) == account_hash)
-        {
+        // Pool bookkeeping is keyed by the member's own hash, whichever form
+        // the caller reported.
+        let member_hash = settings
+            .members
+            .iter()
+            .find(|m| m.in_pool && pool_member_hash_matches(&m.account_id, account_hash))
+            .map(|m| pool_account_hash(&m.account_id))
+            .filter(|_| settings.enabled);
+        let Some(member_hash) = member_hash else {
             log::info!("[QuotaPool] event=retry_declined stage=pool reason=disabled_or_not_pool_member account={account_hash} allow_retry={allow_retry}");
             return Ok(None);
-        }
+        };
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         // Prefer the provider's reset. Without one, use the observed window
         // reset retained by routing, or a conservative five-hour window.
         let until = reset_at.filter(|t| *t > now).unwrap_or_else(|| {
             self.pool_reset_times
                 .lock()
-                .get(account_hash)
+                .get(&member_hash)
                 .copied()
                 .filter(|t| *t > now)
                 .unwrap_or(now + 18_000_000)
         });
         self.exhausted_pool_accounts
             .lock()
-            .insert(account_hash.to_owned(), until);
+            .insert(member_hash.clone(), until);
+        log::info!("[QuotaPool] event=retry_mark_exhausted account={member_hash} until={until}");
         if !allow_retry {
             log::info!("[QuotaPool] event=retry_declined stage=pool reason=allow_retry_false account={account_hash}");
             return Ok(None);
@@ -1458,10 +1462,53 @@ impl CodexOAuthManager {
         } else {
             None
         };
-        let observation = windows
-            .as_deref()
-            .and_then(|windows| quota_pool_observation(windows, weekly_floor));
-        let plan_type = metadata.and_then(|a| a.plan_type);
+        self.pool_candidate_from(account, windows.as_deref(), weekly_floor)
+            .await
+    }
+
+    /// Read one alternative for a gated active turn. A reading younger than
+    /// the display cache is reused, so a turn that finds no fitting member
+    /// adds at most one usage request per member per cache period.
+    async fn fresh_pool_candidate(
+        &self,
+        account: &str,
+        weekly_floor: u8,
+    ) -> (
+        crate::quota_pool_router::Candidate,
+        Option<QuotaPoolObservation>,
+    ) {
+        let windows = match self.valid_auth_for(account).await {
+            Ok(auth) => crate::codex_quota::query_with_cache_ttl(
+                &auth.access_token,
+                &auth.account_id,
+                &auth.credential_id,
+                false,
+                crate::codex_quota::GATED_ALTERNATIVE_QUOTA_CACHE_TTL,
+            )
+            .await
+            .ok(),
+            Err(_) => None,
+        };
+        self.pool_candidate_from(account, windows.as_deref(), weekly_floor)
+            .await
+    }
+
+    async fn pool_candidate_from(
+        &self,
+        account: &str,
+        windows: Option<&[crate::model::QuotaSnapshot]>,
+        weekly_floor: u8,
+    ) -> (
+        crate::quota_pool_router::Candidate,
+        Option<QuotaPoolObservation>,
+    ) {
+        let observation = windows.and_then(|windows| quota_pool_observation(windows, weekly_floor));
+        let plan_type = self
+            .accounts
+            .read()
+            .await
+            .get(account)
+            .and_then(|a| a.plan_type.clone());
         let mut candidate = crate::quota_pool_router::Candidate {
             account_id: account.into(),
             capacity_prior: crate::quota_pool_router::plan_capacity_prior(plan_type.as_deref()),
@@ -1483,7 +1530,10 @@ impl CodexOAuthManager {
     }
 
     /// Each response.create is a safe socket handoff boundary, even when the
-    /// enclosing Codex root turn continues. Quota reads here are cache-only.
+    /// enclosing Codex root turn continues. The incumbent is judged from the
+    /// cache, so an ordinary request adds no quota read. Once it is gated, the
+    /// alternatives are read: during a long turn only the account in use stays
+    /// warm, and each refresh evicts readings older than the display cache.
     async fn active_turn_pool_auth(
         &self,
         account: &str,
@@ -1512,27 +1562,28 @@ impl CodexOAuthManager {
             observation.as_ref().and_then(|o| o.skip_reason)
         };
         if let Some(reason) = reason {
-            let mut candidates = Vec::new();
-            for member in settings
+            let reads = settings
                 .members
                 .iter()
                 .filter(|m| m.in_pool && !m.paused && m.account_id != account)
-            {
-                if self
-                    .exhausted_pool_accounts
-                    .lock()
-                    .get(&pool_account_hash(&member.account_id))
-                    .is_some_and(|until| *until > now)
-                {
-                    continue;
-                }
-                let (candidate, quota) = self
-                    .cached_pool_candidate(&member.account_id, member.weekly_floor)
-                    .await;
-                if quota.is_some_and(|o| o.usable) {
-                    candidates.push(candidate);
-                }
-            }
+                .filter(|m| {
+                    !self
+                        .exhausted_pool_accounts
+                        .lock()
+                        .get(&pool_account_hash(&m.account_id))
+                        .is_some_and(|until| *until > now)
+                })
+                .map(|m| self.fresh_pool_candidate(&m.account_id, m.weekly_floor))
+                .collect::<Vec<_>>();
+            let alternatives = reads.len();
+            let mut candidates = collect_balanced_quota_reads(reads)
+                .await
+                .into_iter()
+                .filter_map(|(candidate, quota)| {
+                    quota.is_some_and(|o| o.usable).then_some(candidate)
+                })
+                .collect::<Vec<_>>();
+            let usable = candidates.len();
             while !candidates.is_empty() {
                 // No incumbent cache discount on a full-input account switch.
                 let mut placement = context.clone();
@@ -1575,7 +1626,7 @@ impl CodexOAuthManager {
                     }
                 }
             }
-            log::info!("[QuotaPool] event=active_turn_stay account={} reason=no_fitting_cached_alternative gate={reason}", pool_account_hash(account));
+            log::info!("[QuotaPool] event=active_turn_stay account={} reason=no_fitting_alternative gate={reason} alternatives={alternatives} usable={usable}", pool_account_hash(account));
         }
         self.smart_router.lock().choose(&[incumbent], context, now);
         None
@@ -1872,6 +1923,18 @@ struct QuotaPoolObservation {
 
 fn pool_account_hash(account_id: &str) -> String {
     vellum_proxy_runtime::account_hash(account_id)
+}
+
+/// The proxy runtime reports its execution account as `sha256:` plus the full
+/// digest, the same identity socket affinity carries without the prefix. Pool
+/// bookkeeping uses the shorter `pool_account_hash`. Accept either form; the
+/// two lengths differ, so neither can be mistaken for the other.
+fn pool_member_hash_matches(account_id: &str, account_hash: &str) -> bool {
+    pool_account_hash(account_id) == account_hash
+        || account_hash.strip_prefix("sha256:").is_some_and(|digest| {
+            digest
+                == vellum_proxy_runtime::request::OfficialSocketAffinity::hash_account(account_id)
+        })
 }
 
 fn log_pool_candidate(
@@ -2693,7 +2756,13 @@ mod tests {
     #[tokio::test]
     async fn quota_retry_requires_fit_and_excludes_exhausted_account_until_reset() {
         use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
-        for strategy in [QuotaPoolStrategy::Balanced, QuotaPoolStrategy::Rank] {
+        use vellum_proxy_runtime::request::OfficialSocketAffinity;
+        for (strategy, runtime_form) in [
+            (QuotaPoolStrategy::Balanced, false),
+            (QuotaPoolStrategy::Balanced, true),
+            (QuotaPoolStrategy::Rank, false),
+            (QuotaPoolStrategy::Rank, true),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let manager = CodexOAuthManager::new(temp.path().to_path_buf());
             let mut members = Vec::new();
@@ -2750,10 +2819,21 @@ mod tests {
                 ..Default::default()
             };
             let hash = pool_account_hash("quota-retry-a");
+            // The proxy runtime reports its execution account as the full
+            // digest (`plan.execution_account_hash`), not the pool's short
+            // form; every 429 it relayed used to miss the membership check.
+            let reported = if runtime_form {
+                format!(
+                    "sha256:{}",
+                    OfficialSocketAffinity::hash_account("quota-retry-a")
+                )
+            } else {
+                hash.clone()
+            };
             let reset = chrono::Utc::now().timestamp_millis().max(0) as u64 + 60_000;
             assert_eq!(
                 manager
-                    .retry_pool_after_quota(&hash, Some(reset), &context, true)
+                    .retry_pool_after_quota(&reported, Some(reset), &context, true)
                     .await
                     .unwrap()
                     .unwrap()
@@ -2773,7 +2853,7 @@ mod tests {
             context.estimated_input_tokens = 10_000_000;
             assert!(
                 manager
-                    .retry_pool_after_quota(&hash, Some(reset), &context, true)
+                    .retry_pool_after_quota(&reported, Some(reset), &context, true)
                     .await
                     .unwrap()
                     .is_none(),
@@ -2781,10 +2861,26 @@ mod tests {
             );
             context.estimated_input_tokens = 1000;
             assert!(manager
-                .retry_pool_after_quota(&hash, Some(reset), &context, false)
+                .retry_pool_after_quota(&reported, Some(reset), &context, false)
                 .await
                 .unwrap()
                 .is_none());
+            assert!(
+                manager
+                    .retry_pool_after_quota(
+                        &format!(
+                            "sha256:{}",
+                            OfficialSocketAffinity::hash_account("outsider")
+                        ),
+                        Some(reset),
+                        &context,
+                        true,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "an account outside the pool still declines"
+            );
             manager.exhausted_pool_accounts.lock().insert(hash, 0);
             manager
                 .exhausted_pool_accounts
@@ -2927,17 +3023,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_turn_uses_cached_reserve_and_exhaustion_gates_with_fit_fallback() {
+    async fn active_turn_gates_on_cached_incumbent_and_reads_alternatives_fresh() {
         use vellum_proxy_runtime::official_auth::OfficialRoutingContext;
         use vellum_proxy_runtime::request::OfficialSocketAffinity;
-        for (case, weekly, five, exhausted, tokens, cache_other, expected) in [
-            ("healthy", 10.0, 10.0, false, 1000, true, "a"),
-            ("five-reserve", 10.0, 96.0, false, 1000, true, "b"),
-            ("weekly-reserve", 100.0, 10.0, false, 1000, true, "b"),
-            ("exhausted", 10.0, 10.0, true, 1000, true, "b"),
-            ("no-fit", 10.0, 96.0, false, 300_000, true, "a"),
-            ("no-cache", 10.0, 96.0, false, 1000, false, "a"),
-        ] {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Other {
+            Cached,
+            // Only the usage endpoint can answer: the cached reading was
+            // evicted while the incumbent alone stayed warm (11-06 log).
+            UpstreamOnly,
+            Unreadable,
+        }
+        #[rustfmt::skip]
+        let cases = [
+            ("healthy", 10.0, 10.0, false, 1000, Other::UpstreamOnly, "a", 0),
+            ("five-reserve", 10.0, 96.0, false, 1000, Other::Cached, "b", 0),
+            ("weekly-reserve", 100.0, 10.0, false, 1000, Other::Cached, "b", 0),
+            ("exhausted", 10.0, 10.0, true, 1000, Other::Cached, "b", 0),
+            ("no-fit", 10.0, 96.0, false, 300_000, Other::Cached, "a", 0),
+            ("evicted", 10.0, 96.0, false, 1000, Other::UpstreamOnly, "b", 1),
+            ("unreadable", 10.0, 96.0, false, 1000, Other::Unreadable, "a", 1),
+        ];
+        for (case, weekly, five, exhausted, tokens, other, expected, upstream_reads) in cases {
             let temp = tempfile::tempdir().unwrap();
             let manager = CodexOAuthManager::new(temp.path().into());
             let mut members = Vec::new();
@@ -2968,26 +3075,32 @@ mod tests {
                         expires_at_ms: i64::MAX,
                     },
                 );
-                if suffix == "a" || cache_other {
-                    crate::codex_quota::seed_test_quota(
+                let windows = vec![
+                    quota_window(
+                        crate::model::QuotaPeriodUnit::Hour,
+                        Some(5),
+                        if suffix == "a" { five } else { 10.0 },
+                        None,
+                    ),
+                    quota_window(
+                        crate::model::QuotaPeriodUnit::Week,
+                        None,
+                        if suffix == "a" { weekly } else { 10.0 },
+                        None,
+                    ),
+                ];
+                if suffix == "a" || other == Other::Cached {
+                    crate::codex_quota::seed_test_quota(&token, &id, windows).await;
+                } else if other == Other::UpstreamOnly {
+                    crate::codex_quota::seed_test_upstream(&token, &id, Ok(windows));
+                } else {
+                    crate::codex_quota::seed_test_upstream(
                         &token,
                         &id,
-                        vec![
-                            quota_window(
-                                crate::model::QuotaPeriodUnit::Hour,
-                                Some(5),
-                                if suffix == "a" { five } else { 10.0 },
-                                None,
-                            ),
-                            quota_window(
-                                crate::model::QuotaPeriodUnit::Week,
-                                None,
-                                if suffix == "a" { weekly } else { 10.0 },
-                                None,
-                            ),
-                        ],
-                    )
-                    .await;
+                        Err(crate::codex_quota::CodexQuotaError::Request(
+                            "synthetic upstream failure".into(),
+                        )),
+                    );
                 }
                 members.push(QuotaPoolMember {
                     account_id: id,
@@ -3030,6 +3143,15 @@ mod tests {
                 selected.credential_id,
                 format!("active-cache-{case}-{expected}"),
                 "{case}"
+            );
+            let other_id = format!("active-cache-{case}-b");
+            let other_token = manager.access_tokens.read().await[&other_id]
+                .access_token
+                .clone();
+            assert_eq!(
+                crate::codex_quota::test_upstream_reads(&other_token, &other_id),
+                upstream_reads,
+                "{case}: only a gated incumbent may add a quota read"
             );
         }
     }

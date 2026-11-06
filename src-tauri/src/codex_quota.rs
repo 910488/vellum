@@ -7,6 +7,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 pub const ROUTING_QUOTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Alternatives read once an active turn's account is gated. They are not
+/// being drained by this turn, so a display-age reading is close enough, and
+/// a gated turn that finds no fitting member does not re-read on each request.
+pub const GATED_ALTERNATIVE_QUOTA_CACHE_TTL: std::time::Duration = QUOTA_CACHE_TTL;
 
 #[derive(Clone)]
 struct CachedQuota {
@@ -100,7 +104,8 @@ pub async fn query(
 }
 
 /// Read the last in-memory observation without refreshing or waiting for an
-/// in-flight query. Active-turn routing must never add a quota HTTP request.
+/// in-flight query. Active-turn routing judges its own account from here, so
+/// an ordinary request adds no quota HTTP request.
 /// The caller still checks window reset times and treats a miss as unknown.
 pub async fn cached_snapshot(access_token: &str, account_id: &str) -> Option<Vec<QuotaSnapshot>> {
     let key = format!("{account_id}:{:x}", Sha256::digest(access_token.as_bytes()));
@@ -121,6 +126,10 @@ pub async fn query_with_cache_ttl(
     force_refresh: bool,
     cache_ttl: std::time::Duration,
 ) -> Result<Vec<QuotaSnapshot>, CodexQuotaError> {
+    #[cfg(test)]
+    if let Some(result) = synthetic_upstream_read(access_token, account_id) {
+        return result;
+    }
     query_with_client(
         quota_client()?,
         USAGE_URL,
@@ -364,6 +373,51 @@ fn period(seconds: Option<i64>) -> QuotaPeriod {
         }
         _ => QuotaPeriod::unspecified(),
     }
+}
+
+/// Test-only stand-in for the usage endpoint, keyed like the cache. Manager
+/// tests use it when a read must miss the cache, and count the reads to show
+/// that a path adds none. Unseeded keys keep the normal cache-then-upstream path.
+#[cfg(test)]
+type SyntheticUpstream = HashMap<String, (usize, Result<Vec<QuotaSnapshot>, CodexQuotaError>)>;
+
+#[cfg(test)]
+fn synthetic_upstream() -> std::sync::MutexGuard<'static, SyntheticUpstream> {
+    static UPSTREAM: OnceLock<Mutex<SyntheticUpstream>> = OnceLock::new();
+    UPSTREAM
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+fn synthetic_upstream_read(
+    token: &str,
+    account: &str,
+) -> Option<Result<Vec<QuotaSnapshot>, CodexQuotaError>> {
+    let key = format!("{account}:{:x}", Sha256::digest(token.as_bytes()));
+    synthetic_upstream().get_mut(&key).map(|(reads, result)| {
+        *reads += 1;
+        result.clone()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn seed_test_upstream(
+    token: &str,
+    account: &str,
+    result: Result<Vec<QuotaSnapshot>, CodexQuotaError>,
+) {
+    let key = format!("{account}:{:x}", Sha256::digest(token.as_bytes()));
+    synthetic_upstream().insert(key, (0, result));
+}
+
+#[cfg(test)]
+pub(crate) fn test_upstream_reads(token: &str, account: &str) -> usize {
+    let key = format!("{account}:{:x}", Sha256::digest(token.as_bytes()));
+    synthetic_upstream()
+        .get(&key)
+        .map_or(0, |(reads, _)| *reads)
 }
 
 #[cfg(test)]
