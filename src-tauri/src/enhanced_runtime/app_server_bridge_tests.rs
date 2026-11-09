@@ -574,6 +574,57 @@ fn a_build_without_the_relay_keeps_mobile_control_on_official() {
     assert!(!should_isolate_bridge_state(false, false));
 }
 
+/// Desktop 26.1103's core refuses input on a thread whose provider differs from
+/// the one its config selects. Vellum's config selects `vellum`, so the Official
+/// child has to be told it serves `vellum-official`.
+#[test]
+fn each_child_selects_the_provider_its_plane_binds_threads_to() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config.toml");
+
+    // No config at all: selecting a missing table would stop the App Server.
+    for plane in [ExecutionPlane::OfficialCodex, ExecutionPlane::EnhancedCodex] {
+        assert!(child_model_provider_args(plane, home.path()).is_empty());
+    }
+
+    std::fs::write(
+        &config,
+        r#"model_provider = "vellum"
+
+[model_providers.vellum]
+name = "Vellum"
+
+[model_providers.vellum-official]
+name = "OpenAI"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        child_model_provider_args(ExecutionPlane::OfficialCodex, home.path()),
+        ["-c", "model_provider=\"vellum-official\""]
+    );
+    assert_eq!(
+        child_model_provider_args(ExecutionPlane::EnhancedCodex, home.path()),
+        ["-c", "model_provider=\"vellum\""]
+    );
+
+    // A config without the Official table keeps whatever it selects.
+    std::fs::write(
+        &config,
+        "model_provider = \"vellum\"\n\n[model_providers.vellum]\nname = \"Vellum\"\n",
+    )
+    .unwrap();
+    assert!(child_model_provider_args(ExecutionPlane::OfficialCodex, home.path()).is_empty());
+    assert_eq!(
+        child_model_provider_args(ExecutionPlane::EnhancedCodex, home.path()),
+        ["-c", "model_provider=\"vellum\""]
+    );
+
+    // An unreadable config is treated as missing, not as a reason to guess.
+    std::fs::write(&config, "model_providers = [").unwrap();
+    assert!(child_model_provider_args(ExecutionPlane::OfficialCodex, home.path()).is_empty());
+}
+
 /// The phone failure this branch exists for: `thread/resume` reached the
 /// Enhanced core for a thread Official owns, and the Enhanced core answered
 /// `thread-store conflict: … already has an active writer`. Routing is by the
@@ -639,6 +690,46 @@ fn thread_attachments_are_answered_by_official_whatever_the_owner() {
         &actions[0],
         BridgeAction::ToChild(ExecutionPlane::EnhancedCodex, _)
     ));
+}
+
+/// Official answers every `thread/list`, and Codex fills a missing provider
+/// filter with the one its config selects. Desktop's recent and archived lists
+/// send `null`, so without both of Vellum's tables named here one kind of
+/// thread disappears from them.
+#[test]
+fn unfiltered_thread_lists_name_both_vellum_providers() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = state(&temp);
+    let both = json!(["vellum-official", "vellum"]);
+    let sent = |state: &mut BridgeState, params: Value| {
+        let line = json!({"id": 9, "method": "thread/list", "params": params}).to_string();
+        let actions = state.on_client_line(&line).unwrap();
+        let BridgeAction::ToChild(ExecutionPlane::OfficialCodex, request) = &actions[0] else {
+            panic!("thread/list must reach the official core: {actions:?}");
+        };
+        request["params"].clone()
+    };
+
+    for params in [
+        json!({"modelProviders": null, "archived": false}),
+        json!({"archived": true}),
+    ] {
+        assert_eq!(sent(&mut state, params)["modelProviders"], both);
+    }
+    // An explicit filter, including "every provider", is the client's choice.
+    assert_eq!(
+        sent(&mut state, json!({"modelProviders": []}))["modelProviders"],
+        json!([])
+    );
+    assert_eq!(
+        sent(&mut state, json!({"modelProviders": ["openai"]}))["modelProviders"],
+        json!(["openai"])
+    );
+    // Relation queries are unfiltered in Codex; naming providers would filter them.
+    for relation in ["parentThreadId", "ancestorThreadId", "attachedToThreadId"] {
+        let params = sent(&mut state, json!({"modelProviders": null, relation: "thread-1"}));
+        assert!(params["modelProviders"].is_null(), "{relation}: {params}");
+    }
 }
 
 /// Resuming a thread whose owner is unknown must say so. Trying each core in

@@ -190,6 +190,7 @@ impl Core {
             args.push(arg);
         }
         command
+            .args(child_model_provider_args(plane, &identity.codex_home))
             .args(args)
             .args([
                 "--listen",
