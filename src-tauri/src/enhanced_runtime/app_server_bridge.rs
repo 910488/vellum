@@ -71,6 +71,49 @@ fn configure_fallback_remote_control(
     }
 }
 
+/// The Codex provider table a plane's threads are bound to.
+fn plane_model_provider(plane: ExecutionPlane) -> &'static str {
+    match plane {
+        ExecutionPlane::OfficialCodex => crate::codex::VELLUM_OFFICIAL_PROVIDER_NAME,
+        ExecutionPlane::EnhancedCodex => crate::codex::VELLUM_PROVIDER_NAME,
+    }
+}
+
+/// Tell each child which provider its plane serves.
+///
+/// Codex 0.167 admits input only when a thread's provider is the one the App
+/// Server's own config selects, and resume applies the same rule; anything
+/// else is answered with `modelProviderMismatch`. Vellum's config selects
+/// `vellum` while every Official thread is bound to `vellum-official`, so once
+/// Desktop 26.1103 shipped that core, every Official chat stopped at "This chat
+/// uses vellum-official, but your current provider is vellum."
+///
+/// The override is added only when the child's config defines the table.
+/// Selecting a provider Codex cannot find fails the whole App Server at
+/// startup, which is worse than one thread it refuses.
+///
+/// Without an Enhanced core, Official also receives third-party threads, and
+/// one App Server admits only one provider. Official keeps it.
+fn child_model_provider_args(plane: ExecutionPlane, codex_home: &Path) -> Vec<String> {
+    let provider = plane_model_provider(plane);
+    if !config_defines_model_provider(codex_home, provider) {
+        return Vec::new();
+    }
+    vec!["-c".into(), format!("model_provider=\"{provider}\"")]
+}
+
+fn config_defines_model_provider(codex_home: &Path, provider: &str) -> bool {
+    std::fs::read_to_string(codex_home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|config| {
+            config
+                .get("model_providers")
+                .and_then(|providers| providers.get(provider))
+                .is_some_and(toml::Value::is_table)
+        })
+}
+
 struct BridgeStatePaths {
     attestation: PathBuf,
     observations: PathBuf,
@@ -684,6 +727,7 @@ impl ChildProcess {
         };
         let mut command = Command::new(&identity.executable);
         command
+            .args(child_model_provider_args(plane, &identity.codex_home))
             .args(args)
             // A child that inherited either of these would re-enter the bridge
             // and fork-bomb the machine.
@@ -1061,6 +1105,7 @@ impl BridgeState {
             value["params"]["modelProvider"] = Value::String(child_provider_id);
         }
         normalize_enhanced_guardian_config(plane, &mut value);
+        list_threads_of_both_vellum_providers(&mut value);
         if let (Some(id), Some(pending)) = (id.as_ref(), pending) {
             self.pending_bindings.insert(id_key(id), pending);
         }
@@ -1534,12 +1579,7 @@ impl BridgeState {
         if let Some(route) = self.model_provider_map.resolve(&binding.model_id) {
             return Ok(route.child_provider_id.clone());
         }
-        Ok(match binding.plane {
-            ExecutionPlane::OfficialCodex => {
-                crate::codex::VELLUM_OFFICIAL_PROVIDER_NAME.to_string()
-            }
-            ExecutionPlane::EnhancedCodex => crate::codex::VELLUM_PROVIDER_NAME.to_string(),
-        })
+        Ok(plane_model_provider(binding.plane).to_string())
     }
 
     fn inherit_child_binding(
@@ -1598,6 +1638,38 @@ impl BridgeState {
                 .record_rejected(method, "not part of the enhanced notification contract"),
         }
         Vec::new()
+    }
+}
+
+/// `thread/list` without a provider filter lists only the provider the
+/// answering core selects. Official answers every list and selects
+/// `vellum-official` (see [`child_model_provider_args`]), so Desktop's recent
+/// and archived lists, which send `modelProviders: null`, would drop every
+/// third-party thread; while the shared config selected `vellum` they dropped
+/// every Official one instead. Name both of Vellum's tables.
+///
+/// Codex ignores the provider filter for relation queries (children,
+/// descendants, attached threads). An explicit filter would start applying it
+/// there, so those requests stay as sent.
+fn list_threads_of_both_vellum_providers(request: &mut Value) {
+    if request.get("method").and_then(Value::as_str) != Some("thread/list") {
+        return;
+    }
+    let Some(params) = request.get_mut("params").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let unfiltered = params.get("modelProviders").is_none_or(Value::is_null);
+    let relation = ["parentThreadId", "ancestorThreadId", "attachedToThreadId"]
+        .iter()
+        .any(|key| params.get(*key).is_some_and(|value| !value.is_null()));
+    if unfiltered && !relation {
+        params.insert(
+            "modelProviders".into(),
+            json!([
+                crate::codex::VELLUM_OFFICIAL_PROVIDER_NAME,
+                crate::codex::VELLUM_PROVIDER_NAME
+            ]),
+        );
     }
 }
 
