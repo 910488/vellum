@@ -694,6 +694,9 @@ async fn restart_codex_managed_inner(state: &AppState, force: bool) -> AppResult
         )));
     }
 
+    // Desktop is closed now and reads its global state as it starts.
+    crate::codex_desktop_state::clear_before_launch();
+
     if let Err(error) = launch_codex(launch_target, launch.as_ref()) {
         state.set_draining(false);
         return Err(AppError::Message(format!("無法重新啟動 Codex：{error}")));
@@ -1583,6 +1586,16 @@ fn launch_target_identity(_target: &CodexLaunchTarget) -> String {
     {
         format!("pid:{}", _target.pid)
     }
+}
+
+/// The Codex Desktop main process, when one is running.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn codex_desktop_pid() -> Option<u32> {
+    discover_codex_process()
+        .ok()
+        .flatten()
+        .map(|target| target.pid)
+        .filter(|pid| *pid != 0)
 }
 
 #[cfg(target_os = "windows")]
