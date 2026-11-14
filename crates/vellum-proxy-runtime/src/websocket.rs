@@ -448,6 +448,32 @@ async fn bridge<S: ProxyRuntimeState>(mut client: WebSocket, state: Arc<S>, head
                     };
                     match hydrated {
                         Ok(body) => {
+                            // A rebuild that already lost required ciphertext
+                            // is rejected upstream every time. Take the
+                            // recovery that rejection ends in, Codex's own
+                            // full input, without the doomed request.
+                            if let Some(previous) =
+                                request.get("previous_response_id").and_then(Value::as_str)
+                            {
+                                if let Some(lost) =
+                                    crate::exec::rebuilt_history_lost_ciphertext(&body)
+                                {
+                                    log::info!(
+                                        "[OfficialSocket] account handoff needs Codex's full input reason={lost} connection={connection_id}"
+                                    );
+                                    if send_runtime_failure(
+                                        &mut client,
+                                        &RuntimeError::PreviousResponseNotFound(
+                                            previous.to_owned(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        frames_out += 1;
+                                    }
+                                    continue;
+                                }
+                            }
                             log::info!(
                                 "[OfficialSocket] account handoff replayed on socket connection={connection_id} input_items={}",
                                 crate::request::request_input_items(&body).len()
@@ -1514,6 +1540,8 @@ async fn prepare_quota_handoff(
     reset_at: Option<u64>,
     allow_retry: bool,
 ) -> Option<OfficialWebSocketPlan> {
+    let chained_frame = (allow_retry && request.body.get("previous_response_id").is_some())
+        .then(|| request.body.clone());
     if allow_retry {
         match runtime.hydrate_official_socket_handoff(plan, &request.body) {
             Ok(body) => request.body = body,
@@ -1526,7 +1554,7 @@ async fn prepare_quota_handoff(
             }
         }
     }
-    let next = match runtime
+    let mut next = match runtime
         .prepare_websocket_quota_retry(plan, request, reset_at, allow_retry)
         .await
     {
@@ -1557,6 +1585,11 @@ async fn prepare_quota_handoff(
     };
     request.body["type"] = json!("response.create");
     request.metadata.official_socket_affinity = None;
+    // A chained retry is rebuilt from local history like any account
+    // handoff, so an invalid-request rejection takes the same recovery.
+    if let Some(original) = chained_frame {
+        next.handoff_replay = Some(handoff_replay_summary(&original, &request.body));
+    }
     Some(next)
 }
 
@@ -3949,6 +3982,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_handoff_keeps_encrypted_argument_declarations() {
+        run_official_websocket_account_switch(false, "switch_manifest").await;
+    }
+
+    #[tokio::test]
+    async fn account_handoff_that_lost_ciphertext_asks_codex_without_sending() {
+        run_official_websocket_account_switch(false, "switch_ciphertext").await;
+    }
+
+    #[tokio::test]
     async fn rejected_http_bridge_replay_asks_codex_for_full_input() {
         run_official_websocket_account_switch(false, "bridge_rejected").await;
     }
@@ -4096,6 +4139,11 @@ mod tests {
         let check_contract = mode != "missing";
         let reject_replay = mode == "switch_rejected";
         let reject_http_replay = mode == "bridge_rejected";
+        // Codex 0.167 declares the reserved collaboration tools' `message`
+        // argument `encrypted: true` and carries it as call ciphertext;
+        // Official checks both against the model's configured schema.
+        let manifest = matches!(mode, "switch_manifest" | "switch_ciphertext");
+        let lost_ciphertext = mode == "switch_ciphertext";
         let upstream = Router::new().route(
             "/backend-api/codex/responses",
             get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
@@ -4118,7 +4166,21 @@ mod tests {
                                     .unwrap()
                                     .push((account.clone(), request.clone()));
                                 let turn_count = capture.responses.fetch_add(1, Ordering::SeqCst) + 1;
-                                if reject_replay && turn_count == 2 {
+                                // Official's answer when a reserved function's
+                                // declaration flag or call ciphertext is gone
+                                // (2026-11-12/13).
+                                let schema_mismatch = manifest
+                                    && request["input"].as_array().is_some_and(|items| {
+                                        items.iter().any(|item| {
+                                            (item["type"] == "additional_tools"
+                                                && item["tools"][0]["tools"][0]["parameters"]
+                                                    ["properties"]["message"]["encrypted"]
+                                                    != true)
+                                                || (item["name"] == "followup_task"
+                                                    && item.get("encrypted_content").is_none())
+                                        })
+                                    });
+                                if (reject_replay && turn_count == 2) || schema_mismatch {
                                     // The new account's notice arrives before
                                     // the rejection and shows Codex no output.
                                     socket
@@ -4265,12 +4327,28 @@ mod tests {
         let (mut client, _) = tokio_tungstenite::connect_async(handshake.clone())
             .await
             .unwrap();
+        let mut first_input = vec![json!({"role": "user", "content": "first question"})];
+        if manifest {
+            first_input.insert(0, json!(
+                {"type":"additional_tools","id":"at_01a1d2aa-0f2e-7c41-9a55-3c1d2e4f5a6b","role":"developer","tools":[
+                    {"type":"namespace","name":"collaboration","description":"Coordinate agents","tools":[
+                        {"type":"function","name":"followup_task","strict":false,"parameters":{"type":"object",
+                            "properties":{"message":{"type":"string","encrypted":true},"target":{"type":"string"}},
+                            "required":["target","message"],"additionalProperties":false}}]}]}));
+        }
+        if lost_ciphertext {
+            first_input.extend([
+                json!({"type":"function_call","namespace":"collaboration","name":"followup_task","call_id":"call_followup",
+                    "arguments":"{\"target\":\"worker\",\"message\":\"\"}","encrypted_content":"ciphertext-from-account-a"}),
+                json!({"type":"function_call_output","call_id":"call_followup","output":"queued"}),
+            ]);
+        }
         client
             .send(TungsteniteMessage::Text(
                 json!({
                     "type": "response.create",
                     "model": "vellum-official",
-                    "input": [{"role": "user", "content": "first question"}],
+                    "input": first_input,
                     "tools": desktop_tools(),
                     "client_metadata":{"x-codex-turn-metadata":{"session_id":"switch-session","thread_id":"switch-thread","root_turn_id":"root-one"}},
                     "stream": false
@@ -4315,7 +4393,12 @@ mod tests {
         // the history on a socket; only Auto Review keeps the HTTP bridge.
         let socket_handoff = matches!(
             mode,
-            "switch" | "switch_reconnect" | "switch_rejected" | "revision"
+            "switch"
+                | "switch_reconnect"
+                | "switch_rejected"
+                | "switch_manifest"
+                | "switch_ciphertext"
+                | "revision"
         );
         client
             .send(TungsteniteMessage::Text(
@@ -4348,7 +4431,9 @@ mod tests {
                 .unwrap();
             if let TungsteniteMessage::Text(text) = frame {
                 let event: Value = serde_json::from_str(&text).unwrap();
-                if (reject_replay || reject_http_replay) && event["type"] == "error" {
+                if (reject_replay || reject_http_replay || lost_ciphertext)
+                    && event["type"] == "error"
+                {
                     // Codex's handling of this code: drop the incremental
                     // request and resend its own full input, unchained.
                     assert_eq!(
@@ -4431,6 +4516,25 @@ mod tests {
             assert_eq!(websocket_accounts.last(), Some(expected));
             let frames = capture.websocket_frames.lock().unwrap().clone();
             assert_eq!(frames.len(), if reject_replay { 3 } else { 2 });
+            if mode == "switch_manifest" {
+                assert_eq!(
+                    frames[1].1["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]
+                        ["message"]["encrypted"],
+                    true,
+                    "the rebuilt manifest keeps its declarations: {}",
+                    frames[1].1
+                );
+            }
+            if lost_ciphertext {
+                // A rebuild that already lost the ciphertext never goes
+                // upstream; Codex's own full input is the only B frame.
+                assert_eq!(
+                    frames[1].1["input"].as_array().map(Vec::len),
+                    Some(3),
+                    "Codex's full input reaches upstream unchanged: {}",
+                    frames[1].1
+                );
+            }
             if reject_replay {
                 let (account, retry) = &frames[2];
                 assert_eq!(account, expected);
@@ -4854,10 +4958,15 @@ mod tests {
         run_pool_quota_retry("missing_history").await;
     }
 
+    #[tokio::test]
+    async fn pooled_quota_retry_rejected_as_invalid_asks_codex_for_full_input() {
+        run_pool_quota_retry("rejected_retry").await;
+    }
+
     async fn run_pool_quota_retry(mode: &'static str) {
         let continuation_turns = match mode {
             "long_continuation" => 40,
-            "continuation" => 1,
+            "continuation" | "rejected_retry" => 1,
             _ => 0,
         };
         use crate::config::ProxyRuntimeIdentity;
@@ -4969,6 +5078,9 @@ mod tests {
                                 "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"prior answer"}]}]}})
                         } else if account == "account-b" && matches!(mode, "success" | "handshake" | "continuation" | "long_continuation") {
                             json!({"type":"response.completed", "response":{"id":"resp_retry", "status":"completed", "output":[]}})
+                        } else if account == "account-b" && mode == "rejected_retry" {
+                            json!({"type":"error", "status":400, "error":{"type":"invalid_request_error", "param":"tools", "code":null,
+                                "message":"Invalid Value: 'tools'. Function 'collaboration.followup_task' is reserved for use by this model and must match the configured schema."}})
                         } else {
                             json!({"type":"error", "status":429, "error":{"type":"usage_limit_reached", "code":"usage_limit_reached", "message":"The usage limit has been reached", "resets_at":1_900_000_000_u64}})
                         };
@@ -5068,7 +5180,12 @@ mod tests {
         }
         let retries = matches!(
             mode,
-            "success" | "twice" | "handshake" | "continuation" | "long_continuation"
+            "success"
+                | "twice"
+                | "handshake"
+                | "continuation"
+                | "long_continuation"
+                | "rejected_retry"
         );
         assert_eq!(
             *accounts.lock().unwrap(),
@@ -5105,6 +5222,16 @@ mod tests {
             }
         }
         assert_eq!(received.len(), if mode == "after_output" { 2 } else { 1 });
+        if mode == "rejected_retry" {
+            // The rebuilt retry is a handoff replay too: Codex's own full
+            // input recovers it instead of a fatal invalid request.
+            assert_eq!(
+                received[0]["error"]["code"], "previous_response_not_found",
+                "{}",
+                received[0]
+            );
+            assert!(!received[0].to_string().contains("reserved"));
+        }
         assert_eq!(
             received.last().unwrap()["type"],
             if matches!(
