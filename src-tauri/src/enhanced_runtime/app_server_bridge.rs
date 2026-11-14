@@ -23,7 +23,7 @@ use vellum_enhanced_codex::{AblationProfile, EnhancedEventKind, EnhancedRuntimeF
 
 use super::attestation::{AttestationWriter, BridgeAttestationV1, ChildAttestation};
 use super::launch_manifest::{LaunchManifestError, LaunchManifestV1, RuntimeBinaryIdentity};
-use super::observations::RuntimeObservations;
+use super::observations::{startup_mark, RuntimeObservations};
 use super::official_drift::OfficialSource;
 use super::qualification::{
     parse_enhanced_event, parse_enhanced_identity, QualificationJournal,
@@ -121,7 +121,7 @@ struct BridgeStatePaths {
 }
 
 fn bridge_is_started_by_codex_desktop() -> bool {
-    let Some(parent_pid) = super::process_info::parent_pid(std::process::id()) else {
+    let Some(parent_pid) = super::process_info::own_parent_pid() else {
         return false;
     };
     super::process_info::executable_of(parent_pid)
@@ -202,6 +202,7 @@ impl BridgeConfig {
         child_args: Vec<String>,
     ) -> Result<Self, BridgeError> {
         manifest.verify_on_disk()?;
+        startup_mark("binaries verified");
         let model_provider_map = TrustedModelProviderMap::read(&manifest.model_provider_map_path)?;
         Ok(Self {
             manifest,
@@ -235,14 +236,18 @@ impl BridgeConfig {
 }
 
 pub fn run_from_env() -> Result<(), BridgeError> {
+    startup_mark("start");
     super::child_reaper::bind_children_to_this_process();
     let child_args = env::args().skip(1).collect::<Vec<_>>();
     let manifest_path = LaunchManifestV1::default_path();
+    super::artifact_digests::remember_in(
+        manifest_path.with_file_name(super::artifact_digests::ARTIFACT_DIGESTS_FILE),
+    );
     if !child_args.iter().any(|arg| arg == "app-server") {
         return delegate_non_app_server(&manifest_path, child_args);
     }
-    let parent_executable = super::process_info::parent_pid(std::process::id())
-        .and_then(super::process_info::executable_of);
+    let parent_executable =
+        super::process_info::own_parent_pid().and_then(super::process_info::executable_of);
     if is_startup_config_read(&child_args) {
         return delegate_startup_config_read(
             &manifest_path,
@@ -257,10 +262,21 @@ pub fn run_from_env() -> Result<(), BridgeError> {
     }
     if bridge_is_started_by_codex_desktop() {
         let mut manifest = LaunchManifestV1::read(&manifest_path)?;
+        let shipped = parent_executable
+            .as_deref()
+            .and_then(super::official_drift::desktop_shipped_core);
+        super::launch_manifest::prime_digests(
+            shipped
+                .as_deref()
+                .into_iter()
+                .chain(manifest.verified_artifacts()),
+        );
+        startup_mark("digests primed");
         let (official, source) = super::official_drift::resolve_official_for_desktop(
             &manifest,
             parent_executable.as_deref(),
         )?;
+        startup_mark("official resolved");
         manifest.official_helpers =
             super::official_drift::expected_helpers(&manifest, &official.artifact_sha256);
         // Desktop replaced its core with one this launch never checked, or
