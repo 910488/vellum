@@ -9061,12 +9061,104 @@ fn bounded_provider_diagnostic(body: &[u8]) -> String {
     normalized.chars().take(512).collect()
 }
 
+/// Why a rebuilt Official history cannot reach upstream, if it cannot.
+///
+/// The durable Official projection drops every `encrypted_content`. Since
+/// Codex 0.167 that is no longer only optional reasoning state: an agent
+/// message keeps an `encrypted_content` part Official requires ("Missing
+/// required parameter: 'input[53].content[1].encrypted_content'"), and a call
+/// to a declared tool whose argument is marked `encrypted: true` must carry
+/// the call's ciphertext ("Function 'collaboration.followup_task' is reserved
+/// for use by this model and must match the configured schema"). Codex still
+/// holds the exact input, so the handoff asks for it instead.
+pub(crate) fn rebuilt_history_lost_ciphertext(body: &Value) -> Option<&'static str> {
+    fn has_ciphertext(value: &Value) -> bool {
+        value
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|ciphertext| !ciphertext.is_empty())
+    }
+    fn encrypted_functions<'a>(
+        tools: Option<&'a Value>,
+        namespace: Option<&'a str>,
+        found: &mut Vec<(Option<&'a str>, &'a str)>,
+    ) {
+        for tool in tools.and_then(Value::as_array).into_iter().flatten() {
+            let name = tool.get("name").and_then(Value::as_str);
+            match tool.get("type").and_then(Value::as_str) {
+                Some("namespace") => encrypted_functions(tool.get("tools"), name, found),
+                Some("function") => {
+                    let encrypted = tool
+                        .pointer("/parameters/properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| {
+                            properties.values().any(|property| {
+                                property.get("encrypted") == Some(&Value::Bool(true))
+                            })
+                        });
+                    if let (true, Some(name)) = (encrypted, name) {
+                        found.push((namespace, name));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut encrypted = Vec::new();
+    for item in items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+    {
+        encrypted_functions(item.get("tools"), None, &mut encrypted);
+    }
+    items.iter().find_map(|item| {
+        let lost_part = item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("encrypted_content")
+                        && !has_ciphertext(part)
+                })
+            });
+        if lost_part {
+            return Some("encrypted_content_part");
+        }
+        if item.get("type").and_then(Value::as_str) != Some("function_call") || has_ciphertext(item)
+        {
+            return None;
+        }
+        let name = item.get("name").and_then(Value::as_str)?;
+        let namespace = item.get("namespace").and_then(Value::as_str);
+        // Codex omits the namespace on calls to its default `functions`
+        // namespace, so an unqualified call matches by name.
+        encrypted
+            .iter()
+            .any(|(declared_namespace, declared)| {
+                *declared == name && namespace.is_none_or(|ns| *declared_namespace == Some(ns))
+            })
+            .then_some("encrypted_tool_argument")
+    })
+}
+
 /// Durable conversation projection, distinct from compaction/trajectory input.
 fn sanitize_official_durable_history(items: &[Value]) -> Vec<Value> {
     items
         .iter()
         .flat_map(|item| {
-            if matches!(
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+                // A tool manifest is caller-owned schema with no provider
+                // state in it. The opaque-key filter would delete its
+                // `"encrypted": true` argument flags, and Official rejects a
+                // reserved function whose declaration no longer matches
+                // ("Function 'collaboration.followup_task' is reserved ...").
+                vec![item.clone()]
+            } else if matches!(
                 crate::compaction::classify_item(item),
                 crate::compaction::ItemRole::System
             ) {
@@ -12157,6 +12249,88 @@ mod tests {
             transport.requests.lock().unwrap().len(),
             1,
             "a deterministic rejection must not retry or fail over"
+        );
+    }
+
+    #[test]
+    fn rebuilt_history_names_ciphertext_official_requires() {
+        // Codex 0.167 shapes after the durable projection stripped them.
+        let declaration = json!({"type":"additional_tools","role":"developer","tools":[
+            {"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"followup_task","parameters":{"type":"object","properties":{
+                    "message":{"type":"string","encrypted":true},"target":{"type":"string"}}}},
+                {"type":"function","name":"wait_agent","parameters":{"type":"object","properties":{
+                    "target":{"type":"string"}}}}]}]});
+        let followup = |namespace: Option<&str>, ciphertext: Option<&str>| {
+            let mut call = json!({"type":"function_call","name":"followup_task","call_id":"c",
+                "arguments":"{\"target\":\"worker\",\"message\":\"\"}"});
+            if let Some(namespace) = namespace {
+                call["namespace"] = json!(namespace);
+            }
+            if let Some(ciphertext) = ciphertext {
+                call["encrypted_content"] = json!(ciphertext);
+            }
+            call
+        };
+        let agent_message = |part: Value| {
+            json!({"type":"agent_message","author":"/root/worker","recipient":"/root",
+                "content":[{"type":"input_text","text":"done"}, part]})
+        };
+        let cases = [
+            (
+                vec![declaration.clone(), followup(Some("collaboration"), None)],
+                Some("encrypted_tool_argument"),
+            ),
+            (
+                vec![declaration.clone(), followup(None, None)],
+                Some("encrypted_tool_argument"),
+            ),
+            (
+                vec![
+                    declaration.clone(),
+                    followup(Some("collaboration"), Some("ct")),
+                ],
+                None,
+            ),
+            (
+                vec![declaration.clone(), followup(Some("other"), None)],
+                None,
+            ),
+            (vec![followup(Some("collaboration"), None)], None),
+            (
+                vec![
+                    declaration.clone(),
+                    json!({"type":"function_call","namespace":"collaboration",
+                "name":"wait_agent","call_id":"w","arguments":"{}"}),
+                ],
+                None,
+            ),
+            (
+                vec![agent_message(json!({"type":"encrypted_content"}))],
+                Some("encrypted_content_part"),
+            ),
+            (
+                vec![agent_message(
+                    json!({"type":"encrypted_content","encrypted_content":"ct"}),
+                )],
+                None,
+            ),
+            (
+                vec![json!({"type":"reasoning","summary":[{"type":"summary_text","text":"s"}]})],
+                None,
+            ),
+        ];
+        for (input, expected) in cases {
+            let body = json!({"input": input});
+            assert_eq!(rebuilt_history_lost_ciphertext(&body), expected, "{body}");
+        }
+        // What the durable projection makes of an intact agent message.
+        let stored = crate::compaction::sanitize_portable_history(&[agent_message(
+            json!({"type":"encrypted_content","encrypted_content":"ct"}),
+        )]);
+        assert_eq!(
+            rebuilt_history_lost_ciphertext(&json!({"input": stored})),
+            Some("encrypted_content_part")
         );
     }
 
