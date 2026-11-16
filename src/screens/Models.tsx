@@ -44,6 +44,7 @@ import {
   quotaPoolLastSelection,
 } from "@/lib/quotaPool";
 import { providerState } from "@/lib/vocabulary";
+import { isUserPresent } from "@/lib/presence";
 import { Btn, Cap, Card, Confirm, Empty, KV, Meter, Pill, Row, Rows, State, Toggle, Tray } from "@/components/ui";
 import type {
   CodexOAuthDeviceLogin,
@@ -643,7 +644,7 @@ export function Models({
     let alive = true;
     let pending = false;
     const update = async () => {
-      if (pending) return;
+      if (pending || !isUserPresent()) return;
       pending = true;
       try {
         const status = await api.getCodexQuotaPool();

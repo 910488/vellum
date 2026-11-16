@@ -1,7 +1,8 @@
+import { isUserPresent, onPresenceChange } from "./presence";
+
 /**
- * Detail polling that extends the existing hidden-window pause:
- * hidden document or inactive page does not tick; becoming visible
- * refetches once.
+ * Detail polling that pauses while nobody is at the window (hidden, or no
+ * input for a while; see presence.ts). The user's return refetches once.
  */
 export function startVisiblePoll(options: {
   active: boolean;
@@ -11,7 +12,7 @@ export function startVisiblePoll(options: {
   if (!options.active) return () => undefined;
   let inFlight = false;
   const tick = () => {
-    if (document.visibilityState !== "visible" || inFlight) return;
+    if (!isUserPresent() || inFlight) return;
     inFlight = true;
     try {
       Promise.resolve(options.load())
@@ -24,12 +25,11 @@ export function startVisiblePoll(options: {
     }
   };
   const timer = window.setInterval(tick, options.intervalMs);
-  const onVisibility = () => {
-    if (document.visibilityState === "visible") options.load();
-  };
-  document.addEventListener("visibilitychange", onVisibility);
+  const stopPresence = onPresenceChange((present) => {
+    if (present) tick();
+  });
   return () => {
     window.clearInterval(timer);
-    document.removeEventListener("visibilitychange", onVisibility);
+    stopPresence();
   };
 }
