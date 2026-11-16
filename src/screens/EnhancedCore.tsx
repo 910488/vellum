@@ -26,6 +26,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "@/lib/api";
 import { activeEnhancedSessions, type RuntimeObservations } from "@/lib/enhanced";
+import { isUserPresent } from "@/lib/presence";
 import type { EnhancedDesktopRuntimeStatus } from "@/types";
 import {
   Btn,
@@ -123,8 +124,13 @@ export function EnhancedCore({ status, refreshVersion, onRefreshComplete, onOpen
       } catch (e) {
         if (live) setError(String(e));
       } finally {
-        if (live) { onRefreshComplete(refreshVersion); timer = setTimeout(load, 2000); }
+        if (live) { onRefreshComplete(refreshVersion); timer = setTimeout(next, 2000); }
       }
+    };
+    // Nobody at the window: keep the loop alive without reading.
+    const next = () => {
+      if (isUserPresent()) void load();
+      else timer = setTimeout(next, 2000);
     };
     void load();
     return () => { live = false; clearTimeout(timer); };

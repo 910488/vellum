@@ -4,6 +4,7 @@ import i18n from "i18next";
 import "@/i18n";
 import { App } from "@/App";
 import { shouldApplyProxyLifecycle } from "@/lib/proxyLifecycle";
+import { IDLE_AFTER_MS } from "@/lib/presence";
 import { Today } from "@/screens/Today";
 import type { EnhancedDesktopRuntimeStatus, Overview, ProxyStatus, RuntimeStatus } from "@/types";
 
@@ -474,5 +475,31 @@ describe("proxy lifecycle events reach the UI without a poll", () => {
 
     expect(screen.getByText(/bind/)).toBeTruthy();
     expect(screen.queryByText(/discovery/)).toBeNull();
+  });
+
+  it("stops reading and animating while nobody is at a visible window", async () => {
+    // A maximized window on an unattended Mac stays visible for weeks.
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      window.dispatchEvent(new Event("pointerdown"));
+      render(<App />);
+      await screen.findByRole("button", { name: i18n.t("today.proxy.start") });
+      expect(document.documentElement.dataset.performance).toBe("normal");
+      const reads = () => apiMocks.getOverview.mock.calls.length + apiMocks.getRemoteManagerFeatureFlags.mock.calls.length;
+
+      await vi.advanceTimersByTimeAsync(IDLE_AFTER_MS);
+      expect(document.documentElement.dataset.performance).toBe("idle");
+      const idleReads = reads();
+      const idleOverviews = apiMocks.getOverview.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(reads()).toBe(idleReads);
+
+      window.dispatchEvent(new Event("pointermove"));
+      expect(document.documentElement.dataset.performance).toBe("normal");
+      await waitFor(() => expect(apiMocks.getOverview.mock.calls.length).toBe(idleOverviews + 1));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

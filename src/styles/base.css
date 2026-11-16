@@ -202,6 +202,15 @@ html[data-performance="low"] *::after {
   transition: none !important;
 }
 
+/* Visible with nobody at it (lib/presence.ts): the page keeps how it looks,
+   but stops producing frames. The breathing status dot alone kept a window
+   repainting its blended layers for weeks. */
+html[data-performance="idle"] *,
+html[data-performance="idle"] *::before,
+html[data-performance="idle"] *::after {
+  animation-play-state: paused !important;
+}
+
 /* ---------- 應用外殼 ----------
    常駐狀態列橫跨整個寬度，導覽軌與內容區排在它下面。狀態列跨全寬是刻意的：
    它講的是「整個系統現在怎樣」，不屬於任何一頁。 */

@@ -1,10 +1,12 @@
 import { useSyncExternalStore } from "react";
 import { api } from "./api";
+import { isUserPresent, onPresenceChange } from "./presence";
 import { handoffTerminal, type RemoteHandoffRecord } from "./remoteHandoff";
 
 let records: RemoteHandoffRecord[] = [];
 const listeners = new Set<() => void>();
 let timer: ReturnType<typeof setInterval> | undefined;
+let stopPresence: (() => void) | undefined;
 let loading: Promise<void> | null = null;
 export function refreshHandoffs(): Promise<void> {
   if (loading) return loading;
@@ -22,19 +24,19 @@ export function refreshHandoffs(): Promise<void> {
   return loading;
 }
 function tick() {
-  if (document.visibilityState !== "hidden") void refreshHandoffs().catch(() => undefined);
+  if (isUserPresent()) void refreshHandoffs().catch(() => undefined);
 }
 function subscribe(listener: () => void) {
   listeners.add(listener);
   if (listeners.size === 1) {
     tick(); timer = setInterval(tick, 10000);
-    document.addEventListener("visibilitychange", tick);
+    stopPresence = onPresenceChange((present) => { if (present) tick(); });
   }
   return () => {
     listeners.delete(listener);
     if (!listeners.size) {
       clearInterval(timer); timer = undefined;
-      document.removeEventListener("visibilitychange", tick);
+      stopPresence?.(); stopPresence = undefined;
     }
   };
 }

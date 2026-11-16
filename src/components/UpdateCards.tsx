@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { Btn, Card } from "@/components/ui";
 import { VellumUpdate } from "@/components/VellumUpdate";
 import { autoUpdateOn, vellumUpdateHosts, vellumUpdateState } from "@/lib/vellumUpdate";
+import { isUserPresent } from "@/lib/presence";
 import type { UpdateStatusSnapshot } from "@/types";
 
 const RELEASES_URL = "https://github.com/910488/vellum/releases/latest";
@@ -110,6 +111,7 @@ export function UpdateCards({
     if (!live) return;
     let alive = true;
     const timer = window.setInterval(() => {
+      if (!isUserPresent()) return;
       void api.getUpdateStatus().then((next) => {
         if (alive) onChanged(next);
       }).catch(() => undefined);

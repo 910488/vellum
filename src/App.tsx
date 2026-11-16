@@ -30,6 +30,7 @@ import { EnhancedCore } from "@/screens/EnhancedCore";
 import { accessibleScreen, visibleScreens, type ScreenId } from "@/screens/registry";
 import { noticeText } from "@/lib/notice";
 import { shouldApplyProxyLifecycle } from "@/lib/proxyLifecycle";
+import { isUserPresent, onPresenceChange } from "@/lib/presence";
 import type { ProxyStatus } from "@/types";
 
 function emptyOnboardingConnections(): Record<ConnectKind, OnboardingConnection> {
@@ -127,9 +128,10 @@ export function App() {
       }).catch(() => {});
     };
     refreshFlags();
-    const timer = window.setInterval(refreshFlags, 5000);
+    const timer = window.setInterval(() => { if (isUserPresent()) refreshFlags(); }, 5000);
+    const stopPresence = onPresenceChange((present) => { if (present) refreshFlags(); });
     window.addEventListener("vellum:remote-sidebar-changed", refreshFlags);
-    return () => { active = false; window.clearInterval(timer); window.removeEventListener("vellum:remote-sidebar-changed", refreshFlags); };
+    return () => { active = false; window.clearInterval(timer); stopPresence(); window.removeEventListener("vellum:remote-sidebar-changed", refreshFlags); };
   }, []);
 
   const reloadOnboardingConnections = useCallback(async () => {
@@ -407,15 +409,14 @@ export function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void refresh();
+      if (isUserPresent()) void refresh();
     }, 60_000);
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
+    const stopPresence = onPresenceChange((present) => {
+      if (present) void refresh();
+    });
     return () => {
       window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisibility);
+      stopPresence();
     };
   }, [refresh]);
 
@@ -426,7 +427,7 @@ export function App() {
     let active = true;
     let polling = false;
     const poll = async () => {
-      if (polling || document.visibilityState !== "visible") return;
+      if (polling || !isUserPresent()) return;
       polling = true;
       try {
         const updates = await api.getUpdateStatus();
@@ -441,14 +442,14 @@ export function App() {
   }, [updatesOpen, updateInProgress]);
 
   useEffect(() => {
-    const updatePerformanceMode = () => {
+    // Hidden drops the decorative layers too; visible with nobody at it
+    // keeps the page as it looks and only stops animating.
+    const updatePerformanceMode = (present = isUserPresent()) => {
       document.documentElement.dataset.performance =
-        document.visibilityState === "visible" ? "normal" : "low";
+        document.visibilityState !== "visible" ? "low" : present ? "normal" : "idle";
     };
     updatePerformanceMode();
-    document.addEventListener("visibilitychange", updatePerformanceMode);
-    return () =>
-      document.removeEventListener("visibilitychange", updatePerformanceMode);
+    return onPresenceChange(updatePerformanceMode);
   }, []);
 
   /* registry.ts 一直宣稱鍵盤捷徑從它讀，但其實從來沒接上。 */
