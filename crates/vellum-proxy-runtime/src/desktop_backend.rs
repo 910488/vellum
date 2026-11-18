@@ -11,6 +11,14 @@
 //! reported as unlimited; everything else is forwarded unchanged, under
 //! Desktop's own identity, so the phone and Desktop stay on the same account.
 //!
+//! Since early November, Desktop can also be *pushed* usage: it registers at
+//! `/codex/notification/subscriptions`, and snapshots then arrive over
+//! ChatGPT's pubsub WebSocket. That socket is opened by the renderer straight
+//! to `wss://…chatgpt.com` (its CSP allows nothing else), so the relay never
+//! sees a pushed snapshot, and a pushed snapshot wins over the rewritten
+//! `/wham/usage`. The relay therefore declines that registration; Desktop
+//! answers a 404 there by polling `/wham/usage` again, which it does see.
+//!
 //! Desktop keeps the request's path and swaps only the origin, so the relay
 //! serves every path chatgpt.com does: `/backend-api/...`, and also the
 //! `/api/...` paths attachment uploads go to. Pointing
@@ -233,6 +241,9 @@ pub fn guarded_router(relay: Arc<DesktopBackendRelay>, port: u16) -> Router {
 pub struct DesktopBackendRelay {
     backend: String,
     client: reqwest::Client,
+    /// Logs the first declined push registration only; Desktop's inbox asks
+    /// again every minute.
+    declined_push: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DesktopBackendRelay {
@@ -250,6 +261,7 @@ impl DesktopBackendRelay {
                 .connect_timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
+            declined_push: Arc::default(),
         }
     }
 }
@@ -276,6 +288,18 @@ fn usage_shape(path: &str) -> Option<UsageShape> {
     }
 }
 
+/// Desktop's registration for pushed Codex notifications, usage among them.
+///
+/// The body is empty and the only marker of what it registers for is an
+/// optional `X-OpenAI-Codex-Initial-Snapshot` header that renewals leave out,
+/// so a usage registration cannot be told from the notification inbox's.
+/// Both are declined: on a 404 the usage code falls back to polling for good,
+/// and the inbox falls back to refreshing and asks again a minute later.
+fn is_push_registration(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST
+        && path.trim_end_matches('/') == "/backend-api/codex/notification/subscriptions"
+}
+
 async fn relay_backend(
     State(relay): State<Arc<DesktopBackendRelay>>,
     request: Request,
@@ -293,6 +317,21 @@ async fn relay_backend(
             Err(rejection) => return rejection.into_response(),
         };
         return relay_websocket(upgrade, &url, &parts.headers).await;
+    }
+    if is_push_registration(&parts.method, &path) {
+        if !relay
+            .declined_push
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            log::info!(
+                "[DesktopBackend] declined Codex push registration; Desktop polls /wham/usage instead"
+            );
+        }
+        return (
+            StatusCode::NOT_FOUND,
+            "desktop backend relay: pushed usage is not relayed",
+        )
+            .into_response();
     }
     // Buffered so the upstream sees a Content-Length (and none on a GET)
     // rather than a chunked body Desktop never sent.
@@ -608,9 +647,16 @@ fn rewrite_event_lines(chunk: &[u8]) -> Vec<u8> {
 /// is set, a limit has `limit_reached` or not `allowed`, a spend control is
 /// `reached`, or a plan has neither credits nor unlimited credits. The same
 /// shape repeats under `additional_rate_limits`, hence the walk.
+///
+/// The upsells go too. `rate_limit_upsell` is the server-written "your usage
+/// is used up" banner (its `blocked_model_slug` can also force a fallback
+/// model), and `model_picker_upsell` turns picking a blocked model into an
+/// upsell dialog. Both describe the limit this rewrite reports away.
 pub fn mark_unlimited(value: &mut Value) {
     match value {
         Value::Object(object) => {
+            object.remove("rate_limit_upsell");
+            object.remove("model_picker_upsell");
             for (key, field) in object.iter_mut() {
                 match key.as_str() {
                     "rate_limit_reached_type" => *field = Value::Null,
@@ -764,6 +810,103 @@ mod tests {
             reply.into_text().unwrap().as_str(),
             "Bearer desktop-login|hello"
         );
+    }
+
+    /// The banner in a user's 11-18 screenshot ("your Codex and work usage is
+    /// used up") is `rate_limit_upsell.title`, written by the server.
+    #[test]
+    fn limit_upsells_are_dropped_wherever_usage_appears() {
+        let banner = json!({
+            "banner_type": "rate_limit_reached",
+            "title": "used up",
+            "description": "",
+            "ctas": [],
+            "presentation": "inline",
+            "blocked_model_slug": "gpt-6"
+        });
+        let mut usage = exhausted();
+        usage["rate_limit_upsell"] = banner.clone();
+        usage["model_picker_upsell"] = json!({"blocked_model_slug": "gpt-6", "title": "", "description": "", "ctas": [], "footer": ""});
+        usage["plan_type"] = json!("plus");
+        let mut snapshot = json!({
+            "type": "usage.snapshot",
+            "payload": {"version": 1, "usage_by_client": {"electron": usage.clone()}}
+        });
+        mark_unlimited(&mut usage);
+        mark_unlimited(&mut snapshot);
+        for usage in [&usage, &snapshot["payload"]["usage_by_client"]["electron"]] {
+            assert!(usage.get("rate_limit_upsell").is_none(), "{usage}");
+            assert!(usage.get("model_picker_upsell").is_none(), "{usage}");
+            assert_eq!(usage["rate_limit"]["allowed"], true);
+            assert_eq!(usage["plan_type"], "plus");
+        }
+    }
+
+    #[test]
+    fn only_the_push_registration_post_is_declined() {
+        use axum::http::Method;
+        let path = "/backend-api/codex/notification/subscriptions";
+        assert!(is_push_registration(&Method::POST, path));
+        assert!(is_push_registration(&Method::POST, &format!("{path}/")));
+        assert!(!is_push_registration(&Method::GET, path));
+        assert!(!is_push_registration(
+            &Method::POST,
+            "/backend-api/codex/notification/inbox"
+        ));
+        assert!(!is_push_registration(
+            &Method::POST,
+            "/codex/notification/subscriptions"
+        ));
+    }
+
+    /// Codex Desktop 26.1111 takes pushed usage over the polled one, and the
+    /// push arrives on a socket the relay cannot reach. A 404 here is what
+    /// sends Desktop back to `/wham/usage`, so the registration must never
+    /// reach chatgpt.com, where it would succeed.
+    #[tokio::test]
+    async fn push_registration_is_answered_here_and_other_posts_go_through() {
+        use tower::ServiceExt;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let upstream = Router::new().fallback({
+            let seen = seen.clone();
+            move |request: Request| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(request.uri().path().to_string());
+                    axum::Json(
+                        json!({"account_user_id": "u", "account_id": "a", "renewal_seconds": 300}),
+                    )
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let relay = router(Arc::new(DesktopBackendRelay::with_backend(format!(
+            "http://{address}"
+        ))));
+        let post = |path: &'static str, snapshot: Option<&'static str>| {
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", "Bearer desktop-login")
+                .header("chatgpt-account-id", "a");
+            if let Some(snapshot) = snapshot {
+                builder = builder.header("x-openai-codex-initial-snapshot", snapshot);
+            }
+            relay.clone().oneshot(builder.body(Body::empty()).unwrap())
+        };
+        for snapshot in [Some("usage"), Some("inbox"), None] {
+            let response = post("/backend-api/codex/notification/subscriptions", snapshot)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{snapshot:?}");
+        }
+        let response = post("/backend-api/wham/tasks/list", None).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), vec!["/backend-api/wham/tasks/list"]);
     }
 
     #[test]

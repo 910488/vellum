@@ -390,7 +390,15 @@ Vellum App Server bridge, and the bridge does not forward global
 composer for every model when its native ChatGPT login reaches a weekly limit,
 including third-party models routed through Vellum. Newer native Desktop
 builds also read `/wham/usage` directly: empty App Server snapshots alone no
-longer release the composer quota gate. The automatic Windows repair copy in
+longer release the composer quota gate. The Desktop backend relay reports that
+response as unlimited and drops its `rate_limit_upsell` and
+`model_picker_upsell`. Desktop 26.1111 can instead be pushed usage over
+ChatGPT's pubsub WebSocket after registering at
+`/backend-api/codex/notification/subscriptions`; a pushed snapshot overrides
+the polled one, and the renderer opens that socket directly to chatgpt.com.
+The relay answers that registration with 404, so Desktop falls back to polling
+`/wham/usage`. The notification inbox shares the registration and falls back
+to refreshing. The automatic Windows repair copy in
 `scripts/codex-steer-repair.mjs` only releases that composer gate, retaining
 its atom subscription and the native usage display. See `BUILDING.md` for
 the pinned version, integrity changes, and activation limits. Vellum's native
