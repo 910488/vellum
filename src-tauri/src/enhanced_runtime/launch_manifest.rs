@@ -264,8 +264,23 @@ impl LaunchManifestV1 {
         }
     }
 
+    /// Every file [`Self::verify_on_disk`] hashes.
+    pub fn verified_artifacts(&self) -> impl Iterator<Item = &Path> {
+        self.relay
+            .iter()
+            .map(|relay| relay.executable.as_path())
+            .chain(std::iter::once(self.official.executable.as_path()))
+            .chain(
+                self.enhanced
+                    .iter()
+                    .map(|identity| identity.executable.as_path()),
+            )
+            .chain(std::iter::once(self.model_provider_map_path.as_path()))
+    }
+
     /// Recomputes both binary hashes and the model map hash from disk.
     pub fn verify_on_disk(&self) -> Result<(), LaunchManifestError> {
+        prime_digests(self.verified_artifacts());
         if let Some(relay) = &self.relay {
             let actual = sha256_file(&relay.executable)?;
             if !relay.executable.is_absolute() || actual != relay.artifact_sha256 {
@@ -333,6 +348,27 @@ fn digest_metadata_is_settled(modified: Option<SystemTime>, now: SystemTime) -> 
         .is_some_and(|age| age > DIGEST_MTIME_SETTLE_TIME)
 }
 
+/// Hashes these files on parallel threads, so the checks that follow find
+/// each digest already computed instead of reading ~1 GB of executables one
+/// file after another before the first core can start. It decides nothing:
+/// every check still compares its own digest, and a file that is missing,
+/// unreadable or too freshly written to cache is simply hashed again there.
+pub fn prime_digests<'a>(paths: impl IntoIterator<Item = &'a Path>) {
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.len() < 2 {
+        return;
+    }
+    std::thread::scope(|scope| {
+        for path in paths {
+            scope.spawn(move || {
+                let _ = sha256_file(path);
+            });
+        }
+    });
+}
+
 pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
     let metadata = std::fs::metadata(path).map_err(|error| LaunchManifestError::Read {
         path: path.to_path_buf(),
@@ -356,6 +392,41 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
         }
     }
 
+    let version = cacheable
+        .then(|| super::artifact_digests::version(path, metadata.len(), modified))
+        .flatten();
+    let digest = match version
+        .as_ref()
+        .and_then(|version| super::artifact_digests::recall(&canonical, version))
+    {
+        Some(digest) => digest,
+        None => {
+            let digest = hash_file(path)?;
+            if let Some(version) = version {
+                super::artifact_digests::remember(&canonical, path, version, &digest);
+            }
+            digest
+        }
+    };
+    if let Ok(mut entries) = cache.lock() {
+        entries.retain(|entry| entry.path != canonical);
+        if cacheable {
+            entries.push(DigestCacheEntry {
+                path: canonical,
+                len: metadata.len(),
+                modified,
+                digest: digest.clone(),
+                checked_at: Instant::now(),
+            });
+        }
+        if entries.len() > 16 {
+            entries.remove(0);
+        }
+    }
+    Ok(digest)
+}
+
+fn hash_file(path: &Path) -> Result<String, LaunchManifestError> {
     let mut file = std::fs::File::open(path).map_err(|error| LaunchManifestError::Read {
         path: path.to_path_buf(),
         message: error.to_string(),
@@ -374,23 +445,7 @@ pub fn sha256_file(path: &Path) -> Result<String, LaunchManifestError> {
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-    if let Ok(mut entries) = cache.lock() {
-        entries.retain(|entry| entry.path != canonical);
-        if cacheable {
-            entries.push(DigestCacheEntry {
-                path: canonical,
-                len: metadata.len(),
-                modified,
-                digest: digest.clone(),
-                checked_at: Instant::now(),
-            });
-        }
-        if entries.len() > 16 {
-            entries.remove(0);
-        }
-    }
-    Ok(digest)
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 #[derive(Debug, thiserror::Error)]

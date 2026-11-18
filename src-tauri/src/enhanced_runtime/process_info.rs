@@ -68,6 +68,15 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+/// This process's parent. A parent id is fixed when a process is created, and
+/// each lookup walks a snapshot of every process (about 20 ms on a busy
+/// desktop), so the bridge asks the system once instead of at every step of
+/// its startup.
+pub fn own_parent_pid() -> Option<u32> {
+    static PARENT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *PARENT.get_or_init(|| parent_pid(std::process::id()))
+}
+
 pub fn parent_pid(pid: u32) -> Option<u32> {
     #[cfg(target_os = "windows")]
     {

@@ -224,6 +224,7 @@ impl Core {
         command.creation_flags(0x08000000);
         super::super::child_reaper::own_tokio_process_group(&mut command);
         let mut process = command.spawn()?;
+        startup_mark(&format!("{} spawned", plane.as_str()));
         let group =
             super::super::child_reaper::ProcessGroupGuard::adopt(process.id().unwrap_or_default());
         let mut lines = tokio::io::BufReader::new(process.stderr.take().unwrap()).lines();
@@ -245,6 +246,7 @@ impl Core {
         })
         .await
         .map_err(|_| BridgeError::Protocol("core listener startup timed out".into()))??;
+        startup_mark(&format!("{} listening", plane.as_str()));
         // Drain diagnostics without persisting prompts or credential-bearing messages.
         tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
         Ok(Self {
@@ -358,6 +360,15 @@ fn route_desktop_account_read(
     }
 }
 
+/// Desktop's first requests. On Codex Desktop 26.1103 the sidebar is read
+/// once, before the signed-in account is known, so when these finish decides
+/// whether it shows any projects.
+fn mark_desktop_request(method: Option<&str>, stage: &str) {
+    if let Some(method @ ("initialize" | "getAuthStatus" | "account/read")) = method {
+        startup_mark(&format!("{method} {stage}"));
+    }
+}
+
 async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     let m = &config.manifest;
     let relay_identity = m
@@ -376,30 +387,49 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     owner
         .try_lock_exclusive()
         .map_err(|_| BridgeError::Protocol("Remote Control owner conflict".into()))?;
-    let mut official = Core::start(&config, ExecutionPlane::OfficialCodex).await?;
-    let mut enhanced = if m.enhanced.is_some() {
-        Some(Core::start(&config, ExecutionPlane::EnhancedCodex).await?)
-    } else {
-        None
+    // Process lookups and the binding database do not need the cores, so they
+    // run while the cores start instead of after both are listening.
+    let setup = {
+        let m = m.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut attestation = AttestationWriter::new(
+                m.attestation_path.clone(),
+                m.launch_id.clone(),
+                m.model_provider_map_sha256.clone(),
+                m.binding_db.clone(),
+                ChildAttestation {
+                    binary_sha256: m.official.artifact_sha256.clone(),
+                    runtime_digest: m.official.runtime_digest.clone(),
+                    ..Default::default()
+                },
+                enhanced_child_attestation(&m),
+            );
+            attestation.set_incomplete_official(
+                crate::enhanced_runtime::launch_manifest::missing_official_helpers(
+                    &m.official.executable,
+                    &m.official_helpers,
+                ),
+            );
+            ThreadRuntimeBindingStore::open(&m.binding_db).map(|store| (attestation, store))
+        })
     };
-    let mut attestation = AttestationWriter::new(
-        m.attestation_path.clone(),
-        m.launch_id.clone(),
-        m.model_provider_map_sha256.clone(),
-        m.binding_db.clone(),
-        ChildAttestation {
-            binary_sha256: m.official.artifact_sha256.clone(),
-            runtime_digest: m.official.runtime_digest.clone(),
-            ..Default::default()
-        },
-        enhanced_child_attestation(m),
-    );
-    attestation.set_incomplete_official(
-        crate::enhanced_runtime::launch_manifest::missing_official_helpers(
-            &m.official.executable,
-            &m.official_helpers,
-        ),
-    );
+    // The cores do not depend on each other, so neither waits for the other to
+    // listen. If either fails, the other is dropped and `kill_on_drop` stops it.
+    let enhanced_start = async {
+        match m.enhanced.is_some() {
+            true => Core::start(&config, ExecutionPlane::EnhancedCodex)
+                .await
+                .map(Some),
+            false => Ok(None),
+        }
+    };
+    let (mut official, mut enhanced) = tokio::try_join!(
+        Core::start(&config, ExecutionPlane::OfficialCodex),
+        enhanced_start
+    )?;
+    let (mut attestation, bindings) = setup
+        .await
+        .map_err(|error| BridgeError::Protocol(format!("bridge setup failed: {error}")))??;
     attestation.set_child_pid(
         ExecutionPlane::OfficialCodex,
         official.process.id().unwrap(),
@@ -411,8 +441,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         );
     }
     attestation.flush().map_err(std::io::Error::other)?;
+    startup_mark("attestation written");
     let mut state = BridgeState::new(
-        ThreadRuntimeBindingStore::open(&m.binding_db)?,
+        bindings,
         m.providers(),
         m.official.runtime_digest.clone(),
         m.enhanced_digest(),
@@ -437,7 +468,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     super::super::child_reaper::own_tokio_process_group(&mut command);
+    startup_mark("bridge state ready");
     let mut relay = command.spawn()?;
+    startup_mark("relay spawned");
     let _relay_group =
         super::super::child_reaper::ProcessGroupGuard::adopt(relay.id().unwrap_or_default());
     let mut relay_in = relay.stdin.take().unwrap();
@@ -461,6 +494,7 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
         let _ = relay_tx.send(Event::RelayClosed).await;
     });
     let stdin_tx = tx.clone();
+    startup_mark("serving Desktop");
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -568,6 +602,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
             Event::Client(client, mut value) => {
                 if !clients.contains(&client) {
                     continue;
+                }
+                if client == 0 {
+                    mark_desktop_request(value["method"].as_str(), "received");
                 }
                 let original = value.clone();
                 // Only the authenticated Desktop control channel may manage pairings.
@@ -696,7 +733,11 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                                 })?
                             }
                         };
-                        match core.connect(client, plane, tx.clone()).await {
+                        let connected = core.connect(client, plane, tx.clone()).await;
+                        if client == 0 {
+                            startup_mark(&format!("{} connected", plane.as_str()));
+                        }
+                        match connected {
                             Ok(socket) => {
                                 entry.insert(socket);
                             }
@@ -777,6 +818,9 @@ async fn serve(config: BridgeConfig) -> Result<(), BridgeError> {
                                     _ => {}
                                 }
                             }
+                        }
+                        if client == 0 {
+                            mark_desktop_request(method.as_deref(), "answered");
                         }
                         deliver(client, value, &mut out, &mut relay_in).await?;
                         if initialized {
