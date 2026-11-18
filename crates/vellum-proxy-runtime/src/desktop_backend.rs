@@ -244,6 +244,9 @@ pub struct DesktopBackendRelay {
     /// Logs the first declined push registration only; Desktop's inbox asks
     /// again every minute.
     declined_push: Arc<std::sync::atomic::AtomicBool>,
+    /// Logs the first account check given a stand-in plan only; Desktop
+    /// checks again on every focus.
+    stood_in_plan: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DesktopBackendRelay {
@@ -262,6 +265,7 @@ impl DesktopBackendRelay {
                 .build()
                 .unwrap_or_default(),
             declined_push: Arc::default(),
+            stood_in_plan: Arc::default(),
         }
     }
 }
@@ -286,6 +290,11 @@ fn usage_shape(path: &str) -> Option<UsageShape> {
         "/backend-api/wham/usage/stream" => Some(UsageShape::EventStream),
         _ => None,
     }
+}
+
+/// The account check Desktop takes its plan from (`/accounts/check/{version}`).
+fn is_account_check(path: &str) -> bool {
+    path.starts_with("/backend-api/accounts/check/")
 }
 
 /// Desktop's registration for pushed Codex notifications, usage among them.
@@ -346,8 +355,9 @@ async fn relay_backend(
         }
     };
     let usage = usage_shape(&path);
+    let account_check = is_account_check(&path);
     let mut headers = forwardable_headers(&parts.headers);
-    if usage.is_some() {
+    if usage.is_some() || account_check {
         // The body is rewritten, so it has to arrive uncompressed.
         headers.remove(axum::http::header::ACCEPT_ENCODING);
     }
@@ -364,6 +374,17 @@ async fn relay_backend(
     };
     match usage {
         Some(shape) if upstream.status().is_success() => unlimited_usage(upstream, shape).await,
+        None if account_check && upstream.status().is_success() => {
+            if !relay
+                .stood_in_plan
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                log::info!(
+                    "[DesktopBackend] account check names a stand-in plan; Desktop's own usage cannot block sending"
+                );
+            }
+            stand_in_account_check(upstream).await
+        }
         _ => passthrough(upstream),
     }
 }
@@ -569,6 +590,66 @@ async fn unlimited_usage(upstream: reqwest::Response, shape: UsageShape) -> Resp
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+async fn stand_in_account_check(upstream: reqwest::Response) -> Response {
+    let status = upstream.status();
+    let headers = response_headers(upstream.headers(), true);
+    let body = match upstream.bytes().await {
+        Ok(bytes) => Body::from(rewrite_account_check(&bytes)),
+        Err(error) => return bad_gateway(&error),
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+fn rewrite_account_check(bytes: &[u8]) -> Bytes {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(mut value) => {
+            stand_in_plans(&mut value);
+            Bytes::from(serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec()))
+        }
+        Err(_) => Bytes::copy_from_slice(bytes),
+    }
+}
+
+/// Codex Desktop 26.1111 blocks sending only while the usage it holds names
+/// the same `plan_type` as its account check. Usage also reaches Desktop
+/// outside the relay (snapshots pushed over its chatgpt.com socket), so an
+/// unlimited `/wham/usage` alone cannot keep sending open; an account check
+/// that names a different plan can, whichever way the usage arrived.
+pub fn stand_in_plans(value: &mut Value) {
+    let Some(Value::Object(accounts)) = value.get_mut("accounts") else {
+        return;
+    };
+    for entry in accounts.values_mut() {
+        let Some(Value::Object(account)) = entry.get_mut("account") else {
+            continue;
+        };
+        let stand_in = account
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .and_then(stand_in_plan);
+        if let Some(plan) = stand_in {
+            account.insert("plan_type".into(), Value::String(plan.into()));
+        }
+    }
+}
+
+/// A neighbour from the same family that Desktop still supports: an unknown
+/// plan would deny the Codex surface outright, and the hundreds of other plan
+/// checks should see a plan close to the real one. Plans without a known
+/// neighbour pass unchanged.
+fn stand_in_plan(plan: &str) -> Option<&'static str> {
+    Some(match plan {
+        "free" | "go" | "plus" | "prolite" | "promax" => "pro",
+        "pro" => "promax",
+        "team" => "self_serve_business_prolite",
+        "self_serve_business_prolite" => "team",
+        _ => return None,
+    })
 }
 
 fn rewrite_usage_json(bytes: &[u8]) -> Bytes {
@@ -907,6 +988,155 @@ mod tests {
         let response = post("/backend-api/wham/tasks/list", None).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(*seen.lock().unwrap(), vec!["/backend-api/wham/tasks/list"]);
+    }
+
+    /// Plans Codex Desktop 26.1111 lets onto the Codex surface (`SPnB`);
+    /// any other plan denies it with `unsupported-plan`.
+    const DESKTOP_SUPPORTED_PLANS: &[&str] = &[
+        "free",
+        "go",
+        "plus",
+        "pro",
+        "promax",
+        "prolite",
+        "free_workspace",
+        "team",
+        "self_serve_business_prolite",
+        "sci",
+        "rosalind_academic",
+        "business",
+        "enterprise_cbp_trial",
+        "enterprise_cbp_view_only",
+        "finserv",
+        "law",
+        "ent26",
+        "education",
+        "edu_plus",
+        "edu_pro",
+        "quorum",
+        "enterprise",
+        "hc",
+        "hc_consumption",
+        "deprecated_enterprise",
+        "edu",
+        "deprecated_edu",
+        "k12",
+    ];
+
+    /// A stand-in must stay on Desktop's supported list (or Codex is denied)
+    /// and must differ from the real plan (or the real usage blocks again);
+    /// a plan that is not supported must not become supported.
+    #[test]
+    fn stand_ins_are_supported_neighbours() {
+        for plan in DESKTOP_SUPPORTED_PLANS {
+            if let Some(stand_in) = stand_in_plan(plan) {
+                assert_ne!(stand_in, *plan);
+                assert!(
+                    DESKTOP_SUPPORTED_PLANS.contains(&stand_in),
+                    "{plan} -> {stand_in}"
+                );
+            }
+        }
+        for plan in ["self_serve_business_usage_based", "unknown", ""] {
+            assert_eq!(stand_in_plan(plan), None, "{plan}");
+        }
+        for plan in ["free", "go", "plus", "prolite", "pro", "promax", "team"] {
+            assert!(stand_in_plan(plan).is_some(), "{plan}");
+        }
+    }
+
+    #[test]
+    fn account_check_names_a_stand_in_plan_and_keeps_the_rest() {
+        let mut check = json!({
+            "accounts": {
+                "a": {
+                    "account": {"account_id": "a", "plan_type": "plus", "structure": "personal"},
+                    "can_access_with_session": true
+                },
+                "b": {"account": {"account_id": "b", "plan_type": "team", "structure": "workspace"}},
+                "c": {"account": {"account_id": "c", "plan_type": "pro"}},
+                "d": {"account": {"account_id": "d", "plan_type": "business"}},
+                "default": {"account": {"plan_type": null}}
+            },
+            "account_ordering": ["a", "b"]
+        });
+        stand_in_plans(&mut check);
+        let plan = |id: &str| check["accounts"][id]["account"]["plan_type"].clone();
+        assert_eq!(plan("a"), "pro");
+        assert_eq!(plan("b"), "self_serve_business_prolite");
+        assert_eq!(plan("c"), "promax");
+        assert_eq!(plan("d"), "business");
+        assert_eq!(plan("default"), Value::Null);
+        assert_eq!(check["accounts"]["a"]["account"]["structure"], "personal");
+        assert_eq!(check["accounts"]["a"]["can_access_with_session"], true);
+        assert_eq!(check["account_ordering"], json!(["a", "b"]));
+        assert_eq!(&rewrite_account_check(b"not json")[..], b"not json");
+    }
+
+    /// The gate compares the plan in Desktop's usage with the one from the
+    /// account check. Exhausted usage that never passed the relay must find
+    /// a different plan there.
+    #[tokio::test]
+    async fn account_check_reaches_desktop_with_a_stand_in_plan() {
+        use tower::ServiceExt;
+        let encodings = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let upstream = Router::new().fallback({
+            let encodings = encodings.clone();
+            move |request: Request| {
+                let encodings = encodings.clone();
+                async move {
+                    encodings.lock().unwrap().push(
+                        request
+                            .headers()
+                            .get(axum::http::header::ACCEPT_ENCODING)
+                            .map(|value| value.to_str().unwrap().to_string()),
+                    );
+                    axum::Json(json!({
+                        "accounts": {"a": {"account": {"account_id": "a", "plan_type": "plus"}}}
+                    }))
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let relay = router(Arc::new(DesktopBackendRelay::with_backend(format!(
+            "http://{address}"
+        ))));
+        let get = |path: &'static str| {
+            relay.clone().oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .header("accept-encoding", "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let check = get("/backend-api/accounts/check/v4-2023-04-27")
+            .await
+            .unwrap();
+        assert_eq!(check.status(), StatusCode::OK);
+        assert_eq!(
+            body(check).await["accounts"]["a"]["account"]["plan_type"],
+            "pro"
+        );
+        let other = get("/backend-api/accounts/a/settings").await.unwrap();
+        assert_eq!(
+            body(other).await["accounts"]["a"]["account"]["plan_type"],
+            "plus"
+        );
+        assert_eq!(
+            *encodings.lock().unwrap(),
+            vec![None, Some("gzip, br".to_string())]
+        );
     }
 
     #[test]
