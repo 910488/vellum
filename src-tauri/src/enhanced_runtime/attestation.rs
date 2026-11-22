@@ -257,7 +257,7 @@ impl AttestationWriter {
     ) -> Self {
         let now = chrono::Utc::now().timestamp();
         let bridge_pid = std::process::id();
-        let parent_pid = super::process_info::parent_pid(bridge_pid).unwrap_or(0);
+        let parent_pid = super::process_info::own_parent_pid().unwrap_or(0);
         Self {
             path,
             attestation: BridgeAttestationV1 {

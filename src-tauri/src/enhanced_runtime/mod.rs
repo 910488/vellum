@@ -6,6 +6,7 @@
 //! historical Vellum agent-loop implementation.
 
 pub mod app_server_bridge;
+mod artifact_digests;
 pub(crate) mod atomic;
 pub mod attestation;
 pub mod backend_relay;

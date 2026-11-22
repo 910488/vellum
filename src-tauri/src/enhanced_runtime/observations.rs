@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::Instant,
 };
 
 pub const OBSERVATION_FILE: &str = "enhanced-runtime/observations.json";
@@ -36,6 +38,40 @@ pub struct RemoteObservation {
     pub last_error_code: Option<i64>,
 }
 
+/// One step of the bridge's startup and when it finished, counted from the
+/// moment the process began serving `app-server`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupStage {
+    pub stage: String,
+    pub elapsed_ms: u64,
+}
+
+static STARTUP_CLOCK: OnceLock<Instant> = OnceLock::new();
+static STARTUP_STAGES: Mutex<Vec<StartupStage>> = Mutex::new(Vec::new());
+const MAX_STARTUP_STAGES: usize = 32;
+
+/// Records the first time `stage` is reached. Codex Desktop 26.1103 reads its
+/// project sidebar once, before the signed-in account is known, so how long
+/// the bridge takes to answer Desktop's first requests decides whether the
+/// sidebar shows projects; these stages say where that time went.
+pub fn startup_mark(stage: &str) {
+    let elapsed_ms = STARTUP_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    if let Ok(mut stages) = STARTUP_STAGES.lock() {
+        if stages.len() < MAX_STARTUP_STAGES && !stages.iter().any(|known| known.stage == stage) {
+            stages.push(StartupStage {
+                stage: stage.to_owned(),
+                elapsed_ms,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeObservations {
@@ -46,6 +82,8 @@ pub struct RuntimeObservations {
     pub freshness: String,
     pub sessions: BTreeMap<String, SessionObservation>,
     pub remote: RemoteObservation,
+    #[serde(default)]
+    pub startup: Vec<StartupStage>,
 }
 
 impl RuntimeObservations {
@@ -65,6 +103,9 @@ impl RuntimeObservations {
 
     pub fn write(&mut self, path: &Path) -> std::io::Result<()> {
         self.updated_at = chrono::Utc::now().timestamp();
+        if let Ok(stages) = STARTUP_STAGES.lock() {
+            self.startup.clone_from(&stages);
+        }
         write_atomic(path, &serde_json::to_vec(self)?)
     }
 
