@@ -55,6 +55,14 @@ pub trait ClaudeAccounts: Send + Sync {
 const SUBSTITUTION_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
+/// Anthropic accepts an OAuth access token on the Messages API only with this
+/// beta. A signed-in Desktop already sends it; a third-party Desktop on a
+/// Claude API key does not.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+/// Claude Code's `CLAUDE_CODE_ENTRYPOINT` for a local Code session, as
+/// Desktop sets it: `claude-desktop` signed in to claude.ai, `claude-desktop-3p`
+/// in third-party mode.
+const DESKTOP_ENTRYPOINTS: [&str; 2] = ["claude-desktop", "claude-desktop-3p"];
 const SESSION_IDENTITY_MISSING: &str = "claude_session_identity_missing";
 /// Token estimates in flight at once, out of the 32 request slots.
 const ESTIMATE_SLOTS: usize = 8;
@@ -465,6 +473,7 @@ impl ClaudeCodeProxy {
                 };
                 headers.insert(header::AUTHORIZATION, value);
                 headers.remove("x-api-key");
+                with_oauth_beta(&mut headers);
             }
             if let Some((session, model)) = identity {
                 response_account = account_id.clone();
@@ -899,7 +908,31 @@ fn is_desktop_code(headers: &HeaderMap) -> bool {
     ua.starts_with("claude-cli/")
         && ua
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-            .any(|part| part == "claude-desktop")
+            .any(|part| DESKTOP_ENTRYPOINTS.contains(&part))
+}
+
+/// Adds the OAuth beta to `anthropic-beta`, merging every value Claude Code
+/// sent into one list so the betas it asked for still reach upstream.
+fn with_oauth_beta(headers: &mut HeaderMap) {
+    let betas = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|beta| !beta.is_empty())
+        .collect::<Vec<_>>();
+    if betas.contains(&OAUTH_BETA) {
+        return;
+    }
+    let merged = betas
+        .into_iter()
+        .chain([OAUTH_BETA])
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Ok(value) = HeaderValue::from_str(&merged) {
+        headers.insert("anthropic-beta", value);
+    }
 }
 
 /// The request body without its content encoding.

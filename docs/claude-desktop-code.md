@@ -31,7 +31,16 @@ Windows CA 信任則是額外、明確同意的使用者層級變更，影響其
 保存在 Vellum 的加密憑證儲存。不要將接入中的本機設定納入版本控制。
 
 其他讀取相同專案設定的客戶端可能經過此代理，但只有辨識為 `claude-desktop`
-的原生 Code 推論會替換授權。User-Agent 是相容性辨識，不能證明 OS 程序身分；
+或 `claude-desktop-3p` 的原生 Code 推論會替換授權。
+
+`claude-desktop-3p` 是 Desktop 第三方模式（`deploymentMode: 3p`）下本機 Code
+的進入點。只有推論送往 `api.anthropic.com` 時才會經過替換：provider 選
+「Anthropic」（Claude API key），或 gateway 的 base URL 就是
+`api.anthropic.com`。此時原請求帶的是 `x-api-key`，Vellum 會移除它、改帶
+執行帳號的 OAuth token，並在 `anthropic-beta` 補上 `oauth-2025-04-20`
+（API key 模式本來不送）。Bedrock、Vertex、Foundry 或其他 gateway 主機的
+流量不經過 MITM，維持原樣。Desktop 本身在設定時驗證 API key 的請求不走
+Code 的 proxy 設定，所以仍需要一把有效的 key。User-Agent 是相容性辨識，不能證明 OS 程序身分；
 知道本機代理密碼的程序處於同一信任範圍。
 
 已有 proxy、CA 或 TLS 驗證覆寫的專案／使用者設定會回報衝突，不自動取代。
