@@ -8,6 +8,7 @@ pub mod budget;
 pub mod catalog;
 pub mod claude_code;
 pub mod codex;
+mod codex_desktop_state;
 mod codex_restart;
 pub mod codex_oauth;
 pub mod codex_profile;
@@ -185,6 +186,8 @@ pub fn run() {
                 });
             }
             crate::commands::launch_steward::spawn((*app.state::<AppState>()).clone());
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            crate::codex_desktop_state::spawn_exit_watch();
             crate::updates::spawn_auto_check(app.handle().clone(), data_root.clone());
             crate::five_hour_cadence::spawn(app.state::<AppState>().codex_oauth());
             crate::claude_code::cadence::spawn(
