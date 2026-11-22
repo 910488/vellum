@@ -290,6 +290,23 @@ async fn bundled_sdk_project_auth_token_does_not_override_host() {
     bundled_probe(true, false, true).await;
 }
 
+/// Third-party Desktop on a Claude API key: the native client sends
+/// `claude-desktop-3p` and `x-api-key`, and must still reach upstream as B.
+#[tokio::test]
+#[ignore = "set VELLUM_CLAUDE_CODE_EXE; isolated third-party Desktop with a fake API key"]
+async fn bundled_cli_third_party_api_key_offline_probe() {
+    bundled_probe_as(false, false, false, DesktopHost::ThirdPartyKey).await;
+}
+
+/// How the Desktop that starts the native client is signed in.
+#[derive(Clone, Copy, PartialEq)]
+enum DesktopHost {
+    /// claude.ai sign-in: `claude-desktop` with a host OAuth token.
+    SignedIn,
+    /// Third-party mode on a Claude API key: `claude-desktop-3p`.
+    ThirdPartyKey,
+}
+
 /// Python 3.13+ enables OpenSSL's X509_STRICT checks, which caught the missing
 /// authority key identifier that permissive TLS clients accepted.
 #[tokio::test]
@@ -342,6 +359,10 @@ with socket.create_connection((proxy.hostname, proxy.port), timeout=5) as connec
 }
 
 async fn bundled_probe(sdk: bool, gateway: bool, project_auth: bool) {
+    bundled_probe_as(sdk, gateway, project_auth, DesktopHost::SignedIn).await;
+}
+
+async fn bundled_probe_as(sdk: bool, gateway: bool, project_auth: bool, host: DesktopHost) {
     let executable =
         std::env::var_os("VELLUM_CLAUDE_CODE_EXE").expect("set VELLUM_CLAUDE_CODE_EXE");
     let mut f = Fixture::new().await;
@@ -380,11 +401,18 @@ async fn bundled_probe(sdk: bool, gateway: bool, project_auth: bool) {
     }
     command
         .env("CLAUDE_CONFIG_DIR", temp.path().join("config"))
-        .env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-        .env("CLAUDE_CODE_ENTRYPOINT", "claude-desktop")
-        .env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-offline-fake-A")
-        .env("CLAUDE_CODE_OAUTH_SCOPES", "user:profile user:inference")
-        .env("CLAUDE_CODE_SUBSCRIPTION_TYPE", "max")
+        .env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    match host {
+        DesktopHost::SignedIn => command
+            .env("CLAUDE_CODE_ENTRYPOINT", "claude-desktop")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-offline-fake-A")
+            .env("CLAUDE_CODE_OAUTH_SCOPES", "user:profile user:inference")
+            .env("CLAUDE_CODE_SUBSCRIPTION_TYPE", "max"),
+        DesktopHost::ThirdPartyKey => command
+            .env("CLAUDE_CODE_ENTRYPOINT", "claude-desktop-3p")
+            .env("ANTHROPIC_API_KEY", "sk-ant-api03-offline-fake-A"),
+    };
+    command
         .env("NODE_USE_SYSTEM_CA", "1")
         .env("DISABLE_TELEMETRY", "1")
         .env("DISABLE_ERROR_REPORTING", "1")
@@ -467,6 +495,13 @@ async fn bundled_probe(sdk: bool, gateway: bool, project_auth: bool) {
                 "Bearer token-B"
             };
             assert_eq!(sent.headers[header::AUTHORIZATION], expected);
+            if host == DesktopHost::ThirdPartyKey {
+                let ua = sent.headers[header::USER_AGENT].to_str().unwrap();
+                assert!(ua.contains("claude-desktop-3p"), "{ua}");
+                assert!(!sent.headers.contains_key("x-api-key"));
+                let betas = sent.headers["anthropic-beta"].to_str().unwrap();
+                assert!(betas.split(',').any(|b| b == OAUTH_BETA), "{betas}");
+            }
             saw_inference = true;
         }
     }
@@ -552,6 +587,79 @@ async fn desktop_inference_changes_only_auth_and_encoding_and_keeps_existing_his
     );
     assert_eq!(f.proxy.status().records[1].operation, "count_tokens");
     f.stop().await;
+}
+
+#[tokio::test]
+async fn third_party_desktop_on_an_api_key_reaches_upstream_as_oauth() {
+    let mut f = Fixture::new().await;
+    let bytes = body();
+    let response = f
+        .client
+        .post("https://api.anthropic.com/v1/messages?beta=true")
+        .header(
+            header::USER_AGENT,
+            "claude-cli/2.1.299 (external, claude-desktop-3p)",
+        )
+        .header("x-api-key", "sk-ant-api-must-remove")
+        .header("anthropic-beta", "claude-code-20250219")
+        .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(bytes.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "upstream-response");
+    let sent = f.captured.recv().await.unwrap();
+    assert_eq!(sent.body, bytes);
+    assert_eq!(sent.headers[header::AUTHORIZATION], "Bearer token-B");
+    assert!(!sent.headers.contains_key("x-api-key"));
+    let betas = sent
+        .headers
+        .get_all("anthropic-beta")
+        .iter()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        betas,
+        ["claude-code-20250219,interleaved-thinking-2025-05-14,oauth-2025-04-20"]
+    );
+    assert_eq!(f.proxy.status().records[0].account_id.as_deref(), Some("B"));
+
+    // A signed-in Desktop already carries the beta; it is not repeated.
+    f.request("/v1/messages", body())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let sent = f.captured.recv().await.unwrap();
+    let betas = sent
+        .headers
+        .get_all("anthropic-beta")
+        .iter()
+        .collect::<Vec<_>>();
+    assert_eq!(betas, ["oauth-2025-04-20"]);
+    f.stop().await;
+}
+
+#[test]
+fn desktop_code_is_recognised_by_its_entrypoint_alone() {
+    let desktop = |ua: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+        is_desktop_code(&headers)
+    };
+    assert!(desktop("claude-cli/2.1.299 (external, claude-desktop)"));
+    assert!(desktop("claude-cli/2.1.299 (external, claude-desktop-3p)"));
+    assert!(desktop(
+        "claude-cli/2.1.299 (external, claude-desktop-3p, agent-sdk/0.2.1)"
+    ));
+    assert!(!desktop("claude-cli/2.1.299 (external, cli)"));
+    assert!(!desktop(
+        "claude-cli/2.1.299 (external, claude-desktop-3px)"
+    ));
+    assert!(!desktop("claude-cli/2.1.299 (external, claude-vscode)"));
+    assert!(!desktop("curl/8 (claude-desktop-3p)"));
 }
 
 /// What Claude Code builds for a token estimate: no metadata.
