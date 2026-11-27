@@ -1035,10 +1035,11 @@ fn aumid_only_target(app_id: String) -> CodexLaunchTarget {
     }
 }
 
-// The durable user environment lease lets later user launches keep Enhanced,
-// but the managed restart also binds the verified bridge directly. GUI launch
-// environments can lag or drop a broadcast on both supported desktop systems;
-// a restart must not claim success based on that ambient state alone.
+// The durable user environment lease lets later user launches keep Enhanced.
+// A packaged Desktop is started through its AUMID and reads that lease; a
+// repair copy or an unpackaged install is started by path with the verified
+// bridge bound directly. Either way a restart claims success only from the
+// bridge attestation, never from the ambient environment.
 #[cfg(target_os = "windows")]
 fn launch_codex(
     target: &CodexLaunchTarget,
@@ -1064,7 +1065,7 @@ fn windows_launch_spec(
     target: &CodexLaunchTarget,
     launch: Option<&DesktopRuntimeLaunch>,
 ) -> (PathBuf, Vec<String>, Option<PathBuf>) {
-    if use_direct_desktop_launch(&target.executable, launch.is_some()) {
+    if use_direct_desktop_launch(&target.executable, target.app_id.as_deref()) {
         return (
             target.executable.clone(),
             Vec::new(),
@@ -1077,11 +1078,20 @@ fn windows_launch_spec(
 }
 
 #[cfg(any(target_os = "windows", test))]
-pub(crate) fn use_direct_desktop_launch(executable: &std::path::Path, has_bridge: bool) -> bool {
-    // A stopped MSIX app uses AUMID activation and the HKCU lease prepared by
-    // sync_desktop_launch. await_bridge_ready still verifies actual adoption.
+pub(crate) fn use_direct_desktop_launch(
+    executable: &std::path::Path,
+    app_id: Option<&str>,
+) -> bool {
+    // A packaged app, running or stopped, starts through its AUMID exactly as
+    // the Start menu starts it, and reads the HKCU lease sync_desktop_launch
+    // prepared; await_bridge_ready still verifies actual adoption. Spawning the
+    // packaged ChatGPT.exe by path was refused with ERROR_ACCESS_DENIED on some
+    // machines and on others started a Desktop that did not share the user's
+    // single-instance lock, leaving two side by side. Only a repair copy, which
+    // has no package, or an unpackaged install is started by path.
+    let packaged = app_id.is_some_and(|value| !value.trim().is_empty());
     !executable.as_os_str().is_empty()
-        && (has_bridge || crate::enhanced_runtime::steer_repair::is_verified_copy(executable))
+        && (!packaged || crate::enhanced_runtime::steer_repair::is_verified_copy(executable))
 }
 
 #[cfg(target_os = "macos")]
@@ -1806,7 +1816,7 @@ mod restart_guard_tests {
     }
 
     #[test]
-    fn windows_managed_launch_binds_the_verified_bridge_explicitly() {
+    fn running_packaged_desktop_restarts_through_its_aumid() {
         let target = CodexLaunchTarget {
             pid: 42,
             #[cfg(target_os = "macos")]
@@ -1820,14 +1830,39 @@ mod restart_guard_tests {
             manifest_path: PathBuf::from(r"E:\Vellum\launch.json"),
             attestation_path: PathBuf::from(r"E:\Vellum\attestation.json"),
         };
+        // Spawning the packaged executable by path was refused on some
+        // machines and on others left a second Desktop beside the user's.
+        for launch in [Some(&launch), None] {
+            let (program, args, bridge) = windows_launch_spec(&target, launch);
+            assert_eq!(program, PathBuf::from("explorer.exe"));
+            assert_eq!(args, vec![r"shell:AppsFolder\OpenAI.Codex_123!Codex"]);
+            assert_eq!(bridge, None);
+        }
+    }
+
+    #[test]
+    fn unpackaged_desktop_restarts_by_path_with_the_bridge_bound() {
+        let target = CodexLaunchTarget {
+            pid: 42,
+            #[cfg(target_os = "macos")]
+            started_at: Some("1".into()),
+            executable: PathBuf::from(r"C:\Tools\Codex\ChatGPT.exe"),
+            app_id: None,
+        };
+        let launch = DesktopRuntimeLaunch {
+            bridge_executable: PathBuf::from(r"E:\Vellum\binaries\bridge.exe"),
+            launch_id: "launch-1".into(),
+            manifest_path: PathBuf::from(r"E:\Vellum\launch.json"),
+            attestation_path: PathBuf::from(r"E:\Vellum\attestation.json"),
+        };
         let (program, args, bridge) = windows_launch_spec(&target, Some(&launch));
         assert_eq!(program, target.executable);
         assert!(args.is_empty());
         assert_eq!(bridge.as_deref(), Some(launch.bridge_executable.as_path()));
 
         let (program, args, bridge) = windows_launch_spec(&target, None);
-        assert_eq!(program, PathBuf::from("explorer.exe"));
-        assert_eq!(args, vec![r"shell:AppsFolder\OpenAI.Codex_123!Codex"]);
+        assert_eq!(program, target.executable);
+        assert!(args.is_empty());
         assert_eq!(bridge, None);
     }
 
