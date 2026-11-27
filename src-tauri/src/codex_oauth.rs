@@ -829,6 +829,16 @@ impl CodexOAuthManager {
         Ok(auth)
     }
 
+    /// A redeemed reset credit refills the account's windows upstream. Forget
+    /// what this process recorded from earlier 429s and window reads, or
+    /// routing keeps skipping the account until the pre-reset reset time.
+    pub fn forget_exhaustion(&self, account_id: &str) {
+        let hash = pool_account_hash(account_id);
+        let cleared = self.exhausted_pool_accounts.lock().remove(&hash).is_some();
+        self.pool_reset_times.lock().remove(&hash);
+        log::info!("[QuotaPool] event=reset_credit_cleared account={hash} exhausted={cleared}");
+    }
+
     async fn routing_auth(
         &self,
         context: &vellum_proxy_runtime::official_auth::OfficialRoutingContext,
@@ -2881,7 +2891,10 @@ mod tests {
                     .is_none(),
                 "an account outside the pool still declines"
             );
-            manager.exhausted_pool_accounts.lock().insert(hash, 0);
+            manager
+                .exhausted_pool_accounts
+                .lock()
+                .insert(hash.clone(), 0);
             manager
                 .exhausted_pool_accounts
                 .lock()
@@ -2895,6 +2908,31 @@ mod tests {
                     .credential_id,
                 "quota-retry-a",
                 "account is eligible again after reset"
+            );
+            // A redeemed reset credit refills the windows before `reset`.
+            manager
+                .exhausted_pool_accounts
+                .lock()
+                .insert(hash.clone(), reset);
+            manager.pool_reset_times.lock().insert(hash.clone(), reset);
+            assert!(
+                manager
+                    .valid_routing_auth_with_context(&context)
+                    .await
+                    .is_err(),
+                "with every member marked exhausted nothing is routable"
+            );
+            manager.forget_exhaustion("quota-retry-a");
+            assert!(!manager.pool_reset_times.lock().contains_key(&hash));
+            assert_eq!(
+                manager
+                    .valid_routing_auth_with_context(&context)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_id,
+                "quota-retry-a",
+                "a redeemed reset makes the account eligible at once"
             );
         }
     }

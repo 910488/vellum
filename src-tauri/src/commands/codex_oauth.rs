@@ -330,6 +330,20 @@ pub async fn consume_codex_oauth_reset(
     if !status.is_success() {
         return Err(safe_upstream_error(status, &body, "Reset 失敗"));
     }
+    // The credit is spent from here on. Routing must not keep judging the
+    // account by the 429 or the window reading taken before the redemption;
+    // active-turn routing reads its own account from the cached snapshot.
+    state.codex_oauth().forget_exhaustion(account_id);
+    if let Err(error) = crate::codex_quota::query(
+        &auth.access_token,
+        &auth.account_id,
+        &auth.credential_id,
+        true,
+    )
+    .await
+    {
+        log::warn!("[QuotaPool] event=reset_credit_refresh_failed error={error}");
+    }
     let value: Value = serde_json::from_str(&body)
         .map_err(|error| AppError::Message(format!("Reset 回應格式無效：{error}")))?;
     Ok(CodexResetResult {

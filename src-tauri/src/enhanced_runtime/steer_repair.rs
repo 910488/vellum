@@ -540,11 +540,12 @@ mod tests {
         assert!(is_verified_copy(&repaired));
         assert_eq!(prepare(root.path(), &source).unwrap(), repaired);
         // No pool/proxy settings or bridge are needed to preserve general send.
+        let app_id = Some("OpenAI.Codex_2p2nqsd0c76g0!App");
         assert!(crate::commands::runtime::use_direct_desktop_launch(
-            &repaired, false
+            &repaired, app_id
         ));
         assert!(!crate::commands::runtime::use_direct_desktop_launch(
-            &source, false
+            &source, app_id
         ));
         // Legacy disabled preferences cannot disable the default send repair.
         fs::write(
