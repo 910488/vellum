@@ -660,6 +660,58 @@ fn desktop_code_is_recognised_by_its_entrypoint_alone() {
     ));
     assert!(!desktop("claude-cli/2.1.299 (external, claude-vscode)"));
     assert!(!desktop("curl/8 (claude-desktop-3p)"));
+    // Remote Control on a Desktop project, opened from the phone or claude.ai.
+    assert!(desktop("claude-cli/2.1.330 (external, local_projects)"));
+    assert!(desktop(
+        "claude-cli/2.1.330 (external, local_projects, workload/x)"
+    ));
+    assert!(!desktop("claude-cli/2.1.330 (external, local_projectsx)"));
+    assert!(!desktop("claude-cli/2.1.330 (external, local)"));
+    assert!(!desktop("claude-cli/2.1.330 (external, claude-desktop_x)"));
+}
+
+#[test]
+fn passthrough_log_names_the_user_agent_entrypoint() {
+    let entrypoint = |ua: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+        request_entrypoint(&headers)
+    };
+    assert_eq!(entrypoint("claude-cli/2.1.330 (external, cli)"), "cli");
+    assert_eq!(
+        entrypoint("claude-cli/2.1.330 (external, claude-vscode, agent-sdk/0.2.1)"),
+        "claude-vscode"
+    );
+    assert_eq!(entrypoint("claude-cli/2.1.330 (external)"), "other");
+    assert_eq!(entrypoint("claude-cli/2.1.330 (external, a b)"), "other");
+    assert_eq!(entrypoint("curl/8 (x, cli)"), "other");
+    assert_eq!(request_entrypoint(&HeaderMap::new()), "other");
+}
+
+#[tokio::test]
+async fn remote_control_project_session_runs_on_the_execution_account() {
+    let mut f = Fixture::new().await;
+    let bytes = body();
+    let response = f
+        .client
+        .post("https://api.anthropic.com/v1/messages?beta=true")
+        .header(
+            header::USER_AGENT,
+            "claude-cli/2.1.330 (external, local_projects)",
+        )
+        .bearer_auth("original-A")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(bytes.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "upstream-response");
+    let sent = f.captured.recv().await.unwrap();
+    assert_eq!(sent.body, bytes);
+    assert_eq!(sent.headers[header::AUTHORIZATION], "Bearer token-B");
+    assert_eq!(f.proxy.status().records[0].account_id.as_deref(), Some("B"));
+    f.stop().await;
 }
 
 /// What Claude Code builds for a token estimate: no metadata.

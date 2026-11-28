@@ -30,8 +30,20 @@ Windows CA 信任則是額外、明確同意的使用者層級變更，影響其
 代理的本機存取密碼會出現在該專案設定中；Claude OAuth token 與憑證私鑰則只
 保存在 Vellum 的加密憑證儲存。不要將接入中的本機設定納入版本控制。
 
-其他讀取相同專案設定的客戶端可能經過此代理，但只有辨識為 `claude-desktop`
-或 `claude-desktop-3p` 的原生 Code 推論會替換授權。
+其他讀取相同專案設定的客戶端可能經過此代理，但只有辨識為 `claude-desktop`、
+`claude-desktop-3p` 或 `local_projects` 的原生 Code 推論會替換授權。
+
+`local_projects` 是從手機或 claude.ai 以 Remote Control 開啟 Desktop 專案的
+本機工作階段（「Local session (from a project)」）。這種工作階段仍是 Desktop
+的本機 Code，但 Claude Code 會把每個請求 User-Agent 與計費標頭裡的入口換成
+保留名稱 `local_projects`，原本的 `claude-desktop` 不會出現在任何請求欄位。
+終端機 `claude remote-control` 開的工作階段走另一個旗標，不會用這個名稱，
+因此仍維持原授權。
+
+未替換授權的 `/v1/messages` 推論會記一行
+`[ClaudeCode] passthrough op=messages entrypoint=<入口> status=<狀態碼>`。
+它不進「最近請求」，也不計入用量；用來發現經過代理、卻沒被辨識而直接用
+登入帳號的工作階段。
 
 `claude-desktop-3p` 是 Desktop 第三方模式（`deploymentMode: 3p`）下本機 Code
 的進入點。只有推論送往 `api.anthropic.com` 時才會經過替換：provider 選

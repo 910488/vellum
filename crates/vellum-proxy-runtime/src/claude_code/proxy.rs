@@ -59,10 +59,13 @@ const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 /// beta. A signed-in Desktop already sends it; a third-party Desktop on a
 /// Claude API key does not.
 const OAUTH_BETA: &str = "oauth-2025-04-20";
-/// Claude Code's `CLAUDE_CODE_ENTRYPOINT` for a local Code session, as
-/// Desktop sets it: `claude-desktop` signed in to claude.ai, `claude-desktop-3p`
-/// in third-party mode.
-const DESKTOP_ENTRYPOINTS: [&str; 2] = ["claude-desktop", "claude-desktop-3p"];
+/// The request entrypoint of a local Code session. Desktop sets
+/// `claude-desktop` signed in to claude.ai and `claude-desktop-3p` in
+/// third-party mode. A Remote Control session opened on one of Desktop's
+/// projects from the phone or claude.ai ("Local session (from a project)") is
+/// still that local session, but Claude Code then sends the reserved
+/// `local_projects` instead; a terminal `claude remote-control` session does not.
+const DESKTOP_ENTRYPOINTS: [&str; 3] = ["claude-desktop", "claude-desktop-3p", "local_projects"];
 const SESSION_IDENTITY_MISSING: &str = "claude_session_identity_missing";
 /// Token estimates in flight at once, out of the 32 request slots.
 const ESTIMATE_SLOTS: usize = 8;
@@ -437,6 +440,11 @@ impl ClaudeCodeProxy {
         let inference = parts.method == Method::POST
             && matches!(parts.uri.path(), "/v1/messages" | COUNT_TOKENS_PATH);
         let desktop = is_desktop_code(&parts.headers);
+        // Inference that keeps its own authorization still gets a line.
+        // Without one, a session Vellum does not recognise spends the
+        // signed-in account while nothing here shows it.
+        let passthrough = (inference && !desktop && parts.uri.path() == "/v1/messages")
+            .then(|| request_entrypoint(&parts.headers));
         let mut headers = end_to_end_headers(&parts.headers);
         let mut guard = None;
         let mut response_account = None;
@@ -603,6 +611,12 @@ impl ClaudeCodeProxy {
         };
         self.observe(response_account.as_deref(), upstream.headers());
         let status = upstream.status();
+        if let Some(entrypoint) = passthrough.as_deref() {
+            log::info!(
+                "[ClaudeCode] passthrough op=messages entrypoint={entrypoint} status={}",
+                status.as_u16()
+            );
+        }
         if let Some(guard) = guard.as_mut() {
             guard.update("streaming", Some(status.as_u16()));
             guard.response(upstream.headers(), status.as_u16());
@@ -907,8 +921,29 @@ fn is_desktop_code(headers: &HeaderMap) -> bool {
         .unwrap_or("");
     ua.starts_with("claude-cli/")
         && ua
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
             .any(|part| DESKTOP_ENTRYPOINTS.contains(&part))
+}
+
+/// The entrypoint Claude Code put in its User-Agent,
+/// `claude-cli/<version> (external, <entrypoint>, ...)`, for the log line of
+/// a request that keeps its own authorization. Anything else is `other`.
+fn request_entrypoint(headers: &HeaderMap) -> String {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .filter(|ua| ua.starts_with("claude-cli/"))
+        .and_then(|ua| ua.split_once('('))
+        .and_then(|(_, details)| details.split([',', ')']).nth(1))
+        .map(str::trim)
+        .filter(|entrypoint| {
+            !entrypoint.is_empty()
+                && entrypoint.len() <= 64
+                && entrypoint
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_/.".contains(&c))
+        })
+        .map_or_else(|| "other".into(), str::to_owned)
 }
 
 /// Adds the OAuth beta to `anthropic-beta`, merging every value Claude Code
